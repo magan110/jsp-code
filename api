@@ -1,146 +1,18 @@
-using System;
-using System.Collections.Generic;
-using System.IdentityModel.Tokens.Jwt;
-using System.Linq;
-using System.Text;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.IdentityModel.Tokens;
-using MyFirstApi.Controllers;         // for ApplicationDbContext
-using sparshWebService.DataAccess;   // for DatabaseHelper
-using sparshWebService.Middleware;   // for AuthenticationMiddleware
-
-var builder = WebApplication.CreateBuilder(args);
-
-// ----------------------------------------------------------------------------
-// 1) Load all four connection strings from appsettings.json
-// ----------------------------------------------------------------------------
-var connectionStrings = builder.Configuration.GetSection("ConnectionStrings")
-                                              .Get<Dictionary<string, string>>();
-
-if (!connectionStrings.ContainsKey("DefaultConnection"))
-    throw new Exception("Missing 'DefaultConnection' in ConnectionStrings.");
-
-if (!connectionStrings.ContainsKey("bwlive") ||
-    !connectionStrings.ContainsKey("itkHaria") ||
-    !connectionStrings.ContainsKey("imageData"))
-    throw new Exception("Make sure 'bwlive', 'itkHaria', and 'imageData' are present in ConnectionStrings.");
-
-// ----------------------------------------------------------------------------
-// 2) Register EF Core DbContext for ApplicationDbContext
-//    (so that controllers like DsrActivityController can receive it via DI)
-// ----------------------------------------------------------------------------
-builder.Services.AddDbContext<ApplicationDbContext>(options =>
-    options.UseSqlServer(connectionStrings["DefaultConnection"]));
-
-// ----------------------------------------------------------------------------
-// 3) Register DatabaseHelper as a Singleton (used by AuthenticationMiddleware, etc.)
-// ----------------------------------------------------------------------------
-builder.Services.AddSingleton(provider =>
-    new DatabaseHelper(
-        connectionStrings["bwlive"],
-        connectionStrings["itkHaria"],
-        connectionStrings["imageData"]
-    ));
-
-// ----------------------------------------------------------------------------
-// 4) Register HttpClient (if any controllers or services need outgoing HTTP calls)
-// ----------------------------------------------------------------------------
-builder.Services.AddHttpClient();
-
-// ----------------------------------------------------------------------------
-// 5) Configure JWT Bearer Authentication
-// ----------------------------------------------------------------------------
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = false,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = "Birla White IT", // your expected issuer
-
-            // Dynamically resolve signing key from DB based on "PartnerID" claim
-            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
-            {
-                var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
-                var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-                if (string.IsNullOrEmpty(partnerId))
-                    throw new SecurityTokenInvalidSigningKeyException("PartnerID claim is missing.");
-
-                // Build a temporary service provider to fetch the singleton DatabaseHelper
-                var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
-                var secretKey = dbHelper.GetSecretKey(partnerId);
-                if (string.IsNullOrWhiteSpace(secretKey))
-                    throw new SecurityTokenInvalidSigningKeyException("SecretKey not found for PartnerID.");
-
-                return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
-            }
-        };
-
-        options.Events = new JwtBearerEvents
-        {
-            OnMessageReceived = context =>
-            {
-                var authHeader = context.Request.Headers["Authorization"].ToString();
-                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-                {
-                    context.Token = authHeader["Bearer ".Length..].Trim();
-                }
-                return Task.CompletedTask;
-            }
-        };
-    });
-
-// ----------------------------------------------------------------------------
-// 6) Add Controllers & Swagger/OpenAPI
-// ----------------------------------------------------------------------------
-builder.Services.AddControllers();
-builder.Services.AddSwaggerGen();
-
-var app = builder.Build();
-
-// ----------------------------------------------------------------------------
-// 7) Enable Swagger UI in Development only
-// ----------------------------------------------------------------------------
-if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "ConnectionStrings": {
+    "bwlive": "Server=10.4.64.15;Database=bwlive;User ID=birlawhite;Password=M@nsv1530;Trusted_Connection=False;TrustServerCertificate=true;",
+    "itkHaria": "Server=10.4.64.15;Database=ItKharia;User ID=itKharia;Password=Mans^1530;Trusted_Connection=False;TrustServerCertificate=true;",
+    "imageData": "Server=10.4.64.15;Database=imageData;User ID=sa;Password=Point@0652;Trusted_Connection=False;TrustServerCertificate=true;"
+  },
+  "Jwt": {
+    "Key": "SuperLongRandomSecretKey_ChangeThisToYourOwnSecureValue",
+    "Issuer": "https://qa.birlawhite.com"
+  }
 }
-
-// ----------------------------------------------------------------------------
-// 8) Insert custom AuthenticationMiddleware (PartnerID + AllowedAPIs + “IsBlocked” logic)
-//    This must run BEFORE the built-in UseAuthentication/UseAuthorization.
-// ----------------------------------------------------------------------------
-app.UseMiddleware<AuthenticationMiddleware>();
-
-// ----------------------------------------------------------------------------
-// 9) Standard middleware pipeline
-// ----------------------------------------------------------------------------
-app.UseHttpsRedirection();
-app.UseAuthentication();
-app.UseAuthorization();
-
-// ----------------------------------------------------------------------------
-// 10) (Optional) A simple “landing page” at “/”
-// ----------------------------------------------------------------------------
-app.MapGet("/", async context =>
-{
-    context.Response.ContentType = "text/html";
-    await context.Response.WriteAsync("<h1>Welcome to My API</h1><p>The service is running.</p>");
-});
-
-// ----------------------------------------------------------------------------
-// 11) Map controller endpoints (including DsrActivityController, etc.)
-// ----------------------------------------------------------------------------
-app.MapControllers();
-
-app.Run();
