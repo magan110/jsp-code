@@ -1,18 +1,447 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;   // <-- for DatabaseHelper
+
+namespace MyFirstApi.Controllers
 {
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
+    // ─── DTOs ────────────────────────────────────────────────────────────────────
+
+    public class DsrSubmitRequest
+    {
+        public string PurchaserRetailerType { get; set; }
+        public string AreaCode              { get; set; }
+        public string CodeSearch            { get; set; }
+        public string CustomerName          { get; set; }
+        public string Date                  { get; set; }   // expected "yyyy-MM-dd"
+        public string YourLatitude          { get; set; }
+        public string YourLongitude         { get; set; }
+        public string CustLatitude          { get; set; }
+        public string CustLongitude         { get; set; }
+        public string EntryType             { get; set; }   // "IN" or "Exception"
     }
-  },
-  "AllowedHosts": "*",
-  "ConnectionStrings": {
-    "bwlive": "Server=10.4.64.15;Database=bwlive;User ID=birlawhite;Password=M@nsv1530;Trusted_Connection=False;TrustServerCertificate=true;",
-    "itkHaria": "Server=10.4.64.15;Database=ItKharia;User ID=itKharia;Password=Mans^1530;Trusted_Connection=False;TrustServerCertificate=true;",
-    "imageData": "Server=10.4.64.15;Database=imageData;User ID=sa;Password=Point@0652;Trusted_Connection=False;TrustServerCertificate=true;"
-  },
-  "Jwt": {
-    "Key": "SuperLongRandomSecretKey_ChangeThisToYourOwnSecureValue",
-    "Issuer": "https://qa.birlawhite.com"
-  }
+
+    public class AreaDto
+    {
+        public string AreaCode { get; set; }
+        public string AreaDesc { get; set; }
+    }
+
+    public class RetailerDto
+    {
+        public string Code      { get; set; }
+        public string Name      { get; set; }
+        public string Address   { get; set; }
+        public string City      { get; set; }
+        public double Latitude  { get; set; }
+        public double Longitude { get; set; }
+    }
+
+    // ─── Controller ───────────────────────────────────────────────────────────────
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class DsrActivityController : ControllerBase
+    {
+        private readonly DatabaseHelper _dbHelper;
+
+        public DsrActivityController(DatabaseHelper dbHelper)
+        {
+            _dbHelper = dbHelper;
+        }
+
+        /// <summary>
+        /// GET /api/dsractivity/areas?search=...
+        /// Returns a list of active area codes filtered by the 'search' term (case‐insensitive).
+        /// </summary>
+        [HttpGet("areas")]
+        public IActionResult GetAreas([FromQuery] string search = "")
+        {
+            // Build SQL:
+            //   SELECT AreaCode, AreaDesc
+            //   FROM Areas
+            //   WHERE IsActive = 1
+            //     AND (AreaCode LIKE @search OR AreaDesc LIKE @search)
+            //   ORDER BY AreaDesc;
+            //
+            // We’ll parameterize @search = "%" + search.Trim().ToLower() + "%"
+
+            string sql = @"
+                SELECT AreaCode, AreaDesc
+                FROM Areas
+                WHERE IsActive = 1
+                  AND (
+                        LOWER(AreaCode)   LIKE @search
+                     OR LOWER(AreaDesc)   LIKE @search
+                  )
+                ORDER BY AreaDesc
+            ";
+
+            var parameters = new Dictionary<string, object>
+            {
+                { "@search", $"%{search.Trim().ToLower()}%" }
+            };
+
+            try
+            {
+                var rows = _dbHelper.WebSessBean(sql, parameters);
+                var result = rows
+                    .Select(r => new AreaDto
+                    {
+                        AreaCode = r["AreaCode"].ToString(),
+                        AreaDesc = r["AreaDesc"].ToString()
+                    })
+                    .Take(50)
+                    .ToList();
+
+                return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                // Log ex if desired
+                return StatusCode(500, $"Error fetching areas: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// GET /api/dsractivity/retailers?areaCode=XXX&search=YYY
+        /// Returns a list of active retailers in the given area, filtered by 'search' term.
+        /// </summary>
+        [HttpGet("retailers")]
+        public IActionResult GetRetailers(
+            [FromQuery] string areaCode,
+            [FromQuery] string search = "")
+        {
+            if (string.IsNullOrWhiteSpace(areaCode))
+                return BadRequest("areaCode is required.");
+
+            // Build SQL:
+            //   SELECT Code, Name, Address, City, Latitude, Longitude
+            //   FROM Retailers
+            //   WHERE IsActive = 1
+            //     AND AreaCode = @areaCode
+            //     AND (
+            //          LOWER(Code) LIKE @search
+            //       OR LOWER(Name) LIKE @search
+            //     )
+            //   ORDER BY Name;
+            //
+            // Parameterize areaCode and search.
+
+            string sql = @"
+                SELECT Code,
+                       Name,
+                       Address,
+                       City,
+                       Latitude,
+                       Longitude
+                FROM Retailers
+                WHERE IsActive = 1
+                  AND AreaCode = @areaCode
+                  AND (
+                        LOWER(Code) LIKE @search
+                     OR LOWER(Name) LIKE @search
+                  )
+                ORDER BY Name
+            ";
+
+            var parameters = new Dictionary<string, object>
+            {
+                { "@areaCode", areaCode.Trim() },
+                { "@search",    $"%{search.Trim().ToLower()}%" }
+            };
+
+            try
+            {
+                var rows = _dbHelper.WebSessBean(sql, parameters);
+                var result = rows
+                    .Select(r => new RetailerDto
+                    {
+                        Code      = r["Code"].ToString(),
+                        Name      = r["Name"].ToString(),
+                        Address   = r["Address"].ToString(),
+                        City      = r["City"].ToString(),
+                        Latitude  = Convert.ToDouble(r["Latitude"], CultureInfo.InvariantCulture),
+                        Longitude = Convert.ToDouble(r["Longitude"], CultureInfo.InvariantCulture)
+                    })
+                    .Take(50)
+                    .ToList();
+
+                return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                // Log ex if desired
+                return StatusCode(500, $"Error fetching retailers: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// POST /api/dsractivity/submit
+        /// Accepts a DSR “IN/Exception” submission from the mobile client.
+        /// </summary>
+        [HttpPost("submit")]
+        public IActionResult Submit([FromBody] DsrSubmitRequest request)
+        {
+            if (request == null)
+                return BadRequest("Request body is missing.");
+
+            // Basic validation
+            if (string.IsNullOrWhiteSpace(request.PurchaserRetailerType) ||
+                string.IsNullOrWhiteSpace(request.AreaCode)              ||
+                string.IsNullOrWhiteSpace(request.CodeSearch)            ||
+                string.IsNullOrWhiteSpace(request.CustomerName)          ||
+                string.IsNullOrWhiteSpace(request.Date)                  ||
+                string.IsNullOrWhiteSpace(request.YourLatitude)          ||
+                string.IsNullOrWhiteSpace(request.YourLongitude)         ||
+                string.IsNullOrWhiteSpace(request.CustLatitude)          ||
+                string.IsNullOrWhiteSpace(request.CustLongitude)         ||
+                string.IsNullOrWhiteSpace(request.EntryType))
+            {
+                return BadRequest("All fields are required.");
+            }
+
+            // Parse the date ("yyyy-MM-dd")
+            if (!DateTime.TryParseExact(
+                    request.Date.Trim(),
+                    "yyyy-MM-dd",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out var reportDate))
+            {
+                return BadRequest("Date must be in yyyy-MM-dd format.");
+            }
+
+            // Parse lat/long
+            if (!double.TryParse(request.YourLatitude, out var yourLat) ||
+                !double.TryParse(request.YourLongitude, out var yourLon) ||
+                !double.TryParse(request.CustLatitude, out var custLat) ||
+                !double.TryParse(request.CustLongitude, out var custLon))
+            {
+                return BadRequest("Latitude/Longitude values must be valid numbers.");
+            }
+
+            // Generate a random DocuNumb (e.g. "DSR" + 6-digit random)
+            var rnd = new Random();
+            var suffix = rnd.Next(100000, 1_000_000);   // 100000..999999
+            var docuNumb = "DSR" + suffix;
+
+            // Insert into DsrActivities table in the bwlive database
+            //
+            // Assuming the DsrActivities table has columns roughly like:
+            //  ( Id INT IDENTITY(1,1) PRIMARY KEY,
+            //    DocuNumb       VARCHAR(20),
+            //    DocuDate       DATE,
+            //    DsrParam       VARCHAR(10),
+            //    CusRtlFl       VARCHAR(50),
+            //    CusRtlCd       VARCHAR(50),
+            //    DsrRem01 … DsrRem08   VARCHAR(...)  (we’ll insert empty strings),
+            //    AreaCode       VARCHAR(50),
+            //    CuRtType       VARCHAR(50),
+            //    OrdExDat       VARCHAR(50),
+            //    CreateId       VARCHAR(50),
+            //    CustomerName   VARCHAR(100),
+            //    YourLatitude   FLOAT,
+            //    YourLongitude  FLOAT,
+            //    CustLatitude   FLOAT,
+            //    CustLongitude  FLOAT,
+            //    EntryType      VARCHAR(20),
+            //    CreatedAt      DATETIME
+            //  )
+            //
+            // You may need to adjust column names to exactly match your schema. Below is a sample:
+
+            string insertSql = @"
+                INSERT INTO DsrActivities
+                (
+                  DocuNumb,
+                  DocuDate,
+                  DsrParam,
+                  CusRtlFl,
+                  CusRtlCd,
+                  DsrRem01,
+                  DsrRem02,
+                  DsrRem03,
+                  DsrRem04,
+                  DsrRem05,
+                  DsrRem06,
+                  DsrRem07,
+                  DsrRem08,
+                  AreaCode,
+                  CuRtType,
+                  OrdExDat,
+                  CreateId,
+                  CustomerName,
+                  YourLatitude,
+                  YourLongitude,
+                  CustLatitude,
+                  CustLongitude,
+                  EntryType,
+                  CreatedAt
+                )
+                VALUES
+                (
+                  @DocuNumb,
+                  @DocuDate,
+                  @DsrParam,
+                  @CusRtlFl,
+                  @CusRtlCd,
+                  @DsrRem01,
+                  @DsrRem02,
+                  @DsrRem03,
+                  @DsrRem04,
+                  @DsrRem05,
+                  @DsrRem06,
+                  @DsrRem07,
+                  @DsrRem08,
+                  @AreaCode,
+                  @CuRtType,
+                  @OrdExDat,
+                  @CreateId,
+                  @CustomerName,
+                  @YourLatitude,
+                  @YourLongitude,
+                  @CustLatitude,
+                  @CustLongitude,
+                  @EntryType,
+                  @CreatedAt
+                )
+            ";
+
+            // We’ll supply empty strings for DsrRem01..DsrRem08, and leave CuRtType & OrdExDat blank
+            var parameters = new Dictionary<string, object>
+            {
+                { "@DocuNumb",       docuNumb },
+                { "@DocuDate",       reportDate },
+                { "@DsrParam",       request.EntryType == "IN" ? "05" : "EX" },
+                { "@CusRtlFl",       request.PurchaserRetailerType.Trim() },
+                { "@CusRtlCd",       request.CodeSearch.Trim() },
+                { "@DsrRem01",       "" },
+                { "@DsrRem02",       "" },
+                { "@DsrRem03",       "" },
+                { "@DsrRem04",       "" },
+                { "@DsrRem05",       "" },
+                { "@DsrRem06",       "" },
+                { "@DsrRem07",       "" },
+                { "@DsrRem08",       "" },
+                { "@AreaCode",       request.AreaCode.Trim() },
+                { "@CuRtType",       "" },
+                { "@OrdExDat",       "" },
+                { "@CreateId",       "2961" },   // Hard‐coded or pull from your login context
+                { "@CustomerName",   request.CustomerName.Trim() },
+                { "@YourLatitude",   yourLat },
+                { "@YourLongitude",  yourLon },
+                { "@CustLatitude",   custLat },
+                { "@CustLongitude",  custLon },
+                { "@EntryType",      request.EntryType.Trim() },
+                { "@CreatedAt",      DateTime.UtcNow }
+            };
+
+            try
+            {
+                // Because your DatabaseHelper maps "bwlive" to the bwlive connection string,
+                // we call ExecuteCommandForDb("bwlive", ...)
+                int rowsAffected = _dbHelper.ExecuteCommandForDb(
+                    "bwlive",
+                    insertSql,
+                    parameters
+                );
+
+                if (rowsAffected > 0)
+                {
+                    return Ok(new
+                    {
+                        message    = "DSR activity submitted successfully.",
+                        docuNumb   = docuNumb
+                    });
+                }
+                else
+                {
+                    return StatusCode(500, "Insert succeeded but no rows were affected.");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log ex if desired
+                return StatusCode(500, $"Submission failed: {ex.Message}");
+            }
+        }
+    }
 }
+
+
+
+
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using sparshWebService.DataAccess;    // ← DatabaseHelper
+using sparshWebService.Middleware;    // ← AuthenticationMiddleware
+
+var builder = WebApplication.CreateBuilder(args);
+
+// ─── 1) Read ConnectionStrings from appsettings.json ─────────────────────────
+var configuration = builder.Configuration;
+var connStrings = configuration.GetSection("ConnectionStrings")
+                               .Get<Dictionary<string, string>>();
+
+if (!connStrings.ContainsKey("bwlive") ||
+    !connStrings.ContainsKey("itkHaria") ||
+    !connStrings.ContainsKey("imageData"))
+{
+    throw new Exception("Please configure bwlive, itkHaria, and imageData in ConnectionStrings.");
+}
+
+// ─── 2) Register DatabaseHelper as a Singleton ────────────────────────────────
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        connStrings["bwlive"],
+        connStrings["itkHaria"],
+        connStrings["imageData"]
+    ));
+
+// ─── 3) Add HttpClient (if you need it later) ─────────────────────────────────
+builder.Services.AddHttpClient();
+
+// ─── 4) Add Authentication/Authorization (JWT, plus your custom Middleware) ───
+// (Assuming you still want JWT and PartnerID‐validation.)
+builder.Services.AddAuthentication(/* … your JWT setup … */);
+builder.Services.AddAuthorization();
+
+// ─── 5) Add Controllers and Swagger ─────────────────────────────────────────
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+// ─── 6) Swagger in Development ───────────────────────────────────────────────
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ─── 7) Custom PartnerID + “IsBlocked” + Allowed-APIs middleware ─────────────
+app.UseMiddleware<AuthenticationMiddleware>();
+
+// ─── 8) Standard ASP.NET Core pipeline ───────────────────────────────────────
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ─── 9) Home page (optional) ────────────────────────────────────────────────
+app.MapGet("/", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.WriteAsync("<h1>Welcome</h1><p>API is running.</p>");
+});
+
+// ─── 10) Map Controllers ─────────────────────────────────────────────────────
+app.MapControllers();
+
+app.Run();
