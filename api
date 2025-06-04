@@ -1,3 +1,120 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using MyFirstApi.DataAccess;
+using MyFirstApi.Middleware;
+using MyFirstApi.Models;
+using System.IdentityModel.Tokens.Jwt;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// ─── 1) Register EF Core DbContext ──────────────────────────────────────────
+//    Replace "DefaultConnection" with whatever name you used above in appsettings.json
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"))
+);
+
+// ─── 2) Register DatabaseHelper ──────────────────────────────────────────────
+//    We pull three connection strings (bwlive, itkHaria, imageData) from configuration.
+//    DatabaseHelper is a singleton because it just holds those connection strings and
+//    provides helper methods for raw SQL queries.
+var connStrings = builder.Configuration
+                          .GetSection("ConnectionStrings")
+                          .Get<Dictionary<string, string>>();
+
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        connStrings["bwlive"],
+        connStrings["itkHaria"],
+        connStrings["imageData"]
+    )
+);
+
+// ─── 3) Add HttpClient (if you need to call external HTTP) ───────────────────
+builder.Services.AddHttpClient();
+
+// ─── 4) Add Controllers + Swagger/OpenAPI ────────────────────────────────────
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// ─── 5) Configure JWT Bearer Authentication ─────────────────────────────────
+//    We validate tokens by looking up the PartnerID claim, retrieving its secret key
+//    from the DB, and then using that key to validate the signature.
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer           = true,
+            ValidateAudience         = false,
+            ValidateLifetime         = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer              = builder.Configuration["JwtSettings:Issuer"],
+            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
+            {
+                // At validation time, decode the token, extract PartnerID claim,
+                // fetch the corresponding secret key from DB, and return a SymmetricSecurityKey.
+                var jwtToken  = new JwtSecurityTokenHandler().ReadJwtToken(token);
+                var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+                if (!string.IsNullOrEmpty(partnerId))
+                {
+                    var dbHelper  = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
+                    var secretKey = dbHelper.GetSecretKey(partnerId);
+                    if (!string.IsNullOrWhiteSpace(secretKey))
+                    {
+                        return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
+                    }
+                }
+                throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
+            }
+        };
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                // Extract the raw token from "Authorization: Bearer <token>"
+                var authHeader = context.Request.Headers["Authorization"].ToString();
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+                {
+                    context.Token = authHeader.Substring("Bearer ".Length).Trim();
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+var app = builder.Build();
+
+// ─── 6) Enable Swagger in Development ────────────────────────────────────────
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ─── 7) Custom Middleware for Block‐Check & Allowed‐API Validation ─────────────
+//    We run this BEFORE UseAuthentication() so that our middleware can also
+//    verify partner ID + block status + allowed‐API list. If we wanted the
+//    built‐in JWT middleware to verify signatures first, we would swap order.
+
+app.UseMiddleware<AuthenticationMiddleware>();
+
+app.UseHttpsRedirection();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();
+
+app.Run();
+
+
+
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -7,19 +124,90 @@ using Microsoft.EntityFrameworkCore;
 
 namespace MyFirstApi.Controllers
 {
-    // DTOs
+    ///
+    /// ─── COMBINED MODELS + DbContext + CONTROLLER ───────────────────────────────
+    ///
+
+    // ─── 1) Entity Classes (formerly in Models/Area.cs, Retailer.cs, DsrActivity.cs) ───
+
+    public class Area
+    {
+        public string AreaCode { get; set; }
+        public string AreaDesc { get; set; }
+        public bool IsActive   { get; set; }
+    }
+
+    public class Retailer
+    {
+        public string Code      { get; set; }
+        public string Name      { get; set; }
+        public string Address   { get; set; }
+        public string City      { get; set; }
+        public double Latitude  { get; set; }
+        public double Longitude { get; set; }
+        public string AreaCode  { get; set; }
+        public bool IsActive    { get; set; }
+    }
+
+    public class DsrActivity
+    {
+        public int Id                      { get; set; }
+        public string PurchaserRetailerType { get; set; }
+        public string AreaCode             { get; set; }
+        public string CustomerCode         { get; set; }
+        public string CustomerName         { get; set; }
+        public DateTime ReportDate         { get; set; }
+        public double YourLatitude         { get; set; }
+        public double YourLongitude        { get; set; }
+        public double CustLatitude         { get; set; }
+        public double CustLongitude        { get; set; }
+        public string EntryType            { get; set; }
+        public DateTime CreatedAt          { get; set; }
+    }
+
+    // ─── 2) EF Core DbContext (formerly in Models/ApplicationDbContext.cs) ───────────
+
+    public class ApplicationDbContext : DbContext
+    {
+        public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
+            : base(options)
+        { }
+
+        public DbSet<Area> Areas { get; set; }
+        public DbSet<Retailer> Retailers { get; set; }
+        public DbSet<DsrActivity> DsrActivities { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<Area>()
+                .HasKey(a => a.AreaCode);
+
+            modelBuilder.Entity<Retailer>()
+                .HasKey(r => r.Code);
+
+            // By convention, DsrActivity.Id is the primary key.
+        }
+    }
+
+    // ─── 3) DTO Classes (formerly in Controller file) ────────────────────────────────
+
+    /// <summary>
+    /// Payload for POST /api/dsractivity/submit
+    /// </summary>
     public class DsrSubmitRequest
     {
         public string PurchaserRetailerType { get; set; }
-        public string AreaCode { get; set; }
-        public string CodeSearch { get; set; }
-        public string CustomerName { get; set; }
-        public string Date { get; set; } // expected format: "yyyy-MM-dd"
-        public string YourLatitude { get; set; }
-        public string YourLongitude { get; set; }
-        public string CustLatitude { get; set; }
-        public string CustLongitude { get; set; }
-        public string EntryType { get; set; } // "IN" or "Exception"
+        public string AreaCode              { get; set; }
+        public string CodeSearch            { get; set; }
+        public string CustomerName          { get; set; }
+        public string Date                  { get; set; } // expected format: "yyyy-MM-dd"
+        public string YourLatitude          { get; set; }
+        public string YourLongitude         { get; set; }
+        public string CustLatitude          { get; set; }
+        public string CustLongitude         { get; set; }
+        public string EntryType             { get; set; } // "IN" or "Exception"
     }
 
     public class AreaDto
@@ -30,62 +218,15 @@ namespace MyFirstApi.Controllers
 
     public class RetailerDto
     {
-        public string Code { get; set; }
-        public string Name { get; set; }
-        public string Address { get; set; }
-        public string City { get; set; }
-        public double Latitude { get; set; }
+        public string Code      { get; set; }
+        public string Name      { get; set; }
+        public string Address   { get; set; }
+        public string City      { get; set; }
+        public double Latitude  { get; set; }
         public double Longitude { get; set; }
     }
 
-    // Assuming your EF Core DbContext looks something like this:
-    public class ApplicationDbContext : DbContext
-    {
-        public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
-            : base(options)
-        { }
-
-        public DbSet<Area> Areas { get; set; }
-        public DbSet<Retailer> Retailers { get; set; }
-        public DbSet<DsrActivity> DsrActivities { get; set; }
-        // ... other DbSets ...
-    }
-
-    // Entity classes
-    public class Area
-    {
-        public string AreaCode { get; set; }
-        public string AreaDesc { get; set; }
-        public bool IsActive { get; set; }
-    }
-
-    public class Retailer
-    {
-        public string Code { get; set; }
-        public string Name { get; set; }
-        public string Address { get; set; }
-        public string City { get; set; }
-        public double Latitude { get; set; }
-        public double Longitude { get; set; }
-        public string AreaCode { get; set; }
-        public bool IsActive { get; set; }
-    }
-
-    public class DsrActivity
-    {
-        public int Id { get; set; }
-        public string PurchaserRetailerType { get; set; }
-        public string AreaCode { get; set; }
-        public string CustomerCode { get; set; }
-        public string CustomerName { get; set; }
-        public DateTime ReportDate { get; set; }
-        public double YourLatitude { get; set; }
-        public double YourLongitude { get; set; }
-        public double CustLatitude { get; set; }
-        public double CustLongitude { get; set; }
-        public string EntryType { get; set; }
-        public DateTime CreatedAt { get; set; }
-    }
+    // ─── 4) Controller (formerly in Controllers/DsrActivityController.cs) ────────────
 
     [ApiController]
     [Route("api/[controller]")]
@@ -100,7 +241,7 @@ namespace MyFirstApi.Controllers
 
         /// <summary>
         /// GET /api/dsractivity/areas?search=...
-        /// Returns a list of active area codes filtered by 'search' term (case‐insensitive).
+        /// Returns up to 50 active area codes, filtered by the 'search' term (case‐insensitive).
         /// </summary>
         [HttpGet("areas")]
         public async Task<IActionResult> GetAreas([FromQuery] string search = "")
@@ -124,7 +265,7 @@ namespace MyFirstApi.Controllers
                     AreaCode = a.AreaCode,
                     AreaDesc = a.AreaDesc
                 })
-                .Take(50) // limit to 50 results
+                .Take(50)
                 .ToListAsync();
 
             return Ok(result);
@@ -132,7 +273,7 @@ namespace MyFirstApi.Controllers
 
         /// <summary>
         /// GET /api/dsractivity/retailers?areaCode=XXX&search=YYY
-        /// Returns a list of active retailers in a given area (filtered by 'search' term).
+        /// Returns up to 50 active retailers in a given area, filtered by 'search' term.
         /// </summary>
         [HttpGet("retailers")]
         public async Task<IActionResult> GetRetailers(
@@ -158,11 +299,11 @@ namespace MyFirstApi.Controllers
                 .OrderBy(r => r.Name)
                 .Select(r => new RetailerDto
                 {
-                    Code = r.Code,
-                    Name = r.Name,
-                    Address = r.Address,
-                    City = r.City,
-                    Latitude = r.Latitude,
+                    Code      = r.Code,
+                    Name      = r.Name,
+                    Address   = r.Address,
+                    City      = r.City,
+                    Latitude  = r.Latitude,
                     Longitude = r.Longitude
                 })
                 .Take(50)
@@ -173,7 +314,7 @@ namespace MyFirstApi.Controllers
 
         /// <summary>
         /// POST /api/dsractivity/submit
-        /// Accepts a DSR “IN/Exception” submission from the mobile client.
+        /// Inserts a new DsrActivity record for IN/Exception entries.
         /// </summary>
         [HttpPost("submit")]
         public async Task<IActionResult> Submit([FromBody] DsrSubmitRequest request)
@@ -181,7 +322,7 @@ namespace MyFirstApi.Controllers
             if (request == null)
                 return BadRequest("Request body is missing.");
 
-            // Basic validation
+            // 1) Validate required fields
             if (string.IsNullOrWhiteSpace(request.PurchaserRetailerType) ||
                 string.IsNullOrWhiteSpace(request.AreaCode) ||
                 string.IsNullOrWhiteSpace(request.CodeSearch) ||
@@ -196,7 +337,7 @@ namespace MyFirstApi.Controllers
                 return BadRequest("All fields are required.");
             }
 
-            // Parse the date
+            // 2) Parse Date ("yyyy-MM-dd")
             if (!DateTime.TryParseExact(
                     request.Date.Trim(),
                     "yyyy-MM-dd",
@@ -207,7 +348,7 @@ namespace MyFirstApi.Controllers
                 return BadRequest("Date must be in yyyy-MM-dd format.");
             }
 
-            // Parse lat/long fields
+            // 3) Parse lat/long
             if (!double.TryParse(request.YourLatitude, out var yourLat) ||
                 !double.TryParse(request.YourLongitude, out var yourLon) ||
                 !double.TryParse(request.CustLatitude, out var custLat) ||
@@ -216,29 +357,178 @@ namespace MyFirstApi.Controllers
                 return BadRequest("Latitude/Longitude values must be valid numbers.");
             }
 
-            // Create new DsrActivity record
+            // 4) Create and save a new DsrActivity
             var activity = new DsrActivity
             {
                 PurchaserRetailerType = request.PurchaserRetailerType.Trim(),
-                AreaCode = request.AreaCode.Trim(),
-                CustomerCode = request.CodeSearch.Trim(),
-                CustomerName = request.CustomerName.Trim(),
-                ReportDate = reportDate,
-                YourLatitude = yourLat,
-                YourLongitude = yourLon,
-                CustLatitude = custLat,
-                CustLongitude = custLon,
-                EntryType = request.EntryType.Trim(),
-                CreatedAt = DateTime.UtcNow
+                AreaCode              = request.AreaCode.Trim(),
+                CustomerCode          = request.CodeSearch.Trim(),
+                CustomerName          = request.CustomerName.Trim(),
+                ReportDate            = reportDate,
+                YourLatitude          = yourLat,
+                YourLongitude         = yourLon,
+                CustLatitude          = custLat,
+                CustLongitude         = custLon,
+                EntryType             = request.EntryType.Trim(),
+                CreatedAt             = DateTime.UtcNow
             };
 
             _context.DsrActivities.Add(activity);
             await _context.SaveChangesAsync();
 
-            return Ok(new { message = "DSR activity submitted successfully.", activityId = activity.Id });
+            return Ok(new
+            {
+                message    = "DSR activity submitted successfully.",
+                activityId = activity.Id
+            });
         }
     }
 }
+
+
+
+using Microsoft.AspNetCore.Http;
+using MyFirstApi.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace MyFirstApi.Middleware
+{
+    /// <summary>
+    /// This middleware enforces:
+    ///  1) Presence of the “PartnerID” header + “Authorization: Bearer <token>” header.
+    ///  2) That the JWT’s PartnerID claim matches the header.
+    ///  3) That the user is not blocked (Users.IsBlocked = 1 in your ’Users’ table).
+    ///  4) That this PartnerID is allowed to call the current endpoint (path).
+    /// 
+    /// If any check fails, we short‐circuit with 400/401/403. Otherwise, call _next(context).
+    /// </summary>
+    public class AuthenticationMiddleware
+    {
+        private readonly RequestDelegate _next;
+        private readonly DatabaseHelper _dbHelper;
+
+        public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
+        {
+            _next     = next;
+            _dbHelper = dbHelper;
+        }
+
+        public async Task InvokeAsync(HttpContext context)
+        {
+            // 1) Normalize the path (lowercase)
+            var currentPath = context.Request.Path.Value?.ToLower();
+
+            // 2) Bypass authentication for certain endpoints (e.g. login, token issuance).
+            //    Adjust these as needed for your actual “anonymous” endpoints.
+            if (currentPath?.StartsWith("/api/token") == true ||
+                currentPath?.StartsWith("/api/auth/login") == true ||
+                currentPath?.StartsWith("/api/dsractivity/submit") == true)
+            {
+                // If you want /api/dsractivity/submit to be public, keep this line.
+                // Otherwise, remove "/api/dsractivity/submit" from this list so it is protected.
+                await _next(context);
+                return;
+            }
+
+            // 3) Extract PartnerID header + Authorization header
+            var partnerId        = context.Request.Headers["PartnerID"].FirstOrDefault();
+            var authorizationHdr = context.Request.Headers["Authorization"].FirstOrDefault();
+
+            if (string.IsNullOrWhiteSpace(partnerId) ||
+                string.IsNullOrWhiteSpace(authorizationHdr) ||
+                !authorizationHdr.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsync("PartnerID header and Bearer token are required.");
+                return;
+            }
+
+            // 4) Extract the raw JWT (strip "Bearer ")
+            var jwtTokenString = authorizationHdr.Substring("Bearer ".Length).Trim();
+
+            try
+            {
+                var jwtHandler = new JwtSecurityTokenHandler();
+                if (!jwtHandler.CanReadToken(jwtTokenString))
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    await context.Response.WriteAsync("Invalid JWT token format.");
+                    return;
+                }
+
+                // 5) Read the token without checking signature here (signature was checked by AddJwtBearer)
+                var token = jwtHandler.ReadJwtToken(jwtTokenString);
+                var tokenPartnerId = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+
+                // 6) Verify that PartnerID claim matches header
+                if (string.IsNullOrEmpty(tokenPartnerId) ||
+                    !string.Equals(tokenPartnerId, partnerId, StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
+                    return;
+                }
+
+                // 7) Check if this PartnerID is blocked (Users table)
+                var blockQuery = @"
+                    SELECT IsBlocked, BlockMessage
+                    FROM Users
+                    WHERE LoginId = @PartnerID";
+                var blockParams = new Dictionary<string, object>
+                {
+                    { "@PartnerID", partnerId }
+                };
+                var userRows = _dbHelper.KkrSessBean(blockQuery, blockParams);
+
+                if (userRows.Count > 0)
+                {
+                    bool isBlocked = Convert.ToBoolean(userRows[0]["IsBlocked"]);
+                    if (isBlocked)
+                    {
+                        var blockMsg = userRows[0]["BlockMessage"]?.ToString()
+                                       ?? "Your account has been blocked. Contact support.";
+                        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                        await context.Response.WriteAsync(blockMsg);
+                        return;
+                    }
+                }
+                else
+                {
+                    // No matching user → unauthorized
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    await context.Response.WriteAsync("PartnerID not found.");
+                    return;
+                }
+
+                // 8) Check allowed‐API list for this PartnerID
+                var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
+                // Normalize path (no trailing slash)
+                var normalizedPath = currentPath?.TrimEnd('/') ?? string.Empty;
+
+                if (!allowedApis.Contains(normalizedPath))
+                {
+                    context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                    await context.Response.WriteAsync("Access to this API is not allowed for this PartnerID.");
+                    return;
+                }
+
+                // 9) All checks passed → proceed down the pipeline
+                await _next(context);
+            }
+            catch (Exception ex)
+            {
+                // Any unexpected error → 401 Unauthorized
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
+            }
+        }
+    }
+}
+
 
 
 
@@ -247,8 +537,20 @@ using System.Collections.Generic;
 using System.Data.SqlClient;
 using System.Linq;
 
-namespace sparshWebService.DataAccess
+namespace MyFirstApi.DataAccess
 {
+    /// <summary>
+    /// Utility to execute raw SQL against three different databases:
+    ///   1) bwlive   (connection string name: "bwlive")
+    ///   2) itkHaria (connection string name: "itkHaria")
+    ///   3) imageData (connection string name: "imageData")
+    /// 
+    /// Used mostly by AuthenticationMiddleware to:
+    ///  - fetch secret key for a PartnerID
+    ///  - check if a user is blocked
+    ///  - retrieve allowed API list for a PartnerID
+    ///  - log requests/responses if desired
+    /// </summary>
     public class DatabaseHelper
     {
         private readonly string _bwliveConnectionString;
@@ -257,35 +559,41 @@ namespace sparshWebService.DataAccess
 
         public DatabaseHelper(string bwliveConnectionString, string itKhariaConnectionString, string imageDataConnectionString)
         {
-            _bwliveConnectionString = bwliveConnectionString;
+            _bwliveConnectionString  = bwliveConnectionString;
             _itKhariaConnectionString = itKhariaConnectionString;
             _imageDataConnectionString = imageDataConnectionString;
         }
 
-        // Public getters for connection strings
-        public string BwliveConnectionString => _bwliveConnectionString;
+        // Expose public getters in case you need them elsewhere
+        public string BwliveConnectionString   => _bwliveConnectionString;
         public string ItKhariaConnectionString => _itKhariaConnectionString;
         public string ImageDataConnectionString => _imageDataConnectionString;
 
-        // Utility: ExecuteCommand by dbKey
+        /// <summary>
+        /// Execute a non‐query (INSERT/UPDATE/DELETE) against one of the three databases,
+        /// determined by dbKey = "bwlive", "itkharia", or "imagedata".
+        /// </summary>
         public int ExecuteCommandForDb(string dbKey, string query, Dictionary<string, object> parameters)
         {
             string connStr = dbKey.ToLower() switch
             {
-                "bwlive" => _bwliveConnectionString,
+                "bwlive"   => _bwliveConnectionString,
                 "itkharia" => _itKhariaConnectionString,
                 "imagedata" => _imageDataConnectionString,
-                _ => throw new Exception("Unknown DB key")
+                _ => throw new Exception($"Unknown DB key: {dbKey}")
             };
             return ExecuteCommand(connStr, query, parameters);
         }
 
-        // General method to execute SELECT queries for any connection string
+        /// <summary>
+        /// Execute a SELECT query (returning rows) against a given connection string.
+        /// </summary>
         private List<Dictionary<string, object>> ExecuteSelectQuery(string connectionString, string query, Dictionary<string, object> parameters)
         {
             var resultList = new List<Dictionary<string, object>>();
+
             using (var conn = new SqlConnection(connectionString))
-            using (var cmd = new SqlCommand(query, conn))
+            using (var cmd  = new SqlCommand(query, conn))
             {
                 foreach (var param in parameters)
                 {
@@ -306,14 +614,18 @@ namespace sparshWebService.DataAccess
                     }
                 }
             }
+
             return resultList;
         }
 
-        // General method to execute INSERT, UPDATE, or DELETE queries for any connection string
+        /// <summary>
+        /// Execute an INSERT / UPDATE / DELETE against a connection string.
+        /// Returns number of rows affected.
+        /// </summary>
         public int ExecuteCommand(string connectionString, string query, Dictionary<string, object> parameters)
         {
             using (var conn = new SqlConnection(connectionString))
-            using (var cmd = new SqlCommand(query, conn))
+            using (var cmd  = new SqlCommand(query, conn))
             {
                 foreach (var param in parameters)
                 {
@@ -321,78 +633,126 @@ namespace sparshWebService.DataAccess
                 }
 
                 conn.Open();
-                return cmd.ExecuteNonQuery(); // Returns the number of rows affected
+                return cmd.ExecuteNonQuery();
             }
         }
 
-        // SELECT helpers
+        /// <summary>
+        /// Convenience: SELECT against the bwlive database.
+        /// </summary>
         public List<Dictionary<string, object>> WebSessBean(string query, Dictionary<string, object> parameters)
             => ExecuteSelectQuery(_bwliveConnectionString, query, parameters);
 
+        /// <summary>
+        /// Convenience: SELECT against the itKharia database.
+        /// </summary>
         public List<Dictionary<string, object>> KkrSessBean(string query, Dictionary<string, object> parameters)
             => ExecuteSelectQuery(_itKhariaConnectionString, query, parameters);
 
+        /// <summary>
+        /// Convenience: SELECT against the imageData database.
+        /// </summary>
         public List<Dictionary<string, object>> ImgSessBean(string query, Dictionary<string, object> parameters)
             => ExecuteSelectQuery(_imageDataConnectionString, query, parameters);
 
+        /// <summary>
+        /// Look up the secret key for a given PartnerID from prmApiPrtnr (in itKharia).
+        /// Throws if not found.
+        /// </summary>
         public string GetSecretKey(string partnerId)
         {
             var query = "SELECT secrtKey FROM prmApiPrtnr WHERE partnrId = @PartnerID";
-            var parameters = new Dictionary<string, object> { { "@PartnerID", partnerId } };
+            var parameters = new Dictionary<string, object>
+            {
+                { "@PartnerID", partnerId }
+            };
             var result = KkrSessBean(query, parameters);
             if (result.Count > 0)
-                return result[0]["secrtKey"]?.ToString();
-            throw new Exception("SecretKey not found for the given PartnerID.");
+            {
+                return result[0]["secrtKey"]?.ToString() ?? throw new Exception("SecretKey was null.");
+            }
+            throw new Exception($"SecretKey not found for PartnerID '{partnerId}'.");
         }
 
+        /// <summary>
+        /// Look up the comma‐separated allowed‐API list (allwdAPI) for this PartnerID.
+        /// Returns a List<string> of normalized (lowercase, trimmed) paths.
+        /// </summary>
         public List<string> GetAllowedAPIs(string partnerId)
         {
             var query = @"SELECT allwdAPI FROM prmApiPrtnr WHERE partnrId = @PartnerID";
-            var parameters = new Dictionary<string, object> { { "@PartnerID", partnerId } };
+            var parameters = new Dictionary<string, object>
+            {
+                { "@PartnerID", partnerId }
+            };
             var result = KkrSessBean(query, parameters);
             if (result.Count > 0)
             {
                 var allowedApis = result[0]["allwdAPI"]?.ToString();
-                return allowedApis?.Split(',').Select(api => api.Trim().ToLower()).ToList();
+                return allowedApis?
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(api => api.Trim().ToLower())
+                    .ToList()
+                    ?? new List<string>();
             }
-            throw new Exception("No APIs found for the given PartnerID.");
+            throw new Exception($"No allowed APIs found for PartnerID '{partnerId}'.");
         }
 
+        /// <summary>
+        /// Insert a row into comApiLogs for auditing. Logs up to 8 request‐body fields.
+        /// If PartnerID doesn't exist in prmApiPrtnr, we skip insertion.
+        /// </summary>
         public void InsertIntoLog(string partnerId, string endpoint, string responseStatus, int statCode, object requestBody)
         {
+            // 1) Check that PartnerID exists
             var checkQuery = "SELECT COUNT(*) AS Count FROM prmApiPrtnr WHERE partnrId = @PartnerID";
             var checkParams = new Dictionary<string, object> { { "@PartnerID", partnerId } };
             var exists = KkrSessBean(checkQuery, checkParams);
             if (exists.Count == 0 || Convert.ToInt32(exists[0]["Count"]) == 0)
             {
-                Console.WriteLine($"Warning: PartnerID '{partnerId}' does not exist. Log insertion skipped.");
+                Console.WriteLine($"Warning: PartnerID '{partnerId}' not found. Skipping log insertion.");
                 return;
             }
-            var bodyDict = requestBody?.GetType().GetProperties()
+
+            // 2) Flatten up to 8 request‐body props into strings "Name=Value"
+            var bodyProps = requestBody?
+                .GetType()
+                .GetProperties()
                 .Where(p => p.GetValue(requestBody) != null)
                 .Select(p => $"{p.Name}={p.GetValue(requestBody)}")
                 .Take(8)
-                .ToList() ?? new List<string>();
-            while (bodyDict.Count < 8)
-                bodyDict.Add("");
+                .ToList()
+                ?? new List<string>();
+
+            while (bodyProps.Count < 8)
+                bodyProps.Add(string.Empty);
+
+            // 3) Insert into comApiLogs
             var insertQuery = @"
-        INSERT INTO comApiLogs (PartnerID, Endpoint, ResponseStatus, statCode, ReqsBod1, ReqsBod2, ReqsBod3, ReqsBod4, ReqsBod5, ReqsBod6, ReqsBod7, ReqsBod8)
-        VALUES (@PartnerID, @Endpoint, @ResponseStatus, @StatCode, @ReqsBod1, @ReqsBod2, @ReqsBod3, @ReqsBod4, @ReqsBod5, @ReqsBod6, @ReqsBod7, @ReqsBod8)";
+                INSERT INTO comApiLogs
+                (PartnerID, Endpoint, ResponseStatus, statCode,
+                 ReqsBod1, ReqsBod2, ReqsBod3, ReqsBod4,
+                 ReqsBod5, ReqsBod6, ReqsBod7, ReqsBod8)
+                VALUES
+                (@PartnerID, @Endpoint, @ResponseStatus, @StatCode,
+                 @ReqsBod1, @ReqsBod2, @ReqsBod3, @ReqsBod4,
+                 @ReqsBod5, @ReqsBod6, @ReqsBod7, @ReqsBod8)";
             var insertParams = new Dictionary<string, object>
             {
-                { "@PartnerID", partnerId },
-                { "@Endpoint", endpoint },
+                { "@PartnerID",      partnerId },
+                { "@Endpoint",       endpoint },
                 { "@ResponseStatus", responseStatus },
-                { "@StatCode", statCode },
-                { "@ReqsBod1", bodyDict[0] },
-                { "@ReqsBod2", bodyDict[1] },
-                { "@ReqsBod3", bodyDict[2] },
-                { "@ReqsBod4", bodyDict[3] },
-                { "@ReqsBod5", bodyDict[4] },
-                { "@ReqsBod6", bodyDict[5] },
-                { "@ReqsBod7", bodyDict[6] },
-                { "@ReqsBod8", bodyDict[7] }
+                { "@StatCode",       statCode },
+                { "@ReqsBod1", bodyProps[0] },
+                { "@ReqsBod2", bodyProps[1] },
+                { "@ReqsBod3", bodyProps[2] },
+                { "@ReqsBod4", bodyProps[3] },
+                { "@ReqsBod5", bodyProps[4] },
+                { "@ReqsBod6", bodyProps[5] },
+                { "@ReqsBod7", bodyProps[6] },
+                { "@ReqsBod8", bodyProps[7] }
             };
+
             ExecuteCommand(_itKhariaConnectionString, insertQuery, insertParams);
         }
     }
@@ -400,246 +760,3 @@ namespace sparshWebService.DataAccess
 
 
 
-using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.IdentityModel.Tokens;
-using sparshWebService.DataAccess;
-using System.IdentityModel.Tokens.Jwt;
-using System.Text;
-
-var builder = WebApplication.CreateBuilder(args);
-
-// Add Controllers
-builder.Services.AddControllers();
-builder.Services.AddSwaggerGen();
-
-// Retrieve Connection Strings
-var connectionStrings = builder.Configuration.GetSection("ConnectionStrings").Get<Dictionary<string, string>>();
-
-// Register DatabaseHelper as a Singleton
-builder.Services.AddSingleton(provider =>
-    new DatabaseHelper(
-        connectionStrings["bwlive"],
-        connectionStrings["itkHaria"],
-        connectionStrings["imageData"]));
-
-// Add HttpClient for DI
-builder.Services.AddHttpClient();
-
-// Add Authentication
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = false,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = "Birla White IT", // Set your valid issuer
-            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
-            {
-                // Resolve signing key dynamically based on PartnerID
-                var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
-                var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-                if (partnerId != null)
-                {
-                    var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
-                    var secretKey = dbHelper.GetSecretKey(partnerId); // Retrieve SecretKey from DB
-                    if (!string.IsNullOrEmpty(secretKey))
-                    {
-                        return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
-                    }
-                }
-                throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
-            }
-        };
-
-        options.Events = new JwtBearerEvents
-        {
-            OnMessageReceived = context =>
-            {
-                var authHeader = context.Request.Headers["Authorization"].ToString();
-                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
-                {
-                    context.Token = authHeader.Replace("Bearer ", "");
-                }
-                return Task.CompletedTask;
-            }
-        };
-    });
-
-var app = builder.Build();
-
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
-
-// Custom Middleware for PartnerID and API access validation
-app.UseMiddleware<AuthenticationMiddleware>();
-
-app.UseHttpsRedirection();
-app.UseAuthentication();
-app.UseAuthorization();
-
-// Add a default home page for the API
-app.MapGet("/", async context =>
-{
-    context.Response.ContentType = "text/html";
-    await context.Response.WriteAsync("<h1>Welcome to My API</h1><p>This is the default home page.</p>");
-});
-
-app.MapControllers();
-app.Run();
-
-
-
-
-using Microsoft.AspNetCore.Http;
-using sparshWebService.DataAccess;
-using System;
-using System.IdentityModel.Tokens.Jwt;
-using System.Linq;
-using System.Threading.Tasks;
-
-namespace sparshWebService.Middleware
-{
-    public class AuthenticationMiddleware
-    {
-        private readonly RequestDelegate _next;
-        private readonly DatabaseHelper _dbHelper;
-
-        public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
-        {
-            _next = next;
-            _dbHelper = dbHelper;
-        }
-
-        public async Task InvokeAsync(HttpContext context)
-        {
-            // 1) Determine the current request path (lowercased, to normalize)
-            var currentPath = context.Request.Path.Value?.ToLower();
-
-            // 2) Bypass authentication for login (TokenController) and any other endpoints
-            //    that you want to allow anonymously (e.g. /api/auth/login).
-            //    In your original code you bypassed "/api/token"; adjust if needed.
-            if (currentPath?.StartsWith("/api/token", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/auth/login", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrbtlactivity/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrworkhome/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrsampling/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrphnpurc/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrphnbldr/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsroffleave/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrofficework/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrmeetnpur/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrmeetconr/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsrintmeett/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsranyactiv/submit", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/retailerinout/submit", StringComparison.OrdinalIgnoreCase) == true)
-            {
-                await _next(context);
-                return;
-            }
-
-            // 3) Extract PartnerID header and Authorization header
-            var partnerId = context.Request.Headers["PartnerID"].FirstOrDefault();
-            var authorizationHeader = context.Request.Headers["Authorization"].FirstOrDefault();
-
-            if (string.IsNullOrEmpty(partnerId) ||
-                string.IsNullOrEmpty(authorizationHeader) ||
-                !authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            {
-                context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                await context.Response.WriteAsync("PartnerID header and Authorization Bearer token are required.");
-                return;
-            }
-
-            // 4) Extract the raw JWT (strip "Bearer ")
-            var jwtTokenString = authorizationHeader.Substring("Bearer ".Length).Trim();
-
-            try
-            {
-                var jwtHandler = new JwtSecurityTokenHandler();
-                if (!jwtHandler.CanReadToken(jwtTokenString))
-                {
-                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    await context.Response.WriteAsync("Invalid JWT token format.");
-                    return;
-                }
-
-                // 5) Read the JWT without validating signature (signature was checked earlier by JWT middleware)
-                var token = jwtHandler.ReadJwtToken(jwtTokenString);
-                var tokenPartnerId = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-
-                // 6) Check that PartnerID claim in token matches header
-                if (string.IsNullOrEmpty(tokenPartnerId) ||
-                    !string.Equals(tokenPartnerId, partnerId, StringComparison.OrdinalIgnoreCase))
-                {
-                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
-                    return;
-                }
-
-                // ===== ADDED BLOCK CHECK =====
-                // 7) Query your Users table to see if this PartnerID is blocked
-                //    Assume Users.LoginId == PartnerID and Users.IsBlocked bit = 1 if blocked
-                var blockQuery = @"
-                    SELECT IsBlocked, BlockMessage
-                    FROM Users
-                    WHERE LoginId = @PartnerID";
-                var blockParams = new Dictionary<string, object>
-                {
-                    { "@PartnerID", partnerId }
-                };
-                var userRows = _dbHelper.KkrSessBean(blockQuery, blockParams);
-
-                if (userRows.Count > 0)
-                {
-                    bool isBlocked = Convert.ToBoolean(userRows[0]["IsBlocked"]);
-                    if (isBlocked)
-                    {
-                        // Retrieve DBA’s custom message (or fallback)
-                        var blockMsg = userRows[0]["BlockMessage"]?.ToString()
-                                       ?? "Your account has been blocked. Contact support.";
-
-                        context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                        await context.Response.WriteAsync(blockMsg);
-                        return;
-                    }
-                }
-                else
-                {
-                    // If user not found in Users table, optionally treat as unauthorized
-                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    await context.Response.WriteAsync("PartnerID not found.");
-                    return;
-                }
-                // ===== END BLOCK CHECK =====
-
-                // 8) Now verify that this PartnerID is allowed to call the current API
-                var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
-                // Normalize currentPath (e.g. remove trailing slash if any)
-                var normalizedPath = currentPath?.TrimEnd('/') ?? string.Empty;
-
-                if (!allowedApis.Contains(normalizedPath))
-                {
-                    context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                    await context.Response.WriteAsync("Access to this API is not allowed for this PartnerID.");
-                    return;
-                }
-
-                // 9) All checks passed → invoke the next middleware
-                await _next(context);
-            }
-            catch (Exception ex)
-            {
-                // Any unexpected exception → return 401 Unauthorized
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
-            }
-        }
-    }
-}
