@@ -331,7 +331,7 @@ namespace sparshWebService.Controllers
 
         /// <summary>
         /// GET /api/DsrActivity/{docuNumb}
-        /// Retrieve a DSR header + details by document number.
+        /// Returns one DSR header (all columns) plus its detail rows (all columns).
         /// </summary>
         [HttpGet("{docuNumb}")]
         public IActionResult GetDsr(string docuNumb)
@@ -341,117 +341,26 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // 1) Select header from dptDSRActvt
-                var headerQuery = @"
-                    SELECT
-                      docuNumb,
-                      CONVERT(char(10), docuDate, 103) AS docuDate,
-                      dsrParam,
-                      cusRtlFl,
-                      cusRtlCd,
-                      areaCode,
-                      CONVERT(char(10), ordExDat, 103)          AS ordExDat,
-                      prtDsCnt,
-                      pendIsue,
-                      pndIsuDt,
-                      isuDetal,
-                      wcErlSlb,
-                      wpErlSlb,
-                      vpErlSlb,
-                      bwStkWcc,
-                      bwStkWcp,
-                      bwStkVap,
-                      brndSlWc,
-                      brndSlWp,
-                      dsrRem05                            AS dsrRemOther,
-                      cityName,
-                      geoLatit,
-                      geoLongt,
-                      dsrExcpA,
-                      custName,
-                      ltLgDist,
-                      createId
-                    FROM dptDSRActvt WITH (NOLOCK)
-                    WHERE docuNumb = @docuNumb;";
+                // 1) SELECT * FROM dptDSRActvt
+                var headerQuery = "SELECT * FROM dptDSRActvt WITH (NOLOCK) WHERE docuNumb = @docuNumb;";
+                var hdrParams   = new Dictionary<string, object> { { "@docuNumb", docuNumb } };
+                var hdrRows     = _dbHelper.WebSessBean(headerQuery, hdrParams);
 
-                var headerParams = new Dictionary<string, object>
+                if (hdrRows.Count == 0)
+                    return NotFound($"No DSR found with docuNumb = '{docuNumb}'.");
+
+                // Build a dictionary of header‐column → value
+                var headerDict = hdrRows[0];
+
+                // 2) SELECT * FROM dptDSRActvtDtl
+                var detailQuery = "SELECT * FROM dptDSRActvtDtl WITH (NOLOCK) WHERE docuNumb = @docuNumb;";
+                var dtlRows     = _dbHelper.WebSessBean(detailQuery, hdrParams);
+
+                return Ok(new
                 {
-                    { "@docuNumb", docuNumb }
-                };
-                var headerRows = _dbHelper.WebSessBean(headerQuery, headerParams);
-                if (headerRows.Count == 0)
-                    return NotFound($"No DSR found with document number '{docuNumb}'.");
-
-                // Map the single header row into a DTO
-                var hdr = headerRows[0];
-                var dto = new DsrActivityDto
-                {
-                    DocuNumb    = hdr["docuNumb"]?.ToString(),
-                    DocuDate    = hdr["docuDate"]?.ToString(),
-                    DsrParam    = hdr["dsrParam"]?.ToString(),
-                    CusRtlFl    = hdr["cusRtlFl"]?.ToString(),
-                    CusRtlCd    = hdr["cusRtlCd"]?.ToString(),
-                    AreaCode    = hdr["areaCode"]?.ToString(),
-                    OrdExDat    = hdr["ordExDat"]?.ToString(),
-                    PrtDsCnt    = hdr["prtDsCnt"]?.ToString(),
-                    PendIsue    = hdr["pendIsue"]?.ToString(),
-                    PndIsuDt    = hdr["pndIsuDt"]?.ToString(),
-                    IsuDetal    = hdr["isuDetal"]?.ToString(),
-                    WcErlSlb    = Convert.ToDecimal(hdr["wcErlSlb"] ?? 0m),
-                    WpErlSlb    = Convert.ToDecimal(hdr["wpErlSlb"] ?? 0m),
-                    VpErlSlb    = Convert.ToDecimal(hdr["vpErlSlb"] ?? 0m),
-                    BwStkWcc    = Convert.ToDecimal(hdr["bwStkWcc"] ?? 0m),
-                    BwStkWcp    = Convert.ToDecimal(hdr["bwStkWcp"] ?? 0m),
-                    BwStkVap    = Convert.ToDecimal(hdr["bwStkVap"] ?? 0m),
-                    BrndSlWc    = hdr["brndSlWc"]?.ToString(),
-                    BrndSlWp    = hdr["brndSlWp"]?.ToString(),
-                    DsrRemOther = hdr["dsrRemOther"]?.ToString(),
-                    CityName    = hdr["cityName"]?.ToString(),
-                    GeoLatit    = hdr["geoLatit"]?.ToString(),
-                    GeoLongt    = hdr["geoLongt"]?.ToString(),
-                    DsrExcpA    = hdr["dsrExcpA"]?.ToString(),
-                    CustName    = hdr["custName"]?.ToString(),
-                    LtLgDist    = hdr["ltLgDist"]?.ToString(),
-                    CreateId    = hdr["createId"]?.ToString()
-                };
-
-                // 2) Select detail rows from dptDSRActvtDtl
-                var detailQuery = @"
-                    SELECT
-                      repoCatg,
-                      prodCode,
-                      prodQnty,
-                      projQnty,
-                      actnRemk,
-                      CONVERT(char(10), targetDt, 103) AS targetDt,
-                      mrktData
-                    FROM dptDSRActvtDtl WITH (NOLOCK)
-                    WHERE docuNumb = @docuNumb
-                      AND createId = @createId;";
-
-                var detailParams = new Dictionary<string, object>
-                {
-                    { "@docuNumb",  docuNumb },
-                    { "@createId",  dto.CreateId }
-                };
-                var detailRows = _dbHelper.WebSessBean(detailQuery, detailParams);
-
-                dto.Details = new List<DsrActivityDetailDto>();
-                foreach (var r in detailRows)
-                {
-                    dto.Details.Add(new DsrActivityDetailDto
-                    {
-                        RepoCatg = r["repoCatg"]?.ToString(),
-                        ProdCode = r["prodCode"]?.ToString(),
-                        ProdQnty = Convert.ToDecimal(r["prodQnty"] ?? 0m),
-                        ProjQnty = Convert.ToDecimal(r["projQnty"] ?? 0m),
-                        ActnRemk = r["actnRemk"]?.ToString(),
-                        TargetDt = r["targetDt"]?.ToString(),
-                        MrktData = r["mrktData"]?.ToString()
-                    });
-                }
-
-                return Ok(dto);
+                    Header = headerDict,
+                    Details = dtlRows
+                });
             }
             catch (Exception ex)
             {
@@ -461,21 +370,30 @@ namespace sparshWebService.Controllers
 
         /// <summary>
         /// POST /api/DsrActivity
-        /// Create a new DSR header + details.
+        /// Creates a new DSR header + detail rows.
+        /// 
+        /// Because we don’t know every column in dptDSRActvt, we explicitly INSERT only
+        /// the columns shown in your JSP code’s SELECT statements. Adjust as needed.
         /// </summary>
         [HttpPost]
-        public IActionResult CreateDsr([FromBody] DsrActivityDto dto)
+        public IActionResult CreateDsr([FromBody] DsrActivityCreateDto dto)
         {
             if (dto == null)
                 return BadRequest("Request body is required.");
             if (string.IsNullOrWhiteSpace(dto.DocuNumb))
                 return BadRequest("DocuNumb is required.");
             if (string.IsNullOrWhiteSpace(dto.CreateId))
-                return BadRequest("CreateId (loginId) is required.");
+                return BadRequest("CreateId is required.");
 
             try
             {
-                // 1) Insert header
+                //
+                // 1) INSERT into dptDSRActvt
+                //    (We only list columns that JSP definitely uses: 
+                //     docuNumb, docuDate, dsrParam, cusRtlFl, cusRtlCd,
+                //     dsrRem01..dsrRem08, areaCode, cuRtType, ordExDat, createId
+                //    )
+                //
                 var insertHeaderSql = @"
                     INSERT INTO dptDSRActvt
                     (
@@ -484,27 +402,17 @@ namespace sparshWebService.Controllers
                       dsrParam,
                       cusRtlFl,
                       cusRtlCd,
-                      areaCode,
-                      ordExDat,
-                      prtDsCnt,
-                      pendIsue,
-                      pndIsuDt,
-                      isuDetal,
-                      wcErlSlb,
-                      wpErlSlb,
-                      vpErlSlb,
-                      bwStkWcc,
-                      bwStkWcp,
-                      bwStkVap,
-                      brndSlWc,
-                      brndSlWp,
+                      dsrRem01,
+                      dsrRem02,
+                      dsrRem03,
+                      dsrRem04,
                       dsrRem05,
-                      cityName,
-                      geoLatit,
-                      geoLongt,
-                      dsrExcpA,
-                      custName,
-                      ltLgDist,
+                      dsrRem06,
+                      dsrRem07,
+                      dsrRem08,
+                      areaCode,
+                      cuRtType,
+                      ordExDat,
                       createId
                     )
                     VALUES
@@ -514,64 +422,50 @@ namespace sparshWebService.Controllers
                       @dsrParam,
                       @cusRtlFl,
                       @cusRtlCd,
-                      @areaCode,
-                      CASE WHEN @ordExDat = '' THEN NULL ELSE CONVERT(datetime, @ordExDat, 103) END,
-                      @prtDsCnt,
-                      @pendIsue,
-                      @pndIsuDt,
-                      @isuDetal,
-                      @wcErlSlb,
-                      @wpErlSlb,
-                      @vpErlSlb,
-                      @bwStkWcc,
-                      @bwStkWcp,
-                      @bwStkVap,
-                      @brndSlWc,
-                      @brndSlWp,
+                      @dsrRem01,
+                      @dsrRem02,
+                      @dsrRem03,
+                      @dsrRem04,
                       @dsrRem05,
-                      @cityName,
-                      @geoLatit,
-                      @geoLongt,
-                      @dsrExcpA,
-                      @custName,
-                      @ltLgDist,
+                      @dsrRem06,
+                      @dsrRem07,
+                      @dsrRem08,
+                      @areaCode,
+                      @cuRtType,
+                      CASE WHEN @ordExDat = '' THEN NULL ELSE CONVERT(datetime, @ordExDat, 103) END,
                       @createId
                     );";
 
-                var headerParams = new Dictionary<string, object>
+                var hdrParams = new Dictionary<string, object>
                 {
-                    { "@docuNumb",    dto.DocuNumb },
-                    { "@docuDate",    dto.DocuDate },
-                    { "@dsrParam",    dto.DsrParam ?? "" },
-                    { "@cusRtlFl",    dto.CusRtlFl ?? "" },
-                    { "@cusRtlCd",    dto.CusRtlCd ?? "" },
-                    { "@areaCode",    dto.AreaCode ?? "" },
-                    { "@ordExDat",    dto.OrdExDat ?? "" },
-                    { "@prtDsCnt",    dto.PrtDsCnt ?? "" },
-                    { "@pendIsue",    dto.PendIsue ?? "" },
-                    { "@pndIsuDt",    dto.PndIsuDt ?? "" },
-                    { "@isuDetal",    dto.IsuDetal ?? "" },
-                    { "@wcErlSlb",    dto.WcErlSlb },
-                    { "@wpErlSlb",    dto.WpErlSlb },
-                    { "@vpErlSlb",    dto.VpErlSlb },
-                    { "@bwStkWcc",    dto.BwStkWcc },
-                    { "@bwStkWcp",    dto.BwStkWcp },
-                    { "@bwStkVap",    dto.BwStkVap },
-                    { "@brndSlWc",    dto.BrndSlWc ?? "" },
-                    { "@brndSlWp",    dto.BrndSlWp ?? "" },
-                    { "@dsrRem05",    dto.DsrRemOther ?? "" },
-                    { "@cityName",    dto.CityName ?? "" },
-                    { "@geoLatit",    dto.GeoLatit ?? "" },
-                    { "@geoLongt",    dto.GeoLongt ?? "" },
-                    { "@dsrExcpA",    dto.DsrExcpA ?? "" },
-                    { "@custName",    dto.CustName ?? "" },
-                    { "@ltLgDist",    dto.LtLgDist ?? "" },
-                    { "@createId",    dto.CreateId }
+                    { "@docuNumb", dto.DocuNumb },
+                    { "@docuDate", dto.DocuDate      ?? "" },
+                    { "@dsrParam", dto.DsrParam      ?? "" },
+                    { "@cusRtlFl", dto.CusRtlFl      ?? "" },
+                    { "@cusRtlCd", dto.CusRtlCd      ?? "" },
+                    { "@dsrRem01", dto.DsrRem01      ?? "" },
+                    { "@dsrRem02", dto.DsrRem02      ?? "" },
+                    { "@dsrRem03", dto.DsrRem03      ?? "" },
+                    { "@dsrRem04", dto.DsrRem04      ?? "" },
+                    { "@dsrRem05", dto.DsrRem05      ?? "" },
+                    { "@dsrRem06", dto.DsrRem06      ?? "" },
+                    { "@dsrRem07", dto.DsrRem07      ?? "" },
+                    { "@dsrRem08", dto.DsrRem08      ?? "" },
+                    { "@areaCode", dto.AreaCode      ?? "" },
+                    { "@cuRtType", dto.CuRtType      ?? "" },
+                    { "@ordExDat", dto.OrdExDat      ?? "" },
+                    { "@createId", dto.CreateId      ?? "" }
                 };
 
-                _dbHelper.ExecuteCommandForDb("bwlive", insertHeaderSql, headerParams);
+                _dbHelper.ExecuteCommandForDb("bwlive", insertHeaderSql, hdrParams);
 
-                // 2) Insert each detail row
+                //
+                // 2) Insert detail rows into dptDSRActvtDtl
+                //    (We only list columns that JSP definitely references:
+                //     docuNumb, createId, repoCatg, catgPack, prodQnty, projQnty,
+                //     prodQtyV, actnRemk, targetDt, mrktData
+                //    )
+                //
                 if (dto.Details != null)
                 {
                     var insertDetailSql = @"
@@ -580,9 +474,10 @@ namespace sparshWebService.Controllers
                           docuNumb,
                           createId,
                           repoCatg,
-                          prodCode,
+                          catgPack,
                           prodQnty,
                           projQnty,
+                          prodQtyV,
                           actnRemk,
                           targetDt,
                           mrktData
@@ -592,9 +487,10 @@ namespace sparshWebService.Controllers
                           @docuNumb,
                           @createId,
                           @repoCatg,
-                          @prodCode,
+                          @catgPack,
                           @prodQnty,
                           @projQnty,
+                          @prodQtyV,
                           @actnRemk,
                           CASE WHEN @targetDt = '' THEN NULL ELSE CONVERT(datetime, @targetDt, 103) END,
                           @mrktData
@@ -602,19 +498,20 @@ namespace sparshWebService.Controllers
 
                     foreach (var d in dto.Details)
                     {
-                        var detailParams = new Dictionary<string, object>
+                        var dtlParams = new Dictionary<string, object>
                         {
-                            { "@docuNumb",  dto.DocuNumb },
-                            { "@createId",  dto.CreateId },
-                            { "@repoCatg",  d.RepoCatg ?? "" },
-                            { "@prodCode",  d.ProdCode ?? "" },
-                            { "@prodQnty",  d.ProdQnty },
-                            { "@projQnty",  d.ProjQnty },
-                            { "@actnRemk",  d.ActnRemk ?? "" },
-                            { "@targetDt",  d.TargetDt ?? "" },
-                            { "@mrktData",  d.MrktData ?? "" }
+                            { "@docuNumb", dto.DocuNumb   },
+                            { "@createId", dto.CreateId   },
+                            { "@repoCatg", d.RepoCatg   ?? "" },
+                            { "@catgPack", d.CatgPack   ?? "" },
+                            { "@prodQnty", d.ProdQnty         },
+                            { "@projQnty", d.ProjQnty         },
+                            { "@prodQtyV", d.ProdQtyV         },
+                            { "@actnRemk", d.ActnRemk   ?? "" },
+                            { "@targetDt", d.TargetDt   ?? "" },
+                            { "@mrktData", d.MrktData   ?? "" }
                         };
-                        _dbHelper.ExecuteCommandForDb("bwlive", insertDetailSql, detailParams);
+                        _dbHelper.ExecuteCommandForDb("bwlive", insertDetailSql, dtlParams);
                     }
                 }
 
@@ -622,108 +519,95 @@ namespace sparshWebService.Controllers
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error creating DSR: {ex.Message}");
+                return StatusCode(500, $"Error inserting DSR: {ex.Message}");
             }
         }
 
         /// <summary>
         /// PUT /api/DsrActivity/{docuNumb}
-        /// Update an existing DSR header & its detail rows.
+        /// Updates an existing DSR header + details. We first delete existing detail rows,
+        /// then re‐insert the ones sent in the request.
         /// </summary>
         [HttpPut("{docuNumb}")]
-        public IActionResult UpdateDsr(string docuNumb, [FromBody] DsrActivityDto dto)
+        public IActionResult UpdateDsr(string docuNumb, [FromBody] DsrActivityCreateDto dto)
         {
             if (string.IsNullOrWhiteSpace(docuNumb))
                 return BadRequest("Document number is required.");
             if (dto == null)
                 return BadRequest("Request body is required.");
             if (string.IsNullOrWhiteSpace(dto.CreateId))
-                return BadRequest("CreateId (loginId) is required.");
+                return BadRequest("CreateId is required.");
 
             try
             {
-                // 1) Check existence
+                // 1) Check if the header exists
                 var existsQuery = "SELECT COUNT(1) AS Cnt FROM dptDSRActvt WHERE docuNumb = @docuNumb;";
-                var existsParams = new Dictionary<string, object> { { "@docuNumb", docuNumb } };
-                var existsRows = _dbHelper.WebSessBean(existsQuery, existsParams);
-                if (existsRows.Count == 0 || Convert.ToInt32(existsRows[0]["Cnt"]) == 0)
-                    return NotFound($"No DSR found with document number '{docuNumb}' to update.");
+                var existParams = new Dictionary<string, object> { { "@docuNumb", docuNumb } };
+                var existRows   = _dbHelper.WebSessBean(existsQuery, existParams);
+                if (existRows.Count == 0 || Convert.ToInt32(existRows[0]["Cnt"]) == 0)
+                    return NotFound($"No DSR found with docuNumb = '{docuNumb}' to update.");
 
-                // 2) Update header
+                //
+                // 2) UPDATE the header (same columns as INSERT above)
+                //
                 var updateHeaderSql = @"
                     UPDATE dptDSRActvt SET
                       docuDate   = CONVERT(datetime, @docuDate, 103),
                       dsrParam   = @dsrParam,
                       cusRtlFl   = @cusRtlFl,
                       cusRtlCd   = @cusRtlCd,
-                      areaCode   = @areaCode,
-                      ordExDat   = CASE WHEN @ordExDat = '' THEN NULL ELSE CONVERT(datetime, @ordExDat, 103) END,
-                      prtDsCnt   = @prtDsCnt,
-                      pendIsue   = @pendIsue,
-                      pndIsuDt   = @pndIsuDt,
-                      isuDetal   = @isuDetal,
-                      wcErlSlb   = @wcErlSlb,
-                      wpErlSlb   = @wpErlSlb,
-                      vpErlSlb   = @vpErlSlb,
-                      bwStkWcc   = @bwStkWcc,
-                      bwStkWcp   = @bwStkWcp,
-                      bwStkVap   = @bwStkVap,
-                      brndSlWc   = @brndSlWc,
-                      brndSlWp   = @brndSlWp,
+                      dsrRem01   = @dsrRem01,
+                      dsrRem02   = @dsrRem02,
+                      dsrRem03   = @dsrRem03,
+                      dsrRem04   = @dsrRem04,
                       dsrRem05   = @dsrRem05,
-                      cityName   = @cityName,
-                      geoLatit   = @geoLatit,
-                      geoLongt   = @geoLongt,
-                      dsrExcpA   = @dsrExcpA,
-                      custName   = @custName,
-                      ltLgDist   = @ltLgDist
+                      dsrRem06   = @dsrRem06,
+                      dsrRem07   = @dsrRem07,
+                      dsrRem08   = @dsrRem08,
+                      areaCode   = @areaCode,
+                      cuRtType   = @cuRtType,
+                      ordExDat   = CASE WHEN @ordExDat = '' THEN NULL ELSE CONVERT(datetime, @ordExDat, 103) END
                     WHERE docuNumb = @docuNumb;";
 
-                var headerParams = new Dictionary<string, object>
+                var hdrParams = new Dictionary<string, object>
                 {
-                    { "@docuNumb",    docuNumb },
-                    { "@docuDate",    dto.DocuDate },
-                    { "@dsrParam",    dto.DsrParam ?? "" },
-                    { "@cusRtlFl",    dto.CusRtlFl ?? "" },
-                    { "@cusRtlCd",    dto.CusRtlCd ?? "" },
-                    { "@areaCode",    dto.AreaCode ?? "" },
-                    { "@ordExDat",    dto.OrdExDat ?? "" },
-                    { "@prtDsCnt",    dto.PrtDsCnt ?? "" },
-                    { "@pendIsue",    dto.PendIsue ?? "" },
-                    { "@pndIsuDt",    dto.PndIsuDt ?? "" },
-                    { "@isuDetal",    dto.IsuDetal ?? "" },
-                    { "@wcErlSlb",    dto.WcErlSlb },
-                    { "@wpErlSlb",    dto.WpErlSlb },
-                    { "@vpErlSlb",    dto.VpErlSlb },
-                    { "@bwStkWcc",    dto.BwStkWcc },
-                    { "@bwStkWcp",    dto.BwStkWcp },
-                    { "@bwStkVap",    dto.BwStkVap },
-                    { "@brndSlWc",    dto.BrndSlWc ?? "" },
-                    { "@brndSlWp",    dto.BrndSlWp ?? "" },
-                    { "@dsrRem05",    dto.DsrRemOther ?? "" },
-                    { "@cityName",    dto.CityName ?? "" },
-                    { "@geoLatit",    dto.GeoLatit ?? "" },
-                    { "@geoLongt",    dto.GeoLongt ?? "" },
-                    { "@dsrExcpA",    dto.DsrExcpA ?? "" },
-                    { "@custName",    dto.CustName ?? "" },
-                    { "@ltLgDist",    dto.LtLgDist ?? "" }
+                    { "@docuNumb", docuNumb            },
+                    { "@docuDate", dto.DocuDate      ?? "" },
+                    { "@dsrParam", dto.DsrParam      ?? "" },
+                    { "@cusRtlFl", dto.CusRtlFl      ?? "" },
+                    { "@cusRtlCd", dto.CusRtlCd      ?? "" },
+                    { "@dsrRem01", dto.DsrRem01      ?? "" },
+                    { "@dsrRem02", dto.DsrRem02      ?? "" },
+                    { "@dsrRem03", dto.DsrRem03      ?? "" },
+                    { "@dsrRem04", dto.DsrRem04      ?? "" },
+                    { "@dsrRem05", dto.DsrRem05      ?? "" },
+                    { "@dsrRem06", dto.DsrRem06      ?? "" },
+                    { "@dsrRem07", dto.DsrRem07      ?? "" },
+                    { "@dsrRem08", dto.DsrRem08      ?? "" },
+                    { "@areaCode", dto.AreaCode      ?? "" },
+                    { "@cuRtType", dto.CuRtType      ?? "" },
+                    { "@ordExDat", dto.OrdExDat      ?? "" }
                 };
 
-                _dbHelper.ExecuteCommandForDb("bwlive", updateHeaderSql, headerParams);
+                _dbHelper.ExecuteCommandForDb("bwlive", updateHeaderSql, hdrParams);
 
-                // 3) Delete existing details for this docuNumb + createId
+                //
+                // 3) DELETE existing detail rows for this docuNumb + createId
+                //
                 var deleteDetailsSql = @"
                     DELETE FROM dptDSRActvtDtl
                     WHERE docuNumb = @docuNumb
                       AND createId = @createId;";
-                var deleteParams = new Dictionary<string, object>
+                var delParams = new Dictionary<string, object>
                 {
-                    { "@docuNumb", docuNumb },
-                    { "@createId", dto.CreateId }
+                    { "@docuNumb", docuNumb       },
+                    { "@createId", dto.CreateId   }
                 };
-                _dbHelper.ExecuteCommandForDb("bwlive", deleteDetailsSql, deleteParams);
+                _dbHelper.ExecuteCommandForDb("bwlive", deleteDetailsSql, delParams);
 
-                // 4) Re‐insert each detail row
+                //
+                // 4) Re‐INSERT detail rows (same columns as in Create)
+                //
                 if (dto.Details != null)
                 {
                     var insertDetailSql = @"
@@ -732,9 +616,10 @@ namespace sparshWebService.Controllers
                           docuNumb,
                           createId,
                           repoCatg,
-                          prodCode,
+                          catgPack,
                           prodQnty,
                           projQnty,
+                          prodQtyV,
                           actnRemk,
                           targetDt,
                           mrktData
@@ -744,9 +629,10 @@ namespace sparshWebService.Controllers
                           @docuNumb,
                           @createId,
                           @repoCatg,
-                          @prodCode,
+                          @catgPack,
                           @prodQnty,
                           @projQnty,
+                          @prodQtyV,
                           @actnRemk,
                           CASE WHEN @targetDt = '' THEN NULL ELSE CONVERT(datetime, @targetDt, 103) END,
                           @mrktData
@@ -754,19 +640,20 @@ namespace sparshWebService.Controllers
 
                     foreach (var d in dto.Details)
                     {
-                        var detailParams = new Dictionary<string, object>
+                        var dtlParams = new Dictionary<string, object>
                         {
-                            { "@docuNumb",  docuNumb },
-                            { "@createId",  dto.CreateId },
-                            { "@repoCatg",  d.RepoCatg ?? "" },
-                            { "@prodCode",  d.ProdCode ?? "" },
-                            { "@prodQnty",  d.ProdQnty },
-                            { "@projQnty",  d.ProjQnty },
-                            { "@actnRemk",  d.ActnRemk ?? "" },
-                            { "@targetDt",  d.TargetDt ?? "" },
-                            { "@mrktData",  d.MrktData ?? "" }
+                            { "@docuNumb", dto.DocuNumb   },
+                            { "@createId", dto.CreateId   },
+                            { "@repoCatg", d.RepoCatg   ?? "" },
+                            { "@catgPack", d.CatgPack   ?? "" },
+                            { "@prodQnty", d.ProdQnty         },
+                            { "@projQnty", d.ProjQnty         },
+                            { "@prodQtyV", d.ProdQtyV         },
+                            { "@actnRemk", d.ActnRemk   ?? "" },
+                            { "@targetDt", d.TargetDt   ?? "" },
+                            { "@mrktData", d.MrktData   ?? "" }
                         };
-                        _dbHelper.ExecuteCommandForDb("bwlive", insertDetailSql, detailParams);
+                        _dbHelper.ExecuteCommandForDb("bwlive", insertDetailSql, dtlParams);
                     }
                 }
 
@@ -780,7 +667,7 @@ namespace sparshWebService.Controllers
 
         /// <summary>
         /// DELETE /api/DsrActivity/{docuNumb}
-        /// Delete a DSR header + all detail rows.
+        /// Deletes both the header and all detail rows.
         /// </summary>
         [HttpDelete("{docuNumb}")]
         public IActionResult DeleteDsr(string docuNumb)
@@ -790,24 +677,24 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // 1) Check if exists
+                // 1) Verify existence
                 var existsQuery = "SELECT COUNT(1) AS Cnt FROM dptDSRActvt WHERE docuNumb = @docuNumb;";
-                var existsParams = new Dictionary<string, object> { { "@docuNumb", docuNumb } };
-                var existsRows = _dbHelper.WebSessBean(existsQuery, existsParams);
-                if (existsRows.Count == 0 || Convert.ToInt32(existsRows[0]["Cnt"]) == 0)
-                    return NotFound($"No DSR found with document number '{docuNumb}' to delete.");
+                var existParams = new Dictionary<string, object> { { "@docuNumb", docuNumb } };
+                var existRows   = _dbHelper.WebSessBean(existsQuery, existParams);
+                if (existRows.Count == 0 || Convert.ToInt32(existRows[0]["Cnt"]) == 0)
+                    return NotFound($"No DSR found with docuNumb = '{docuNumb}' to delete.");
 
-                // 2) Delete detail rows
+                // 2) DELETE details first
                 var deleteDetailsSql = @"
                     DELETE FROM dptDSRActvtDtl
                     WHERE docuNumb = @docuNumb;";
-                _dbHelper.ExecuteCommandForDb("bwlive", deleteDetailsSql, existsParams);
+                _dbHelper.ExecuteCommandForDb("bwlive", deleteDetailsSql, existParams);
 
-                // 3) Delete header
+                // 3) DELETE header
                 var deleteHeaderSql = @"
                     DELETE FROM dptDSRActvt
                     WHERE docuNumb = @docuNumb;";
-                _dbHelper.ExecuteCommandForDb("bwlive", deleteHeaderSql, existsParams);
+                _dbHelper.ExecuteCommandForDb("bwlive", deleteHeaderSql, existParams);
 
                 return NoContent();
             }
@@ -819,59 +706,53 @@ namespace sparshWebService.Controllers
     }
 
     /// <summary>
-    /// DTO for the DSR header (maps to dptDSRActvt) plus a list of detail rows.
+    /// DTO used for creating/updating a DSR. We explicitly list only the columns
+    /// that your JSP actually touched (based on the SELECT statements). If your table
+    /// has extra columns, you can add them here as needed.
     /// </summary>
-    public class DsrActivityDto
+    public class DsrActivityCreateDto
     {
-        // Header fields
-        public string DocuNumb    { get; set; }
-        public string DocuDate    { get; set; }   // "dd/MM/yyyy"
-        public string DsrParam    { get; set; }
-        public string CusRtlFl    { get; set; }
-        public string CusRtlCd    { get; set; }
-        public string AreaCode    { get; set; }
-        public string OrdExDat    { get; set; }   // "dd/MM/yyyy" or ""
-        public string PrtDsCnt    { get; set; }
-        public string PendIsue    { get; set; }
-        public string PndIsuDt    { get; set; }
-        public string IsuDetal    { get; set; }
-        public decimal WcErlSlb   { get; set; }
-        public decimal WpErlSlb   { get; set; }
-        public decimal VpErlSlb   { get; set; }
-        public decimal BwStkWcc   { get; set; }
-        public decimal BwStkWcp   { get; set; }
-        public decimal BwStkVap   { get; set; }
-        public string BrndSlWc    { get; set; }   // comma-separated list
-        public string BrndSlWp    { get; set; }   // comma-separated list
-        public string DsrRemOther { get; set; }   // maps to dsrRem05
-        public string CityName    { get; set; }
-        public string GeoLatit    { get; set; }
-        public string GeoLongt    { get; set; }
-        public string DsrExcpA    { get; set; }
-        public string CustName    { get; set; }
-        public string LtLgDist    { get; set; }
+        // *** Header columns (dptDSRActvt) ***
+        public string DocuNumb { get; set; }    // e.g. "DSR000123"
+        public string DocuDate { get; set; }    // "dd/MM/yyyy"
+        public string DsrParam { get; set; }    // e.g. "05"
+        public string CusRtlFl { get; set; }    // e.g. "R"
+        public string CusRtlCd { get; set; }    // e.g. "CUST001"
+        public string DsrRem01 { get; set; }    // JSP uses dsrRem01..08 for various fields
+        public string DsrRem02 { get; set; }
+        public string DsrRem03 { get; set; }
+        public string DsrRem04 { get; set; }
+        public string DsrRem05 { get; set; }
+        public string DsrRem06 { get; set; }
+        public string DsrRem07 { get; set; }
+        public string DsrRem08 { get; set; }
+        public string AreaCode { get; set; }    // Sale area, e.g. "AREA01"
+        public string CuRtType { get; set; }    // e.g. "RR"
+        public string OrdExDat { get; set; }    // "dd/MM/yyyy" or empty
+        public string CreateId { get; set; }    // loginId, e.g. "2961"
 
-        // The loginId of the user who created/updates this DSR (maps to createId in the table).
-        public string CreateId    { get; set; }
-
-        // Child detail rows
-        public List<DsrActivityDetailDto> Details { get; set; }
+        // *** Detail rows (dptDSRActvtDtl) ***
+        public List<DsrActivityDetailCreateDto> Details { get; set; }
     }
 
     /// <summary>
-    /// DTO for each detail row (maps to dptDSRActvtDtl).
+    /// DTO for each detail row in dptDSRActvtDtl. We only list the columns that JSP used:
+    ///   • docuNumb, createId, repoCatg, catgPack, prodQnty, projQnty, prodQtyV, actnRemk, targetDt, mrktData
+    /// If your table has other columns, add them here (and update the INSERT SQL accordingly).
     /// </summary>
-    public class DsrActivityDetailDto
+    public class DsrActivityDetailCreateDto
     {
-        public string RepoCatg { get; set; }
-        public string ProdCode { get; set; }
-        public decimal ProdQnty { get; set; }
-        public decimal ProjQnty { get; set; }
-        public string ActnRemk { get; set; }
-        public string TargetDt { get; set; }   // "dd/MM/yyyy" or ""
-        public string MrktData { get; set; }   // e.g. "05", "06"
+        public string RepoCatg  { get; set; }   // e.g. "01"
+        public string CatgPack  { get; set; }   // e.g. "PACK001"
+        public decimal ProdQnty { get; set; }   // numeric
+        public decimal ProjQnty { get; set; }   // numeric
+        public decimal ProdQtyV { get; set; }   // e.g. “Volume” (some JSP paths used prodQtyV)
+        public string ActnRemk  { get; set; }   // any text
+        public string TargetDt  { get; set; }   // "dd/MM/yyyy" or empty
+        public string MrktData  { get; set; }   // e.g. "05" (indicates market data type)
     }
 }
+
 
 
 
