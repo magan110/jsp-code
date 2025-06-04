@@ -1,32 +1,154 @@
-System.InvalidOperationException: Unable to resolve service for type 'MyFirstApi.Controllers.ApplicationDbContext' while attempting to activate 'MyFirstApi.Controllers.DsrActivityController'.
-   at Microsoft.Extensions.DependencyInjection.ActivatorUtilities.ThrowHelperUnableToResolveService(Type type, Type requiredBy)
-   at lambda_method9(Closure, IServiceProvider, Object[])
-   at Microsoft.AspNetCore.Mvc.Controllers.ControllerFactoryProvider.<>c__DisplayClass6_0.<CreateControllerFactory>g__CreateController|0(ControllerContext controllerContext)
-   at Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker.Next(State& next, Scope& scope, Object& state, Boolean& isCompleted)
-   at Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker.InvokeInnerFilterAsync()
---- End of stack trace from previous location ---
-   at Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker.<InvokeFilterPipelineAsync>g__Awaited|20_0(ResourceInvoker invoker, Task lastTask, State next, Scope scope, Object state, Boolean isCompleted)
-   at Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker.<InvokeAsync>g__Awaited|17_0(ResourceInvoker invoker, Task task, IDisposable scope)
-   at Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker.<InvokeAsync>g__Awaited|17_0(ResourceInvoker invoker, Task task, IDisposable scope)
-   at Microsoft.AspNetCore.Authorization.AuthorizationMiddleware.Invoke(HttpContext context)
-   at Microsoft.AspNetCore.Authentication.AuthenticationMiddleware.Invoke(HttpContext context)
-   at AuthenticationMiddleware.InvokeAsync(HttpContext context) in C:\Users\Magan.Dhaniya-mkt\Desktop\SparshAPIs\SparshWebServices\AuthenticationMiddleware.cs:line 51
-   at Swashbuckle.AspNetCore.SwaggerUI.SwaggerUIMiddleware.Invoke(HttpContext httpContext)
-   at Swashbuckle.AspNetCore.Swagger.SwaggerMiddleware.Invoke(HttpContext httpContext, ISwaggerProvider swaggerProvider)
-   at Microsoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddlewareImpl.Invoke(HttpContext context)
+using System;
+using System.Collections.Generic;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.IdentityModel.Tokens;
+using MyFirstApi.Controllers;           // for ApplicationDbContext
+using sparshWebService.DataAccess;     // for DatabaseHelper
+using sparshWebService.Middleware;     // for AuthenticationMiddleware
 
-HEADERS
-=======
-Accept: */*
-Host: localhost:7223
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
-Accept-Encoding: gzip, deflate, br, zstd
-Accept-Language: en-US,en;q=0.9
-Referer: https://localhost:7223/swagger/index.html
-sec-ch-ua-platform: "Windows"
-sec-ch-ua: "Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"
-sec-ch-ua-mobile: ?0
-sec-fetch-site: same-origin
-sec-fetch-mode: cors
-sec-fetch-dest: empty
-priority: u=1, i
+var builder = WebApplication.CreateBuilder(args);
+
+// ----------------------------------------------------------
+// 1) Configure Connection Strings (in appsettings.json):
+//
+// "ConnectionStrings": {
+//   "DefaultConnection": "Server=...;Database=MyFirstApiDb;Trusted_Connection=True;",
+//   "bwlive":           "Server=...;Database=BWLiveDb;Trusted_Connection=True;",
+//   "itkHaria":         "Server=...;Database=ItKhariaDb;Trusted_Connection=True;",
+//   "imageData":        "Server=...;Database=ImageDataDb;Trusted_Connection=True;"
+// }
+// ----------------------------------------------------------
+
+// Read individual connection strings
+var defaultConn    = builder.Configuration.GetConnectionString("DefaultConnection");
+var bwliveConn     = builder.Configuration.GetConnectionString("bwlive");
+var itkHariaConn   = builder.Configuration.GetConnectionString("itkHaria");
+var imageDataConn  = builder.Configuration.GetConnectionString("imageData");
+
+// ----------------------------------------------------------
+// 2) Register EF Core DbContext for ApplicationDbContext
+//    (so that DsrActivityController can receive it via DI)
+// ----------------------------------------------------------
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseSqlServer(defaultConn));
+
+// ----------------------------------------------------------
+// 3) Register DatabaseHelper as a Singleton
+//    Used by AuthenticationMiddleware (and elsewhere if needed)
+// ----------------------------------------------------------
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        bwliveConn,
+        itkHariaConn,
+        imageDataConn
+    ));
+
+// ----------------------------------------------------------
+// 4) Register HttpClient (if any controllers/services need it)
+// ----------------------------------------------------------
+builder.Services.AddHttpClient();
+
+// ----------------------------------------------------------
+// 5) Configure JWT Bearer Authentication
+// ----------------------------------------------------------
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer           = true,
+            ValidateAudience         = false,
+            ValidateLifetime         = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer              = "Birla White IT",
+
+            // Dynamically resolve the signing key from the database per PartnerID claim
+            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
+            {
+                // Read the raw JWT to extract the PartnerID claim
+                var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
+                var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+                if (string.IsNullOrEmpty(partnerId))
+                    throw new SecurityTokenInvalidSigningKeyException("PartnerID claim is missing.");
+
+                // Retrieve DatabaseHelper from the DI container
+                var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
+                var secretKey = dbHelper.GetSecretKey(partnerId);
+                if (string.IsNullOrWhiteSpace(secretKey))
+                    throw new SecurityTokenInvalidSigningKeyException("SecretKey not found for PartnerID.");
+
+                return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
+            }
+        };
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Token = authHeader["Bearer ".Length..].Trim();
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+// ----------------------------------------------------------
+// 6) Add Controllers, Swagger, etc.
+// ----------------------------------------------------------
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+// ----------------------------------------------------------
+// 7) Enable Swagger in Development
+// ----------------------------------------------------------
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ----------------------------------------------------------
+// 8) Custom Middleware for PartnerID / API Validation
+//    Place this before UseAuthentication so that it can
+//    check the raw JWT & PartnerID headers itself.
+// ----------------------------------------------------------
+app.UseMiddleware<AuthenticationMiddleware>();
+
+// ----------------------------------------------------------
+// 9) Standard ASP.NET Core Middleware Pipeline
+// ----------------------------------------------------------
+app.UseHttpsRedirection();
+
+// Ensure Authentication runs before Authorization
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ----------------------------------------------------------
+// 10) Expose a default home page (optional)
+// ----------------------------------------------------------
+app.MapGet("/", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.WriteAsync("<h1>Welcome to MyFirstApi</h1><p>The API is up and running.</p>");
+});
+
+// ----------------------------------------------------------
+// 11) Map Controller Endpoints
+// ----------------------------------------------------------
+app.MapControllers();
+
+app.Run();
