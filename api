@@ -1,29 +1,61 @@
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.IdentityModel.Tokens;
-using sparshWebService.DataAccess;
+using System;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
 using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.IdentityModel.Tokens;
+using MyFirstApi.Controllers;         // for ApplicationDbContext
+using sparshWebService.DataAccess;   // for DatabaseHelper
+using sparshWebService.Middleware;   // for AuthenticationMiddleware
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add Controllers
-builder.Services.AddControllers();
-builder.Services.AddSwaggerGen();
+// ----------------------------------------------------------------------------
+// 1) Load all four connection strings from appsettings.json
+// ----------------------------------------------------------------------------
+var connectionStrings = builder.Configuration.GetSection("ConnectionStrings")
+                                              .Get<Dictionary<string, string>>();
 
-// Retrieve Connection Strings
-var connectionStrings = builder.Configuration.GetSection("ConnectionStrings").Get<Dictionary<string, string>>();
+if (!connectionStrings.ContainsKey("DefaultConnection"))
+    throw new Exception("Missing 'DefaultConnection' in ConnectionStrings.");
 
-// Register DatabaseHelper as a Singleton
+if (!connectionStrings.ContainsKey("bwlive") ||
+    !connectionStrings.ContainsKey("itkHaria") ||
+    !connectionStrings.ContainsKey("imageData"))
+    throw new Exception("Make sure 'bwlive', 'itkHaria', and 'imageData' are present in ConnectionStrings.");
+
+// ----------------------------------------------------------------------------
+// 2) Register EF Core DbContext for ApplicationDbContext
+//    (so that controllers like DsrActivityController can receive it via DI)
+// ----------------------------------------------------------------------------
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseSqlServer(connectionStrings["DefaultConnection"]));
+
+// ----------------------------------------------------------------------------
+// 3) Register DatabaseHelper as a Singleton (used by AuthenticationMiddleware, etc.)
+// ----------------------------------------------------------------------------
 builder.Services.AddSingleton(provider =>
     new DatabaseHelper(
         connectionStrings["bwlive"],
         connectionStrings["itkHaria"],
-        connectionStrings["imageData"]));
+        connectionStrings["imageData"]
+    ));
 
-// Add HttpClient for DI
+// ----------------------------------------------------------------------------
+// 4) Register HttpClient (if any controllers or services need outgoing HTTP calls)
+// ----------------------------------------------------------------------------
 builder.Services.AddHttpClient();
 
-// Add Authentication
+// ----------------------------------------------------------------------------
+// 5) Configure JWT Bearer Authentication
+// ----------------------------------------------------------------------------
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
@@ -33,22 +65,23 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateAudience = false,
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
-            ValidIssuer = "Birla White IT", // Set your valid issuer
+            ValidIssuer = "Birla White IT", // your expected issuer
+
+            // Dynamically resolve signing key from DB based on "PartnerID" claim
             IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
             {
-                // Resolve signing key dynamically based on PartnerID
                 var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
                 var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-                if (partnerId != null)
-                {
-                    var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
-                    var secretKey = dbHelper.GetSecretKey(partnerId); // Retrieve SecretKey from DB
-                    if (!string.IsNullOrEmpty(secretKey))
-                    {
-                        return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
-                    }
-                }
-                throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
+                if (string.IsNullOrEmpty(partnerId))
+                    throw new SecurityTokenInvalidSigningKeyException("PartnerID claim is missing.");
+
+                // Build a temporary service provider to fetch the singleton DatabaseHelper
+                var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
+                var secretKey = dbHelper.GetSecretKey(partnerId);
+                if (string.IsNullOrWhiteSpace(secretKey))
+                    throw new SecurityTokenInvalidSigningKeyException("SecretKey not found for PartnerID.");
+
+                return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
             }
         };
 
@@ -57,36 +90,57 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             OnMessageReceived = context =>
             {
                 var authHeader = context.Request.Headers["Authorization"].ToString();
-                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
                 {
-                    context.Token = authHeader.Replace("Bearer ", "");
+                    context.Token = authHeader["Bearer ".Length..].Trim();
                 }
                 return Task.CompletedTask;
             }
         };
     });
 
+// ----------------------------------------------------------------------------
+// 6) Add Controllers & Swagger/OpenAPI
+// ----------------------------------------------------------------------------
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
 var app = builder.Build();
 
+// ----------------------------------------------------------------------------
+// 7) Enable Swagger UI in Development only
+// ----------------------------------------------------------------------------
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-// Custom Middleware for PartnerID and API access validation
+// ----------------------------------------------------------------------------
+// 8) Insert custom AuthenticationMiddleware (PartnerID + AllowedAPIs + “IsBlocked” logic)
+//    This must run BEFORE the built-in UseAuthentication/UseAuthorization.
+// ----------------------------------------------------------------------------
 app.UseMiddleware<AuthenticationMiddleware>();
 
+// ----------------------------------------------------------------------------
+// 9) Standard middleware pipeline
+// ----------------------------------------------------------------------------
 app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 
-// Add a default home page for the API
+// ----------------------------------------------------------------------------
+// 10) (Optional) A simple “landing page” at “/”
+// ----------------------------------------------------------------------------
 app.MapGet("/", async context =>
 {
     context.Response.ContentType = "text/html";
-    await context.Response.WriteAsync("<h1>Welcome to My API</h1><p>This is the default home page.</p>");
+    await context.Response.WriteAsync("<h1>Welcome to My API</h1><p>The service is running.</p>");
 });
 
+// ----------------------------------------------------------------------------
+// 11) Map controller endpoints (including DsrActivityController, etc.)
+// ----------------------------------------------------------------------------
 app.MapControllers();
+
 app.Run();
