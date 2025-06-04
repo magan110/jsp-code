@@ -1,3 +1,22 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "ConnectionStrings": {
+    "bwlive": "Server=10.4.64.15;Database=bwlive;User ID=birlawhite;Password=M@nsv1530;Trusted_Connection=False;TrustServerCertificate=true;",
+    "itkHaria": "Server=10.4.64.15;Database=ItKharia;User ID=itKharia;Password=Mans^1530;Trusted_Connection=False;TrustServerCertificate=true;",
+    "imageData": "Server=10.4.64.15;Database=imageData;User ID=sa;Password=Point@0652;Trusted_Connection=False;TrustServerCertificate=true;"
+  },
+  "Jwt": {
+    "Key": "SuperLongRandomSecretKey_ChangeThisToYourOwnSecureValue",
+    "Issuer": "https://qa.birlawhite.com"
+  }
+} 
+
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
@@ -709,3 +728,378 @@ namespace MyFirstApi.Controllers
         }
     }
 }
+
+
+
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using sparshWebService.DataAccess;    // ← DatabaseHelper
+   
+
+var builder = WebApplication.CreateBuilder(args);
+
+// ─── 1) Read ConnectionStrings from appsettings.json ─────────────────────────
+var configuration = builder.Configuration;
+var connStrings = configuration.GetSection("ConnectionStrings")
+                               .Get<Dictionary<string, string>>();
+
+if (!connStrings.ContainsKey("bwlive") ||
+    !connStrings.ContainsKey("itkHaria") ||
+    !connStrings.ContainsKey("imageData"))
+{
+    throw new Exception("Please configure bwlive, itkHaria, and imageData in ConnectionStrings.");
+}
+
+// ─── 2) Register DatabaseHelper as a Singleton ────────────────────────────────
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        connStrings["bwlive"],
+        connStrings["itkHaria"],
+        connStrings["imageData"]
+    ));
+
+// ─── 3) Add HttpClient (if you need it later) ─────────────────────────────────
+builder.Services.AddHttpClient();
+
+// ─── 4) Add Authentication/Authorization (JWT, plus your custom Middleware) ───
+// (Assuming you still want JWT and PartnerID‐validation.)
+builder.Services.AddAuthorization();
+
+// ─── 5) Add Controllers and Swagger ─────────────────────────────────────────
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+// ─── 6) Swagger in Development ───────────────────────────────────────────────
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ─── 7) Custom PartnerID + “IsBlocked” + Allowed-APIs middleware ─────────────
+app.UseMiddleware<AuthenticationMiddleware>();
+
+// ─── 8) Standard ASP.NET Core pipeline ───────────────────────────────────────
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ─── 9) Home page (optional) ────────────────────────────────────────────────
+app.MapGet("/", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.WriteAsync("<h1>Welcome</h1><p>API is running.</p>");
+});
+
+// ─── 10) Map Controllers ─────────────────────────────────────────────────────
+app.MapControllers();
+
+app.Run();
+
+
+
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using sparshWebService.DataAccess;
+using System;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Threading.Tasks;
+
+public class AuthenticationMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly DatabaseHelper _dbHelper;
+
+    public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
+    {
+        _next = next;
+        _dbHelper = dbHelper;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        // Bypass authentication for TokenController
+        var currentPath = context.Request.Path.Value?.ToLower();
+
+        if (
+    currentPath?.StartsWith("/api/token", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/auth/login", StringComparison.OrdinalIgnoreCase) == true ||
+
+    // DsrActivityController GETs
+    currentPath?.StartsWith("/api/dsractivity/areas", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsractivity/retailers", StringComparison.OrdinalIgnoreCase) == true ||
+
+    // DsrActivityController POST
+    currentPath?.StartsWith("/api/dsractivity/submit", StringComparison.OrdinalIgnoreCase) == true ||
+
+    // (other existing bypasses...)
+    currentPath?.StartsWith("/api/dsrbtlactivity/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrworkhome/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrsampling/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrphnpurc/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrphnbldr/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsroffleave/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrofficework/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrmeetnpur/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrmeetconr/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsrintmeett/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/dsranyactiv/submit", StringComparison.OrdinalIgnoreCase) == true ||
+    currentPath?.StartsWith("/api/retailerinout/submit", StringComparison.OrdinalIgnoreCase) == true
+   )
+        {
+            await _next(context);
+            return;
+        }
+
+
+        // Extract PartnerID and Authorization header
+        var partnerId = context.Request.Headers["PartnerID"].FirstOrDefault();
+        var authorizationHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+
+        if (string.IsNullOrEmpty(partnerId) || string.IsNullOrEmpty(authorizationHeader) || !authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 400; // Bad Request
+            await context.Response.WriteAsync("PartnerID header and Authorization Bearer token are required.");
+            return;
+        }
+
+        // Extract JWT token
+        var jwtToken = authorizationHeader.Replace("Bearer ", "", StringComparison.OrdinalIgnoreCase).Trim();
+        try
+        {
+            var jwtHandler = new JwtSecurityTokenHandler();
+            if (!jwtHandler.CanReadToken(jwtToken))
+            {
+                context.Response.StatusCode = 401; // Unauthorized
+                await context.Response.WriteAsync("Invalid JWT token.");
+                return;
+            }
+
+            // Validate the JWT token
+            var token = jwtHandler.ReadJwtToken(jwtToken);
+            var tokenPartnerId = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+
+            if (string.IsNullOrEmpty(tokenPartnerId) || !string.Equals(tokenPartnerId, partnerId, StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = 401; // Unauthorized
+                await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
+                return;
+            }
+
+            // Validate API access
+            var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
+            if (!allowedApis.Contains(currentPath))
+            {
+                context.Response.StatusCode = 403; // Forbidden
+                await context.Response.WriteAsync("Access to the API is not allowed for this PartnerID.");
+                return;
+            }
+
+            // Call the next middleware
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            context.Response.StatusCode = 401; // Unauthorized
+            await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
+        }
+    }
+}
+
+
+
+
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.Linq;
+
+namespace sparshWebService.DataAccess
+{
+    public class DatabaseHelper
+    {
+        private readonly string _bwliveConnectionString;
+        private readonly string _itKhariaConnectionString;
+        private readonly string _imageDataConnectionString;
+
+        public DatabaseHelper(string bwliveConnectionString, string itKhariaConnectionString, string imageDataConnectionString)
+        {
+            _bwliveConnectionString = bwliveConnectionString;
+            _itKhariaConnectionString = itKhariaConnectionString;
+            _imageDataConnectionString = imageDataConnectionString;
+        }
+
+        // Public getters for connection strings
+        public string BwliveConnectionString => _bwliveConnectionString;
+        public string ItKhariaConnectionString => _itKhariaConnectionString;
+        public string ImageDataConnectionString => _imageDataConnectionString;
+
+        // Utility: ExecuteCommand by dbKey
+        public int ExecuteCommandForDb(string dbKey, string query, Dictionary<string, object> parameters)
+        {
+            string connStr = dbKey.ToLower() switch
+            {
+                "bwlive" => _bwliveConnectionString,
+                "itkharia" => _itKhariaConnectionString,
+                "imagedata" => _imageDataConnectionString,
+                _ => throw new Exception("Unknown DB key")
+            };
+            return ExecuteCommand(connStr, query, parameters);
+        }
+
+        // General method to execute SELECT queries for any connection string
+        private List<Dictionary<string, object>> ExecuteSelectQuery(string connectionString, string query, Dictionary<string, object> parameters)
+        {
+            var resultList = new List<Dictionary<string, object>>();
+            using (var conn = new SqlConnection(connectionString))
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                }
+
+                conn.Open();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader[i];
+                        }
+                        resultList.Add(row);
+                    }
+                }
+            }
+            return resultList;
+        }
+
+        // General method to execute INSERT, UPDATE, or DELETE queries for any connection string
+        public int ExecuteCommand(string connectionString, string query, Dictionary<string, object> parameters)
+        {
+            using (var conn = new SqlConnection(connectionString))
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                }
+
+                conn.Open();
+                return cmd.ExecuteNonQuery(); // Returns the number of rows affected
+            }
+        }
+
+        // SELECT helpers
+        public List<Dictionary<string, object>> WebSessBean(string query, Dictionary<string, object> parameters)
+            => ExecuteSelectQuery(_bwliveConnectionString, query, parameters);
+
+        public List<Dictionary<string, object>> KkrSessBean(string query, Dictionary<string, object> parameters)
+            => ExecuteSelectQuery(_itKhariaConnectionString, query, parameters);
+
+        public List<Dictionary<string, object>> ImgSessBean(string query, Dictionary<string, object> parameters)
+            => ExecuteSelectQuery(_imageDataConnectionString, query, parameters);
+
+        public string GetSecretKey(string partnerId)
+        {
+            var query = "SELECT secrtKey FROM prmApiPrtnr WHERE partnrId = @PartnerID";
+            var parameters = new Dictionary<string, object> { { "@PartnerID", partnerId } };
+            var result = KkrSessBean(query, parameters);
+            if (result.Count > 0)
+                return result[0]["secrtKey"]?.ToString();
+            throw new Exception("SecretKey not found for the given PartnerID.");
+        }
+
+        public List<string> GetAllowedAPIs(string partnerId)
+        {
+            var query = @"SELECT allwdAPI FROM prmApiPrtnr WHERE partnrId = @PartnerID";
+            var parameters = new Dictionary<string, object> { { "@PartnerID", partnerId } };
+            var result = KkrSessBean(query, parameters);
+            if (result.Count > 0)
+            {
+                var allowedApis = result[0]["allwdAPI"]?.ToString();
+                return allowedApis?.Split(',').Select(api => api.Trim().ToLower()).ToList();
+            }
+            throw new Exception("No APIs found for the given PartnerID.");
+        }
+
+        public void InsertIntoLog(string partnerId, string endpoint, string responseStatus, int statCode, object requestBody)
+        {
+            var checkQuery = "SELECT COUNT(*) AS Count FROM prmApiPrtnr WHERE partnrId = @PartnerID";
+            var checkParams = new Dictionary<string, object> { { "@PartnerID", partnerId } };
+            var exists = KkrSessBean(checkQuery, checkParams);
+            if (exists.Count == 0 || Convert.ToInt32(exists[0]["Count"]) == 0)
+            {
+                Console.WriteLine($"Warning: PartnerID '{partnerId}' does not exist. Log insertion skipped.");
+                return;
+            }
+            var bodyDict = requestBody?.GetType().GetProperties()
+                .Where(p => p.GetValue(requestBody) != null)
+                .Select(p => $"{p.Name}={p.GetValue(requestBody)}")
+                .Take(8)
+                .ToList() ?? new List<string>();
+            while (bodyDict.Count < 8)
+                bodyDict.Add("");
+            var insertQuery = @"
+        INSERT INTO comApiLogs (PartnerID, Endpoint, ResponseStatus, statCode, ReqsBod1, ReqsBod2, ReqsBod3, ReqsBod4, ReqsBod5, ReqsBod6, ReqsBod7, ReqsBod8)
+        VALUES (@PartnerID, @Endpoint, @ResponseStatus, @StatCode, @ReqsBod1, @ReqsBod2, @ReqsBod3, @ReqsBod4, @ReqsBod5, @ReqsBod6, @ReqsBod7, @ReqsBod8)";
+            var insertParams = new Dictionary<string, object>
+            {
+                { "@PartnerID", partnerId },
+                { "@Endpoint", endpoint },
+                { "@ResponseStatus", responseStatus },
+                { "@StatCode", statCode },
+                { "@ReqsBod1", bodyDict[0] },
+                { "@ReqsBod2", bodyDict[1] },
+                { "@ReqsBod3", bodyDict[2] },
+                { "@ReqsBod4", bodyDict[3] },
+                { "@ReqsBod5", bodyDict[4] },
+                { "@ReqsBod6", bodyDict[5] },
+                { "@ReqsBod7", bodyDict[6] },
+                { "@ReqsBod8", bodyDict[7] }
+            };
+            ExecuteCommand(_itKhariaConnectionString, insertQuery, insertParams);
+        }
+    }
+}
+
+
+System.InvalidOperationException: Unable to resolve service for type 'MyFirstApi.Controllers.ApplicationDbContext' while attempting to activate 'MyFirstApi.Controllers.DsrActivityController'.
+   at Microsoft.Extensions.DependencyInjection.ActivatorUtilities.ThrowHelperUnableToResolveService(Type type, Type requiredBy)
+   at lambda_method9(Closure, IServiceProvider, Object[])
+   at Microsoft.AspNetCore.Mvc.Controllers.ControllerFactoryProvider.<>c__DisplayClass6_0.<CreateControllerFactory>g__CreateController|0(ControllerContext controllerContext)
+   at Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker.Next(State& next, Scope& scope, Object& state, Boolean& isCompleted)
+   at Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker.InvokeInnerFilterAsync()
+--- End of stack trace from previous location ---
+   at Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker.<InvokeFilterPipelineAsync>g__Awaited|20_0(ResourceInvoker invoker, Task lastTask, State next, Scope scope, Object state, Boolean isCompleted)
+   at Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker.<InvokeAsync>g__Awaited|17_0(ResourceInvoker invoker, Task task, IDisposable scope)
+   at Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker.<InvokeAsync>g__Awaited|17_0(ResourceInvoker invoker, Task task, IDisposable scope)
+   at Microsoft.AspNetCore.Authorization.AuthorizationMiddleware.Invoke(HttpContext context)
+   at Microsoft.AspNetCore.Authentication.AuthenticationMiddleware.Invoke(HttpContext context)
+   at AuthenticationMiddleware.InvokeAsync(HttpContext context) in C:\Users\Magan.Dhaniya-mkt\Desktop\SparshAPIs\SparshWebServices\AuthenticationMiddleware.cs:line 51
+   at Swashbuckle.AspNetCore.SwaggerUI.SwaggerUIMiddleware.Invoke(HttpContext httpContext)
+   at Swashbuckle.AspNetCore.Swagger.SwaggerMiddleware.Invoke(HttpContext httpContext, ISwaggerProvider swaggerProvider)
+   at Microsoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddlewareImpl.Invoke(HttpContext context)
+
+HEADERS
+=======
+Accept: */*
+Host: localhost:7223
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: en-US,en;q=0.9
+Referer: https://localhost:7223/swagger/index.html
+sec-ch-ua-platform: "Windows"
+sec-ch-ua: "Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"
+sec-ch-ua-mobile: ?0
+sec-fetch-site: same-origin
+sec-fetch-mode: cors
+sec-fetch-dest: empty
+priority: u=1, i
