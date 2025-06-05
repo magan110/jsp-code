@@ -1932,3 +1932,92 @@ namespace sparshWebService.DTOs
   "distance": 2.5,
   "distanceExceptionReason": "None"
 }
+
+
+
+// Program.cs
+using Microsoft.AspNetCore.Builder;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using sparshWebService.DataAccess;       // ← DatabaseHelper
+using MyFirstApi.Controllers;           // ← (for dependency injection of controllers, if any)
+
+var builder = WebApplication.CreateBuilder(args);
+var configuration = builder.Configuration;
+
+// ─── 1) Read all three connection‐strings from appsettings.json ──────────────
+var connStrings = configuration.GetSection("ConnectionStrings")
+                               .Get<Dictionary<string, string>>();
+
+if (!connStrings.ContainsKey("bwlive") ||
+    !connStrings.ContainsKey("itkHaria") ||
+    !connStrings.ContainsKey("imageData"))
+{
+    throw new Exception("Please configure 'bwlive', 'itkHaria' and 'imageData' under ConnectionStrings.");
+}
+
+// ─── 2) Register DatabaseHelper as a Singleton ────────────────────────────────
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        connStrings["bwlive"],
+        connStrings["itkHaria"],
+        connStrings["imageData"]
+    ));
+
+// ─── 3) Register HttpClient (if needed later) ────────────────────────────────
+builder.Services.AddHttpClient();
+
+// ─── 4) Add CORS policy ───────────────────────────────────────────────────────
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+    {
+        policy
+          .AllowAnyOrigin()
+          .AllowAnyHeader()
+          .AllowAnyMethod();
+    });
+});
+
+// ─── 5) Add Authentication/Authorization (JWT + custom middleware) ───────────
+builder.Services.AddAuthentication();
+builder.Services.AddAuthorization();
+
+// ─── 6) Add Controllers & Swagger ────────────────────────────────────────────
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+// ─── 7) Enable Swagger in Development ────────────────────────────────────────
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ─── 8) Enable the CORS policy BEFORE Authentication/Authorization ────────────
+app.UseCors("AllowAll");
+
+// ─── 9) Custom PartnerID‐Validation Middleware ───────────────────────────────
+app.UseMiddleware<AuthenticationMiddleware>();
+
+// ─── 10) Standard ASP.NET Core pipeline ───────────────────────────────────────
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ─── 11) Optionally a simple GET home page ───────────────────────────────────
+app.MapGet("/", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.WriteAsync("<h1>Welcome</h1><p>API is running.</p>");
+});
+
+// ─── 12) Map Controllers ─────────────────────────────────────────────────────
+app.MapControllers();
+
+app.Run();
+
