@@ -1699,3 +1699,83 @@ namespace sparshWebService.Controllers
   "geoLongt": "77.2090",     
   "distanceExceptionReason": ""  
 }
+
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using sparshWebService.DataAccess;
+
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    // Point ContentRoot to the folder where Program.cs (and csproj) live:
+    ContentRootPath = Directory.GetCurrentDirectory(),
+    // Force WebRoot to be the same folder as ContentRoot so ASP.NET Core
+    // DOES NOT try to find "<ContentRoot>/wwwroot" on startup.
+    // (As long as WebRootPath points to a folder that actually exists,
+    // you won’t see the "DirectoryNotFoundException" for missing wwwroot.)
+    WebRootPath = Directory.GetCurrentDirectory()
+});
+
+// ─── 1) Load ConnectionStrings from appsettings.json ─────────────────────────
+var configuration = builder.Configuration;
+var connStrings = configuration.GetSection("ConnectionStrings")
+                               .Get<Dictionary<string, string>>();
+
+if (!connStrings.ContainsKey("bwlive") ||
+    !connStrings.ContainsKey("itkHaria") ||
+    !connStrings.ContainsKey("imageData"))
+{
+    throw new Exception("Please configure 'bwlive', 'itkHaria' and 'imageData' under ConnectionStrings in appsettings.json.");
+}
+
+// ─── 2) Register your DatabaseHelper as a singleton ──────────────────────────
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        connStrings["bwlive"],
+        connStrings["itkHaria"],
+        connStrings["imageData"]
+    ));
+
+// ─── 3) (Optional) If you plan to call external HTTP APIs later ─────────────
+builder.Services.AddHttpClient();
+
+// ─── 4) Add Authentication/Authorization (JWT + custom middleware) ─────────
+builder.Services.AddAuthentication();   // we still expect your JWT to be validated in middleware
+builder.Services.AddAuthorization();
+
+// ─── 5) Add Controllers & Swagger ──────────────────────────────────────────
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+// ─── 6) Build the WebApplication ───────────────────────────────────────────
+var app = builder.Build();
+
+// ─── 7) Enable Swagger only in Development ─────────────────────────────────
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// ─── 8) Run your custom AuthenticationMiddleware here ───────────────────────
+app.UseMiddleware<AuthenticationMiddleware>();
+
+// ─── 9) Standard ASP.NET Core pipeline ────────────────────────────────────
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ─── 10) (Optional) A simple “hello” endpoint ───────────────────────────────
+app.MapGet("/", () => "API is running. If you see this, we did not crash on wwwroot.");
+
+// ─── 11) Map Controllers ───────────────────────────────────────────────────
+app.MapControllers();
+
+app.Run();
+
