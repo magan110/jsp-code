@@ -1,263 +1,521 @@
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
+using Microsoft.AspNetCore.Authorization; // Required for AllowAnonymous
+using Microsoft.IdentityModel.Tokens;
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
 
 namespace MyFirstApi.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    [Authorize(AuthenticationSchemes = "Bearer")]
-    public class DsrController : ControllerBase
+    public class TokenController : ControllerBase
     {
-        private readonly DatabaseHelper _db;
+        private readonly string _issuer;
 
-        public DsrController(DatabaseHelper db)
+        public TokenController()
         {
-            _db = db;
+            _issuer = "Birla White IT"; // Issuer for the JWT
         }
 
-        // GET api/dsr
-        [HttpGet]
-        public ActionResult<IEnumerable<DsrDto>> GetAll()
+        [HttpPost("generate")]
+        [AllowAnonymous] // Bypass authentication for this endpoint
+        public IActionResult GenerateToken([FromBody] TokenRequest request)
         {
-            var sql = @"
-                SELECT 
-                    docuNumb,
-                    CONVERT(char(10), docuDate, 120) AS docuDate,
-                    dsrParam,
-                    cusRtlFl,
-                    cusRtlCd,
-                    dsrRem01, dsrRem02, dsrRem03, dsrRem04,
-                    dsrRem05, dsrRem06, dsrRem07, dsrRem08,
-                    areaCode,
-                    cuRtType,
-                    CONVERT(char(10), ordExDat, 120) AS ordExDat
-                FROM dptDSRActvt";
-            
-            // NOTE: ExecuteSelectQuery should be public on your DatabaseHelper
-            var rows = _db.ExecuteSelectQuery(_db. /* whichever connection you use for DSR */, sql, new Dictionary<string,object>());
-            
-            var dtos = rows.Select(r => new DsrDto
+            if (string.IsNullOrEmpty(request.PartnerID) || string.IsNullOrEmpty(request.SecretKey))
             {
-                DocuNumb  = r["docuNumb"]?.ToString(),
-                DocuDate  = DateTime.Parse(r["docuDate"]?.ToString()!),
-                DsrParam  = r["dsrParam"]?.ToString(),
-                CusRtlFl  = r["cusRtlFl"]?.ToString(),
-                CusRtlCd  = r["cusRtlCd"]?.ToString(),
-                DsrRem01  = r["dsrRem01"]?.ToString(),
-                DsrRem02  = r["dsrRem02"]?.ToString(),
-                DsrRem03  = r["dsrRem03"]?.ToString(),
-                DsrRem04  = r["dsrRem04"]?.ToString(),
-                DsrRem05  = r["dsrRem05"]?.ToString(),
-                DsrRem06  = r["dsrRem06"]?.ToString(),
-                DsrRem07  = r["dsrRem07"]?.ToString(),
-                DsrRem08  = r["dsrRem08"]?.ToString(),
-                AreaCode  = r["areaCode"]?.ToString(),
-                CuRtType  = r["cuRtType"]?.ToString(),
-                OrdExDat  = DateTime.TryParse(r["ordExDat"]?.ToString(), out var dt) ? dt : (DateTime?)null
-            })
-            .ToList();
+                return BadRequest("PartnerID and SecretKey are required.");
+            }
 
-            return Ok(dtos);
+            try
+            {
+                var token = CreateJwtToken(request.PartnerID, request.SecretKey);
+                return Ok(new { Token = token });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"An error occurred while generating the token: {ex.Message}");
+            }
         }
 
-        // GET api/dsr/{id}
-        [HttpGet("{id}")]
-        public ActionResult<DsrDto> GetById(string id)
+        private string CreateJwtToken(string partnerId, string secretKey)
         {
-            var sql = @"
-                SELECT 
-                    docuNumb,
-                    CONVERT(char(10), docuDate, 120) AS docuDate,
-                    dsrParam,
-                    cusRtlFl,
-                    cusRtlCd,
-                    dsrRem01, dsrRem02, dsrRem03, dsrRem04,
-                    dsrRem05, dsrRem06, dsrRem07, dsrRem08,
-                    areaCode,
-                    cuRtType,
-                    CONVERT(char(10), ordExDat, 120) AS ordExDat
-                FROM dptDSRActvt
-                WHERE docuNumb = @docuNumb";
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
-            var rows = _db.ExecuteSelectQuery(
-                _db. /* your DSR DB */,
-                sql,
-                new Dictionary<string,object>{{ "@docuNumb", id }}
-            );
-
-            if (!rows.Any())
-                return NotFound();
-
-            var r = rows.First();
-            var dto = new DsrDto
+            var claims = new[]
             {
-                DocuNumb  = r["docuNumb"]?.ToString(),
-                DocuDate  = DateTime.Parse(r["docuDate"]?.ToString()!),
-                DsrParam  = r["dsrParam"]?.ToString(),
-                CusRtlFl  = r["cusRtlFl"]?.ToString(),
-                CusRtlCd  = r["cusRtlCd"]?.ToString(),
-                DsrRem01  = r["dsrRem01"]?.ToString(),
-                DsrRem02  = r["dsrRem02"]?.ToString(),
-                DsrRem03  = r["dsrRem03"]?.ToString(),
-                DsrRem04  = r["dsrRem04"]?.ToString(),
-                DsrRem05  = r["dsrRem05"]?.ToString(),
-                DsrRem06  = r["dsrRem06"]?.ToString(),
-                DsrRem07  = r["dsrRem07"]?.ToString(),
-                DsrRem08  = r["dsrRem08"]?.ToString(),
-                AreaCode  = r["areaCode"]?.ToString(),
-                CuRtType  = r["cuRtType"]?.ToString(),
-                OrdExDat  = DateTime.TryParse(r["ordExDat"]?.ToString(), out var dt) ? dt : (DateTime?)null
+                new Claim("PartnerID", partnerId), // Add PartnerID to claims
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()), // Unique token ID
+                new Claim(JwtRegisteredClaimNames.Iss, _issuer) // Issuer claim
             };
 
-            return Ok(dto);
-        }
+            var token = new JwtSecurityToken(
+                issuer: _issuer,
+                claims: claims,
+                expires: DateTime.UtcNow.AddHours(24), // Token valid for 24 hour
+                signingCredentials: creds);
 
-        // POST api/dsr
-        [HttpPost]
-        public async Task<IActionResult> Create([FromBody] DsrDto dto)
-        {
-            var sql = @"
-                INSERT INTO dptDSRActvt
-                    (docuNumb, docuDate, dsrParam, cusRtlFl, cusRtlCd,
-                     dsrRem01, dsrRem02, dsrRem03, dsrRem04,
-                     dsrRem05, dsrRem06, dsrRem07, dsrRem08,
-                     areaCode, cuRtType, ordExDat)
-                VALUES
-                    (@docuNumb, @docuDate, @dsrParam, @cusRtlFl, @cusRtlCd,
-                     @dsrRem01, @dsrRem02, @dsrRem03, @dsrRem04,
-                     @dsrRem05, @dsrRem06, @dsrRem07, @dsrRem08,
-                     @areaCode, @cuRtType, @ordExDat)";
-
-            var p = new Dictionary<string,object>
-            {
-                ["@docuNumb"] = dto.DocuNumb,
-                ["@docuDate"] = dto.DocuDate,
-                ["@dsrParam"] = dto.DsrParam,
-                ["@cusRtlFl"] = dto.CusRtlFl,
-                ["@cusRtlCd"] = dto.CusRtlCd,
-                ["@dsrRem01"] = dto.DsrRem01 ?? "",
-                ["@dsrRem02"] = dto.DsrRem02 ?? "",
-                ["@dsrRem03"] = dto.DsrRem03 ?? "",
-                ["@dsrRem04"] = dto.DsrRem04 ?? "",
-                ["@dsrRem05"] = dto.DsrRem05 ?? "",
-                ["@dsrRem06"] = dto.DsrRem06 ?? "",
-                ["@dsrRem07"] = dto.DsrRem07 ?? "",
-                ["@dsrRem08"] = dto.DsrRem08 ?? "",
-                ["@areaCode"] = dto.AreaCode,
-                ["@cuRtType"] = dto.CuRtType ?? "",
-                ["@ordExDat"] = (object?)dto.OrdExDat ?? DBNull.Value
-            };
-
-            await _db.ExecuteNonQueryAsyncBwlive(sql, p);
-            return CreatedAtAction(nameof(GetById), new { id = dto.DocuNumb }, dto);
-        }
-
-        // PUT api/dsr/{id}
-        [HttpPut("{id}")]
-        public async Task<IActionResult> Update(string id, [FromBody] DsrDto dto)
-        {
-            if (id != dto.DocuNumb)
-                return BadRequest("Document number mismatch");
-
-            var sql = @"
-                UPDATE dptDSRActvt
-                   SET docuDate  = @docuDate,
-                       dsrParam  = @dsrParam,
-                       cusRtlFl  = @cusRtlFl,
-                       cusRtlCd  = @cusRtlCd,
-                       dsrRem01  = @dsrRem01,
-                       dsrRem02  = @dsrRem02,
-                       dsrRem03  = @dsrRem03,
-                       dsrRem04  = @dsrRem04,
-                       dsrRem05  = @dsrRem05,
-                       dsrRem06  = @dsrRem06,
-                       dsrRem07  = @dsrRem07,
-                       dsrRem08  = @dsrRem08,
-                       areaCode  = @areaCode,
-                       cuRtType  = @cuRtType,
-                       ordExDat  = @ordExDat
-                WHERE docuNumb = @docuNumb";
-
-            var p = new Dictionary<string,object>
-            {
-                ["@docuNumb"] = dto.DocuNumb,
-                ["@docuDate"] = dto.DocuDate,
-                ["@dsrParam"] = dto.DsrParam,
-                ["@cusRtlFl"] = dto.CusRtlFl,
-                ["@cusRtlCd"] = dto.CusRtlCd,
-                ["@dsrRem01"] = dto.DsrRem01 ?? "",
-                ["@dsrRem02"] = dto.DsrRem02 ?? "",
-                ["@dsrRem03"] = dto.DsrRem03 ?? "",
-                ["@dsrRem04"] = dto.DsrRem04 ?? "",
-                ["@dsrRem05"] = dto.DsrRem05 ?? "",
-                ["@dsrRem06"] = dto.DsrRem06 ?? "",
-                ["@dsrRem07"] = dto.DsrRem07 ?? "",
-                ["@dsrRem08"] = dto.DsrRem08 ?? "",
-                ["@areaCode"] = dto.AreaCode,
-                ["@cuRtType"] = dto.CuRtType ?? "",
-                ["@ordExDat"] = (object?)dto.OrdExDat ?? DBNull.Value
-            };
-
-            var rowsAffected = await _db.ExecuteNonQueryAsyncBwlive(sql, p);
-            if (rowsAffected == 0) return NotFound();
-            return NoContent();
-        }
-
-        // DELETE api/dsr/{id}
-        [HttpDelete("{id}")]
-        public async Task<IActionResult> Delete(string id)
-        {
-            var sql = "DELETE FROM dptDSRActvt WHERE docuNumb = @docuNumb";
-            var p   = new Dictionary<string,object>{{ "@docuNumb", id }};
-            var deleted = await _db.ExecuteNonQueryAsyncBwlive(sql, p);
-            if (deleted == 0) return NotFound();
-            return NoContent();
+            return new JwtSecurityTokenHandler().WriteToken(token);
         }
     }
 
-    public class DsrDto
+    public class TokenRequest
     {
-        public string   DocuNumb  { get; set; } = "";
-        public DateTime DocuDate  { get; set; }
-        public string?  DsrParam  { get; set; }
-        public string?  CusRtlFl  { get; set; }
-        public string?  CusRtlCd  { get; set; }
-        public string?  DsrRem01  { get; set; }
-        public string?  DsrRem02  { get; set; }
-        public string?  DsrRem03  { get; set; }
-        public string?  DsrRem04  { get; set; }
-        public string?  DsrRem05  { get; set; }
-        public string?  DsrRem06  { get; set; }
-        public string?  DsrRem07  { get; set; }
-        public string?  DsrRem08  { get; set; }
-        public string?  AreaCode  { get; set; }
-        public string?  CuRtType  { get; set; }
-        public DateTime? OrdExDat { get; set; }
+        public string PartnerID { get; set; }
+        public string SecretKey { get; set; }
     }
 }
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
 
-
-
+namespace sparshWebService.DataAccess
 {
-  "docuNumb": "DSR0001",
-  "docuDate": "2023-08-01T00:00:00",
-  "dsrParam": "04",
-  "cusRtlFl": "R",
-  "cusRtlCd": "100123",
-  "dsrRem01": "MarketX",
-  "dsrRem02": "N",
-  "dsrRem03": "",
-  "dsrRem04": "",
-  "dsrRem05": "",
-  "dsrRem06": "",
-  "dsrRem07": "",
-  "dsrRem08": "",
-  "areaCode": "DEL",
-  "cuRtType": "RR",
-  "ordExDat": "2023-08-10T00:00:00"
+    public class DatabaseHelper
+    {
+        private readonly string _bwliveConnectionString;
+        private readonly string _itKhariaConnectionString;
+        private readonly string _imageDataConnectionString;
+
+        public DatabaseHelper(string bwliveConnectionString, string itKhariaConnectionString, string imageDataConnectionString)
+        {
+            _bwliveConnectionString = bwliveConnectionString;
+            _itKhariaConnectionString = itKhariaConnectionString;
+            _imageDataConnectionString = imageDataConnectionString;
+        }
+
+        // General method to execute SELECT queries for any connection string
+        private List<Dictionary<string, object>> ExecuteSelectQuery(string connectionString, string query, Dictionary<string, object> parameters)
+        {
+            var resultList = new List<Dictionary<string, object>>();
+
+            using (var conn = new SqlConnection(connectionString))
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                }
+
+                conn.Open();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader[i];
+                        }
+                        resultList.Add(row);
+                    }
+                }
+            }
+
+            return resultList;
+        }
+
+        // General method to execute INSERT, UPDATE, or DELETE queries for any connection string
+        private int ExecuteCommand(string connectionString, string query, Dictionary<string, object> parameters)
+        {
+            using (var conn = new SqlConnection(connectionString))
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                }
+
+                conn.Open();
+                return cmd.ExecuteNonQuery(); // Returns the number of rows affected
+            }
+        }
+
+        // Function to handle queries for bwlive database (WebSessBean)
+        public List<Dictionary<string, object>> WebSessBean(string query, Dictionary<string, object> parameters)
+        {
+            return ExecuteSelectQuery(_bwliveConnectionString, query, parameters);
+        }
+
+        // Function to handle queries for itKharia database (KkrSessBean)
+        public List<Dictionary<string, object>> KkrSessBean(string query, Dictionary<string, object> parameters)
+        {
+            return ExecuteSelectQuery(_itKhariaConnectionString, query, parameters);
+        }
+
+        // Function to handle queries for imageData database (ImgSessBean)
+        public List<Dictionary<string, object>> ImgSessBean(string query, Dictionary<string, object> parameters)
+        {
+            return ExecuteSelectQuery(_imageDataConnectionString, query, parameters);
+        }
+
+        // Retrieve SecretKey for a given PartnerID from the RegisteredUsers table (itKharia)
+        public string GetSecretKey(string partnerId)
+        {
+            var query = "SELECT secrtKey FROM prmApiPrtnr WHERE partnrId = @PartnerID";
+            var parameters = new Dictionary<string, object>
+            {
+                { "@PartnerID", partnerId }
+            };
+
+            var result = KkrSessBean(query, parameters);
+            if (result.Count > 0)
+            {
+                return result[0]["secrtKey"]?.ToString();
+            }
+
+            throw new Exception("SecretKey not found for the given PartnerID.");
+        }
+        public List<string> GetAllowedAPIs(string partnerId)
+        {
+            var query = @"SELECT allwdAPI 
+                  FROM prmApiPrtnr 
+                  WHERE partnrId = @PartnerID";
+            var parameters = new Dictionary<string, object>
+    {
+        { "@PartnerID", partnerId }
+    };
+
+            var result = KkrSessBean(query, parameters);
+            if (result.Count > 0)
+            {
+                var allowedApis = result[0]["allwdAPI"]?.ToString();
+                return allowedApis?.Split(',').Select(api => api.Trim().ToLower()).ToList();
+            }
+
+            throw new Exception("No APIs found for the given PartnerID.");
+        }
+
+        // Log API requests into the comApiLogs table (itKharia)
+        public void InsertIntoLog(string partnerId, string endpoint, string responseStatus, int statCode, object requestBody)
+        {
+            var checkQuery = "SELECT COUNT(*) AS Count FROM prmApiPrtnr WHERE partnrId = @PartnerID";
+            var checkParams = new Dictionary<string, object>
+    {
+        { "@PartnerID", partnerId }
+    };
+
+            var exists = KkrSessBean(checkQuery, checkParams);
+            if (exists.Count == 0 || Convert.ToInt32(exists[0]["Count"]) == 0)
+            {
+                Console.WriteLine($"Warning: PartnerID '{partnerId}' does not exist. Log insertion skipped.");
+                return;
+            }
+            // Extract up to 8 properties from the request body
+            var bodyDict = requestBody?.GetType().GetProperties()
+                .Where(p => p.GetValue(requestBody) != null)
+                .Select(p => $"{p.Name}={p.GetValue(requestBody)}")
+                .Take(8)
+                .ToList() ?? new List<string>();
+
+            // Fill missing fields with empty strings
+            while (bodyDict.Count < 8)
+                bodyDict.Add("");
+
+            var insertQuery = @"
+        INSERT INTO comApiLogs (PartnerID, Endpoint, ResponseStatus, statCode, ReqsBod1, ReqsBod2, ReqsBod3, ReqsBod4, ReqsBod5, ReqsBod6, ReqsBod7, ReqsBod8)
+        VALUES (@PartnerID, @Endpoint, @ResponseStatus, @StatCode, @ReqsBod1, @ReqsBod2, @ReqsBod3, @ReqsBod4, @ReqsBod5, @ReqsBod6, @ReqsBod7, @ReqsBod8)";
+
+            var insertParams = new Dictionary<string, object>
+    {
+        { "@PartnerID", partnerId },
+        { "@Endpoint", endpoint },
+        { "@ResponseStatus", responseStatus },
+        { "@StatCode", statCode },
+        { "@ReqsBod1", bodyDict[0] },
+        { "@ReqsBod2", bodyDict[1] },
+        { "@ReqsBod3", bodyDict[2] },
+        { "@ReqsBod4", bodyDict[3] },
+        { "@ReqsBod5", bodyDict[4] },
+        { "@ReqsBod6", bodyDict[5] },
+        { "@ReqsBod7", bodyDict[6] },
+        { "@ReqsBod8", bodyDict[7] }
+    };
+            ExecuteCommand(_itKhariaConnectionString, insertQuery, insertParams);
+        }
+
+        internal async Task<int> ExecuteNonQueryAsyncBwlive(string sql, Dictionary<string, object> p)
+        {
+            throw new NotImplementedException();
+        }
+
+        internal object ExecuteSelectQuery(object , string sql, Dictionary<string, object> dictionary)
+        {
+            throw new NotImplementedException();
+        }
+    }
 }
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "ConnectionStrings": {
+    "bwlive": "Server=10.1.64.15,1500;Database=bwlive;User ID=birlawhite;Password=M@nsv1530;Trusted_Connection=False;TrustServerCertificate=true;",
+    "itkHaria": "Server=10.1.64.15,1500;Database=ItKharia;User ID=itKharia;Password=Mans^1530;Trusted_Connection=False;TrustServerCertificate=true;",
+    "imageData": "Server=10.4.64.15;Database=imageData;User ID=sa;Password=Point@0652;Trusted_Connection=False;TrustServerCertificate=true;"
+  }
+}
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using sparshWebService.DataAccess;
+using System;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Threading.Tasks;
+
+public class AuthenticationMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly DatabaseHelper _dbHelper;
+
+    public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
+    {
+        _next = next;
+        _dbHelper = dbHelper;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        // Bypass authentication for TokenController
+        var currentPath = context.Request.Path.Value?.ToLower();
+        if (currentPath?.StartsWith("/api/token", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            // Skip authentication for TokenController
+            await _next(context);
+            return;
+        }
+
+        // Extract PartnerID and Authorization header
+        var partnerId = context.Request.Headers["PartnerID"].FirstOrDefault();
+        var authorizationHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+
+        if (string.IsNullOrEmpty(partnerId) || string.IsNullOrEmpty(authorizationHeader) || !authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 400; // Bad Request
+            await context.Response.WriteAsync("PartnerID header and Authorization Bearer token are required.");
+            return;
+        }
+
+        // Extract JWT token
+        var jwtToken = authorizationHeader.Replace("Bearer ", "", StringComparison.OrdinalIgnoreCase).Trim();
+        try
+        {
+            var jwtHandler = new JwtSecurityTokenHandler();
+            if (!jwtHandler.CanReadToken(jwtToken))
+            {
+                context.Response.StatusCode = 401; // Unauthorized
+                await context.Response.WriteAsync("Invalid JWT token.");
+                return;
+            }
+
+            // Validate the JWT token
+            var token = jwtHandler.ReadJwtToken(jwtToken);
+            var tokenPartnerId = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+
+            if (string.IsNullOrEmpty(tokenPartnerId) || !string.Equals(tokenPartnerId, partnerId, StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = 401; // Unauthorized
+                await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
+                return;
+            }
+
+            // Validate API access
+            var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
+            if (!allowedApis.Contains(currentPath))
+            {
+                context.Response.StatusCode = 403; // Forbidden
+                await context.Response.WriteAsync("Access to the API is not allowed for this PartnerID.");
+                return;
+            }
+
+            // Call the next middleware
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            context.Response.StatusCode = 401; // Unauthorized
+            await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
+        }
+    }
+}
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using sparshWebService.DataAccess;
+using System;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Threading.Tasks;
+
+public class AuthenticationMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly DatabaseHelper _dbHelper;
+
+    public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
+    {
+        _next = next;
+        _dbHelper = dbHelper;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        // Bypass authentication for TokenController
+        var currentPath = context.Request.Path.Value?.ToLower();
+        if (currentPath?.StartsWith("/api/token", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            // Skip authentication for TokenController
+            await _next(context);
+            return;
+        }
+
+        // Extract PartnerID and Authorization header
+        var partnerId = context.Request.Headers["PartnerID"].FirstOrDefault();
+        var authorizationHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+
+        if (string.IsNullOrEmpty(partnerId) || string.IsNullOrEmpty(authorizationHeader) || !authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 400; // Bad Request
+            await context.Response.WriteAsync("PartnerID header and Authorization Bearer token are required.");
+            return;
+        }
+
+        // Extract JWT token
+        var jwtToken = authorizationHeader.Replace("Bearer ", "", StringComparison.OrdinalIgnoreCase).Trim();
+        try
+        {
+            var jwtHandler = new JwtSecurityTokenHandler();
+            if (!jwtHandler.CanReadToken(jwtToken))
+            {
+                context.Response.StatusCode = 401; // Unauthorized
+                await context.Response.WriteAsync("Invalid JWT token.");
+                return;
+            }
+
+            // Validate the JWT token
+            var token = jwtHandler.ReadJwtToken(jwtToken);
+            var tokenPartnerId = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+
+            if (string.IsNullOrEmpty(tokenPartnerId) || !string.Equals(tokenPartnerId, partnerId, StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = 401; // Unauthorized
+                await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
+                return;
+            }
+
+            // Validate API access
+            var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
+            if (!allowedApis.Contains(currentPath))
+            {
+                context.Response.StatusCode = 403; // Forbidden
+                await context.Response.WriteAsync("Access to the API is not allowed for this PartnerID.");
+                return;
+            }
+
+            // Call the next middleware
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            context.Response.StatusCode = 401; // Unauthorized
+            await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
+        }
+    }
+}
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using sparshWebService.DataAccess;
+using System.IdentityModel.Tokens.Jwt;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add Controllers
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+// Retrieve Connection Strings
+var connectionStrings = builder.Configuration.GetSection("ConnectionStrings").Get<Dictionary<string, string>>();
+
+// Register DatabaseHelper as a Singleton
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(
+        connectionStrings["bwlive"],
+        connectionStrings["itkHaria"],
+        connectionStrings["imageData"]));
+
+// Add HttpClient for DI
+builder.Services.AddHttpClient();
+
+// Add Authentication
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = false,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = "Birla White IT", // Set your valid issuer
+            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
+            {
+                // Resolve signing key dynamically based on PartnerID
+                var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
+                var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+                if (partnerId != null)
+                {
+                    var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
+                    var secretKey = dbHelper.GetSecretKey(partnerId); // Retrieve SecretKey from DB
+                    if (!string.IsNullOrEmpty(secretKey))
+                    {
+                        return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
+                    }
+                }
+                throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
+            }
+        };
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var authHeader = context.Request.Headers["Authorization"].ToString();
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+                {
+                    context.Token = authHeader.Replace("Bearer ", "");
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// Custom Middleware for PartnerID and API access validation
+app.UseMiddleware<AuthenticationMiddleware>();
+
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Add a default home page for the API
+app.MapGet("/", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.WriteAsync("<h1>Welcome to My API</h1><p>This is the default home page.</p>");
+});
+
+app.MapControllers();
+app.Run();
