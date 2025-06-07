@@ -1,1781 +1,263 @@
-{
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
-    }
-  },
-  "AllowedHosts": "*",
-  "ConnectionStrings": {
-    "bwlive": "Server=10.4.64.15;Database=bwlive;User ID=birlawhite;Password=M@nsv1530;Trusted_Connection=False;TrustServerCertificate=true;",
-    "itkHaria": "Server=10.4.64.15;Database=ItKharia;User ID=itKharia;Password=Mans^1530;Trusted_Connection=False;TrustServerCertificate=true;",
-    "imageData": "Server=10.4.64.15;Database=imageData;User ID=sa;Password=Point@0652;Trusted_Connection=False;TrustServerCertificate=true;"
-  },
-  "Jwt": {
-    "Key": "SuperLongRandomSecretKey_ChangeThisToYourOwnSecureValue",
-    "Issuer": "https://qa.birlawhite.com"
-  }
-}
-
-
-
-
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using sparshWebService.DataAccess;
-
-var builder = WebApplication.CreateBuilder(args);
-
-// ─── 1) Read all three connection‐strings from appsettings.json ──────────────
-var configuration = builder.Configuration;
-var connStrings = configuration.GetSection("ConnectionStrings")
-                               .Get<Dictionary<string, string>>();
-
-if (!connStrings.ContainsKey("bwlive") ||
-    !connStrings.ContainsKey("itkHaria") ||
-    !connStrings.ContainsKey("imageData"))
-{
-    throw new Exception("Please configure 'bwlive', 'itkHaria' and 'imageData' under ConnectionStrings.");
-}
-
-// ─── 2) Register DatabaseHelper as a Singleton ────────────────────────────────
-builder.Services.AddSingleton(provider =>
-    new DatabaseHelper(
-        connStrings["bwlive"],
-        connStrings["itkHaria"],
-        connStrings["imageData"]
-    ));
-
-// ─── 3) Register HttpClient (if needed later) ────────────────────────────────
-builder.Services.AddHttpClient();
-
-// ─── 4) Add Authentication/Authorization (JWT + custom middleware) ───────────
-builder.Services.AddAuthentication();
-builder.Services.AddAuthorization();
-
-// ─── 5) Add Controllers & Swagger ────────────────────────────────────────────
-builder.Services.AddControllers();
-builder.Services.AddSwaggerGen();
-
-var app = builder.Build();
-
-// ─── 6) Enable Swagger in Development ────────────────────────────────────────
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
-
-// ─── 7) Custom PartnerID‐Validation Middleware ───────────────────────────────
-app.UseMiddleware<AuthenticationMiddleware>();
-
-// ─── 8) Standard ASP.NET Core pipeline ───────────────────────────────────────
-app.UseHttpsRedirection();
-app.UseAuthentication();
-app.UseAuthorization();
-
-// ─── 9) Simple GET home page ─────────────────────────────────────────────────
-app.MapGet("/", async context =>
-{
-    context.Response.ContentType = "text/html";
-    await context.Response.WriteAsync("<h1>Welcome</h1><p>API is running.</p>");
-});
-
-// ─── 10) Map Controllers ─────────────────────────────────────────────────────
-app.MapControllers();
-
-app.Run();
-
-
-
-
-using Microsoft.AspNetCore.Http;
-using sparshWebService.DataAccess;
-using System;
-using System.IdentityModel.Tokens.Jwt;
-using System.Linq;
-using System.Threading.Tasks;
-
-namespace sparshWebService
-{
-    public class AuthenticationMiddleware
-    {
-        private readonly RequestDelegate _next;
-        private readonly DatabaseHelper _dbHelper;
-
-        public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
-        {
-            _next = next;
-            _dbHelper = dbHelper;
-        }
-
-        public async Task InvokeAsync(HttpContext context)
-        {
-            // Bypass authentication for specific routes:
-            var currentPath = context.Request.Path.Value?.ToLower();
-
-            if (
-                // Token/Auth endpoints
-                currentPath?.StartsWith("/api/token", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/auth/login", StringComparison.OrdinalIgnoreCase) == true ||
-
-                // DSR GETs (areas, retailers, details)
-                currentPath?.StartsWith("/api/dsractivity/areas", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/retailers", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/details", StringComparison.OrdinalIgnoreCase) == true ||
-
-                // DSR Header/Full submissions
-                currentPath?.StartsWith("/api/dsractivity/submitheader", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/submitfull", StringComparison.OrdinalIgnoreCase) == true ||
-
-                // NEW POST endpoints to bypass (if any)
-                currentPath?.StartsWith("/api/dsractivity/retailerinout", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/workfromhome", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/anyotheractivity", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/meetingcontractor", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/meetingnewpurchaser", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/internalteammeeting", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/officework", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/onleave", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/phonecallbuilder", StringComparison.OrdinalIgnoreCase) == true ||
-                currentPath?.StartsWith("/api/dsractivity/phonecallunregistered", StringComparison.OrdinalIgnoreCase) == true
-            )
-            {
-                // Let these endpoints run without checking JWT/PartnerID
-                await _next(context);
-                return;
-            }
-
-            // For everything else: require PartnerID header + Bearer token
-            var partnerId = context.Request.Headers["PartnerID"].FirstOrDefault();
-            var authorizationHeader = context.Request.Headers["Authorization"].FirstOrDefault();
-
-            if (string.IsNullOrEmpty(partnerId)
-             || string.IsNullOrEmpty(authorizationHeader)
-             || !authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            {
-                context.Response.StatusCode = 400; // Bad Request
-                await context.Response.WriteAsync("PartnerID header and Authorization Bearer token are required.");
-                return;
-            }
-
-            var jwtToken = authorizationHeader.Replace("Bearer ", "").Trim();
-            try
-            {
-                var jwtHandler = new JwtSecurityTokenHandler();
-                if (!jwtHandler.CanReadToken(jwtToken))
-                {
-                    context.Response.StatusCode = 401; // Unauthorized
-                    await context.Response.WriteAsync("Invalid JWT token.");
-                    return;
-                }
-
-                var token = jwtHandler.ReadJwtToken(jwtToken);
-                var tokenPartner = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-
-                if (string.IsNullOrEmpty(tokenPartner)
-                 || !string.Equals(tokenPartner, partnerId, StringComparison.OrdinalIgnoreCase))
-                {
-                    context.Response.StatusCode = 401; // Unauthorized
-                    await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
-                    return;
-                }
-
-                // Check if this partner is allowed to call the requested path
-                var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
-                if (!allowedApis.Contains(currentPath))
-                {
-                    context.Response.StatusCode = 403; // Forbidden
-                    await context.Response.WriteAsync("Access to the API is not allowed for this PartnerID.");
-                    return;
-                }
-
-                // All good: proceed
-                await _next(context);
-            }
-            catch (Exception ex)
-            {
-                context.Response.StatusCode = 401; // Unauthorized
-                await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
-            }
-        }
-    }
-}
-
-
-
-
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
-using System.Linq;
-
-namespace sparshWebService.DataAccess
-{
-    public class DatabaseHelper
-    {
-        private readonly string _bwliveConnectionString;
-        private readonly string _itKhariaConnectionString;
-        private readonly string _imageDataConnectionString;
-
-        public DatabaseHelper(string bwliveConnectionString, string itKhariaConnectionString, string imageDataConnectionString)
-        {
-            _bwliveConnectionString = bwliveConnectionString;
-            _itKhariaConnectionString = itKhariaConnectionString;
-            _imageDataConnectionString = imageDataConnectionString;
-        }
-
-        // Public getters for connection strings
-        public string BwliveConnectionString    => _bwliveConnectionString;
-        public string ItKhariaConnectionString => _itKhariaConnectionString;
-        public string ImageDataConnectionString => _imageDataConnectionString;
-
-        // Execute SELECT queries for any given connection string
-        public List<Dictionary<string, object>> ExecuteSelectQuery(string connectionString, string query, Dictionary<string, object> parameters)
-        {
-            var resultList = new List<Dictionary<string, object>>();
-            using (var conn = new SqlConnection(connectionString))
-            using (var cmd = new SqlCommand(query, conn))
-            {
-                if (parameters != null)
-                {
-                    foreach (var param in parameters)
-                        cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
-                }
-
-                conn.Open();
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            row[reader.GetName(i)] = reader.IsDBNull(i) ? DBNull.Value : reader[i];
-                        }
-                        resultList.Add(row);
-                    }
-                }
-            }
-            return resultList;
-        }
-
-        // Execute INSERT, UPDATE, DELETE for any given connection string
-        public int ExecuteCommand(string connectionString, string query, Dictionary<string, object> parameters)
-        {
-            using (var conn = new SqlConnection(connectionString))
-            using (var cmd = new SqlCommand(query, conn))
-            {
-                if (parameters != null)
-                {
-                    foreach (var param in parameters)
-                        cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
-                }
-                conn.Open();
-                return cmd.ExecuteNonQuery();
-            }
-        }
-
-        // Dispatch by database key for commands (INSERT/UPDATE/DELETE)
-        public int ExecuteCommandForDb(string dbKey, string query, Dictionary<string, object> parameters)
-        {
-            string connStr = dbKey.ToLower() switch
-            {
-                "bwlive"   => _bwliveConnectionString,
-                "itkharia" => _itKhariaConnectionString,
-                "imagedata"=> _imageDataConnectionString,
-                _ => throw new ArgumentException("Unknown DB key provided.", nameof(dbKey))
-            };
-            return ExecuteCommand(connStr, query, parameters);
-        }
-
-        // SELECT helpers specific to each DB
-        public List<Dictionary<string, object>> WebSessBean(string query, Dictionary<string, object> parameters)
-            => ExecuteSelectQuery(_bwliveConnectionString, query, parameters);
-
-        public List<Dictionary<string, object>> KkrSessBean(string query, Dictionary<string, object> parameters)
-            => ExecuteSelectQuery(_itKhariaConnectionString, query, parameters);
-
-        public List<Dictionary<string, object>> ImgSessBean(string query, Dictionary<string, object> parameters)
-            => ExecuteSelectQuery(_imageDataConnectionString, query, parameters);
-
-        // Fetch secret key for a PartnerID (from ItKharia DB)
-        public string GetSecretKey(string partnerId)
-        {
-            var query = "SELECT secrtKey FROM prmApiPrtnr WHERE partnrId = @PartnerID";
-            var parameters = new Dictionary<string, object> { { "@PartnerID", partnerId } };
-            var result = KkrSessBean(query, parameters);
-
-            if (result.Count > 0 && result[0]["secrtKey"] != DBNull.Value)
-                return result[0]["secrtKey"]?.ToString() 
-                       ?? throw new Exception("SecretKey is null in database.");
-
-            throw new Exception("SecretKey not found for the given PartnerID.");
-        }
-
-        // Fetch allowed APIs (comma‐separated) for a PartnerID (from ItKharia DB)
-        public List<string> GetAllowedAPIs(string partnerId)
-        {
-            var query = @"SELECT allwdAPI FROM prmApiPrtnr WHERE partnrId = @PartnerID";
-            var parameters = new Dictionary<string, object> { { "@PartnerID", partnerId } };
-            var result = KkrSessBean(query, parameters);
-
-            if (result.Count > 0 && result[0]["allwdAPI"] != DBNull.Value)
-            {
-                var allowedApis = result[0]["allwdAPI"]?.ToString();
-                return allowedApis?
-                    .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                    .Select(api => api.Trim().ToLower())
-                    .ToList()
-                    ?? new List<string>();
-            }
-
-            // If no config found, return empty list (no allowed APIs)
-            return new List<string>();
-        }
-
-        // Log every API call (save up to 8 key/value pairs from requestBody)
-        public void InsertIntoLog(
-            string partnerId,
-            string endpoint,
-            string responseStatus,
-            int statCode,
-            object? requestBody)
-        {
-            // Prepare up to 8 “ReqsBodX” fields
-            var bodyParts = new string[8];
-            for (int i = 0; i < 8; i++) bodyParts[i] = string.Empty;
-
-            if (requestBody != null)
-            {
-                var properties = requestBody.GetType().GetProperties();
-                int index = 0;
-                foreach (var prop in properties.Take(8))
-                {
-                    if (index < 8)
-                    {
-                        try
-                        {
-                            var propValue = prop.GetValue(requestBody);
-                            bodyParts[index] = $"{prop.Name}={(propValue?.ToString() ?? "null")}";
-                            if (bodyParts[index].Length > 250)
-                                bodyParts[index] = bodyParts[index].Substring(0, 250);
-                        }
-                        catch
-                        {
-                            bodyParts[index] = $"{prop.Name}=<ErrorReadingValue>";
-                        }
-                        index++;
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-            }
-
-            var insertQuery = @"
-                INSERT INTO comApiLogs 
-                  (
-                    PartnerID, Endpoint, ResponseStatus, statCode,
-                    ReqsBod1, ReqsBod2, ReqsBod3, ReqsBod4,
-                    ReqsBod5, ReqsBod6, ReqsBod7, ReqsBod8,
-                    logDate
-                  )
-                VALUES
-                  (
-                    @PartnerID, @Endpoint, @ResponseStatus, @StatCode,
-                    @ReqsBod1, @ReqsBod2, @ReqsBod3, @ReqsBod4,
-                    @ReqsBod5, @ReqsBod6, @ReqsBod7, @ReqsBod8,
-                    GETDATE()
-                  );";
-
-            var parameters = new Dictionary<string, object>
-            {
-                { "@PartnerID", partnerId },
-                { "@Endpoint", endpoint },
-                { "@ResponseStatus", responseStatus },
-                { "@StatCode", statCode },
-                { "@ReqsBod1", bodyParts[0] },
-                { "@ReqsBod2", bodyParts[1] },
-                { "@ReqsBod3", bodyParts[2] },
-                { "@ReqsBod4", bodyParts[3] },
-                { "@ReqsBod5", bodyParts[4] },
-                { "@ReqsBod6", bodyParts[5] },
-                { "@ReqsBod7", bodyParts[6] },
-                { "@ReqsBod8", bodyParts[7] }
-            };
-
-            // Always write logs to the “bwlive” database
-            ExecuteCommand(_bwliveConnectionString, insertQuery, parameters);
-        }
-    }
-}
-
-
-
-
-using System;
-using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
-
-namespace sparshWebService.DTOs
-{
-    // Generic API Response DTO
-    public class ApiResponse<T>
-    {
-        public bool Success { get; set; }
-        public string Message { get; set; }
-        public T? Data { get; set; } 
-        public List<string>? Errors { get; set; }
-
-        public ApiResponse(bool success, string message, T? data = default, List<string>? errors = null)
-        {
-            Success = success;
-            Message = message;
-            Data = data;
-            Errors = errors ?? new List<string>();
-        }
-    }
-
-    // Main DTO for submitting or retrieving a full DSR
-    public class DsrActivityFullDto
-    {
-        [Required]
-        public string LoginIdM { get; set; }
-
-        public string? DocuNumb { get; set; }
-
-        [Required]
-        public string Proctype { get; set; } // "Add", "Update", "Delete"
-
-        [Required]
-        public string DocuDate { get; set; } // Expected "yyyy-MM-dd"
-
-        public string? DsrParam { get; set; }
-        public string? CusRtlFl { get; set; }
-        public string? CusRtlCd { get; set; }
-        public string? AreaCode { get; set; }
-        public string? CusRtlNm { get; set; }
-        public string? CuRtType { get; set; }
-
-        public string? KycStatus { get; set; }
-        public string? MarketName { get; set; }
-        public string? DisplayContestParticipation { get; set; }
-        public string? PendingIssueStatus { get; set; }
-        public string? PendingIssueDetailType { get; set; }
-        public string? PendingIssueSpecifyText { get; set; }
-
-        public decimal? EnrolWCSlab { get; set; }
-        public decimal? EnrolWCPSlab { get; set; }
-        public decimal? EnrolVAPSlab { get; set; }
-
-        public decimal? BwStockWC { get; set; }
-        public decimal? BwStockWCP { get; set; }
-        public decimal? BwStockVAP { get; set; }
-
-        public List<string>? BrandsSellingWC { get; set; }
-        public decimal? WcIndustryVolume { get; set; }
-        public List<string>? BrandsSellingWCP { get; set; }
-        public decimal? WcpIndustryVolume { get; set; }
-
-        public decimal? Last3MonthsBwWC { get; set; }
-        public decimal? Last3MonthsBwWCP { get; set; }
-        public decimal? Last3MonthsBwVAP { get; set; }
-
-        public decimal? CurrentMonthBwWC { get; set; }
-        public decimal? CurrentMonthBwWCP { get; set; }
-        public decimal? CurrentMonthBwVAP { get; set; }
-
-        public List<DsrCompetitorAvgSaleDto>? CompetitorAvgSales { get; set; }
-        public List<DsrLastBillingDto>? LastBillings { get; set; }
-        public List<DsrOrderItemDto>? OrderItems { get; set; }
-        public List<DsrMarketWcpSkuDto>? MarketWcpSkus { get; set; }
-
-        public string? OrderExecDate { get; set; } // yyyy-MM-dd
-        public string? OtherRemarks { get; set; }
-
-        public List<DsrGiftItemDto>? GiftItems { get; set; }
-
-        public string? IsTileAdhesiveSeller { get; set; }
-        public decimal? TileAdhesiveStock { get; set; }
-
-        public string? GeoLatit { get; set; }
-        public string? GeoLongt { get; set; }
-        public string? PurchaserLatit { get; set; }
-        public string? PurchaserLongt { get; set; }
-        public string? LocationCapturedAddress { get; set; }
-        public string? DistanceExceptionReason { get; set; }
-
-        // Internal fields for DB‐mapping (not expected from client)
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem01 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem02 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem03 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem04 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem05 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem06 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem07 { get; set; }
-        [Newtonsoft.Json.JsonIgnore]
-        [System.Text.Json.Serialization.JsonIgnore]
-        public string? DsrRem08 { get; set; }
-    }
-
-    public class DsrCompetitorAvgSaleDto
-    {
-        public string? BrandName { get; set; }
-        public decimal? WcQty { get; set; }
-        public decimal? WcpQty { get; set; }
-    }
-
-    public class DsrLastBillingDto
-    {
-        public string? ProductName { get; set; }
-        public string? Date { get; set; }
-        public decimal Quantity { get; set; }
-    }
-
-    public class DsrOrderItemDto
-    {
-        public string? RepoCatg { get; set; }
-        public string? ProdCode { get; set; }
-        public decimal? QuantityInBags { get; set; }
-        public decimal? QuantityInMT { get; set; }
-    }
-
-    public class DsrMarketWcpSkuDto
-    {
-        public string? BrandName { get; set; }
-        public string? PrdCodMk { get; set; }
-        public decimal? BPriceVl { get; set; }
-        public decimal? CPriceVl { get; set; }
-    }
-
-    public class DsrGiftItemDto
-    {
-        public string? GiftTypeCode { get; set; }
-        public int? Quantity { get; set; }
-    }
-
-    public class AreaCodeDto
-    {
-        public string AreaCode { get; set; } = string.Empty;
-        public string AreaDesc { get; set; } = string.Empty;
-    }
-
-    public class RetailerInfoDto
-    {
-        public string? Code { get; set; }
-        public string? Name { get; set; }
-        public string? Address { get; set; }
-        public string? City { get; set; }
-        public double? Latitude { get; set; }
-        public double? Longitude { get; set; }
-        public string? KycStatus { get; set; }
-        public string? MobileNo { get; set; }
-        public string? MarketName { get; set; }
-    }
-
-    public class DsrHeaderSubmitDto
-    {
-        [Required] public string LoginIdM { get; set; } = string.Empty;
-        public string? DocuNumb { get; set; }
-        [Required] public string DocuDate { get; set; } = string.Empty;
-        [Required] public string DsrParam { get; set; } = string.Empty;
-        [Required] public string CusRtlFl { get; set; } = string.Empty;
-        [Required] public string CusRtlCd { get; set; } = string.Empty;
-        [Required] public string AreaCode { get; set; } = string.Empty;
-
-        public string? CuRtType { get; set; }
-        public string? OrdExDat { get; set; }
-        public string? DsrRem01 { get; set; }
-        public string? DsrRem02 { get; set; }
-
-        public string? GeoLatit { get; set; }
-        public string? GeoLongt { get; set; }
-        public double? Distance { get; set; }
-        public string? DistanceExceptionReason { get; set; }
-    }
-}
-
-
-
-
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Logging;
 using sparshWebService.DataAccess;
-using sparshWebService.DTOs;
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 
-namespace sparshWebService.Controllers
+namespace MyFirstApi.Controllers
 {
-    [Route("api/dsractivity")]
+    [Route("api/[controller]")]
     [ApiController]
-    public class DsrActivityController : ControllerBase
+    [Authorize(AuthenticationSchemes = "Bearer")]
+    public class DsrController : ControllerBase
     {
-        private readonly DatabaseHelper _dbHelper;
-        private readonly ILogger<DsrActivityController> _logger;
+        private readonly DatabaseHelper _db;
 
-        public DsrActivityController(DatabaseHelper dbHelper, ILogger<DsrActivityController> logger)
+        public DsrController(DatabaseHelper db)
         {
-            _dbHelper = dbHelper;
-            _logger = logger;
+            _db = db;
         }
 
-        // ─── POST /api/dsractivity/submitheader ────────────────────────────────────
-        [HttpPost("submitheader")]
-        public async Task<IActionResult> SubmitDsrHeader([FromBody] DsrHeaderSubmitDto request)
+        // GET api/dsr
+        [HttpGet]
+        public ActionResult<IEnumerable<DsrDto>> GetAll()
         {
-            if (!ModelState.IsValid)
+            var sql = @"
+                SELECT 
+                    docuNumb,
+                    CONVERT(char(10), docuDate, 120) AS docuDate,
+                    dsrParam,
+                    cusRtlFl,
+                    cusRtlCd,
+                    dsrRem01, dsrRem02, dsrRem03, dsrRem04,
+                    dsrRem05, dsrRem06, dsrRem07, dsrRem08,
+                    areaCode,
+                    cuRtType,
+                    CONVERT(char(10), ordExDat, 120) AS ordExDat
+                FROM dptDSRActvt";
+            
+            // NOTE: ExecuteSelectQuery should be public on your DatabaseHelper
+            var rows = _db.ExecuteSelectQuery(_db. /* whichever connection you use for DSR */, sql, new Dictionary<string,object>());
+            
+            var dtos = rows.Select(r => new DsrDto
             {
-                return BadRequest(
-                    new ApiResponse<object>(
-                        false,
-                        "Invalid request data.",
-                        data: null,
-                        errors: ModelState.Values
-                                    .SelectMany(v => v.Errors.Select(e => e.ErrorMessage))
-                                    .ToList()
-                    ));
-            }
+                DocuNumb  = r["docuNumb"]?.ToString(),
+                DocuDate  = DateTime.Parse(r["docuDate"]?.ToString()!),
+                DsrParam  = r["dsrParam"]?.ToString(),
+                CusRtlFl  = r["cusRtlFl"]?.ToString(),
+                CusRtlCd  = r["cusRtlCd"]?.ToString(),
+                DsrRem01  = r["dsrRem01"]?.ToString(),
+                DsrRem02  = r["dsrRem02"]?.ToString(),
+                DsrRem03  = r["dsrRem03"]?.ToString(),
+                DsrRem04  = r["dsrRem04"]?.ToString(),
+                DsrRem05  = r["dsrRem05"]?.ToString(),
+                DsrRem06  = r["dsrRem06"]?.ToString(),
+                DsrRem07  = r["dsrRem07"]?.ToString(),
+                DsrRem08  = r["dsrRem08"]?.ToString(),
+                AreaCode  = r["areaCode"]?.ToString(),
+                CuRtType  = r["cuRtType"]?.ToString(),
+                OrdExDat  = DateTime.TryParse(r["ordExDat"]?.ToString(), out var dt) ? dt : (DateTime?)null
+            })
+            .ToList();
 
-            string docuNumbToUse = request.DocuNumb ?? string.Empty;
-            bool isNewRecord = string.IsNullOrWhiteSpace(docuNumbToUse);
+            return Ok(dtos);
+        }
 
-            if (!DateTime.TryParseExact(
-                    request.DocuDate,
-                    "yyyy-MM-dd",
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.None,
-                    out DateTime docuDateParsed))
+        // GET api/dsr/{id}
+        [HttpGet("{id}")]
+        public ActionResult<DsrDto> GetById(string id)
+        {
+            var sql = @"
+                SELECT 
+                    docuNumb,
+                    CONVERT(char(10), docuDate, 120) AS docuDate,
+                    dsrParam,
+                    cusRtlFl,
+                    cusRtlCd,
+                    dsrRem01, dsrRem02, dsrRem03, dsrRem04,
+                    dsrRem05, dsrRem06, dsrRem07, dsrRem08,
+                    areaCode,
+                    cuRtType,
+                    CONVERT(char(10), ordExDat, 120) AS ordExDat
+                FROM dptDSRActvt
+                WHERE docuNumb = @docuNumb";
+
+            var rows = _db.ExecuteSelectQuery(
+                _db. /* your DSR DB */,
+                sql,
+                new Dictionary<string,object>{{ "@docuNumb", id }}
+            );
+
+            if (!rows.Any())
+                return NotFound();
+
+            var r = rows.First();
+            var dto = new DsrDto
             {
-                return BadRequest(
-                    new ApiResponse<object>(false, "Invalid DocuDate format. Expected yyyy-MM-dd.", data: null)
-                );
-            }
-
-            // Parse OrdExDat if provided
-            DateTime? ordExDatParsed = null;
-            if (!string.IsNullOrWhiteSpace(request.OrdExDat))
-            {
-                if (!DateTime.TryParseExact(
-                        request.OrdExDat,
-                        "yyyy-MM-dd",
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.None,
-                        out DateTime tempOrdExDate))
-                {
-                    return BadRequest(
-                        new ApiResponse<object>(false, "Invalid OrdExDat format. Expected yyyy-MM-dd.", data: null)
-                    );
-                }
-                ordExDatParsed = tempOrdExDate;
-            }
-
-            // ─── If new, generate DocuNumb ─────────────────────────────────────────
-            if (isNewRecord)
-            {
-                // Build prefix: either “D” or “T” + first three of AreaCode (or pad with Xs)
-                string areaCodePart;
-                if (string.IsNullOrEmpty(request.AreaCode))
-                    areaCodePart = "XXX";
-                else if (request.AreaCode.Length >= 3)
-                    areaCodePart = request.AreaCode.Substring(0, 3);
-                else
-                    areaCodePart = request.AreaCode.PadRight(3, 'X');
-
-                string prefix = (request.DsrParam == "05" ? "D" : "T") + areaCodePart;
-                string datePart = docuDateParsed.ToString("yyMM");
-
-                // Parameterized LIKE pattern
-                string seqQuery = @"
-                    SELECT
-                      ISNULL(
-                        MAX(
-                          CAST(
-                            SUBSTRING(docuNumb, 
-                                      @PrefixLenPlusDateLen + 1, 
-                                      4
-                            ) AS INT)
-                        ), 0
-                      ) + 1
-                    FROM dptDSRActvt
-                    WHERE docuNumb LIKE @PrefixDatePattern
-                      AND compCode = '01'
-                      AND locaCode = '01';";
-
-                var seqParams = new Dictionary<string, object>
-                {
-                    { "@PrefixLenPlusDateLen", prefix.Length + datePart.Length },
-                    { "@PrefixDatePattern", $"{prefix}{datePart}%" }
-                };
-
-                try
-                {
-                    var seqResult = await Task.Run(() => _dbHelper.WebSessBean(seqQuery, seqParams));
-                    int nextSeq = 1;
-                    if (seqResult.Any()
-                     && seqResult[0].Values.FirstOrDefault() != null
-                     && seqResult[0].Values.First() != DBNull.Value)
-                    {
-                        nextSeq = Convert.ToInt32(seqResult[0].Values.First());
-                    }
-                    docuNumbToUse = $"{prefix}{datePart}{nextSeq:D4}";
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error generating sequence for DocuNumb prefix {Prefix}{DatePart}", prefix, datePart);
-                    return StatusCode(
-                        500,
-                        new ApiResponse<object>(false, "Error generating document number.", data: null)
-                    );
-                }
-            }
-
-            // ─── Build INSERT or UPDATE SQL ────────────────────────────────────────
-            string sql;
-            if (isNewRecord)
-            {
-                sql = @"
-                    INSERT INTO dptDSRActvt
-                      (
-                        compCode, locaCode, finYear, docuNumb, docuDate,
-                        dsrParam, cusRtlFl, cusRtlCd, areaCode, createId,
-                        createDt, statFlag, rtInTim, cuRtType, ordExDat,
-                        dsrRem01, dsrRem02, geoLatit, geoLongt, dsrExcpRsn
-                      )
-                    VALUES
-                      (
-                        @CompCode, @LocaCode, dbo.wcfFinYrGet(@DocuDate), @DocuNumb, @DocuDate,
-                        @DsrParam, @CusRtlFl, @CusRtlCd, @AreaCode, @CreateId,
-                        GETDATE(), 'N', @RtInTim, @CuRtType, @OrdExDat,
-                        @DsrRem01, @DsrRem02, @GeoLatit, @GeoLongt, @DistanceExceptionReason
-                      );";
-            }
-            else
-            {
-                sql = @"
-                    UPDATE dptDSRActvt
-                       SET docuDate = @DocuDate,
-                           dsrParam = @DsrParam,
-                           cusRtlFl = @CusRtlFl,
-                           cusRtlCd = @CusRtlCd,
-                           areaCode = @AreaCode,
-                           lastUpBy = @CreateId,
-                           lastUpDt = GETDATE(),
-                           rtInTim = @RtInTim,
-                           cuRtType = @CuRtType,
-                           ordExDat = @OrdExDat,
-                           dsrRem01 = @DsrRem01,
-                           dsrRem02 = @DsrRem02,
-                           geoLatit = @GeoLatit,
-                           geoLongt = @GeoLongt,
-                           dsrExcpRsn = @DistanceExceptionReason
-                     WHERE docuNumb = @DocuNumb
-                       AND createId = @CreateId
-                       AND statFlag = 'N';";
-            }
-
-            // ─── Build parameter dictionary ────────────────────────────────────────
-            var parameters = new Dictionary<string, object>
-            {
-                { "@CompCode", "01" },
-                { "@LocaCode", "01" },
-                { "@DocuNumb", docuNumbToUse },
-                { "@DocuDate", docuDateParsed },
-                { "@DsrParam", request.DsrParam },
-                { "@CusRtlFl", request.CusRtlFl },
-                { "@CusRtlCd", request.CusRtlCd },
-                { "@AreaCode", request.AreaCode },
-                { "@CreateId", request.LoginIdM },
-
-                // If DsrParam == "05", record current time as rtInTim; else NULL
-                { "@RtInTim", (request.DsrParam == "05") ? DateTime.Now.ToString("HH:mm") : (object)DBNull.Value },
-
-                { "@CuRtType", (object)request.CuRtType ?? DBNull.Value },
-                { "@OrdExDat", ordExDatParsed.HasValue ? (object)ordExDatParsed.Value : DBNull.Value },
-                { "@DsrRem01", (object)request.DsrRem01 ?? DBNull.Value },
-                { "@DsrRem02", (object)request.DsrRem02 ?? DBNull.Value },
-                { "@GeoLatit", (object)request.GeoLatit ?? DBNull.Value },
-                { "@GeoLongt", (object)request.GeoLongt ?? DBNull.Value },
-                { "@DistanceExceptionReason", (object)request.DistanceExceptionReason ?? DBNull.Value }
+                DocuNumb  = r["docuNumb"]?.ToString(),
+                DocuDate  = DateTime.Parse(r["docuDate"]?.ToString()!),
+                DsrParam  = r["dsrParam"]?.ToString(),
+                CusRtlFl  = r["cusRtlFl"]?.ToString(),
+                CusRtlCd  = r["cusRtlCd"]?.ToString(),
+                DsrRem01  = r["dsrRem01"]?.ToString(),
+                DsrRem02  = r["dsrRem02"]?.ToString(),
+                DsrRem03  = r["dsrRem03"]?.ToString(),
+                DsrRem04  = r["dsrRem04"]?.ToString(),
+                DsrRem05  = r["dsrRem05"]?.ToString(),
+                DsrRem06  = r["dsrRem06"]?.ToString(),
+                DsrRem07  = r["dsrRem07"]?.ToString(),
+                DsrRem08  = r["dsrRem08"]?.ToString(),
+                AreaCode  = r["areaCode"]?.ToString(),
+                CuRtType  = r["cuRtType"]?.ToString(),
+                OrdExDat  = DateTime.TryParse(r["ordExDat"]?.ToString(), out var dt) ? dt : (DateTime?)null
             };
 
-            try
-            {
-                _logger.LogInformation("Executing DSR Header Submit for DocuNumb: {DocuNumb}, User: {LoginIdM}", docuNumbToUse, request.LoginIdM);
-                int rowsAffected = await Task.Run(() => _dbHelper.ExecuteCommand(_dbHelper.BwliveConnectionString, sql, parameters));
-
-                if (rowsAffected > 0)
-                {
-                    _dbHelper.InsertIntoLog(
-                        request.LoginIdM,
-                        "api/dsractivity/submitheader",
-                        "Success",
-                        200,
-                        request
-                    );
-                    return Ok(new ApiResponse<object>(true, "DSR Header submitted successfully.", data: new { generatedDocuNumb = docuNumbToUse }));
-                }
-
-                _logger.LogWarning("DSR Header Submit for DocuNumb: {DocuNumb} affected 0 rows.", docuNumbToUse);
-                _dbHelper.InsertIntoLog(
-                    request.LoginIdM,
-                    "api/dsractivity/submitheader",
-                    "Failed to save",
-                    500,
-                    request
-                );
-                return StatusCode(500, new ApiResponse<object>(false, "Failed to submit DSR Header. Record not found or no changes made.", data: null));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error submitting DSR Header for User: {LoginIdM}, DocuNumb: {DocuNumb}", request.LoginIdM, docuNumbToUse);
-                _dbHelper.InsertIntoLog(
-                    request.LoginIdM,
-                    "api/dsractivity/submitheader",
-                    $"Error: {ex.Message}",
-                    500,
-                    request
-                );
-                return StatusCode(500, new ApiResponse<object>(false, $"An error occurred: {ex.Message}", data: null));
-            }
+            return Ok(dto);
         }
 
-        // ─── POST /api/dsractivity/submitfull ─────────────────────────────────────
-        [HttpPost("submitfull")]
-        public async Task<IActionResult> SubmitFullDsr([FromBody] DsrActivityFullDto request)
+        // POST api/dsr
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] DsrDto dto)
         {
-            if (!ModelState.IsValid)
+            var sql = @"
+                INSERT INTO dptDSRActvt
+                    (docuNumb, docuDate, dsrParam, cusRtlFl, cusRtlCd,
+                     dsrRem01, dsrRem02, dsrRem03, dsrRem04,
+                     dsrRem05, dsrRem06, dsrRem07, dsrRem08,
+                     areaCode, cuRtType, ordExDat)
+                VALUES
+                    (@docuNumb, @docuDate, @dsrParam, @cusRtlFl, @cusRtlCd,
+                     @dsrRem01, @dsrRem02, @dsrRem03, @dsrRem04,
+                     @dsrRem05, @dsrRem06, @dsrRem07, @dsrRem08,
+                     @areaCode, @cuRtType, @ordExDat)";
+
+            var p = new Dictionary<string,object>
             {
-                return BadRequest(
-                    new ApiResponse<object>(
-                        false,
-                        "Invalid request data.",
-                        data: null,
-                        errors: ModelState.Values
-                                    .SelectMany(v => v.Errors.Select(e => e.ErrorMessage))
-                                    .ToList()
-                    ));
-            }
-
-            if (string.IsNullOrWhiteSpace(request.DocuNumb))
-            {
-                return BadRequest(
-                    new ApiResponse<object>(false, "DocuNumb is required for submitting full DSR details.", data: null)
-                );
-            }
-
-            if (!DateTime.TryParseExact(
-                    request.DocuDate,
-                    "yyyy-MM-dd",
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.None,
-                    out DateTime docuDateParsedFull))
-            {
-                return BadRequest(
-                    new ApiResponse<object>(false, "Invalid DocuDate format. Expected yyyy-MM-dd.", data: null)
-                );
-            }
-
-            DateTime? ordExDatParsedFull = null;
-            if (!string.IsNullOrWhiteSpace(request.OrderExecDate))
-            {
-                if (!DateTime.TryParseExact(
-                        request.OrderExecDate,
-                        "yyyy-MM-dd",
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.None,
-                        out DateTime tempOrdExDate))
-                {
-                    return BadRequest(
-                        new ApiResponse<object>(false, "Invalid OrderExecDate format. Expected yyyy-MM-dd.", data: null)
-                    );
-                }
-                ordExDatParsedFull = tempOrdExDate;
-            }
-
-            try
-            {
-                // Build the DsrRemXX values from various fields
-                string dsrRem01_val = request.MarketName ?? string.Empty;
-                string dsrRem02_val = request.PendingIssueStatus ?? string.Empty;
-                string dsrRem03_val = request.PendingIssueDetailType ?? string.Empty;
-                string dsrRem04_val = request.PendingIssueSpecifyText ?? string.Empty;
-                string dsrRem05_val = request.OtherRemarks ?? string.Empty;
-                string dsrRem06_val = (request.BrandsSellingWC != null && request.BrandsSellingWC.Any())
-                                        ? string.Join(",", request.BrandsSellingWC)
-                                        : null;
-                string dsrRem07_val = (request.BrandsSellingWCP != null && request.BrandsSellingWCP.Any())
-                                        ? string.Join(",", request.BrandsSellingWCP)
-                                        : null;
-                string dsrRem08_val = request.DisplayContestParticipation ?? string.Empty;
-
-                // ─── 1) UPDATE the header row ───────────────────────────────────────
-                string updateHeaderSql = @"
-                    UPDATE dptDSRActvt
-                       SET docuDate    = @DocuDate,
-                           dsrParam    = @DsrParam,
-                           cusRtlFl    = @CusRtlFl,
-                           cusRtlCd    = @CusRtlCd,
-                           areaCode    = @AreaCode,
-                           dsrRem01    = @DsrRem01,
-                           dsrRem02    = @DsrRem02,
-                           dsrRem03    = @DsrRem03,
-                           dsrRem04    = @DsrRem04,
-                           dsrRem05    = @DsrRem05,
-                           dsrRem06    = @DsrRem06,
-                           dsrRem07    = @DsrRem07,
-                           dsrRem08    = @DsrRem08,
-                           cuRtType    = @CuRtType,
-                           ordExDat    = @OrdExDat,
-                           lastUpBy    = @LoginIdM,
-                           lastUpDt    = GETDATE(),
-                           geoLatit    = @GeoLatit,
-                           geoLongt    = @GeoLongt,
-                           purchLatit  = @PurchaserLatit,
-                           purchLongt  = @PurchaserLongt,
-                           locaCapr    = @LocationCapturedAddress,
-                           isTileAdhSlr= @IsTileAdhesiveSeller,
-                           tileAdhStk  = @TileAdhesiveStock
-                     WHERE docuNumb = @DocuNumb
-                       AND createId = @LoginIdM
-                       AND statFlag = 'N';";
-
-                var headerParams = new Dictionary<string, object>
-                {
-                    { "@DocuNumb", request.DocuNumb! },
-                    { "@LoginIdM", request.LoginIdM },
-                    { "@DocuDate", docuDateParsedFull },
-                    { "@DsrParam", (object)request.DsrParam ?? DBNull.Value },
-                    { "@CusRtlFl", (object)request.CusRtlFl ?? DBNull.Value },
-                    { "@CusRtlCd", (object)request.CusRtlCd ?? DBNull.Value },
-                    { "@AreaCode", (object)request.AreaCode ?? DBNull.Value },
-                    { "@DsrRem01", (object)dsrRem01_val ?? DBNull.Value },
-                    { "@DsrRem02", (object)dsrRem02_val ?? DBNull.Value },
-                    { "@DsrRem03", (object)dsrRem03_val ?? DBNull.Value },
-                    { "@DsrRem04", (object)dsrRem04_val ?? DBNull.Value },
-                    { "@DsrRem05", (object)dsrRem05_val ?? DBNull.Value },
-                    { "@DsrRem06", (object)dsrRem06_val ?? DBNull.Value },
-                    { "@DsrRem07", (object)dsrRem07_val ?? DBNull.Value },
-                    { "@DsrRem08", (object)dsrRem08_val ?? DBNull.Value },
-                    { "@CuRtType", (object)request.CuRtType ?? DBNull.Value },
-                    { "@OrdExDat", ordExDatParsedFull.HasValue ? (object)ordExDatParsedFull.Value : DBNull.Value },
-                    { "@GeoLatit", (object)request.GeoLatit ?? DBNull.Value },
-                    { "@GeoLongt", (object)request.GeoLongt ?? DBNull.Value },
-                    { "@PurchaserLatit", (object)request.PurchaserLatit ?? DBNull.Value },
-                    { "@PurchaserLongt", (object)request.PurchaserLongt ?? DBNull.Value },
-                    { "@LocationCapturedAddress", (object)request.LocationCapturedAddress ?? DBNull.Value },
-                    { "@IsTileAdhesiveSeller", (object)request.IsTileAdhesiveSeller ?? DBNull.Value },
-                    { "@TileAdhesiveStock", request.TileAdhesiveStock.HasValue ? (object)request.TileAdhesiveStock.Value : DBNull.Value }
-                };
-
-                _logger.LogInformation("Updating DSR Header for DocuNumb: {DocuNumb}", request.DocuNumb);
-                int headerRows = await Task.Run(() =>
-                    _dbHelper.ExecuteCommand(_dbHelper.BwliveConnectionString, updateHeaderSql, headerParams)
-                );
-
-                if (headerRows == 0)
-                {
-                    // No matching header found or statFlag != 'N'
-                    _logger.LogWarning("No DSR Header updated for DocuNumb: {DocuNumb}", request.DocuNumb);
-                    _dbHelper.InsertIntoLog(
-                        request.LoginIdM,
-                        "api/dsractivity/submitfull",
-                        "Header not found or not editable",
-                        404,
-                        new { request.DocuNumb, request.Proctype }
-                    );
-                    return NotFound(new ApiResponse<object>(false, "No matching DSR header found or already closed.", data: null));
-                }
-
-                // ─── 2) DELETE existing detail rows ────────────────────────────────
-                string deleteDetailsSql = @"
-                    DELETE FROM dptDSRActvtDtl
-                     WHERE docuNumb = @DocuNumb
-                       AND compCode = '01'
-                       AND locaCode = '01'
-                       AND createId = @LoginIdM;";
-
-                var deleteParams = new Dictionary<string, object>
-                {
-                    { "@DocuNumb", request.DocuNumb! },
-                    { "@LoginIdM", request.LoginIdM }
-                };
-
-                await Task.Run(() =>
-                    _dbHelper.ExecuteCommand(_dbHelper.BwliveConnectionString, deleteDetailsSql, deleteParams)
-                );
-
-                // ─── 3) INSERT new detail rows ──────────────────────────────────
-                string insertDetailSql = @"
-                    INSERT INTO dptDSRActvtDtl
-                      (
-                        compCode, locaCode, finYear, docuNumb,
-                        docuSrNo, createId, createDt, mrktData,
-                        repoCatg, catgPack, prodQnty, projQnty,
-                        actnRemk, prodQtyV
-                      )
-                    VALUES
-                      (
-                        @CompCode, @LocaCode, dbo.wcfFinYrGet(@DocuDateForDetail), @DocuNumb,
-                        @DocuSrNo, @CreateId, GETDATE(), @MrktData,
-                        @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty,
-                        @ActnRemk, @ProdQtyV
-                      );";
-
-                int detailSrNo = 1;
-                async Task InsertDtlAsync(Dictionary<string, object> dtlParams)
-                {
-                    dtlParams.Add("@CompCode", "01");
-                    dtlParams.Add("@LocaCode", "01");
-                    dtlParams.Add("@DocuNumb", request.DocuNumb!);
-                    dtlParams.Add("@CreateId", request.LoginIdM);
-                    dtlParams.Add("@DocuSrNo", detailSrNo++);
-                    dtlParams.Add("@DocuDateForDetail", docuDateParsedFull);
-
-                    await Task.Run(() =>
-                        _dbHelper.ExecuteCommand(_dbHelper.BwliveConnectionString, insertDetailSql, dtlParams)
-                    );
-                }
-
-                // 3.1) Enrollment Slab (mrktData = '01')
-                if (request.EnrolWCSlab.HasValue || request.EnrolWCPSlab.HasValue || request.EnrolVAPSlab.HasValue)
-                {
-                    var p = new Dictionary<string, object>
-                    {
-                        { "@MrktData", "01" },
-                        { "@RepoCatg", DBNull.Value },
-                        { "@CatgPack", DBNull.Value },
-                        { "@ProdQnty", request.EnrolWCSlab.HasValue ? (object)request.EnrolWCSlab.Value : DBNull.Value },
-                        { "@ProjQnty", request.EnrolWCPSlab.HasValue ? (object)request.EnrolWCPSlab.Value : DBNull.Value },
-                        { "@ProdQtyV", request.EnrolVAPSlab.HasValue ? (object)request.EnrolVAPSlab.Value : DBNull.Value },
-                        { "@ActnRemk", DBNull.Value }
-                    };
-                    await InsertDtlAsync(p);
-                }
-
-                // 3.2) BW Stocks (mrktData = '02')
-                if (request.BwStockWC.HasValue || request.BwStockWCP.HasValue || request.BwStockVAP.HasValue)
-                {
-                    var p = new Dictionary<string, object>
-                    {
-                        { "@MrktData", "02" },
-                        { "@RepoCatg", DBNull.Value },
-                        { "@CatgPack", DBNull.Value },
-                        { "@ProdQnty", request.BwStockWC.HasValue ? (object)request.BwStockWC.Value : DBNull.Value },
-                        { "@ProjQnty", request.BwStockWCP.HasValue ? (object)request.BwStockWCP.Value : DBNull.Value },
-                        { "@ProdQtyV", request.BwStockVAP.HasValue ? (object)request.BwStockVAP.Value : DBNull.Value },
-                        { "@ActnRemk", DBNull.Value }
-                    };
-                    await InsertDtlAsync(p);
-                }
-
-                // 3.3) Competitor Avg Sales (mrktData = '04')
-                if (request.CompetitorAvgSales != null)
-                {
-                    foreach (var compSale in request.CompetitorAvgSales)
-                    {
-                        var p = new Dictionary<string, object>
-                        {
-                            { "@MrktData", "04" },
-                            { "@RepoCatg", DBNull.Value },
-                            { "@CatgPack", DBNull.Value },
-                            { "@ProdQnty", compSale.WcQty.HasValue ? (object)compSale.WcQty.Value : DBNull.Value },
-                            { "@ProjQnty", compSale.WcpQty.HasValue ? (object)compSale.WcpQty.Value : DBNull.Value },
-                            { "@ProdQtyV", DBNull.Value },
-                            { "@ActnRemk", (object)compSale.BrandName ?? DBNull.Value }
-                        };
-                        await InsertDtlAsync(p);
-                    }
-                }
-
-                // 3.4) Order Items (mrktData = '05')
-                if (request.OrderItems != null)
-                {
-                    foreach (var item in request.OrderItems)
-                    {
-                        var p = new Dictionary<string, object>
-                        {
-                            { "@MrktData", "05" },
-                            { "@RepoCatg", (object)item.RepoCatg ?? DBNull.Value },
-                            { "@CatgPack", (object)item.ProdCode ?? DBNull.Value },
-                            { "@ProdQnty", item.QuantityInBags.HasValue ? (object)item.QuantityInBags.Value : DBNull.Value },
-                            { "@ProjQnty", item.QuantityInMT.HasValue ? (object)item.QuantityInMT.Value : DBNull.Value },
-                            { "@ProdQtyV", DBNull.Value },
-                            { "@ActnRemk", DBNull.Value }
-                        };
-                        await InsertDtlAsync(p);
-                    }
-                }
-
-                // 3.5) Market WCP SKUs (mrktData = '06')
-                if (request.MarketWcpSkus != null)
-                {
-                    foreach (var sku in request.MarketWcpSkus)
-                    {
-                        var p = new Dictionary<string, object>
-                        {
-                            { "@MrktData", "06" },
-                            { "@RepoCatg", (object)sku.BrandName ?? DBNull.Value },
-                            { "@CatgPack", (object)sku.PrdCodMk ?? DBNull.Value },
-                            { "@ProdQnty", sku.BPriceVl.HasValue ? (object)sku.BPriceVl.Value : DBNull.Value },
-                            { "@ProjQnty", sku.CPriceVl.HasValue ? (object)sku.CPriceVl.Value : DBNull.Value },
-                            { "@ProdQtyV", DBNull.Value },
-                            { "@ActnRemk", DBNull.Value }
-                        };
-                        await InsertDtlAsync(p);
-                    }
-                }
-
-                // 3.6) Gift Items (mrktData = '07')
-                if (request.GiftItems != null)
-                {
-                    foreach (var gift in request.GiftItems)
-                    {
-                        var p = new Dictionary<string, object>
-                        {
-                            { "@MrktData", "07" },
-                            { "@RepoCatg", (object)gift.GiftTypeCode ?? DBNull.Value },
-                            { "@CatgPack", DBNull.Value },
-                            { "@ProdQnty", gift.Quantity.HasValue ? (object)gift.Quantity.Value : DBNull.Value },
-                            { "@ProjQnty", DBNull.Value },
-                            { "@ProdQtyV", DBNull.Value },
-                            { "@ActnRemk", DBNull.Value }
-                        };
-                        await InsertDtlAsync(p);
-                    }
-                }
-
-                // ─── 4) Optionally compute historical averages / last billings ────
-                // If needed, compute Last3Months and CurrentMonth averages using real SQL
-                if (!string.IsNullOrWhiteSpace(request.CusRtlCd)
-                 && !string.IsNullOrWhiteSpace(request.CusRtlFl)
-                 && docuDateParsedFull != DateTime.MinValue)
-                {
-                    // Example:
-/*
-                    request.Last3MonthsBwWC   = await GetSalesAverageAsync(request.CusRtlCd, request.CusRtlFl, 3, docuDateParsedFull);
-                    request.CurrentMonthBwWC  = await GetSalesAverageAsync(request.CusRtlCd, request.CusRtlFl, 1, docuDateParsedFull);
-                    request.LastBillings      = await GetLastBillingsAsync(request.CusRtlCd, request.CusRtlFl);
-*/
-                }
-
-                _logger.LogInformation("Successfully submitted full DSR for DocuNumb: {DocuNumb}", request.DocuNumb);
-                _dbHelper.InsertIntoLog(
-                    request.LoginIdM,
-                    "api/dsractivity/submitfull",
-                    "Success",
-                    200,
-                    new { request.DocuNumb, request.Proctype }
-                );
-                return Ok(new ApiResponse<object>(true, "DSR submitted successfully.", data: null));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error submitting full DSR for DocuNumb: {DocuNumb}, User: {LoginIdM}", request.DocuNumb, request.LoginIdM);
-                _dbHelper.InsertIntoLog(
-                    request.LoginIdM,
-                    "api/dsractivity/submitfull",
-                    $"Error: {ex.Message}",
-                    500,
-                    new { request.DocuNumb, request.Proctype }
-                );
-                return StatusCode(500, new ApiResponse<object>(false, $"An error occurred: {ex.Message}", data: null));
-            }
-        }
-
-        // ─── GET /api/dsractivity/details/{docuNumb}?loginIdM=XXX ──────────────
-        [HttpGet("details/{docuNumb}")]
-        public async Task<IActionResult> GetDsrDetails(string docuNumb, [FromQuery] string loginIdM)
-        {
-            if (string.IsNullOrWhiteSpace(docuNumb) || string.IsNullOrWhiteSpace(loginIdM))
-            {
-                return BadRequest(
-                    new ApiResponse<object>(false, "Document number and Login ID are required.", data: null)
-                );
-            }
-
-            var responseDto = new DsrActivityFullDto
-            {
-                LoginIdM = loginIdM,
-                DocuNumb = docuNumb
+                ["@docuNumb"] = dto.DocuNumb,
+                ["@docuDate"] = dto.DocuDate,
+                ["@dsrParam"] = dto.DsrParam,
+                ["@cusRtlFl"] = dto.CusRtlFl,
+                ["@cusRtlCd"] = dto.CusRtlCd,
+                ["@dsrRem01"] = dto.DsrRem01 ?? "",
+                ["@dsrRem02"] = dto.DsrRem02 ?? "",
+                ["@dsrRem03"] = dto.DsrRem03 ?? "",
+                ["@dsrRem04"] = dto.DsrRem04 ?? "",
+                ["@dsrRem05"] = dto.DsrRem05 ?? "",
+                ["@dsrRem06"] = dto.DsrRem06 ?? "",
+                ["@dsrRem07"] = dto.DsrRem07 ?? "",
+                ["@dsrRem08"] = dto.DsrRem08 ?? "",
+                ["@areaCode"] = dto.AreaCode,
+                ["@cuRtType"] = dto.CuRtType ?? "",
+                ["@ordExDat"] = (object?)dto.OrdExDat ?? DBNull.Value
             };
 
-            DateTime docuDateFromDb = DateTime.MinValue;
-            try
-            {
-                // ─── 1) Fetch header row ─────────────────────────────────────────
-                string headerSql = @"
-                    SELECT
-                      *,
-                      CONVERT(CHAR(10), docuDate, 23) AS docuDateStr,
-                      CONVERT(CHAR(10), ordExDat, 23) AS ordExDatStr
-                    FROM dptDSRActvt
-                    WHERE docuNumb = @DocuNumb
-                      AND createId = @LoginIdM;";
-
-                var headerParams = new Dictionary<string, object>
-                {
-                    { "@DocuNumb", docuNumb },
-                    { "@LoginIdM", loginIdM }
-                };
-                var headerResult = await Task.Run(() => _dbHelper.WebSessBean(headerSql, headerParams));
-
-                if (!headerResult.Any())
-                {
-                    return NotFound(
-                        new ApiResponse<object>(false, "DSR not found or access denied.", data: null)
-                    );
-                }
-
-                var hr = headerResult.First();
-                responseDto.DocuDate = hr["docuDateStr"]?.ToString();
-                if (!string.IsNullOrWhiteSpace(responseDto.DocuDate))
-                {
-                    DateTime.TryParseExact(
-                        responseDto.DocuDate,
-                        "yyyy-MM-dd",
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.None,
-                        out docuDateFromDb
-                    );
-                }
-
-                // Map header fields
-                responseDto.DsrParam    = hr["dsrParam"]?.ToString();
-                responseDto.CusRtlFl    = hr["cusRtlFl"]?.ToString();
-                responseDto.CusRtlCd    = hr["cusRtlCd"]?.ToString();
-                responseDto.AreaCode    = hr["areaCode"]?.ToString();
-                responseDto.CuRtType    = hr["cuRtType"]?.ToString();
-                responseDto.MarketName  = hr["dsrRem01"]?.ToString();
-                responseDto.PendingIssueStatus      = hr["dsrRem02"]?.ToString();
-                responseDto.PendingIssueDetailType  = hr["dsrRem03"]?.ToString();
-                responseDto.PendingIssueSpecifyText = hr["dsrRem04"]?.ToString();
-                responseDto.OtherRemarks            = hr["dsrRem05"]?.ToString();
-
-                if (hr["dsrRem06"] != DBNull.Value && hr["dsrRem06"] != null)
-                    responseDto.BrandsSellingWC = hr["dsrRem06"].ToString()!.Split(',').ToList();
-
-                if (hr["dsrRem07"] != DBNull.Value && hr["dsrRem07"] != null)
-                    responseDto.BrandsSellingWCP = hr["dsrRem07"].ToString()!.Split(',').ToList();
-
-                responseDto.DisplayContestParticipation = hr["dsrRem08"]?.ToString();
-                responseDto.OrderExecDate  = hr["ordExDatStr"]?.ToString();
-                responseDto.IsTileAdhesiveSeller = hr["isTileAdhSlr"]?.ToString();
-                responseDto.TileAdhesiveStock    = GetDecimal(hr["tileAdhStk"]);
-                responseDto.GeoLatit            = hr["geoLatit"]?.ToString();
-                responseDto.GeoLongt            = hr["geoLongt"]?.ToString();
-                responseDto.PurchaserLatit      = hr["purchLatit"]?.ToString();
-                responseDto.PurchaserLongt      = hr["purchLongt"]?.ToString();
-                responseDto.LocationCapturedAddress = hr["locaCapr"]?.ToString();
-                responseDto.DistanceExceptionReason = hr["dsrExcpRsn"]?.ToString();
-
-                // ─── 2) Fetch customer/retailer name & KYC ──────────────────────
-                if (!string.IsNullOrWhiteSpace(responseDto.CusRtlCd)
-                 && !string.IsNullOrWhiteSpace(responseDto.CusRtlFl))
-                {
-                    string mappedCusRtlFl = MapFlutterCusRtlFlToDbCode(responseDto.CusRtlFl);
-                    string custMasterSql;
-                    var custParams = new Dictionary<string, object> { { "@CusRtlCd", responseDto.CusRtlCd } };
-
-                    if (mappedCusRtlFl == "R" || mappedCusRtlFl == "RR")
-                    {
-                        custMasterSql = @"
-                            SELECT 
-                              retlName, 
-                              ISNULL(kycVerFl, 'N') AS kycVerFl
-                            FROM rtmRetailer
-                            WHERE retlCode = @CusRtlCd;";
-                    }
-                    else
-                    {
-                        custMasterSql = @"
-                            SELECT
-                              custName,
-                              'Y' AS kycVerFl
-                            FROM dpmCustomer
-                            WHERE custCode = @CusRtlCd;";
-                    }
-
-                    var custResult = await Task.Run(() => _dbHelper.WebSessBean(custMasterSql, custParams));
-                    if (custResult.Any())
-                    {
-                        responseDto.CusRtlNm = custResult.First()[
-                            (mappedCusRtlFl == "R" || mappedCusRtlFl == "RR") ? "retlName" : "custName"
-                        ]?.ToString();
-
-                        responseDto.KycStatus = custResult.First()["kycVerFl"]?.ToString();
-                    }
-                }
-
-                // ─── 3) Fetch detail rows ───────────────────────────────────────
-                string detailSql = @"
-                    SELECT *
-                    FROM dptDSRActvtDtl
-                    WHERE docuNumb = @DocuNumb
-                      AND createId = @LoginIdM
-                    ORDER BY mrktData, docuSrNo;";
-
-                var detailResults = await Task.Run(() => _dbHelper.WebSessBean(detailSql, headerParams));
-
-                responseDto.OrderItems         = new List<DsrOrderItemDto>();
-                responseDto.MarketWcpSkus      = new List<DsrMarketWcpSkuDto>();
-                responseDto.GiftItems          = new List<DsrGiftItemDto>();
-                responseDto.CompetitorAvgSales = new List<DsrCompetitorAvgSaleDto>();
-
-                foreach (var dr in detailResults)
-                {
-                    string mrktData = dr["mrktData"]?.ToString() ?? string.Empty;
-                    switch (mrktData)
-                    {
-                        case "01":
-                            responseDto.EnrolWCSlab   = GetDecimal(dr["prodQnty"]);
-                            responseDto.EnrolWCPSlab  = GetDecimal(dr["projQnty"]);
-                            responseDto.EnrolVAPSlab  = GetDecimal(dr["prodQtyV"]);
-                            break;
-
-                        case "02":
-                            responseDto.BwStockWC     = GetDecimal(dr["prodQnty"]);
-                            responseDto.BwStockWCP    = GetDecimal(dr["projQnty"]);
-                            responseDto.BwStockVAP    = GetDecimal(dr["prodQtyV"]);
-                            break;
-
-                        case "04":
-                            responseDto.CompetitorAvgSales.Add(new DsrCompetitorAvgSaleDto
-                            {
-                                BrandName = dr["actnRemk"]?.ToString(),
-                                WcQty     = GetDecimal(dr["prodQnty"]),
-                                WcpQty    = GetDecimal(dr["projQnty"])
-                            });
-                            break;
-
-                        case "05":
-                            responseDto.OrderItems.Add(new DsrOrderItemDto
-                            {
-                                RepoCatg       = dr["repoCatg"]?.ToString(),
-                                ProdCode       = dr["catgPack"]?.ToString(),
-                                QuantityInBags = GetDecimal(dr["prodQnty"]),
-                                QuantityInMT   = GetDecimal(dr["projQnty"])
-                            });
-                            break;
-
-                        case "06":
-                            responseDto.MarketWcpSkus.Add(new DsrMarketWcpSkuDto
-                            {
-                                BrandName = dr["repoCatg"]?.ToString(),
-                                PrdCodMk  = dr["catgPack"]?.ToString(),
-                                BPriceVl  = GetDecimal(dr["prodQnty"]),
-                                CPriceVl  = GetDecimal(dr["projQnty"])
-                            });
-                            break;
-
-                        case "07":
-                            responseDto.GiftItems.Add(new DsrGiftItemDto
-                            {
-                                GiftTypeCode = dr["repoCatg"]?.ToString(),
-                                Quantity     = GetInt(dr["prodQnty"])
-                            });
-                            break;
-                    }
-                }
-
-                // ─── 4) Optionally compute historical data if needed ───────────
-                if (!string.IsNullOrWhiteSpace(responseDto.CusRtlCd)
-                 && !string.IsNullOrWhiteSpace(responseDto.CusRtlFl)
-                 && docuDateFromDb != DateTime.MinValue)
-                {
-                    // Example calls (uncomment once implemented):
-                    //responseDto.Last3MonthsBwWC   = await GetSalesAverageAsync(responseDto.CusRtlCd, responseDto.CusRtlFl, 3, docuDateFromDb);
-                    //responseDto.CurrentMonthBwWC  = await GetSalesAverageAsync(responseDto.CusRtlCd, responseDto.CusRtlFl, 1, docuDateFromDb);
-                    //responseDto.LastBillings      = await GetLastBillingsAsync(responseDto.CusRtlCd, responseDto.CusRtlFl);
-                }
-
-                _logger.LogInformation("Fetched DSR Details for DocuNumb: {DocuNumb}", docuNumb);
-                _dbHelper.InsertIntoLog(
-                    loginIdM,
-                    $"api/dsractivity/details/{docuNumb}",
-                    "Success",
-                    200,
-                    null
-                );
-                return Ok(new ApiResponse<DsrActivityFullDto>(true, "DSR details fetched successfully.", data: responseDto));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching DSR details for DocuNumb: {DocuNumb}", docuNumb);
-                _dbHelper.InsertIntoLog(
-                    loginIdM,
-                    $"api/dsractivity/details/{docuNumb}",
-                    $"Error: {ex.Message}",
-                    500,
-                    null
-                );
-                return StatusCode(500, new ApiResponse<object>(false, $"An error occurred while fetching DSR details: {ex.Message}", data: null));
-            }
+            await _db.ExecuteNonQueryAsyncBwlive(sql, p);
+            return CreatedAtAction(nameof(GetById), new { id = dto.DocuNumb }, dto);
         }
 
-        // ─── GET /api/dsractivity/areas?search=XXX ────────────────────────────
-        [HttpGet("areas")]
-        public async Task<IActionResult> GetAreaCodes([FromQuery] string? search)
+        // PUT api/dsr/{id}
+        [HttpPut("{id}")]
+        public async Task<IActionResult> Update(string id, [FromBody] DsrDto dto)
         {
-            string sql = "SELECT areaCode, areaDesc FROM bkmAreaMast WHERE isActive = 'Y'";
-            var parameters = new Dictionary<string, object>();
+            if (id != dto.DocuNumb)
+                return BadRequest("Document number mismatch");
 
-            if (!string.IsNullOrWhiteSpace(search))
+            var sql = @"
+                UPDATE dptDSRActvt
+                   SET docuDate  = @docuDate,
+                       dsrParam  = @dsrParam,
+                       cusRtlFl  = @cusRtlFl,
+                       cusRtlCd  = @cusRtlCd,
+                       dsrRem01  = @dsrRem01,
+                       dsrRem02  = @dsrRem02,
+                       dsrRem03  = @dsrRem03,
+                       dsrRem04  = @dsrRem04,
+                       dsrRem05  = @dsrRem05,
+                       dsrRem06  = @dsrRem06,
+                       dsrRem07  = @dsrRem07,
+                       dsrRem08  = @dsrRem08,
+                       areaCode  = @areaCode,
+                       cuRtType  = @cuRtType,
+                       ordExDat  = @ordExDat
+                WHERE docuNumb = @docuNumb";
+
+            var p = new Dictionary<string,object>
             {
-                sql += " AND (areaCode LIKE @SearchPattern OR areaDesc LIKE @SearchPattern)";
-                parameters.Add("@SearchPattern", $"%{search}%");
-            }
-
-            sql += " ORDER BY areaDesc";
-
-            try
-            {
-                var results = await Task.Run(() => _dbHelper.WebSessBean(sql, parameters));
-                var responseData = results
-                    .Select(r => new AreaCodeDto
-                    {
-                        AreaCode = r["areaCode"]?.ToString() ?? string.Empty,
-                        AreaDesc = r["areaDesc"]?.ToString() ?? string.Empty
-                    })
-                    .ToList();
-
-                return Ok(responseData);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching area codes.");
-                return StatusCode(500, new ApiResponse<object>(false, "Failed to fetch area codes.", data: null));
-            }
-        }
-
-        // ─── GET /api/dsractivity/retailers?areaCode=XXX&cusRtlFl=XXX&search=XXX&loginIdM=YYY ───────────
-        [HttpGet("retailers")]
-        public async Task<IActionResult> GetRetailers(
-            [FromQuery] string areaCode,
-            [FromQuery] string cusRtlFl,
-            [FromQuery] string? search,
-            [FromQuery] string loginIdM)
-        {
-            if (string.IsNullOrWhiteSpace(areaCode) || string.IsNullOrWhiteSpace(cusRtlFl))
-            {
-                return BadRequest(new ApiResponse<object>(false, "Area code and Customer Type (cusRtlFl) are required.", data: null));
-            }
-
-            string customerTypeDbCode = MapFlutterCusRtlFlToDbCode(cusRtlFl);
-            var parameters = new Dictionary<string, object>
-            {
-                { "@AreaCode", areaCode }
+                ["@docuNumb"] = dto.DocuNumb,
+                ["@docuDate"] = dto.DocuDate,
+                ["@dsrParam"] = dto.DsrParam,
+                ["@cusRtlFl"] = dto.CusRtlFl,
+                ["@cusRtlCd"] = dto.CusRtlCd,
+                ["@dsrRem01"] = dto.DsrRem01 ?? "",
+                ["@dsrRem02"] = dto.DsrRem02 ?? "",
+                ["@dsrRem03"] = dto.DsrRem03 ?? "",
+                ["@dsrRem04"] = dto.DsrRem04 ?? "",
+                ["@dsrRem05"] = dto.DsrRem05 ?? "",
+                ["@dsrRem06"] = dto.DsrRem06 ?? "",
+                ["@dsrRem07"] = dto.DsrRem07 ?? "",
+                ["@dsrRem08"] = dto.DsrRem08 ?? "",
+                ["@areaCode"] = dto.AreaCode,
+                ["@cuRtType"] = dto.CuRtType ?? "",
+                ["@ordExDat"] = (object?)dto.OrdExDat ?? DBNull.Value
             };
 
-            string commonRetailerFields = @"
-                ISNULL(addrLine, '')    AS address,
-                ISNULL(cityName, '')    AS city,
-                ISNULL(latitute, '0.0') AS latitude,
-                ISNULL(lgtitute, '0.0') AS longitude,
-                ISNULL(kycVerFl, 'N')   AS kycStatus,
-                ISNULL(mobileNo, '')    AS mobileNo,
-                ISNULL(mrktName, '')    AS marketName";
-
-            string commonCustomerFields = @"
-                ISNULL(addrLine1, '')   AS address,
-                ISNULL(cityName, '')    AS city,
-                ISNULL(latitute, '0.0') AS latitude,
-                ISNULL(lgtitute, '0.0') AS longitude,
-                'Y'                     AS kycStatus,
-                ISNULL(mobileNo, '')    AS mobileNo,
-                ISNULL(mrktName, '')    AS marketName";
-
-            string sql;
-            if (customerTypeDbCode == "R" || customerTypeDbCode == "RR")
-            {
-                // Retailers
-                sql = $@"
-                    SELECT TOP 50
-                      retlCode AS code,
-                      retlName AS name,
-                      {commonRetailerFields}
-                    FROM rtmRetailer
-                    WHERE areaCode = @AreaCode
-                      AND isActive = 'Y'
-                      AND cusRtlFl = @CustomerTypeDbCode";
-                parameters.Add("@CustomerTypeDbCode", customerTypeDbCode);
-            }
-            else
-            {
-                // Customers in dpmCustomer
-                sql = $@"
-                    SELECT TOP 50
-                      custCode AS code,
-                      custName AS name,
-                      {commonCustomerFields}
-                    FROM dpmCustomer
-                    WHERE areaCode = @AreaCode
-                      AND isActive = 'Y'
-                      AND cusTypCd = @CustomerTypeDbCode";
-                parameters.Add("@CustomerTypeDbCode", customerTypeDbCode);
-            }
-
-            if (!string.IsNullOrWhiteSpace(search))
-            {
-                sql += " AND (code LIKE @SearchPattern OR name LIKE @SearchPattern)";
-                parameters.Add("@SearchPattern", $"%{search}%");
-            }
-
-            sql += " ORDER BY name;";
-
-            try
-            {
-                var results = await Task.Run(() => _dbHelper.WebSessBean(sql, parameters));
-                var responseData = results
-                    .Select(r => new RetailerInfoDto
-                    {
-                        Code       = r["code"]?.ToString(),
-                        Name       = r["name"]?.ToString(),
-                        Address    = r["address"]?.ToString(),
-                        City       = r["city"]?.ToString(),
-                        Latitude   = GetDouble(r["latitude"]),
-                        Longitude  = GetDouble(r["longitude"]),
-                        KycStatus  = r["kycStatus"]?.ToString(),
-                        MobileNo   = r["mobileNo"]?.ToString(),
-                        MarketName = r["marketName"]?.ToString()
-                    })
-                    .ToList();
-
-                return Ok(responseData);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching retailers for Area: {AreaCode}, Type: {CusRtlFl}", areaCode, cusRtlFl);
-                return StatusCode(500, new ApiResponse<object>(false, "Failed to fetch retailers.", data: null));
-            }
+            var rowsAffected = await _db.ExecuteNonQueryAsyncBwlive(sql, p);
+            if (rowsAffected == 0) return NotFound();
+            return NoContent();
         }
 
-        #region ─── Helpers & TODOs ─────────────────────────────────────────────────
-
-        private decimal? GetDecimal(object? dbValue) =>
-            (dbValue != DBNull.Value && dbValue != null) ? Convert.ToDecimal(dbValue) : null;
-
-        private int? GetInt(object? dbValue) =>
-            (dbValue != DBNull.Value && dbValue != null) ? Convert.ToInt32(dbValue) : null;
-
-        private double? GetDouble(object? dbValue) =>
-            (dbValue != DBNull.Value && dbValue != null) ? Convert.ToDouble(dbValue) : null;
-
-        private string MapFlutterCusRtlFlToDbCode(string flutterCusRtlFlText)
+        // DELETE api/dsr/{id}
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> Delete(string id)
         {
-            switch (flutterCusRtlFlText?.Trim().ToLower())
-            {
-                case "retailer":                return "R";
-                case "rural retailer":          return "RR";
-                case "stokiest/urban stokiest": return "ST";
-                case "direct dealer":           return "DD";
-                case "rural stokiest":          return "RD";
-                case "ad":                      return "AD";
-                case "ubs":                     return "UR";
-                default:
-                    _logger.LogWarning("Unmapped CusRtlFl text from Flutter: {FlutterCusRtlFlText}", flutterCusRtlFlText);
-                    return flutterCusRtlFlText; // Fallback—ensure the client never passes an invalid code
-            }
+            var sql = "DELETE FROM dptDSRActvt WHERE docuNumb = @docuNumb";
+            var p   = new Dictionary<string,object>{{ "@docuNumb", id }};
+            var deleted = await _db.ExecuteNonQueryAsyncBwlive(sql, p);
+            if (deleted == 0) return NotFound();
+            return NoContent();
         }
+    }
 
-        /// <summary>
-        /// TODO: Implement actual SQL logic for past‐3‐months average.
-        /// Example given below; adjust table/column names as per your schema.
-        /// </summary>
-        private async Task<decimal?> GetSalesAverageAsync(
-            string cusRtlCd,
-            string cusRtlFl,
-            int monthOffset,
-            DateTime currentDsrDate)
-        {
-            _logger.LogDebug("Computing sales average for CusRtlCd={CusRtlCd}, MonthOffset={MonthOffset}", cusRtlCd, monthOffset);
-
-            // Example: calculate first/last day of the target month window
-            DateTime startOfWindow = new DateTime(currentDsrDate.Year, currentDsrDate.Month, 1).AddMonths(-monthOffset + 1);
-            DateTime endOfWindow   = new DateTime(currentDsrDate.Year, currentDsrDate.Month, 1).AddMonths(-monthOffset).AddDays(-1);
-
-            string avgSql = @"
-                SELECT
-                  AVG(CAST(D.prodQnty AS DECIMAL(18,2))) AS AvgBWWC
-                FROM dptDSRActvtDtl D
-                JOIN dptDSRActvt H
-                  ON D.docuNumb = H.docuNumb
-                WHERE H.cusRtlCd = @CusRtlCd
-                  AND H.cusRtlFl = @CusRtlFl
-                  AND D.mrktData = '02'
-                  AND H.docuDate BETWEEN @StartDate AND @EndDate;";
-
-            var parameters = new Dictionary<string, object>
-            {
-                { "@CusRtlCd", cusRtlCd },
-                { "@CusRtlFl", cusRtlFl },
-                { "@StartDate", startOfWindow },
-                { "@EndDate", endOfWindow }
-            };
-
-            var result = await Task.Run(() => _dbHelper.WebSessBean(avgSql, parameters));
-            if (!result.Any())
-                return null;
-
-            object avgObj = result[0]["AvgBWWC"];
-            if (avgObj == DBNull.Value || avgObj == null)
-                return null;
-
-            return Convert.ToDecimal(avgObj);
-        }
-
-        /// <summary>
-        /// TODO: Implement actual SQL logic for “last billings”.
-        /// Example below uses a fictional `dptCustomerBilling` table—adjust as per your schema.
-        /// </summary>
-        private async Task<List<DsrLastBillingDto>> GetLastBillingsAsync(string cusRtlCd, string cusRtlFl)
-        {
-            _logger.LogDebug("Fetching last billings for CusRtlCd={CusRtlCd}", cusRtlCd);
-
-            string billingSql = @"
-                SELECT TOP 5
-                  prodName      AS ProductName,
-                  CONVERT(CHAR(10), billingDate, 23) AS Date,
-                  quantity      AS Quantity
-                FROM dptCustomerBilling
-                WHERE custCode = @CusRtlCd
-                ORDER BY billingDate DESC;";
-
-            var parameters = new Dictionary<string, object>
-            {
-                { "@CusRtlCd", cusRtlCd }
-            };
-
-            var dt = await Task.Run(() => _dbHelper.WebSessBean(billingSql, parameters));
-            return dt.Select(r => new DsrLastBillingDto
-            {
-                ProductName = r["ProductName"]?.ToString(),
-                Date        = r["Date"]?.ToString(),
-                Quantity    = Convert.ToDecimal(r["Quantity"])
-            }).ToList();
-        }
-
-        #endregion
+    public class DsrDto
+    {
+        public string   DocuNumb  { get; set; } = "";
+        public DateTime DocuDate  { get; set; }
+        public string?  DsrParam  { get; set; }
+        public string?  CusRtlFl  { get; set; }
+        public string?  CusRtlCd  { get; set; }
+        public string?  DsrRem01  { get; set; }
+        public string?  DsrRem02  { get; set; }
+        public string?  DsrRem03  { get; set; }
+        public string?  DsrRem04  { get; set; }
+        public string?  DsrRem05  { get; set; }
+        public string?  DsrRem06  { get; set; }
+        public string?  DsrRem07  { get; set; }
+        public string?  DsrRem08  { get; set; }
+        public string?  AreaCode  { get; set; }
+        public string?  CuRtType  { get; set; }
+        public DateTime? OrdExDat { get; set; }
     }
 }
 
 
 
 {
-  "loginIdM": "USER123",
-  "docuNumb": "",           
-  "docuDate": "2025-06-05",  
-  "dsrParam": "02",          
-  "cusRtlFl": "retailer",
-  "cusRtlCd": "RTRL001",
-  "areaCode": "ABC",
-  "cuRtType": "Regular",     
-  "ordExDat": "2025-06-10",  
-  "dsrRem01": "",            
-  "dsrRem02": "",            
-  "geoLatit": "28.6139",     
-  "geoLongt": "77.2090",     
-  "distanceExceptionReason": ""  
+  "docuNumb": "DSR0001",
+  "docuDate": "2023-08-01T00:00:00",
+  "dsrParam": "04",
+  "cusRtlFl": "R",
+  "cusRtlCd": "100123",
+  "dsrRem01": "MarketX",
+  "dsrRem02": "N",
+  "dsrRem03": "",
+  "dsrRem04": "",
+  "dsrRem05": "",
+  "dsrRem06": "",
+  "dsrRem07": "",
+  "dsrRem08": "",
+  "areaCode": "DEL",
+  "cuRtType": "RR",
+  "ordExDat": "2023-08-10T00:00:00"
 }
-
-
-
-using System;
-using System.Collections.Generic;
-using System.IO;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using sparshWebService.DataAccess;
-
-var builder = WebApplication.CreateBuilder(new WebApplicationOptions
-{
-    // Point ContentRoot to the folder where Program.cs (and csproj) live:
-    ContentRootPath = Directory.GetCurrentDirectory(),
-    // Force WebRoot to be the same folder as ContentRoot so ASP.NET Core
-    // DOES NOT try to find "<ContentRoot>/wwwroot" on startup.
-    // (As long as WebRootPath points to a folder that actually exists,
-    // you won’t see the "DirectoryNotFoundException" for missing wwwroot.)
-    WebRootPath = Directory.GetCurrentDirectory()
-});
-
-// ─── 1) Load ConnectionStrings from appsettings.json ─────────────────────────
-var configuration = builder.Configuration;
-var connStrings = configuration.GetSection("ConnectionStrings")
-                               .Get<Dictionary<string, string>>();
-
-if (!connStrings.ContainsKey("bwlive") ||
-    !connStrings.ContainsKey("itkHaria") ||
-    !connStrings.ContainsKey("imageData"))
-{
-    throw new Exception("Please configure 'bwlive', 'itkHaria' and 'imageData' under ConnectionStrings in appsettings.json.");
-}
-
-// ─── 2) Register your DatabaseHelper as a singleton ──────────────────────────
-builder.Services.AddSingleton(provider =>
-    new DatabaseHelper(
-        connStrings["bwlive"],
-        connStrings["itkHaria"],
-        connStrings["imageData"]
-    ));
-
-// ─── 3) (Optional) If you plan to call external HTTP APIs later ─────────────
-builder.Services.AddHttpClient();
-
-// ─── 4) Add Authentication/Authorization (JWT + custom middleware) ─────────
-builder.Services.AddAuthentication();   // we still expect your JWT to be validated in middleware
-builder.Services.AddAuthorization();
-
-// ─── 5) Add Controllers & Swagger ──────────────────────────────────────────
-builder.Services.AddControllers();
-builder.Services.AddSwaggerGen();
-
-// ─── 6) Build the WebApplication ───────────────────────────────────────────
-var app = builder.Build();
-
-// ─── 7) Enable Swagger only in Development ─────────────────────────────────
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
-
-// ─── 8) Run your custom AuthenticationMiddleware here ───────────────────────
-app.UseMiddleware<AuthenticationMiddleware>();
-
-// ─── 9) Standard ASP.NET Core pipeline ────────────────────────────────────
-app.UseHttpsRedirection();
-app.UseAuthentication();
-app.UseAuthorization();
-
-// ─── 10) (Optional) A simple “hello” endpoint ───────────────────────────────
-app.MapGet("/", () => "API is running. If you see this, we did not crash on wwwroot.");
-
-// ─── 11) Map Controllers ───────────────────────────────────────────────────
-app.MapControllers();
-
-app.Run();
-
