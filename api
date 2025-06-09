@@ -1,252 +1,3 @@
-using System;
-
-using System.Collections.Generic;
-
-using System.Linq;
-
-using Microsoft.AspNetCore.Mvc;
-
-using sparshWebService.DataAccess;
-
-namespace sparshWebService.Controllers
-
-{
-
-    [ApiController]
-
-    [Route("api/[controller]")]
-
-    public class DsrRetailerInOutController : ControllerBase
-
-    {
-
-        private readonly DatabaseHelper _dbHelper;
-
-        public DsrRetailerInOutController(DatabaseHelper dbHelper)
-
-        {
-
-            _dbHelper = dbHelper;
-
-        }
-
-        /// <summary>
-
-        /// GET /api/DsrRetailerInOut/areaCodes
-
-        /// Returns every areaCode in bkmAreaMast (no filters).
-
-        /// </summary>
-
-        [HttpGet("areacodes")]
-
-        [ProducesResponseType(typeof(IEnumerable<AreaCodeDto>), 200)]
-
-        [ProducesResponseType(500)]
-
-        public IActionResult GetAreaCodes()
-
-        {
-
-            try
-
-            {
-
-                const string sql = @"
-
-                    SELECT areaCode,
-
-                           areaDesc,
-
-                           isActive
-
-                      FROM bwlive.dbo.bkmAreaMast WITH(NOLOCK)
-
-                     ORDER BY areaDesc";
-
-                var rows = _dbHelper.WebSessBean(sql, new Dictionary<string, object>());
-
-                var list = rows.Select(r => new AreaCodeDto
-
-                {
-
-                    Code = r["areaCode"]?.ToString() ?? "",
-
-                    Description = r["areaDesc"]?.ToString() ?? "",
-
-                    IsActive = (r["isActive"]?.ToString() ?? "N") == "Y"
-
-                })
-
-                .ToList();
-
-                return Ok(list);
-
-            }
-
-            catch (Exception ex)
-
-            {
-
-                return StatusCode(500, $"Error fetching area codes: {ex.Message}");
-
-            }
-
-        }
-
-        /// <summary>
-
-        /// GET /api/DsrRetailerInOut/codeSearch?areaCode={areaCode}&code={code}
-
-        /// Finds one record by code+area: checks retailers first, then customers—no active check.
-
-        /// </summary>
-
-        [HttpGet("codesearch")]
-
-        [ProducesResponseType(typeof(CodeSearchDto), 200)]
-
-        [ProducesResponseType(404)]
-
-        [ProducesResponseType(500)]
-
-        public IActionResult SearchByCode(
-
-            [FromQuery] string areaCode,
-
-            [FromQuery] string code)
-
-        {
-
-            try
-
-            {
-
-                const string sql = @"
-
-                    WITH Combined AS (
-
-                        SELECT 
-
-                          r.retlCode   AS Code,
-
-                          r.retlName   AS Name,
-
-                          r.latitute   AS Latitude,
-
-                          r.lgtitute   AS Longitude,
-
-                          1            AS Ord
-
-                        FROM bwlive.dbo.rtmRetailer r WITH(NOLOCK)
-
-                        WHERE r.retlCode = @Code
-
-                          AND r.areaCode = @AreaCode
- 
-                        UNION ALL
- 
-                        SELECT 
-
-                          c.custCode   AS Code,
-
-                          c.custName   AS Name,
-
-                          c.latitute   AS Latitude,
-
-                          c.lgtitute   AS Longitude,
-
-                          2            AS Ord
-
-                        FROM bwlive.dbo.dpmCustomer c WITH(NOLOCK)
-
-                        WHERE c.custCode = @Code
-
-                    )
-
-                    SELECT TOP 1 Code, Name, Latitude, Longitude
-
-                      FROM Combined
-
-                     ORDER BY Ord";
-
-                var parameters = new Dictionary<string, object>
-
-                {
-
-                    { "@Code",     code     },
-
-                    { "@AreaCode", areaCode }
-
-                };
-
-                var rows = _dbHelper.WebSessBean(sql, parameters);
-
-                if (!rows.Any())
-
-                    return NotFound($"No record found matching code='{code}' in area='{areaCode}'.");
-
-                var row = rows.First();
-
-                var dto = new CodeSearchDto
-
-                {
-
-                    Code = row["Code"]?.ToString() ?? "",
-
-                    Name = row["Name"]?.ToString() ?? "",
-
-                    Latitude = row["Latitude"] != null ? Convert.ToDouble(row["Latitude"]) : (double?)null,
-
-                    Longitude = row["Longitude"] != null ? Convert.ToDouble(row["Longitude"]) : (double?)null
-
-                };
-
-                return Ok(dto);
-
-            }
-
-            catch (Exception ex)
-
-            {
-
-                return StatusCode(500, $"Error searching code: {ex.Message}");
-
-            }
-
-        }
-
-    }
-
-    public class AreaCodeDto
-
-    {
-
-        public string Code { get; set; } = "";
-
-        public string Description { get; set; } = "";
-
-        public bool IsActive { get; set; }
-
-    }
-
-    public class CodeSearchDto
-
-    {
-
-        public string Code { get; set; } = "";
-
-        public string Name { get; set; } = "";
-
-        public double? Latitude { get; set; }
-
-        public double? Longitude { get; set; }
-
-    }
-
-}
-
-
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using sparshWebService.DataAccess;
@@ -255,69 +6,64 @@ using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add Controllers
+// ─── Add Services ─────────────────────────────────────────────────────────────
+
 builder.Services.AddControllers();
-builder.Services.AddSwaggerGen();
 
-// Retrieve Connection Strings
-var connectionStrings = builder.Configuration.GetSection("ConnectionStrings").Get<Dictionary<string, string>>();
+// Register DatabaseHelper
+var cs = builder.Configuration.GetSection("ConnectionStrings")
+                               .Get<Dictionary<string,string>>();
+builder.Services.AddSingleton(new DatabaseHelper(
+    cs["bwlive"], cs["itkHaria"], cs["imageData"]));
 
-// Register DatabaseHelper as a Singleton
-builder.Services.AddSingleton(provider =>
- new DatabaseHelper(
- connectionStrings["bwlive"],
- connectionStrings["itkHaria"],
- connectionStrings["imageData"]));
-
-// Add HttpClient for DI
-builder.Services.AddHttpClient();
-
-// ✅ Register IHttpContextAccessor to fix DI error
+// Add IHttpContextAccessor (needed by the middleware)
 builder.Services.AddHttpContextAccessor();
 
-// Add Authentication
+// Add JWT authentication
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
- .AddJwtBearer(options =>
- {
-     options.TokenValidationParameters = new TokenValidationParameters
-     {
-         ValidateIssuer = true,
-         ValidateAudience = false,
-         ValidateLifetime = true,
-         ValidateIssuerSigningKey = true,
-         ValidIssuer = "Birla White IT", // Set your valid issuer
-         IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
-         {
-             var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
-             var partnerId = jwtToken.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-             if (partnerId != null)
-             {
-                 var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
-                 var secretKey = dbHelper.GetSecretKey(partnerId); // Retrieve SecretKey from DB
-                 if (!string.IsNullOrEmpty(secretKey))
-                 {
-                     return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)) };
-                 }
-             }
-             throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
-         }
-     };
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = false,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = "Birla White IT",
+            IssuerSigningKeyResolver = (token, _, kid, _) =>
+            {
+                var jwt = new JwtSecurityTokenHandler().ReadJwtToken(token);
+                var partnerId = jwt.Claims.FirstOrDefault(c => c.Type=="PartnerID")?.Value;
+                if (partnerId != null)
+                {
+                    var helper = builder.Services.BuildServiceProvider()
+                                      .GetRequiredService<DatabaseHelper>();
+                    var secret = helper.GetSecretKey(partnerId);
+                    if (!string.IsNullOrEmpty(secret))
+                        return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret)) };
+                }
+                throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
+            }
+        };
 
-     options.Events = new JwtBearerEvents
-     {
-         OnMessageReceived = context =>
-         {
-             var authHeader = context.Request.Headers["Authorization"].ToString();
-             if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
-             {
-                 context.Token = authHeader.Replace("Bearer ", "");
-             }
-             return Task.CompletedTask;
-         }
-     };
- });
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = ctx =>
+            {
+                var auth = ctx.Request.Headers["Authorization"].FirstOrDefault();
+                if (!string.IsNullOrEmpty(auth) && auth.StartsWith("Bearer "))
+                    ctx.Token = auth["Bearer ".Length..].Trim();
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+// Add Swagger (optional)
+builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
+
+// ─── Middleware Pipeline ──────────────────────────────────────────────────────
 
 if (app.Environment.IsDevelopment())
 {
@@ -325,26 +71,27 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// Custom Middleware for PartnerID and API access validation
+app.UseHttpsRedirection();
+
+// 1) Our custom PartnerID + allowed-API-list middleware
 app.UseMiddleware<AuthenticationMiddleware>();
 
-app.UseHttpsRedirection();
+// 2) Standard ASP.NET Core auth
 app.UseAuthentication();
 app.UseAuthorization();
 
-// Add a default home page for the API
-app.MapGet("/", async context =>
-{
-    context.Response.ContentType = "text/html";
-    await context.Response.WriteAsync("<h1>Welcome to My API</h1><p>This is the default home page.</p>");
-});
-
 app.MapControllers();
+
+// A simple home page
+app.MapGet("/", () => Results.Content(
+    "<h1>Welcome</h1><p>DSR Retailer IN OUT API</p>", "text/html"));
+
 app.Run();
+
+
+
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Routing;
 using sparshWebService.DataAccess;
-using System;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Threading.Tasks;
@@ -352,81 +99,191 @@ using System.Threading.Tasks;
 public class AuthenticationMiddleware
 {
     private readonly RequestDelegate _next;
-    private readonly DatabaseHelper _dbHelper;
+    private readonly DatabaseHelper _db;
 
     public AuthenticationMiddleware(RequestDelegate next, DatabaseHelper dbHelper)
     {
         _next = next;
-        _dbHelper = dbHelper;
+        _db = dbHelper;
     }
 
     public async Task InvokeAsync(HttpContext context)
     {
-        // Bypass authentication for TokenController
-        var currentPath = context.Request.Path.Value?.ToLower();
-        if (currentPath?.StartsWith("/api/token", StringComparison.OrdinalIgnoreCase) == true ||
-            currentPath?.StartsWith("/api/Dsr", StringComparison.OrdinalIgnoreCase) == true ||
-            currentPath?.StartsWith("/api/DsrRetailerInOut/areacodes", StringComparison.OrdinalIgnoreCase) == true ||
-            currentPath?.StartsWith("/api/DsrRetailerInOut/codesearch", StringComparison.OrdinalIgnoreCase) == true 
-            )
+        // If the endpoint is decorated [AllowAnonymous], skip our checks entirely
+        var endpoint = context.GetEndpoint();
+        if (endpoint?.Metadata?.GetMetadata<Microsoft.AspNetCore.Authorization.AllowAnonymousAttribute>() != null)
         {
-            // Skip authentication for TokenController
             await _next(context);
             return;
         }
 
-        // Extract PartnerID and Authorization header
+        // Extract PartnerID & Bearer token
         var partnerId = context.Request.Headers["PartnerID"].FirstOrDefault();
-        var authorizationHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+        var authHdr   = context.Request.Headers["Authorization"].FirstOrDefault();
 
-        if (string.IsNullOrEmpty(partnerId) || string.IsNullOrEmpty(authorizationHeader) || !authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrEmpty(partnerId)
+            || string.IsNullOrEmpty(authHdr)
+            || !authHdr.StartsWith("Bearer "))
         {
-            context.Response.StatusCode = 400; // Bad Request
+            context.Response.StatusCode = 400;
             await context.Response.WriteAsync("PartnerID header and Authorization Bearer token are required.");
             return;
         }
 
-        // Extract JWT token
-        var jwtToken = authorizationHeader.Replace("Bearer ", "", StringComparison.OrdinalIgnoreCase).Trim();
+        var tokenStr = authHdr["Bearer ".Length..].Trim();
+        var handler  = new JwtSecurityTokenHandler();
+        JwtSecurityToken jwt;
         try
         {
-            var jwtHandler = new JwtSecurityTokenHandler();
-            if (!jwtHandler.CanReadToken(jwtToken))
-            {
-                context.Response.StatusCode = 401; // Unauthorized
-                await context.Response.WriteAsync("Invalid JWT token.");
-                return;
-            }
-
-            // Validate the JWT token
-            var token = jwtHandler.ReadJwtToken(jwtToken);
-            var tokenPartnerId = token.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
-
-            if (string.IsNullOrEmpty(tokenPartnerId) || !string.Equals(tokenPartnerId, partnerId, StringComparison.OrdinalIgnoreCase))
-            {
-                context.Response.StatusCode = 401; // Unauthorized
-                await context.Response.WriteAsync("Invalid or mismatched PartnerID in token.");
-                return;
-            }
-
-            // Validate API access
-            var allowedApis = _dbHelper.GetAllowedAPIs(partnerId);
-            if (!allowedApis.Contains(currentPath))
-            {
-                context.Response.StatusCode = 403; // Forbidden
-                await context.Response.WriteAsync("Access to the API is not allowed for this PartnerID.");
-                return;
-            }
-
-            // Call the next middleware
-            await _next(context);
+            jwt = handler.ReadJwtToken(tokenStr);
         }
-        catch (Exception ex)
+        catch
         {
-            context.Response.StatusCode = 401; // Unauthorized
-            await context.Response.WriteAsync($"Token validation failed: {ex.Message}");
+            context.Response.StatusCode = 401;
+            await context.Response.WriteAsync("Invalid JWT token.");
+            return;
         }
+
+        var tokenPartner = jwt.Claims.FirstOrDefault(c => c.Type == "PartnerID")?.Value;
+        if (!string.Equals(tokenPartner, partnerId, System.StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 401;
+            await context.Response.WriteAsync("Mismatched PartnerID in token.");
+            return;
+        }
+
+        // Check if this path is allowed for that PartnerID
+        var path = context.Request.Path.Value ?? "";
+        var allowed = _db.GetAllowedAPIs(partnerId);
+        if (!allowed.Contains(path, System.StringComparer.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 403;
+            await context.Response.WriteAsync("Access to this API is forbidden for your PartnerID.");
+            return;
+        }
+
+        // All good, continue
+        await _next(context);
     }
 }
-http://qa.birlawhite.com:55232/api/DsrRetailerInOut/areaCodes
-PartnerID header and Authorization Bearer token are required.
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace sparshWebService.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class DsrRetailerInOutController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public DsrRetailerInOutController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        /// <summary>
+        /// No auth required here:
+        /// GET /api/DsrRetailerInOut/areaCodes
+        /// </summary>
+        [AllowAnonymous]
+        [HttpGet("areaCodes")]
+        [ProducesResponseType(typeof(IEnumerable<AreaCodeDto>), 200)]
+        [ProducesResponseType(500)]
+        public IActionResult GetAreaCodes()
+        {
+            try
+            {
+                const string sql = @"
+                    SELECT areaCode, areaDesc, isActive
+                      FROM bwlive.dbo.bkmAreaMast WITH(NOLOCK)
+                     ORDER BY areaDesc";
+                var rows = _db.WebSessBean(sql, new Dictionary<string,object>());
+                var list = rows.Select(r => new AreaCodeDto
+                {
+                    Code        = r["areaCode"]?.ToString() ?? "",
+                    Description = r["areaDesc"]?.ToString() ?? "",
+                    IsActive    = (r["isActive"]?.ToString() ?? "N") == "Y"
+                }).ToList();
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error fetching area codes: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// No auth required here:
+        /// GET /api/DsrRetailerInOut/codeSearch?areaCode=XXX&code=YYY
+        /// </summary>
+        [AllowAnonymous]
+        [HttpGet("codeSearch")]
+        [ProducesResponseType(typeof(CodeSearchDto), 200)]
+        [ProducesResponseType(404)]
+        [ProducesResponseType(500)]
+        public IActionResult SearchByCode([FromQuery] string areaCode, [FromQuery] string code)
+        {
+            try
+            {
+                const string sql = @"
+                    WITH Combined AS (
+                        SELECT r.retlCode AS Code, r.retlName AS Name, r.latitute AS Latitude, r.lgtitute AS Longitude, 1 AS Ord
+                          FROM bwlive.dbo.rtmRetailer r WITH(NOLOCK)
+                         WHERE r.retlCode  = @Code
+                           AND r.areaCode  = @AreaCode
+                        UNION ALL
+                        SELECT c.custCode AS Code, c.custName AS Name, c.latitute AS Latitude, c.lgtitute AS Longitude, 2 AS Ord
+                          FROM bwlive.dbo.dpmCustomer c WITH(NOLOCK)
+                         WHERE c.custCode = @Code
+                    )
+                    SELECT TOP 1 Code, Name, Latitude, Longitude
+                      FROM Combined
+                     ORDER BY Ord";
+
+                var p = new Dictionary<string, object> {
+                    ["@Code"]     = code,
+                    ["@AreaCode"] = areaCode
+                };
+                var rows = _db.WebSessBean(sql, p);
+                if (!rows.Any())
+                    return NotFound($"No record for code='{code}' in area='{areaCode}'.");
+
+                var r = rows.First();
+                return Ok(new CodeSearchDto {
+                    Code      = r["Code"]?.ToString() ?? "",
+                    Name      = r["Name"]?.ToString() ?? "",
+                    Latitude  = r["Latitude"]  != null ? Convert.ToDouble(r["Latitude"])  : (double?)null,
+                    Longitude = r["Longitude"] != null ? Convert.ToDouble(r["Longitude"]) : (double?)null
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error searching code: {ex.Message}");
+            }
+        }
+    }
+
+    public class AreaCodeDto
+    {
+        public string Code        { get; set; } = "";
+        public string Description { get; set; } = "";
+        public bool   IsActive    { get; set; }
+    }
+
+    public class CodeSearchDto
+    {
+        public string   Code      { get; set; } = "";
+        public string   Name      { get; set; } = "";
+        public double?  Latitude  { get; set; }
+        public double?  Longitude { get; set; }
+    }
+}
