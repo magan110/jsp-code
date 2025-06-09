@@ -1,406 +1,236 @@
-<%@ include file="/Envr/JSP/SecurityCom.jsp"%>
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Transactions;
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
 
-<%
-String	sql = "",
-		docuType = "DSR",
-		docuNumb = "",
-		dsrParam = XssFilter.parSmGet("dsrParam"),
-		cusRtlFl = "",
-		areaCode = "",
-		cusRtlCd = "",
-		cusRtTyp = "",
-		repoCatg = "",
-		atchNId1 = "",
-		atchNmId = "",
-		prodQnty = "",
-		upldFlNm = "",
-		projQnty = "",
-		cstBisTy = "",
-		actnRemk = "",
-		targetDt = "",
-		repoCatgMk = "",
-		prodQntyMk = "",
-		projQntyMk = "",
-		custCdRt = "",
-		catgPack = "",
-		actnRemkMk = "",
-		targetDtMk = "",
-		dsrParTy = "83", //implemented from 01-Dec-17
-		procType = XssFilter.parSmGet("procType"),
-		docuDate = XssFilter.parSmGet("docuDate"),
-		dsrRem01 = XssFilter.parSmGet("dsrRem01"),
-		dsrRem02 = XssFilter.parSmGet("dsrRem02"),
-		dsrRem03 = XssFilter.parSmGet("dsrRem03"),
-		dsrRem04 = XssFilter.parSmGet("dsrRem04"),
-		dsrRem05 = XssFilter.parSmGet("dsrRem05"),
-		dsrRem06 = XssFilter.parSmGet("dsrRem06"),
-		dsrRem07 = XssFilter.parSmGet("dsrRem07"),
-		dsrRem08 = XssFilter.parSmGet("dsrRem08"),
-		cityName = XssFilter.parSmGet("cityName"),
-		pinCodeN = XssFilter.parSmGet("pinCodeN"),
-		dsrRem09 = "",
-		district = "",
-		deptCode = XssFilter.parSmGet("deptCode"),
-		submMthd = XssFilter.parSmGet("submMthd"),
-		FinlRslt = XssFilter.parSmGet("FinlRslt"),
-		geoLatit = XssFilter.parSmGet("geoLatit"),
-		geoLongt = XssFilter.parSmGet("geoLongt"),
-		serNumbr[] = null, 
-		serNumMk[] = null, 
-		statFlag = "N",
-		//appValue[] = null,
-		msg = "";
-
-int imgCount = 0;
-
-String[] srNumber1 = XssFilter.parArGet("srNumber1");
-
-cusRtlFl = XssFilter.parSmGet("cusRtlFl");
-areaCode = XssFilter.parSmGet("areaCode");
-if (areaCode.equals(""))
+namespace sparshWebService.Controllers
 {
-	areaCode = log.getArCode();
+    [ApiController]
+    [Route("api/[controller]")]
+    public class DsrActvController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public DsrActvController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        // POST api/DsrActv
+        [HttpPost]
+        public IActionResult Create([FromBody] DsrActvRequest req)
+        {
+            try
+            {
+                using var scope = new TransactionScope();
+
+                // 1) Generate new document number via stored proc
+                string docuNumb;
+                using (var conn = new SqlConnection(_db.BwliveConnStr))
+                using (var cmd = new SqlCommand("usp_GetNextDocumentNo", conn) { CommandType = CommandType.StoredProcedure })
+                {
+                    cmd.Parameters.AddWithValue("@DocType", "DSR");
+                    cmd.Parameters.AddWithValue("@AreaCode", req.AreaCode);
+                    var outParam = new SqlParameter("@NextDocNo", SqlDbType.VarChar, 20) { Direction = ParameterDirection.Output };
+                    cmd.Parameters.Add(outParam);
+                    conn.Open();
+                    cmd.ExecuteNonQuery();
+                    docuNumb = outParam.Value.ToString();
+                }
+
+                // 2) Insert master record
+                var masterSql = @"
+                    INSERT INTO dptDSRActvt
+                        (docuNumb, docuDate, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd,
+                         dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07,
+                         dsrRem08, dsrRem09, district, deptCode, statFlag, createId, createDt,
+                         locaCapr, latitute, lgtitute, pinCodeN, cityName, cstBisTy, cuRtType)
+                    VALUES
+                        (@docuNumb,@docuDate,@dsrParTy,@dsrParam,@cusRtlFl,@areaCode,@cusRtlCd,
+                         @dsrRem01,@dsrRem02,@dsrRem03,@dsrRem04,@dsrRem05,@dsrRem06,@dsrRem07,
+                         @dsrRem08,@dsrRem09,@district,@deptCode,'N',@loginId,GETDATE(),
+                         @finlRslt,@geoLat,@geoLong,@pinCode,@city,@bisTy,@cuRtType)";
+                var masterParams = new Dictionary<string, object>
+                {
+                    ["@docuNumb"]  = docuNumb,
+                    ["@docuDate"]  = req.DocuDate,
+                    ["@dsrParTy"]  = req.DsrParTy,
+                    ["@dsrParam"]  = req.DsrParam,
+                    ["@cusRtlFl"]  = req.CusRtlFl,
+                    ["@areaCode"]  = req.AreaCode,
+                    ["@cusRtlCd"]  = req.CusRtlCd,
+                    ["@dsrRem01"]  = req.DsrRem01 ?? string.Empty,
+                    ["@dsrRem02"]  = req.DsrRem02 ?? string.Empty,
+                    ["@dsrRem03"]  = req.DsrRem03 ?? string.Empty,
+                    ["@dsrRem04"]  = req.DsrRem04 ?? string.Empty,
+                    ["@dsrRem05"]  = req.DsrRem05 ?? string.Empty,
+                    ["@dsrRem06"]  = req.DsrRem06 ?? string.Empty,
+                    ["@dsrRem07"]  = req.DsrRem07 ?? string.Empty,
+                    ["@dsrRem08"]  = req.DsrRem08 ?? string.Empty,
+                    ["@dsrRem09"]  = req.DsrRem09 ?? string.Empty,
+                    ["@district"]  = req.District ?? string.Empty,
+                    ["@deptCode"]  = req.DeptCode,
+                    ["@loginId"]   = req.LoginId,
+                    ["@finlRslt"]  = req.FinlRslt,
+                    ["@geoLat"]    = req.GeoLatit,
+                    ["@geoLong"]   = req.GeoLongt,
+                    ["@pinCode"]   = req.PinCodeN,
+                    ["@city"]      = req.CityName,
+                    ["@bisTy"]     = req.CstBisTy,
+                    ["@cuRtType"]  = req.CuRtType
+                };
+                _db.ExecuteNonQueryBwlive(masterSql, masterParams);
+
+                // 3) Insert detail rows
+                InsertDetails(req.Details, docuNumb, isMarket: false);
+                if (req.MarketDetails?.Any() == true)
+                    InsertDetails(req.MarketDetails, docuNumb, isMarket: true);
+
+                scope.Complete();
+                return CreatedAtAction(nameof(Create), new { id = docuNumb }, new { message = $"Document saved: {docuNumb}" });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ex.Message);
+            }
+        }
+
+        // PUT api/DsrActv/{id}
+        [HttpPut("{id}")]
+        public IActionResult Update(string id, [FromBody] DsrActvRequest req)
+        {
+            try
+            {
+                using var scope = new TransactionScope();
+
+                // 1) Update master record
+                var updateSql = @"
+                    UPDATE dptDSRActvt SET
+                       dsrParTy = @dsrParTy,
+                       dsrParam = @dsrParam,
+                       docuDate = @docuDate,
+                       cusRtlFl = @cusRtlFl,
+                       cusRtlCd = @cusRtlCd,
+                       dsrRem01 = @dsrRem01,
+                       dsrRem02 = @dsrRem02,
+                       dsrRem03 = @dsrRem03,
+                       dsrRem04 = @dsrRem04,
+                       dsrRem05 = @dsrRem05,
+                       dsrRem06 = @dsrRem06,
+                       cstBisTy = @cstBisTy,
+                       dsrRem07 = @dsrRem07,
+                       dsrRem08 = @dsrRem08,
+                       dsrRem09 = @dsrRem09,
+                       district = @district,
+                       pinCodeN = @pinCodeN,
+                       cityName = @cityName,
+                       areaCode = @areaCode,
+                       cuRtType = @cuRtType,
+                       updateDt = GETDATE(),
+                       updateId = @loginId
+                    WHERE docuNumb = @docuNumb";
+                var updParams = new Dictionary<string, object>(masterParams)
+                {
+                    ["@loginId"]  = req.LoginId,
+                    ["@docuNumb"] = id
+                };
+                _db.ExecuteNonQueryBwlive(updateSql, updParams);
+
+                // 2) Delete existing details
+                _db.ExecuteNonQueryBwlive(
+                    "DELETE FROM dptDSRActvtDtl WHERE docuNumb = @docuNumb",
+                    new Dictionary<string, object> { ["@docuNumb"] = id }
+                );
+
+                // 3) Re-insert details
+                InsertDetails(req.Details, id, isMarket: false);
+                if (req.MarketDetails?.Any() == true)
+                    InsertDetails(req.MarketDetails, id, isMarket: true);
+
+                scope.Complete();
+                return Ok(new { message = $"Updated document: {id}" });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ex.Message);
+            }
+        }
+
+        private void InsertDetails(IEnumerable<DsrActvDetail> details, string docuNumb, bool isMarket)
+        {
+            var sql = isMarket
+                ? @"INSERT INTO dptDSRActvtDtl
+                      (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty, actnRemk, targetDt, mrktData, statFlag, createId, createDt)
+                   VALUES
+                      (@docuNumb,@srNo,@repoCatg,@prodQnty,@projQnty,@actnRemk,@targetDt,'01','N',@loginId,GETDATE())"
+                : @"INSERT INTO dptDSRActvtDtl
+                      (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, statFlag, createId, createDt)
+                   VALUES
+                      (@docuNumb,@srNo,@repoCatg,@catgPack,@prodQnty,@projQnty,@actnRemk,@targetDt,'N',@loginId,GETDATE())";
+
+            foreach (var d in details)
+            {
+                var p = new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb,
+                    ["@srNo"]     = d.SerialNo,
+                    ["@repoCatg"]  = d.RepoCatg,
+                    ["@catgPack"]  = d.CatgPack ?? string.Empty,
+                    ["@prodQnty"]  = d.ProdQnty,
+                    ["@projQnty"]  = d.ProjQnty,
+                    ["@actnRemk"]  = d.ActnRemk ?? string.Empty,
+                    ["@targetDt"]  = d.TargetDt ?? (object)DBNull.Value,
+                    ["@loginId"]   = d.CreateId
+                };
+                _db.ExecuteNonQueryBwlive(sql, p);
+            }
+        }
+    }
+
+    public class DsrActvRequest
+    {
+        public string DsrParam    { get; set; }
+        public string CusRtlFl    { get; set; }
+        public string AreaCode    { get; set; }
+        public string CusRtlCd    { get; set; }
+        public string DsrRem01    { get; set; }
+        public string DsrRem02    { get; set; }
+        public string DsrRem03    { get; set; }
+        public string DsrRem04    { get; set; }
+        public string DsrRem05    { get; set; }
+        public string DsrRem06    { get; set; }
+        public string DsrRem07    { get; set; }
+        public string DsrRem08    { get; set; }
+        public string DsrRem09    { get; set; }
+        public string District    { get; set; }
+        public string DeptCode    { get; set; }
+        public string FinlRslt    { get; set; }
+        public string GeoLatit    { get; set; }
+        public string GeoLongt    { get; set; }
+        public string PinCodeN    { get; set; }
+        public string CityName    { get; set; }
+        public string CstBisTy    { get; set; }
+        public string CuRtType    { get; set; }
+        public string DocuDate    { get; set; }
+        public string DsrParTy    { get; set; } = "83";
+        public string LoginId     { get; set; }
+        public List<DsrActvDetail> Details       { get; set; }
+        public List<DsrActvDetail> MarketDetails { get; set; }
+    }
+
+    public class DsrActvDetail
+    {
+        public int       SerialNo { get; set; }
+        public string    RepoCatg  { get; set; }
+        public string    CatgPack  { get; set; }
+        public decimal   ProdQnty  { get; set; }
+        public decimal   ProjQnty  { get; set; }
+        public string    ActnRemk  { get; set; }
+        public DateTime? TargetDt  { get; set; }
+        public string    CreateId  { get; set; }
+    }
 }
-cusRtlCd = XssFilter.parSmGet("cusRtlCd");
-
-if(XssFilter.parArGet("serNumbr") != null)
-	serNumbr = XssFilter.parArGet("serNumbr");
-if(XssFilter.parSmGet("cstBisTy") != null)
-	cstBisTy = XssFilter.parSmGet("cstBisTy");
-
-if(XssFilter.parArGet("serNumMk") != null)
-	serNumMk = XssFilter.parArGet("serNumMk");
-
-
-
-if (dsrParam.equals("50") || dsrParam.equals("61"))
-{
-	dsrRem09 =	XssFilter.parSmGet("dsrRem09");
-	district =	XssFilter.parSmGet("district");
-	custCdRt =	XssFilter.parSmGet("custCdRt");
-	
-//	// System.out.println("custCdRt " + custCdRt);
-	if(!custCdRt.trim().equals(""))
-		cusRtlCd = custCdRt.trim();
-	
-	if(cusRtlFl.equals("R"))
-	{
-		cusRtTyp = "RT";
-	}
-	else if(cusRtlFl.equals("C"))
-	{
-		cusRtTyp = "ST";
-	}
-	else if (cusRtlFl.equals("RD"))
-	{
-		cusRtTyp = "RD";
-	}
-	else if(cusRtlFl.equals("RR"))
-	{
-		cusRtTyp = "RR";
-	}
-	else
-	{
-		cusRtTyp = cusRtlFl;
-	}
-}
-if(!cusRtlCd.trim().equals("")) 
-{
-	if(!cusRtlCd.trim().equals(""))
-		cusRtlCd = cusRtlCd.substring(0, 8);
-
-	if(cusRtlFl.equals("R"))
-	{
-		cusRtTyp = "RT";
-	}
-	else if(cusRtlFl.equals("C") || cusRtlFl.equals("RD"))
-	{
-		sql = "select custType from dpmCustomer with (nolock) where custCode = '" + cusRtlCd + "' and isActive = 'Y' ";
-		rset = WebSessBean.selectRecord(sql);
-		if(rset.next())
-			cusRtTyp = rset.getString(1);
-	
-	}
-}
-if (siteMktg.equals("S"))
-{
-	areaCode = UserBean.getArCode();
-}
-
-
-if (cusRtlFl.equals("RD"))
-{
-	cusRtlFl = "C";
-}
-else if(cusRtlFl.equals("RR"))
-{
-	cusRtTyp = "RR";
-	cusRtlFl = "R";
-}
-else if(cusRtlFl.equals("07") || cusRtlFl.equals("08"))
-{
-	cusRtTyp = cusRtlFl;
-	cusRtlFl = "P";
-}
-
-try
-{
-	WebSessBean.setAutoCommit(false);
-	if (procType.equals("A"))
-	{
-			docuNumb = WebSessBean.getDocumentNo(docuType, areaCode);
-
-			sql = "insert into dptDSRActvt (docuNumb, docuDate, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, district, deptCode, statFlag, createId, createDt, locaCapr, latitute, lgtitute, pinCodeN, cityName, cstBisTy, cuRtType) values ("
-				+ "'" +	docuNumb + "', "
-				+ "'" + WebSessBean.dmyTOddmmmyyyy(docuDate) + "', "
-				+ "'" + dsrParTy + "', "
-				+ "'" + dsrParam + "', "
-				+ "'" + cusRtlFl + "', "
-				+ "'" + areaCode + "', "
-				+ "'" + cusRtlCd + "', "
-				+ "'" + dsrRem01 + "', "
-				+ "'" + dsrRem02 + "', "
-				+ "'" + dsrRem03 + "', "
-				+ "'" + dsrRem04 + "', "
-				+ "'" + dsrRem05 + "', "
-				+ "'" + dsrRem06 + "', "
-				+ "'" + dsrRem07 + "', "
-				+ "'" + dsrRem08 + "', "
-				+ "'" + dsrRem09 + "', "
-				+ "'" + district + "', "
-				+ "'" + deptCode + "', "
-				+ "'" + statFlag + "', "
-				+ "'" + loginIdM + "', "
-				+ "getdate(), "
-				+ "'" + FinlRslt + "', " 
-				+ "'" + geoLatit + "', " 
-				+ "'" + geoLongt + "', " 
-				+ "'" + pinCodeN + "', " 
-				+ "'" + cityName + "', " 
-				+ "'" + cstBisTy + "', " 
-				+ "'" + cusRtTyp + "') "; 
-//	out.println(sql);
-			WebSessBean.updateRecord(sql);	
-			
-			for(int i = 0; serNumbr != null && i < serNumbr.length; i++)
-			{
-				repoCatg = XssFilter.parSmGet("repoCatg" + serNumbr[i]);
-				prodQnty = XssFilter.parSmGet("prodQnty" + serNumbr[i]);
-				projQnty = XssFilter.parSmGet("projQnty" + serNumbr[i]);
-				actnRemk = XssFilter.parSmGet("actnRemk" + serNumbr[i]);
-				catgPack = XssFilter.parSmGet("catgPack" + serNumbr[i]);
-				targetDt = WebSessBean.getNullDate(WebSessBean.dmyTOymd(XssFilter.parSmGet("targetDt" + serNumbr[i]))); 
-				
-		//		// System.out.println("Enter First For loop");
-				if (!repoCatg.equals("") && Double.parseDouble(prodQnty) == 0 && Double.parseDouble(projQnty) == 0)
-					continue;
-				else
-				{
-					sql = "insert into dptDSRActvtDtl (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, statFlag, createId, createDt) "
-							+ "values ( "
-							+ "'" +	docuNumb + "', "
-							+ "'" +	(i + 1) + "', "
-							+ "'" +	repoCatg + "', "
-							+ "'" +	catgPack + "', "
-							+ "'" +	prodQnty + "', "
-							+ "'" +	projQnty + "', "
-							+ "'" +	actnRemk + "', "
-							+ " " +	targetDt + ", "
-							+ "'N', "
-							+ "'" +	loginIdM + "', "
-							+ "getdate()) ";
-					WebSessBean.updateRecord(sql);	
-				}
-			}
-
-			if (dsrParam.equals("50") || dsrParam.equals("01"))
-			{
-		//		// System.out.println("Param Condition");
-				for(int j = 0; serNumMk != null && j < serNumMk.length; j++)
-				{
-			//		// System.out.println("Param Condition Loop");
-					repoCatgMk = XssFilter.parSmGet("repoCatgMk" + serNumMk[j]);
-					prodQntyMk = XssFilter.parSmGet("prodQntyMk" + serNumMk[j]);
-					projQntyMk = XssFilter.parSmGet("projQntyMk" + serNumMk[j]);
-					actnRemkMk = XssFilter.parSmGet("actnRemkMk" + serNumMk[j]);
-					targetDtMk = WebSessBean.getNullDate(WebSessBean.dmyTOymd(XssFilter.parSmGet("targetDtMk" + serNumMk[j]))); 
-
-
-					if (!repoCatg.equals("") && Double.parseDouble(prodQnty) == 0 && Double.parseDouble(projQnty) == 0)
-						continue;
-					else
-					{
-						sql = "insert into dptDSRActvtDtl (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty, actnRemk, targetDt, mrktData, statFlag, createId, createDt) "
-								+ "values ( "
-								+ "'" +	docuNumb + "', "
-								+ "'" +	(serNumbr.length + j + 1) + "', "
-								+ "'" +	repoCatgMk + "', "
-								+ "'" +	prodQntyMk + "', "
-								+ "'" +	projQntyMk + "', "
-								+ "'" +	actnRemkMk + "', "
-								+ " " +	targetDtMk + ", "
-								+ "'01', "
-								+ "'N', "
-								+ "'" +	loginIdM + "', "
-								+ "getdate()) ";
-						WebSessBean.updateRecord(sql);	
-					}
-				}
-			}
-			
-			WebSessBean.insertDocuFlow(docuNumb, 0, "N", loginIdM, ipAddres, machName, "");
-			WebSessBean.setDocumentNo(docuType, areaCode);
-			
-
-				for(int i=0; i<srNumber1.length; i++)
-				{
-					upldFlNm = XssFilter.parSmGet("upldFlNm" + srNumber1[i]);
-				
-					if(!upldFlNm.equals(""))
-					{	
-						sql = "update imagedata.dbo.cotDocAttch "
-							+ "set docuNumb = '" + docuNumb + "', updateDt = GETDATE(), updateId = '" + loginIdM + "' " 
-							+ "where docuNumb = '" + upldFlNm + "' " ;
-
-						KkrSessBean.updateRecord(sql);
-						imgCount++;
-					}
-				}
-
-			if(imgCount > 0)
-			{
-				sql = "select atchNmId from  imagedata.dbo.cotDocAttch with (nolock) where docuNumb = '" + docuNumb + "' ";
-				//// System.out.println(sql);
-				rset = KkrSessBean.selectRecord(sql);
-				while (rset.next())
-				{
-					atchNmId = rset.getString(1);
-					atchNId1 += "," + atchNmId;
-				}
-				
-				atchNId1 = atchNId1.substring(1);
-
-				sql = "update dptDSRActvt set atchNmId = '" + atchNId1 + "' where  docuNumb = '" + docuNumb + "' " ;
-			//	// System.out.println(sql);
-				WebSessBean.updateRecord(sql);
-			}
-			WebSessBean.commitConn();
-			KkrSessBean.commitConn();
-	//	WebSessBean.rollbackConn();
-	//	KkrSessBean.rollbackConn();
-
-		//msg = appValue[1];
-		msg = "Document saved with " + docuNumb;
-	}
-	else if(procType.equals("U"))
-	{
-		docuNumb = XssFilter.parSmGet("docuNumb");
-
-		sql = "update dptDSRActvt set dsrParTy = '" + dsrParTy + "', "
-			+ "dsrParam = '" + dsrParam + "', "
-			+ "docuDate = '" + WebSessBean.dmyTOddmmmyyyy(docuDate) + "', "
-			+ "cusRtlFl = '" + cusRtlFl + "', "
-			+ "cusRtlCd = '" + cusRtlCd + "', "
-			+ "dsrRem01 = '" + dsrRem01 + "', "
-			+ "dsrRem02 = '" + dsrRem02 + "', "
-			+ "dsrRem03 = '" + dsrRem03 + "', "
-			+ "dsrRem04 = '" + dsrRem04 + "', "
-			+ "dsrRem05 = '" + dsrRem05 + "', "
-			+ "dsrRem06 = '" + dsrRem06 + "', "
-			+ "cstBisTy = '" + cstBisTy + "', "
-			+ "dsrRem07 = '" + dsrRem07 + "', "
-			+ "dsrRem08 = '" + dsrRem08 + "',  "
-			+ "dsrRem09 = '" + dsrRem09 + "',  "
-			+ "district = '" + district + "',  "
-			+ "pinCodeN = '" + pinCodeN + "',  "
-			+ "cityName = '" + cityName + "',  "
-			+ "areaCode = '" + areaCode + "',  "
-			+ "cuRtType = '" + cusRtTyp + "',  "
-			+ "updateDt = GETDATE(), "
-			+ "updateId = '" + loginIdM + "' "
-			+ "where  docuNumb = '" + docuNumb + "' " ;
-		
-		WebSessBean.updateRecord(sql);
-
-			sql = "delete from dptDSRActvtDtl where docuNumb = '" + docuNumb + "' ";
-			WebSessBean.updateRecord(sql);	
-			for(int i = 0; serNumbr != null && i < serNumbr.length; i++)
-			{
-				repoCatg = XssFilter.parSmGet("repoCatg" + serNumbr[i]);
-				prodQnty = XssFilter.parSmGet("prodQnty" + serNumbr[i]);
-				projQnty = XssFilter.parSmGet("projQnty" + serNumbr[i]);
-				actnRemk = XssFilter.parSmGet("actnRemk" + serNumbr[i]);
-				catgPack = XssFilter.parSmGet("catgPack" + serNumbr[i]);
-				targetDt = WebSessBean.getNullDate(WebSessBean.dmyTOymd(XssFilter.parSmGet("targetDt" + serNumbr[i]))); 
-
-				if (!repoCatg.equals("") && Double.parseDouble(prodQnty) == 0 && Double.parseDouble(projQnty) == 0)
-					continue;
-				else
-				{
-				sql = "insert into dptDSRActvtDtl (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, statFlag, createId, createDt) "
-							+ "values ( "
-							+ "'" +	docuNumb + "', "
-							+ "'" +	(i + 1) + "', "
-							+ "'" +	repoCatg + "', "
-							+ "'" +	catgPack + "', "
-							+ "'" +	prodQnty + "', "
-							+ "'" +	projQnty + "', "
-							+ "'" +	actnRemk + "', "
-							+ " " +	targetDt + ", "
-							+ "'N', "
-							+ "'" +	loginIdM + "', "
-							+ "getdate()) ";
-					WebSessBean.updateRecord(sql);	
-				}
-			}
-			for(int j = 0; serNumMk != null && j < serNumMk.length; j++)
-			{
-				repoCatgMk = XssFilter.parSmGet("repoCatgMk" + serNumMk[j]);
-				prodQntyMk = XssFilter.parSmGet("prodQntyMk" + serNumMk[j]);
-				projQntyMk = XssFilter.parSmGet("projQntyMk" + serNumMk[j]);
-				actnRemkMk = XssFilter.parSmGet("actnRemkMk" + serNumMk[j]);
-				targetDtMk = WebSessBean.getNullDate(WebSessBean.dmyTOymd(XssFilter.parSmGet("targetDtMk" + serNumMk[j]))); 
-
-				if (!repoCatgMk.equals("") && Double.parseDouble(prodQntyMk) == 0 && Double.parseDouble(projQntyMk) == 0)
-					continue;
-				else
-				{
-					sql = "insert into dptDSRActvtDtl (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty, actnRemk, targetDt, statFlag, createId, createDt) "
-							+ "values ( "
-							+ "'" +	docuNumb + "', "
-							+ "'" +	(j + 1) + "', "
-							+ "'" +	repoCatgMk + "', "
-							+ "'" +	prodQntyMk + "', "
-							+ "'" +	projQntyMk + "', "
-							+ "'" +	actnRemkMk + "', "
-							+ " " +	targetDtMk + ", "
-							+ "'N', "
-							+ "'" +	loginIdM + "', "
-							+ "getdate()) ";
-					WebSessBean.updateRecord(sql);	
-				}
-			}
-
-		WebSessBean.commitConn();
-//		WebSessBean.rollbackConn();
-
-		msg = "Data SuccessFully updated Document No is :  " + docuNumb + "."  ;
-	}
-
-	if(submMthd.equals("E"))
-		response.sendRedirect(errorPage + "?message=" + msg );
-	else
-		response.sendRedirect("DSRActv.jsp?docuDate=" + docuDate);
-}
-catch (Exception e)
-{
-	WebSessBean.rollbackConn();
-	KkrSessBean.rollbackConn();
-	throw new Exception("Error in updating details in " + pageAddress + e.toString() + docuNumb + sql );
-}
-finally
-{
-	UtilBean.sessMgmtRst();
-}
-%>
-
