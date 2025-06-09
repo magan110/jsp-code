@@ -802,3 +802,233 @@ finally
 }
 %>
 
+
+
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+
+namespace sparshWebService.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    [Authorize]
+    public class DsrActivityController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+        public DsrActivityController(DatabaseHelper db) => _db = db;
+
+        /// <summary>
+        /// Create or update a DSR activity (procType "A" = Add, "U" = Update).
+        /// </summary>
+        [HttpPost("save")]
+        public async Task<IActionResult> Save([FromBody] DsrActivityDto dto)
+        {
+            const string docuType = "DSR";
+            const string dsrParTy = "83";
+
+            var loginId = User.Identity?.Name ?? "unknown";
+            string docuNumb;
+            try
+            {
+                // start both DB connections in manual-commit mode
+                _db.WebSessBean("SET IMPLICIT_TRANSACTIONS OFF; BEGIN TRAN", new());
+                _db.KkrSessBean("SET IMPLICIT_TRANSACTIONS OFF; BEGIN TRAN", new());
+
+                if (dto.ProcType == "A")
+                {
+                    // 1️⃣ Generate new document number
+                    docuNumb = _db.GetDocumentNo(docuType, dto.AreaCode);
+
+                    // 2️⃣ Insert master record
+                    var masterSql = @"
+                        INSERT INTO dptDSRActvt
+                          (docuNumb, docuDate, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd,
+                           dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08,
+                           dsrRem09, district, deptCode, statFlag, createId, createDt,
+                           locaCapr, latitute, lgtitute, pinCodeN, cityName, cstBisTy, cuRtType)
+                        VALUES
+                          (@DocuNumb, @DocuDate, @DsrParTy, @DsrParam, @CusRtlFl, @AreaCode, @CusRtlCd,
+                           @DsrRem01, @DsrRem02, @DsrRem03, @DsrRem04, @DsrRem05, @DsrRem06, @DsrRem07, @DsrRem08,
+                           @DsrRem09, @District, @DeptCode, @StatFlag, @CreateId, GETDATE(),
+                           @GeoLat, @GeoLong, @GeoLong, @PinCode, @CityName, @CstBisTy, @CuRtType)";
+                    var masterParams = new Dictionary<string, object>
+                    {
+                        ["@DocuNumb"]   = docuNumb,
+                        ["@DocuDate"]   = dto.DocuDate,
+                        ["@DsrParTy"]   = dsrParTy,
+                        ["@DsrParam"]   = dto.DsrParam,
+                        ["@CusRtlFl"]   = dto.CusRtlFl,
+                        ["@AreaCode"]   = dto.AreaCode,
+                        ["@CusRtlCd"]   = dto.CusRtlCd,
+                        ["@DsrRem01"]   = dto.DsrRem01,
+                        ["@DsrRem02"]   = dto.DsrRem02,
+                        ["@DsrRem03"]   = dto.DsrRem03,
+                        ["@DsrRem04"]   = dto.DsrRem04,
+                        ["@DsrRem05"]   = dto.DsrRem05,
+                        ["@DsrRem06"]   = dto.DsrRem06,
+                        ["@DsrRem07"]   = dto.DsrRem07,
+                        ["@DsrRem08"]   = dto.DsrRem08,
+                        ["@DsrRem09"]   = dto.DsrRem09,
+                        ["@District"]   = dto.District,
+                        ["@DeptCode"]   = dto.DeptCode,
+                        ["@StatFlag"]   = "N",
+                        ["@CreateId"]   = loginId,
+                        ["@GeoLat"]     = dto.GeoLatit,
+                        ["@GeoLong"]    = dto.GeoLongt,
+                        ["@PinCode"]    = dto.PinCodeN,
+                        ["@CityName"]   = dto.CityName,
+                        ["@CstBisTy"]   = dto.CstBisTy,
+                        ["@CuRtType"]   = dto.CuRtType
+                    };
+                    _db.WebSessBean(masterSql, masterParams);
+
+                    // 3️⃣ Insert detail rows
+                    int seq = 1;
+                    foreach (var item in dto.DetailItems)
+                    {
+                        // skip empty
+                        if (string.IsNullOrEmpty(item.RepoCatg) &&
+                            item.ProdQnty == 0 && item.ProjQnty == 0) continue;
+
+                        var detSql = @"
+                            INSERT INTO dptDSRActvtDtl
+                              (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt,
+                               statFlag, createId, createDt)
+                            VALUES
+                              (@DocuNumb, @SrNo, @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty, @ActnRemk, @TargetDt,
+                               'N', @CreateId, GETDATE())";
+                        var detParams = new Dictionary<string, object>
+                        {
+                            ["@DocuNumb"] = docuNumb,
+                            ["@SrNo"]     = seq++,
+                            ["@RepoCatg"] = item.RepoCatg,
+                            ["@CatgPack"] = item.CatgPack,
+                            ["@ProdQnty"] = item.ProdQnty,
+                            ["@ProjQnty"] = item.ProjQnty,
+                            ["@ActnRemk"] = item.ActnRemk,
+                            ["@TargetDt"] = item.TargetDt,
+                            ["@CreateId"] = loginId
+                        };
+                        _db.WebSessBean(detSql, detParams);
+                    }
+
+                    // 4️⃣ Log & flow
+                    _db.InsertDocuFlow(docuNumb, 0, "N", loginId, dto.IpAddress, dto.MachineName, "");
+                    _db.SetDocumentNo(docuType, dto.AreaCode);
+
+                    // 5️⃣ Commit both DBs
+                    _db.WebSessBean("COMMIT", new());
+                    _db.KkrSessBean("COMMIT", new());
+
+                    return Ok(new { message = $"Document saved with {docuNumb}", docuNumb });
+                }
+                else if (dto.ProcType == "U")
+                {
+                    docuNumb = dto.DocuNumb;
+
+                    // master update
+                    var updSql = @"
+                        UPDATE dptDSRActvt SET
+                          dsrParTy = @DsrParTy,
+                          dsrParam = @DsrParam,
+                          docuDate = @DocuDate,
+                          cusRtlFl  = @CusRtlFl,
+                          cusRtlCd  = @CusRtlCd,
+                          dsrRem01  = @DsrRem01,
+                          /* … other fields … */,
+                          updateDt = GETDATE(),
+                          updateId = @UpdateId
+                        WHERE docuNumb = @DocuNumb";
+                    var updParams = new Dictionary<string, object>
+                    {
+                        ["@DocuNumb"] = docuNumb,
+                        ["@DsrParTy"] = dsrParTy,
+                        ["@DsrParam"] = dto.DsrParam,
+                        ["@DocuDate"] = dto.DocuDate,
+                        ["@CusRtlFl"] = dto.CusRtlFl,
+                        ["@CusRtlCd"] = dto.CusRtlCd,
+                        ["@DsrRem01"] = dto.DsrRem01,
+                        /* … etc … */
+                        ["@UpdateId"] = loginId
+                    };
+                    _db.WebSessBean(updSql, updParams);
+
+                    // delete existing details
+                    _db.WebSessBean("DELETE FROM dptDSRActvtDtl WHERE docuNumb = @DocuNumb",
+                        new Dictionary<string, object> { ["@DocuNumb"] = docuNumb });
+
+                    // re-insert details (same loop as above)...
+
+                    _db.WebSessBean("COMMIT", new());
+                    _db.KkrSessBean("COMMIT", new());
+
+                    return Ok(new { message = $"Data successfully updated, Document No: {docuNumb}" });
+                }
+                else
+                {
+                    return BadRequest("Unknown procType");
+                }
+            }
+            catch (Exception ex)
+            {
+                // rollback both
+                _db.WebSessBean("ROLLBACK", new());
+                _db.KkrSessBean("ROLLBACK", new());
+                return StatusCode(500, ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// DTO to bind all your JSP form fields + the array of detail items.
+    /// </summary>
+    public class DsrActivityDto
+    {
+        public string ProcType   { get; set; }
+        public string DocuNumb   { get; set; }
+        public string AreaCode   { get; set; }
+        public string DsrParam   { get; set; }
+        public string CusRtlFl   { get; set; }
+        public string CusRtlCd   { get; set; }
+        public string DsrRem01   { get; set; }
+        public string DsrRem02   { get; set; }
+        public string DsrRem03   { get; set; }
+        public string DsrRem04   { get; set; }
+        public string DsrRem05   { get; set; }
+        public string DsrRem06   { get; set; }
+        public string DsrRem07   { get; set; }
+        public string DsrRem08   { get; set; }
+        public string DsrRem09   { get; set; }
+        public string District   { get; set; }
+        public string DeptCode   { get; set; }
+        public string PinCodeN   { get; set; }
+        public string CityName   { get; set; }
+        public string CstBisTy   { get; set; }
+        public string CuRtType   { get; set; }
+        public string DocuDate   { get; set; }
+        public string SubmMthd   { get; set; }
+        public string IpAddress  { get; set; }
+        public string MachineName{ get; set; }
+
+        // your serial-number arrays turned into typed detail rows
+        public List<DetailItem> DetailItems { get; set; } = new();
+
+        public class DetailItem
+        {
+            public string RepoCatg  { get; set; }
+            public string CatgPack  { get; set; }
+            public double ProdQnty  { get; set; }
+            public double ProjQnty  { get; set; }
+            public string ActnRemk  { get; set; }
+            public DateTime? TargetDt { get; set; }
+        }
+    }
+}
+
