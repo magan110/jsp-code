@@ -1,87 +1,67 @@
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using YourApp.Data;
+using YourApp.Models;
+using YourApp.ViewModels;
 
-namespace MyFirstApi.Controllers
+namespace YourApp.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    public class OfficeWorkController : ControllerBase
+    public class DsrController : ControllerBase
     {
-        private readonly DatabaseHelper _db;
-        public OfficeWorkController(DatabaseHelper db) => _db = db;
+        private readonly ApplicationDbContext _context;
 
-        /// <summary>
-        /// Accepts submissionDate (→ createDt), reportDate (→ docuDate),
-        /// and a list of remarks which get mapped into dsrRem01…dsrRem10.
-        /// The activity type (dsrParam) is fixed to 53.
-        /// </summary>
-        [HttpPost]
-        public IActionResult Post([FromBody] OfficeWorkDto req)
+        public DsrController(ApplicationDbContext context)
         {
-            if (req == null)
-                return BadRequest("Payload is missing.");
-
-            // simple validation
-            if (req.Remarks.Count > 10)
-                return BadRequest("Maximum of 10 remark fields allowed.");
-
-            try
-            {
-                var sql = @"
-INSERT INTO dptDSRActvt
-  (createDt,   docuDate,   dsrParam,
-   dsrRem01,   dsrRem02,   dsrRem03,   dsrRem04,   dsrRem05,
-   dsrRem06,   dsrRem07,   dsrRem08,   dsrRem09,   dsrRem10)
-VALUES
-  (@createDt,  @docuDate,  @dsrParam,
-   @dsrRem01,  @dsrRem02,  @dsrRem03,  @dsrRem04,  @dsrRem05,
-   @dsrRem06,  @dsrRem07,  @dsrRem08,  @dsrRem09,  @dsrRem10);";
-
-                var p = new Dictionary<string, object>
-                {
-                    ["@createDt"] = req.SubmissionDate,
-                    ["@docuDate"] = req.ReportDate,
-                    ["@dsrParam"] = 53
-                };
-
-                // map your list into dsrRem01…dsrRem10
-                for (int i = 0; i < 10; i++)
-                {
-                    var key = $"@dsrRem{(i + 1):D2}";
-                    p[key] = i < req.Remarks.Count
-                        ? (object)req.Remarks[i]
-                        : DBNull.Value;
-                }
-
-                _db.WebSessBean(sql, p);
-                return Ok(new { message = "Record inserted." });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
+            _context = context;
         }
-    }
-
-    public class OfficeWorkDto
-    {
-        /// <summary>
-        /// maps to createDt
-        /// </summary>
-        public DateTime SubmissionDate { get; set; }
 
         /// <summary>
-        /// maps to docuDate
+        /// Submit Office Work activity.
         /// </summary>
-        public DateTime ReportDate { get; set; }
+        /// <param name="vm">Office work details.</param>
+        [HttpPost("officework")]
+        public async Task<IActionResult> SubmitOfficeWork([FromBody] OfficeWorkViewModel vm)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
 
-        /// <summary>
-        /// work-related-to → dsrRem01,
-        /// hours-spent   → dsrRem02,
-        /// then any further remarks in the list
-        /// </summary>
-        public List<string> Remarks { get; set; } = new List<string>();
+            // Create main DSR record
+            var activity = new DsrActivity
+            {
+                DocuNumb = await _context.GenerateDocumentNumberAsync("DSR", vm.AreaCode),
+                DocuDate = vm.ReportDate,
+                DsrParam = "53", // Office Work code
+                CusRtlFl = null,
+                AreaCode = vm.AreaCode,
+                CusRtlCd = null,
+                DsrRem01 = vm.WorkRelatedTo,
+                DsrRem02 = vm.HoursSpent.ToString(),
+                DepartmentCode = vm.DeptCode,
+                CreatedBy = User.Identity.Name,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            _context.DsrActivities.Add(activity);
+            await _context.SaveChangesAsync();
+
+            // Insert detail record for Office Work
+            var detail = new DsrActivityDetail
+            {
+                DocuNumb = activity.DocuNumb,
+                RepoCatg = null,
+                ProdQnty = 0,
+                ProjQnty = vm.HoursSpent,
+                ActnRemk = vm.WorkRelatedTo,
+                TargetDt = null
+            };
+            _context.DsrActivityDetails.Add(detail);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Message = "Office work entry submitted", DocuNumb = activity.DocuNumb });
+        }
     }
 }
