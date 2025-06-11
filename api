@@ -6,6 +6,64 @@ using System.Collections.Generic;
 
 namespace MyFirstApi.Controllers
 {
+    public class DsrEntryDto
+    {
+        public string   ActivityType     { get; set; } = null!;
+        public DateTime SubmissionDate   { get; set; }
+        public DateTime ReportDate       { get; set; }
+        public string   CreateId         { get; set; } = "SYSTEM";
+
+        // Office Work
+        public string?  WorkRelatedTo    { get; set; }
+        public string?  HoursSpent       { get; set; }
+
+        // Internal Team Meetings
+        public string?  MeetWith         { get; set; }
+        public string?  DiscussionPoints { get; set; }
+        public string?  Learnings        { get; set; }
+
+        // New Purchaser
+        public string?  PurchaserName    { get; set; }
+        public string?  TopicDiscussed   { get; set; }
+        public string?  Remarks          { get; set; }
+
+        // Personal Visit
+        public string?  LocationVisited  { get; set; }
+        public string?  Purpose          { get; set; }
+
+        // Phone Call with Builder/Stockist
+        public string?  CallWith         { get; set; }
+        public string?  CallDuration     { get; set; }
+
+        // Meetings With Contractor / Stockist
+        public string?  ContractorName   { get; set; }
+        public string?  MeetingOutcome   { get; set; }
+
+        // Check Sampling at Site
+        public string?  SiteName         { get; set; }
+        public string?  SamplingResult   { get; set; }
+
+        // BTL Activities
+        public string?  ActivityDetails  { get; set; }
+        public string?  Participants     { get; set; }
+
+        // On Leave / Holiday / Off Day
+        public string?  LeaveReason      { get; set; }
+
+        // Work From Home
+        public string?  TasksCompleted   { get; set; }
+
+        // Any Other Activity
+        public string?  Activity1        { get; set; }
+        public string?  Activity2        { get; set; }
+        public string?  Activity3        { get; set; }
+        public string?  AnyOtherPoints   { get; set; }
+
+        // Phone Call with Unregistered Purchasers
+        public string?  UnregCallWith    { get; set; }
+        public string?  UnregCallDetails { get; set; }
+    }
+
     [Route("api/[controller]")]
     [ApiController]
     public class DsrController : ControllerBase
@@ -13,43 +71,152 @@ namespace MyFirstApi.Controllers
         private readonly DatabaseHelper _db;
         public DsrController(DatabaseHelper db) => _db = db;
 
-        // Shared map of endpoint key → (dsrParam, dsrParTy)
-        private static readonly Dictionary<string,(string Param, short ParTy)> _paramMap
+        // Map activity → (dsrParam, dsrParTy)
+        private static readonly Dictionary<string, (string Param, short ParTy)> _map
             = new(StringComparer.OrdinalIgnoreCase)
         {
-            ["officeWork"]            = ("53", 53),
-            ["internalTeamMeeting"]   = ("52", 52),
-            ["newPurchaser"]          = ("50", 50)
-            // … add other activity keys here …
+            ["Office Work"]                             = ("53", 53),
+            ["Internal Team Meetings"]                  = ("52", 52),
+            ["Meeting with New Purchaser"]              = ("50", 50),
+            ["Personal Visit"]                          = ("54", 54),
+            ["Phone Call with Builder/Stockist"]        = ("55", 55),
+            ["Meetings With Contractor / Stockist"]     = ("56", 56),
+            ["Visit to Get / Check Sampling at Site"]   = ("57", 57),
+            ["BTL Activities"]                          = ("58", 58),
+            ["On Leave / Holiday / Off Day"]            = ("59", 59),
+            ["Work From Home"]                          = ("60", 60),
+            ["Any Other Activity"]                      = ("61", 61),
+            ["Phone call with Unregistered Purchasers"] = ("62", 62),
         };
 
-        // ----------------------------
-        // Office Work
-        // ----------------------------
-        public class OfficeWorkDto
-        {
-            public DateTime SubmissionDate { get; set; }
-            public DateTime ReportDate     { get; set; }
-            public string   WorkRelatedTo  { get; set; } = null!;
-            public string   HoursSpent     { get; set; } = null!;
-            public string   CreateId       { get; set; } = "SYSTEM";
-        }
-
-        [HttpPost("officeWork")]
+        [HttpPost("submit")]
         [ProducesResponseType(StatusCodes.Status201Created)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult SubmitOfficeWork([FromBody] OfficeWorkDto dto)
+        public IActionResult Submit([FromBody] DsrEntryDto dto)
         {
-            if (string.IsNullOrWhiteSpace(dto.WorkRelatedTo))
-                return BadRequest("WorkRelatedTo is required.");
-            if (string.IsNullOrWhiteSpace(dto.HoursSpent))
-                return BadRequest("HoursSpent is required.");
+            if (dto == null || string.IsNullOrWhiteSpace(dto.ActivityType))
+                return BadRequest("ActivityType is required.");
 
-            var (dsrParam, dsrParTy) = _paramMap[nameof(SubmitOfficeWork)[..^("Submit".Length)] /* => "officeWork" */];
+            // 1) lookup
+            if (!_map.TryGetValue(dto.ActivityType, out var meta))
+                return BadRequest($"Unknown ActivityType '{dto.ActivityType}'.");
 
-            var raw = "OFFWK" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
-            var docuNumb = raw.Substring(0, 16);
+            var (dsrParam, dsrParTy) = meta;
+
+            // 2) build docuNumb
+            var prefix   = dto.ActivityType.Substring(0, Math.Min(6, dto.ActivityType.Length)).ToUpper();
+            var rawNum   = prefix + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11,'0');
+            var docuNumb = rawNum.Substring(0,16);
+
+            // 3) populate dsrRem slots
+            var rem = new string[11];
+            switch (dto.ActivityType)
+            {
+                case var s when s.StartsWith("Office Work", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.WorkRelatedTo) || string.IsNullOrWhiteSpace(dto.HoursSpent))
+                        return BadRequest("Office Work requires WorkRelatedTo & HoursSpent.");
+                    rem[1] = dto.WorkRelatedTo!;
+                    rem[2] = dto.HoursSpent!;
+                    break;
+
+                case var s when s.StartsWith("Internal Team Meetings", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.MeetWith)
+                     || string.IsNullOrWhiteSpace(dto.DiscussionPoints)
+                     || string.IsNullOrWhiteSpace(dto.Learnings))
+                        return BadRequest("Internal Team Meetings requires MeetWith, DiscussionPoints & Learnings.");
+                    rem[1] = dto.MeetWith!;
+                    rem[2] = dto.DiscussionPoints!;
+                    rem[3] = dto.Learnings!;
+                    break;
+
+                case var s when s.StartsWith("Meeting with New Purchaser", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.PurchaserName)
+                     || string.IsNullOrWhiteSpace(dto.TopicDiscussed)
+                     || string.IsNullOrWhiteSpace(dto.Remarks))
+                        return BadRequest("New Purchaser requires PurchaserName, TopicDiscussed & Remarks.");
+                    rem[1] = dto.PurchaserName!;
+                    rem[2] = dto.TopicDiscussed!;
+                    rem[3] = dto.Remarks!;
+                    break;
+
+                case var s when s.StartsWith("Personal Visit", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.LocationVisited)
+                     || string.IsNullOrWhiteSpace(dto.Purpose))
+                        return BadRequest("Personal Visit requires LocationVisited & Purpose.");
+                    rem[1] = dto.LocationVisited!;
+                    rem[2] = dto.Purpose!;
+                    break;
+
+                case var s when s.StartsWith("Phone Call with Builder/Stockist", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.CallWith)
+                     || string.IsNullOrWhiteSpace(dto.CallDuration))
+                        return BadRequest("Phone Call requires CallWith & CallDuration.");
+                    rem[1] = dto.CallWith!;
+                    rem[2] = dto.CallDuration!;
+                    break;
+
+                case var s when s.StartsWith("Meetings With Contractor / Stockist", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.ContractorName)
+                     || string.IsNullOrWhiteSpace(dto.MeetingOutcome))
+                        return BadRequest("Meetings With Contractor requires ContractorName & MeetingOutcome.");
+                    rem[1] = dto.ContractorName!;
+                    rem[2] = dto.MeetingOutcome!;
+                    break;
+
+                case var s when s.StartsWith("Visit to Get / Check Sampling at Site", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.SiteName)
+                     || string.IsNullOrWhiteSpace(dto.SamplingResult))
+                        return BadRequest("Check Sampling requires SiteName & SamplingResult.");
+                    rem[1] = dto.SiteName!;
+                    rem[2] = dto.SamplingResult!;
+                    break;
+
+                case var s when s.StartsWith("BTL Activities", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.ActivityDetails)
+                     || string.IsNullOrWhiteSpace(dto.Participants))
+                        return BadRequest("BTL Activities requires ActivityDetails & Participants.");
+                    rem[1] = dto.ActivityDetails!;
+                    rem[2] = dto.Participants!;
+                    break;
+
+                case var s when s.StartsWith("On Leave", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.LeaveReason))
+                        return BadRequest("On Leave requires LeaveReason.");
+                    rem[1] = dto.LeaveReason!;
+                    break;
+
+                case var s when s.StartsWith("Work From Home", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.TasksCompleted))
+                        return BadRequest("Work From Home requires TasksCompleted.");
+                    rem[1] = dto.TasksCompleted!;
+                    break;
+
+                case var s when s.StartsWith("Any Other Activity", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.Activity1)
+                     || string.IsNullOrWhiteSpace(dto.Activity2)
+                     || string.IsNullOrWhiteSpace(dto.Activity3)
+                     || string.IsNullOrWhiteSpace(dto.AnyOtherPoints))
+                        return BadRequest("Any Other Activity requires Activity1, Activity2, Activity3 & AnyOtherPoints.");
+                    rem[1] = dto.Activity1!;
+                    rem[2] = dto.Activity2!;
+                    rem[3] = dto.Activity3!;
+                    rem[4] = dto.AnyOtherPoints!;
+                    break;
+
+                case var s when s.StartsWith("Phone call with Unregistered Purchasers", StringComparison.OrdinalIgnoreCase):
+                    if (string.IsNullOrWhiteSpace(dto.UnregCallWith)
+                     || string.IsNullOrWhiteSpace(dto.UnregCallDetails))
+                        return BadRequest("Unregistered Purchasers requires UnregCallWith & UnregCallDetails.");
+                    rem[1] = dto.UnregCallWith!;
+                    rem[2] = dto.UnregCallDetails!;
+                    break;
+
+                default:
+                    return BadRequest($"Handler not implemented for '{dto.ActivityType}'.");
+            }
+
+            for (int i = 1; i <= 10; i++) rem[i] ??= "";
 
             const string sql = @"
 INSERT INTO dptDSRActvt
@@ -69,8 +236,8 @@ INSERT INTO dptDSRActvt
 VALUES
   (@docuNumb, @dsrParam, @reportDate,
    '', '',
-   @workRelatedTo, @hoursSpent, '', '', '',
-   '', '', '', '', '',
+   @r1,@r2,@r3,@r4,@r5,
+   @r6,@r7,@r8,@r9,@r10,
    '', '',
    @createId, @submissionDate,
    '', NULL,
@@ -81,197 +248,11 @@ VALUES
    '', '', '', '', '', '',
    NULL, NULL, NULL);";
 
-            var p = new Dictionary<string, object>
+            var parms = new Dictionary<string, object>
             {
                 ["@docuNumb"]       = docuNumb,
                 ["@dsrParam"]       = dsrParam,
                 ["@dsrParTy"]       = dsrParTy,
                 ["@reportDate"]     = dto.ReportDate,
                 ["@submissionDate"]= dto.SubmissionDate,
-                ["@createId"]       = dto.CreateId,
-                ["@workRelatedTo"]  = dto.WorkRelatedTo,
-                ["@hoursSpent"]     = dto.HoursSpent
-            };
-
-            try
-            {
-                _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(SubmitOfficeWork), new { docuNumb }, dto);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-
-        // ----------------------------
-        // Internal Team Meetings
-        // ----------------------------
-        public class InternalTeamMeetingDto
-        {
-            public DateTime SubmissionDate  { get; set; }
-            public DateTime ReportDate      { get; set; }
-            public string   MeetWith        { get; set; } = null!;
-            public string   DiscussionPoints{ get; set; } = null!;
-            public string   Learnings       { get; set; } = null!;
-            public string   CreateId        { get; set; } = "SYSTEM";
-        }
-
-        [HttpPost("internalTeamMeeting")]
-        [ProducesResponseType(StatusCodes.Status201Created)]
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult SubmitInternalTeamMeeting([FromBody] InternalTeamMeetingDto dto)
-        {
-            if (string.IsNullOrWhiteSpace(dto.MeetWith))
-                return BadRequest("MeetWith is required.");
-            if (string.IsNullOrWhiteSpace(dto.DiscussionPoints))
-                return BadRequest("DiscussionPoints is required.");
-            if (string.IsNullOrWhiteSpace(dto.Learnings))
-                return BadRequest("Learnings is required.");
-
-            var (dsrParam, dsrParTy) = _paramMap[nameof(SubmitInternalTeamMeeting)[..^("Submit".Length)]];
-
-            var raw = "INTMT" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
-            var docuNumb = raw.Substring(0, 16);
-
-            const string sql = @"
-INSERT INTO dptDSRActvt
-  (docuNumb, dsrParam, docuDate,
-   cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
-   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
-   deptCode, statFlag,
-   createId, createDt,
-   updateId, updateDt,
-   dsrParTy,
-   atchNmId, locaCapr, latitute, lgtitute, cuRtType, areaCode,
-   retlStFl, pinCodeN, cityName, district, cstBisTy,
-   ordExDat,
-   pendWith, ltLgDist, apprRemk, ordInsFl, refOrdNo, isTilRtl,
-   tileStck, rtlInTim, rtOutTim)
-VALUES
-  (@docuNumb, @dsrParam, @reportDate,
-   '', '',
-   @meetWith, @discussionPoints, @learnings, '', '',
-   '', '', '', '', '',
-   '', '',
-   @createId, @submissionDate,
-   '', NULL,
-   @dsrParTy,
-   '', '', '', '', '', '',
-   '', '', '', '', '',
-   NULL,
-   '', '', '', '', '', '',
-   NULL, NULL, NULL);";
-
-            var p = new Dictionary<string, object>
-            {
-                ["@docuNumb"]         = docuNumb,
-                ["@dsrParam"]         = dsrParam,
-                ["@dsrParTy"]         = dsrParTy,
-                ["@reportDate"]       = dto.ReportDate,
-                ["@submissionDate"]   = dto.SubmissionDate,
-                ["@createId"]         = dto.CreateId,
-                ["@meetWith"]         = dto.MeetWith,
-                ["@discussionPoints"] = dto.DiscussionPoints,
-                ["@learnings"]        = dto.Learnings
-            };
-
-            try
-            {
-                _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(SubmitInternalTeamMeeting), new { docuNumb }, dto);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-
-        // ----------------------------
-        // New Purchaser
-        // ----------------------------
-        public class NewPurchaserDto
-        {
-            public DateTime SubmissionDate { get; set; }
-            public DateTime ReportDate     { get; set; }
-            public string   PurchaserName  { get; set; } = null!;
-            public string   TopicDiscussed { get; set; } = null!;
-            public string   Remarks         { get; set; } = null!;
-            public string   CreateId        { get; set; } = "SYSTEM";
-        }
-
-        [HttpPost("newPurchaser")]
-        [ProducesResponseType(StatusCodes.Status201Created)]
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult SubmitNewPurchaser([FromBody] NewPurchaserDto dto)
-        {
-            if (string.IsNullOrWhiteSpace(dto.PurchaserName))
-                return BadRequest("PurchaserName is required.");
-            if (string.IsNullOrWhiteSpace(dto.TopicDiscussed))
-                return BadRequest("TopicDiscussed is required.");
-            if (string.IsNullOrWhiteSpace(dto.Remarks))
-                return BadRequest("Remarks is required.");
-
-            var (dsrParam, dsrParTy) = _paramMap[nameof(SubmitNewPurchaser)[..^("Submit".Length)]];
-
-            var raw = "NEWPU" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
-            var docuNumb = raw.Substring(0, 16);
-
-            const string sql = @"
-INSERT INTO dptDSRActvt
-  (docuNumb, dsrParam, docuDate,
-   cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
-   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
-   deptCode, statFlag,
-   createId, createDt,
-   updateId, updateDt,
-   dsrParTy,
-   atchNmId, locaCapr, latitute, lgtitute, cuRtType, areaCode,
-   retlStFl, pinCodeN, cityName, district, cstBisTy,
-   ordExDat,
-   pendWith, ltLgDist, apprRemk, ordInsFl, refOrdNo, isTilRtl,
-   tileStck, rtlInTim, rtOutTim)
-VALUES
-  (@docuNumb, @dsrParam, @reportDate,
-   '', '',
-   @purchaserName, @topicDiscussed, @remarks, '', '',
-   '', '', '', '', '',
-   '', '',
-   @createId, @submissionDate,
-   '', NULL,
-   @dsrParTy,
-   '', '', '', '', '', '',
-   '', '', '', '', '',
-   NULL,
-   '', '', '', '', '', '',
-   NULL, NULL, NULL);";
-
-            var p = new Dictionary<string, object>
-            {
-                ["@docuNumb"]       = docuNumb,
-                ["@dsrParam"]       = dsrParam,
-                ["@dsrParTy"]       = dsrParTy,
-                ["@reportDate"]     = dto.ReportDate,
-                ["@submissionDate"]= dto.SubmissionDate,
-                ["@createId"]       = dto.CreateId,
-                ["@purchaserName"]  = dto.PurchaserName,
-                ["@topicDiscussed"] = dto.TopicDiscussed,
-                ["@remarks"]        = dto.Remarks
-            };
-
-            try
-            {
-                _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(SubmitNewPurchaser), new { docuNumb }, dto);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-    }
-}
+                ["@createId"]       = dto.CreateI
