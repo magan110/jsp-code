@@ -11,251 +11,117 @@ namespace MyFirstApi.Controllers
     public class DsrController : ControllerBase
     {
         private readonly DatabaseHelper _db;
-
-        // max‐length constants
-        private const int LDocuNumb   = 16;
-        private const int LDsrParam   = 2;
-        private const int LCusRtlFl   = 2;
-        private const int LCusRtlCd   = 8;
-        private const int LDeptCode   = 6;
-        private const int LStatFlag   = 1;
-        private const int LCreateId   = 10;
-        private const int LUpdateId   = 10;
-        private const int LRemLong    = 500;
-        private const int LRemShort   = 50;
-        private const int LAtchNmId   = 100;
-        private const int LLatLong    = 30;
-        private const int LAreaCode   = 3;
-        private const int LCuRtType   = 2;
-        private const int LRetlStFl   = 1;
-        private const int LPinCodeN   = 6;
-        private const int LCityName   = 40;
-        private const int LDistrict   = 35;
-        private const int LCstBisTy   = 2;
-        private const int LPendWith   = 10;
-        private const int LLtLgDist   = 100;
-        private const int LApprRemk   = 100;
-        private const int LRefOrdNo   = 16;
-        private const int LIsTilRtl   = 1;
-
         public DsrController(DatabaseHelper db) => _db = db;
 
-        // --------------------------------------------------------------------
-        // 1) Generic CRUD
-        // --------------------------------------------------------------------
-
-        [HttpGet]
-        public IActionResult GetAll()
+        // Shared map of endpoint key → (dsrParam, dsrParTy)
+        private static readonly Dictionary<string,(string Param, short ParTy)> _paramMap
+            = new(StringComparer.OrdinalIgnoreCase)
         {
-            try
-            {
-                var rows = _db.WebSessBean("SELECT * FROM dptDSRActvt", new Dictionary<string, object>());
-                return Ok(rows);
-            }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
+            ["officeWork"]            = ("53", 53),
+            ["internalTeamMeeting"]   = ("52", 52),
+            ["newPurchaser"]          = ("50", 50)
+            // … add other activity keys here …
+        };
+
+        // ----------------------------
+        // Office Work
+        // ----------------------------
+        public class OfficeWorkDto
+        {
+            public DateTime SubmissionDate { get; set; }
+            public DateTime ReportDate     { get; set; }
+            public string   WorkRelatedTo  { get; set; } = null!;
+            public string   HoursSpent     { get; set; } = null!;
+            public string   CreateId       { get; set; } = "SYSTEM";
         }
 
-        [HttpGet("{docuNumb}")]
-        public IActionResult Get(string docuNumb)
+        [HttpPost("officeWork")]
+        [ProducesResponseType(StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        public IActionResult SubmitOfficeWork([FromBody] OfficeWorkDto dto)
         {
-            try
-            {
-                var rows = _db.WebSessBean(
-                    "SELECT * FROM dptDSRActvt WHERE docuNumb = @docuNumb",
-                    new Dictionary<string, object> { ["@docuNumb"] = docuNumb });
-                if (rows.Count == 0) return NotFound();
-                return Ok(rows[0]);
-            }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
-        }
+            if (string.IsNullOrWhiteSpace(dto.WorkRelatedTo))
+                return BadRequest("WorkRelatedTo is required.");
+            if (string.IsNullOrWhiteSpace(dto.HoursSpent))
+                return BadRequest("HoursSpent is required.");
 
-        [HttpPost]
-        public ActionResult<DsrRequest> Create([FromBody] DsrRequest req)
-        {
-            var bad = Validate(req);
-            if (bad != null) return bad;
+            var (dsrParam, dsrParTy) = _paramMap[nameof(SubmitOfficeWork)[..^("Submit".Length)] /* => "officeWork" */];
+
+            var raw = "OFFWK" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
+            var docuNumb = raw.Substring(0, 16);
 
             const string sql = @"
 INSERT INTO dptDSRActvt
-  (docuNumb, docuDate, deptCode, statFlag, createId, updateId,
-   dsrParam, cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02, dsrRem03, dsrRem04,
-   dsrRem05, dsrRem06, dsrRem07, dsrRem08,
-   dsrRem09, dsrRem10,
-   atchNmId, locaCapr, latitute, lgtitute,
-   areaCode, cuRtType,
-   retlStFl, pinCodeN, cityName, district,
-   cstBisTy, pendWith, ltLgDist, apprRemk,
-   ordInsFl, refOrdNo, isTilRtl,
-   ordExDat, dsrParTy,
-   createDt, updateDt)
+  (docuNumb, dsrParam, docuDate,
+   cusRtlFl, cusRtlCd,
+   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
+   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
+   deptCode, statFlag,
+   createId, createDt,
+   updateId, updateDt,
+   dsrParTy,
+   atchNmId, locaCapr, latitute, lgtitute, cuRtType, areaCode,
+   retlStFl, pinCodeN, cityName, district, cstBisTy,
+   ordExDat,
+   pendWith, ltLgDist, apprRemk, ordInsFl, refOrdNo, isTilRtl,
+   tileStck, rtlInTim, rtOutTim)
 VALUES
-  (@docuNumb, @docuDate, @deptCode, @statFlag, @createId, @updateId,
-   @dsrParam, @cusRtlFl, @cusRtlCd,
-   @dsrRem01, @dsrRem02, @dsrRem03, @dsrRem04,
-   @dsrRem05, @dsrRem06, @dsrRem07, @dsrRem08,
-   @dsrRem09, @dsrRem10,
-   @atchNmId, @locaCapr, @latitute, @lgtitute,
-   @areaCode, @cuRtType,
-   @retlStFl, @pinCodeN, @cityName, @district,
-   @cstBisTy, @pendWith, @ltLgDist, @apprRemk,
-   @ordInsFl, @refOrdNo, @isTilRtl,
-   @ordExDat, @dsrParTy,
-   GETDATE(), GETDATE());";
+  (@docuNumb, @dsrParam, @reportDate,
+   '', '',
+   @workRelatedTo, @hoursSpent, '', '', '',
+   '', '', '', '', '',
+   '', '',
+   @createId, @submissionDate,
+   '', NULL,
+   @dsrParTy,
+   '', '', '', '', '', '',
+   '', '', '', '', '',
+   NULL,
+   '', '', '', '', '', '',
+   NULL, NULL, NULL);";
 
             var p = new Dictionary<string, object>
             {
-                ["@docuNumb"] = req.docuNumb,
-                ["@docuDate"] = req.docuDate,
-                ["@deptCode"] = req.deptCode,
-                ["@statFlag"] = req.statFlag,
-                ["@createId"] = req.createId,
-                ["@updateId"] = req.updateId,
-                ["@dsrParam"] = req.dsrParam,
-                ["@cusRtlFl"] = req.cusRtlFl,
-                ["@cusRtlCd"] = req.cusRtlCd,
-                ["@dsrRem01"] = req.dsrRem01,
-                ["@dsrRem02"] = req.dsrRem02,
-                ["@dsrRem03"] = req.dsrRem03,
-                ["@dsrRem04"] = req.dsrRem04,
-                ["@dsrRem05"] = req.dsrRem05,
-                ["@dsrRem06"] = req.dsrRem06,
-                ["@dsrRem07"] = req.dsrRem07,
-                ["@dsrRem08"] = req.dsrRem08,
-                ["@dsrRem09"] = req.dsrRem09,
-                ["@dsrRem10"] = req.dsrRem10,
-                ["@atchNmId"] = req.atchNmId,
-                ["@locaCapr"] = req.locaCapr,
-                ["@latitute"] = req.latitute,
-                ["@lgtitute"] = req.lgtitute,
-                ["@areaCode"] = req.areaCode,
-                ["@cuRtType"] = req.cuRtType,
-                ["@retlStFl"] = req.retlStFl,
-                ["@pinCodeN"] = req.pinCodeN,
-                ["@cityName"] = req.cityName,
-                ["@district"] = req.district,
-                ["@cstBisTy"] = req.cstBisTy,
-                ["@pendWith"] = req.pendWith,
-                ["@ltLgDist"] = req.ltLgDist,
-                ["@apprRemk"] = req.apprRemk,
-                ["@ordInsFl"] = req.ordInsFl,
-                ["@refOrdNo"] = req.refOrdNo,
-                ["@isTilRtl"] = req.isTilRtl,
-                ["@ordExDat"] = req.ordExDat ?? (object)DBNull.Value,
-                ["@dsrParTy"] = req.dsrParTy
+                ["@docuNumb"]       = docuNumb,
+                ["@dsrParam"]       = dsrParam,
+                ["@dsrParTy"]       = dsrParTy,
+                ["@reportDate"]     = dto.ReportDate,
+                ["@submissionDate"]= dto.SubmissionDate,
+                ["@createId"]       = dto.CreateId,
+                ["@workRelatedTo"]  = dto.WorkRelatedTo,
+                ["@hoursSpent"]     = dto.HoursSpent
             };
 
             try
             {
                 _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(Get), new { docuNumb = req.docuNumb }, req);
+                return CreatedAtAction(nameof(SubmitOfficeWork), new { docuNumb }, dto);
             }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ex.Message);
+            }
         }
 
-        [HttpPut("{docuNumb}")]
-        public IActionResult Update(string docuNumb, [FromBody] DsrRequest req)
-        {
-            var bad = Validate(req);
-            if (bad != null) return bad;
-
-            const string sql = @"
-UPDATE dptDSRActvt
-   SET docuDate = @docuDate, deptCode = @deptCode, statFlag = @statFlag,
-       updateId = @updateId, dsrParam = @dsrParam, cusRtlFl = @cusRtlFl,
-       cusRtlCd = @cusRtlCd, dsrRem01 = @dsrRem01, dsrRem02 = @dsrRem02,
-       dsrRem03 = @dsrRem03, dsrRem04 = @dsrRem04, dsrRem05 = @dsrRem05,
-       dsrRem06 = @dsrRem06, dsrRem07 = @dsrRem07, dsrRem08 = @dsrRem08,
-       dsrRem09 = @dsrRem09, dsrRem10 = @dsrRem10, atchNmId = @atchNmId,
-       locaCapr = @locaCapr, latitute = @latitute, lgtitute = @lgtitute,
-       areaCode = @areaCode, cuRtType = @cuRtType, retlStFl = @retlStFl,
-       pinCodeN = @pinCodeN, cityName = @cityName, district = @district,
-       cstBisTy = @cstBisTy, pendWith = @pendWith, ltLgDist = @ltLgDist,
-       apprRemk = @apprRemk, ordInsFl = @ordInsFl, refOrdNo = @refOrdNo,
-       isTilRtl = @isTilRtl, ordExDat = @ordExDat, dsrParTy = @dsrParTy,
-       updateDt = GETDATE()
- WHERE docuNumb = @docuNumb;";
-
-            var p = new Dictionary<string, object>
-            {
-                ["@docuNumb"] = docuNumb,
-                ["@docuDate"] = req.docuDate,
-                ["@deptCode"] = req.deptCode,
-                ["@statFlag"] = req.statFlag,
-                ["@updateId"] = req.updateId,
-                ["@dsrParam"] = req.dsrParam,
-                ["@cusRtlFl"] = req.cusRtlFl,
-                ["@cusRtlCd"] = req.cusRtlCd,
-                ["@dsrRem01"] = req.dsrRem01,
-                ["@dsrRem02"] = req.dsrRem02,
-                ["@dsrRem03"] = req.dsrRem03,
-                ["@dsrRem04"] = req.dsrRem04,
-                ["@dsrRem05"] = req.dsrRem05,
-                ["@dsrRem06"] = req.dsrRem06,
-                ["@dsrRem07"] = req.dsrRem07,
-                ["@dsrRem08"] = req.dsrRem08,
-                ["@dsrRem09"] = req.dsrRem09,
-                ["@dsrRem10"] = req.dsrRem10,
-                ["@atchNmId"] = req.atchNmId,
-                ["@locaCapr"] = req.locaCapr,
-                ["@latitute"] = req.latitute,
-                ["@lgtitute"] = req.lgtitute,
-                ["@areaCode"] = req.areaCode,
-                ["@cuRtType"] = req.cuRtType,
-                ["@retlStFl"] = req.retlStFl,
-                ["@pinCodeN"] = req.pinCodeN,
-                ["@cityName"] = req.cityName,
-                ["@district"] = req.district,
-                ["@cstBisTy"] = req.cstBisTy,
-                ["@pendWith"] = req.pendWith,
-                ["@ltLgDist"] = req.ltLgDist,
-                ["@apprRemk"] = req.apprRemk,
-                ["@ordInsFl"] = req.ordInsFl,
-                ["@refOrdNo"] = req.refOrdNo,
-                ["@isTilRtl"] = req.isTilRtl,
-                ["@ordExDat"] = req.ordExDat ?? (object)DBNull.Value,
-                ["@dsrParTy"] = req.dsrParTy
-            };
-
-            try
-            {
-                var count = _db.WebSessBean(sql, p).Count;
-                if (count == 0) return NotFound();
-                return NoContent();
-            }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
-        }
-
-        [HttpDelete("{docuNumb}")]
-        public IActionResult Delete(string docuNumb)
-        {
-            try
-            {
-                var count = _db.WebSessBean(
-                    "DELETE FROM dptDSRActvt WHERE docuNumb = @docuNumb",
-                    new Dictionary<string, object> { ["@docuNumb"] = docuNumb }
-                ).Count;
-                if (count == 0) return NotFound();
-                return NoContent();
-            }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
-        }
-
-        // --------------------------------------------------------------------
-        // 2) Internal Team Meeting
-        // --------------------------------------------------------------------
+        // ----------------------------
+        // Internal Team Meetings
+        // ----------------------------
         public class InternalTeamMeetingDto
         {
-            public DateTime SubmissionDate   { get; set; }
-            public DateTime ReportDate       { get; set; }
-            public string   MeetWith         { get; set; } = "";
-            public string   DiscussionPoints { get; set; } = "";
-            public string   Learnings        { get; set; } = "";
-            public string   CreateId         { get; set; } = "SYSTEM";
+            public DateTime SubmissionDate  { get; set; }
+            public DateTime ReportDate      { get; set; }
+            public string   MeetWith        { get; set; } = null!;
+            public string   DiscussionPoints{ get; set; } = null!;
+            public string   Learnings       { get; set; } = null!;
+            public string   CreateId        { get; set; } = "SYSTEM";
         }
 
         [HttpPost("internalTeamMeeting")]
-        public IActionResult CreateInternalTeamMeeting([FromBody] InternalTeamMeetingDto dto)
+        [ProducesResponseType(StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        public IActionResult SubmitInternalTeamMeeting([FromBody] InternalTeamMeetingDto dto)
         {
             if (string.IsNullOrWhiteSpace(dto.MeetWith))
                 return BadRequest("MeetWith is required.");
@@ -264,197 +130,148 @@ UPDATE dptDSRActvt
             if (string.IsNullOrWhiteSpace(dto.Learnings))
                 return BadRequest("Learnings is required.");
 
-            // 16-char docuNumb: "INTMT" + timestamp
-            var docuNumb = "INTMT" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
-            docuNumb = docuNumb.Substring(0, 16);
+            var (dsrParam, dsrParTy) = _paramMap[nameof(SubmitInternalTeamMeeting)[..^("Submit".Length)]];
+
+            var raw = "INTMT" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
+            var docuNumb = raw.Substring(0, 16);
 
             const string sql = @"
 INSERT INTO dptDSRActvt
-  (docuNumb, docuDate, deptCode, statFlag, createId, updateId,
-   dsrParam, cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02, dsrRem03,
-   createDt, updateDt)
+  (docuNumb, dsrParam, docuDate,
+   cusRtlFl, cusRtlCd,
+   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
+   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
+   deptCode, statFlag,
+   createId, createDt,
+   updateId, updateDt,
+   dsrParTy,
+   atchNmId, locaCapr, latitute, lgtitute, cuRtType, areaCode,
+   retlStFl, pinCodeN, cityName, district, cstBisTy,
+   ordExDat,
+   pendWith, ltLgDist, apprRemk, ordInsFl, refOrdNo, isTilRtl,
+   tileStck, rtlInTim, rtOutTim)
 VALUES
-  (@docuNumb, @docuDate, '', '', @createId, '',
-   '52','', '',
-   @dsrRem01,@dsrRem02,@dsrRem03,
-   @createDt, GETDATE());";
+  (@docuNumb, @dsrParam, @reportDate,
+   '', '',
+   @meetWith, @discussionPoints, @learnings, '', '',
+   '', '', '', '', '',
+   '', '',
+   @createId, @submissionDate,
+   '', NULL,
+   @dsrParTy,
+   '', '', '', '', '', '',
+   '', '', '', '', '',
+   NULL,
+   '', '', '', '', '', '',
+   NULL, NULL, NULL);";
 
             var p = new Dictionary<string, object>
             {
-                ["@docuNumb"] = docuNumb,
-                ["@docuDate"] = dto.ReportDate,
-                ["@createId"] = dto.CreateId,
-                ["@dsrRem01"] = dto.MeetWith,
-                ["@dsrRem02"] = dto.DiscussionPoints,
-                ["@dsrRem03"] = dto.Learnings,
-                ["@createDt"] = dto.SubmissionDate
+                ["@docuNumb"]         = docuNumb,
+                ["@dsrParam"]         = dsrParam,
+                ["@dsrParTy"]         = dsrParTy,
+                ["@reportDate"]       = dto.ReportDate,
+                ["@submissionDate"]   = dto.SubmissionDate,
+                ["@createId"]         = dto.CreateId,
+                ["@meetWith"]         = dto.MeetWith,
+                ["@discussionPoints"] = dto.DiscussionPoints,
+                ["@learnings"]        = dto.Learnings
             };
 
             try
             {
                 _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(Get), new { docuNumb }, dto);
+                return CreatedAtAction(nameof(SubmitInternalTeamMeeting), new { docuNumb }, dto);
             }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ex.Message);
+            }
         }
 
-        // --------------------------------------------------------------------
-        // 3) Office Work
-        // --------------------------------------------------------------------
-        public class OfficeWorkDto
+        // ----------------------------
+        // New Purchaser
+        // ----------------------------
+        public class NewPurchaserDto
         {
             public DateTime SubmissionDate { get; set; }
             public DateTime ReportDate     { get; set; }
-            public string   WorkRelatedTo  { get; set; } = "";
-            public string   HoursSpent     { get; set; } = "";
-            public string   CreateId       { get; set; } = "SYSTEM";
+            public string   PurchaserName  { get; set; } = null!;
+            public string   TopicDiscussed { get; set; } = null!;
+            public string   Remarks         { get; set; } = null!;
+            public string   CreateId        { get; set; } = "SYSTEM";
         }
 
-        [HttpPost("officeWork")]
-        public IActionResult CreateOfficeWork([FromBody] OfficeWorkDto dto)
+        [HttpPost("newPurchaser")]
+        [ProducesResponseType(StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        public IActionResult SubmitNewPurchaser([FromBody] NewPurchaserDto dto)
         {
-            if (string.IsNullOrWhiteSpace(dto.WorkRelatedTo))
-                return BadRequest("WorkRelatedTo is required.");
-            if (string.IsNullOrWhiteSpace(dto.HoursSpent))
-                return BadRequest("HoursSpent is required.");
+            if (string.IsNullOrWhiteSpace(dto.PurchaserName))
+                return BadRequest("PurchaserName is required.");
+            if (string.IsNullOrWhiteSpace(dto.TopicDiscussed))
+                return BadRequest("TopicDiscussed is required.");
+            if (string.IsNullOrWhiteSpace(dto.Remarks))
+                return BadRequest("Remarks is required.");
 
-            // 16-char docuNumb: "OFFWK" + timestamp
-            var docuNumb = "OFFWK" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
-            docuNumb = docuNumb.Substring(0, 16);
+            var (dsrParam, dsrParTy) = _paramMap[nameof(SubmitNewPurchaser)[..^("Submit".Length)]];
+
+            var raw = "NEWPU" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
+            var docuNumb = raw.Substring(0, 16);
 
             const string sql = @"
 INSERT INTO dptDSRActvt
-  (docuNumb, docuDate, deptCode, statFlag, createId, updateId,
-   dsrParam, cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02,
-   createDt, updateDt)
+  (docuNumb, dsrParam, docuDate,
+   cusRtlFl, cusRtlCd,
+   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
+   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
+   deptCode, statFlag,
+   createId, createDt,
+   updateId, updateDt,
+   dsrParTy,
+   atchNmId, locaCapr, latitute, lgtitute, cuRtType, areaCode,
+   retlStFl, pinCodeN, cityName, district, cstBisTy,
+   ordExDat,
+   pendWith, ltLgDist, apprRemk, ordInsFl, refOrdNo, isTilRtl,
+   tileStck, rtlInTim, rtOutTim)
 VALUES
-  (@docuNumb, @docuDate, '', '', @createId, '',
-   '53','', '',
-   @dsrRem01,@dsrRem02,
-   @createDt, GETDATE());";
+  (@docuNumb, @dsrParam, @reportDate,
+   '', '',
+   @purchaserName, @topicDiscussed, @remarks, '', '',
+   '', '', '', '', '',
+   '', '',
+   @createId, @submissionDate,
+   '', NULL,
+   @dsrParTy,
+   '', '', '', '', '', '',
+   '', '', '', '', '',
+   NULL,
+   '', '', '', '', '', '',
+   NULL, NULL, NULL);";
 
             var p = new Dictionary<string, object>
             {
-                ["@docuNumb"] = docuNumb,
-                ["@docuDate"] = dto.ReportDate,
-                ["@createId"] = dto.CreateId,
-                ["@dsrRem01"] = dto.WorkRelatedTo,
-                ["@dsrRem02"] = dto.HoursSpent,
-                ["@createDt"] = dto.SubmissionDate
+                ["@docuNumb"]       = docuNumb,
+                ["@dsrParam"]       = dsrParam,
+                ["@dsrParTy"]       = dsrParTy,
+                ["@reportDate"]     = dto.ReportDate,
+                ["@submissionDate"]= dto.SubmissionDate,
+                ["@createId"]       = dto.CreateId,
+                ["@purchaserName"]  = dto.PurchaserName,
+                ["@topicDiscussed"] = dto.TopicDiscussed,
+                ["@remarks"]        = dto.Remarks
             };
 
             try
             {
                 _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(Get), new { docuNumb }, dto);
+                return CreatedAtAction(nameof(SubmitNewPurchaser), new { docuNumb }, dto);
             }
-            catch (Exception ex) { return StatusCode(500, ex.Message); }
-        }
-
-        // --------------------------------------------------------------------
-        // 4) Validation helpers
-        // --------------------------------------------------------------------
-
-        private IActionResult Validate(DsrRequest req)
-        {
-            IActionResult bad;
-            if ((bad = Check("docuNumb", req.docuNumb, LDocuNumb)) != null) return bad;
-            if ((bad = Check("deptCode", req.deptCode, LDeptCode)) != null) return bad;
-            if ((bad = Check("statFlag", req.statFlag, LStatFlag)) != null) return bad;
-            if ((bad = Check("createId", req.createId, LCreateId)) != null) return bad;
-            if ((bad = Check("updateId", req.updateId, LUpdateId)) != null) return bad;
-
-            if ((bad = Check("dsrParam", req.dsrParam, LDsrParam)) != null) return bad;
-            if ((bad = Check("cusRtlFl", req.cusRtlFl, LCusRtlFl)) != null) return bad;
-            if ((bad = Check("cusRtlCd", req.cusRtlCd, LCusRtlCd)) != null) return bad;
-
-            for (int i = 1; i <= 8; i++)
+            catch (Exception ex)
             {
-                var val = (string)typeof(DsrRequest)
-                                .GetProperty($"dsrRem0{i}")!
-                                .GetValue(req);
-                if ((bad = Check($"dsrRem0{i}", val, LRemLong)) != null) return bad;
+                return StatusCode(500, ex.Message);
             }
-            if ((bad = Check("dsrRem09", req.dsrRem09, LRemLong)) != null) return bad;
-            if ((bad = Check("dsrRem10", req.dsrRem10, LRemShort)) != null) return bad;
-
-            if ((bad = Check("atchNmId", req.atchNmId, LAtchNmId)) != null) return bad;
-            if (string.IsNullOrEmpty(req.locaCapr)) return BadRequest("locaCapr is required.");
-            if ((bad = Check("latitute", req.latitute, LLatLong)) != null) return bad;
-            if ((bad = Check("lgtitute", req.lgtitute, LLatLong)) != null) return bad;
-
-            if ((bad = Check("areaCode", req.areaCode, LAreaCode)) != null) return bad;
-            if ((bad = Check("cuRtType", req.cuRtType, LCuRtType)) != null) return bad;
-
-            if ((bad = Check("retlStFl", req.retlStFl, LRetlStFl)) != null) return bad;
-            if ((bad = Check("pinCodeN", req.pinCodeN, LPinCodeN)) != null) return bad;
-            if ((bad = Check("cityName", req.cityName, LCityName)) != null) return bad;
-            if ((bad = Check("district", req.district, LDistrict)) != null) return bad;
-
-            if ((bad = Check("cstBisTy", req.cstBisTy, LCstBisTy)) != null) return bad;
-            if ((bad = Check("pendWith", req.pendWith, LPendWith)) != null) return bad;
-            if ((bad = Check("ltLgDist", req.ltLgDist, LLtLgDist)) != null) return bad;
-            if ((bad = Check("apprRemk", req.apprRemk, LApprRemk)) != null) return bad;
-
-            if ((bad = Check("ordInsFl", req.ordInsFl, LIsTilRtl)) != null) return bad;
-            if ((bad = Check("refOrdNo", req.refOrdNo, LRefOrdNo)) != null) return bad;
-            if ((bad = Check("isTilRtl", req.isTilRtl, LIsTilRtl)) != null) return bad;
-
-            if (req.dsrParTy <= 0) return BadRequest("dsrParTy must be > 0.");
-            return null;
         }
-
-        private IActionResult Check(string name, string value, int maxLen)
-        {
-            if (string.IsNullOrEmpty(value))
-                return BadRequest($"{name} is required.");
-            if (value.Length > maxLen)
-                return BadRequest($"{name} must be ≤ {maxLen} chars (you sent {value.Length}).");
-            return null;
-        }
-    }
-
-    public class DsrRequest
-    {
-        public string   docuNumb  { get; set; }
-        public DateTime docuDate  { get; set; }
-        public string   deptCode  { get; set; }
-        public string   statFlag  { get; set; }
-        public string   createId  { get; set; }
-        public string   updateId  { get; set; }
-        public string   dsrParam  { get; set; }
-        public string   cusRtlFl  { get; set; }
-        public string   cusRtlCd  { get; set; }
-        public string   dsrRem01  { get; set; }
-        public string   dsrRem02  { get; set; }
-        public string   dsrRem03  { get; set; }
-        public string   dsrRem04  { get; set; }
-        public string   dsrRem05  { get; set; }
-        public string   dsrRem06  { get; set; }
-        public string   dsrRem07  { get; set; }
-        public string   dsrRem08  { get; set; }
-        public string   dsrRem09  { get; set; }
-        public string   dsrRem10  { get; set; }
-        public string   atchNmId  { get; set; }
-        public string   locaCapr  { get; set; }
-        public string   latitute  { get; set; }
-        public string   lgtitute  { get; set; }
-        public string   areaCode  { get; set; }
-        public string   cuRtType  { get; set; }
-        public string   retlStFl  { get; set; }
-        public string   pinCodeN  { get; set; }
-        public string   cityName  { get; set; }
-        public string   district  { get; set; }
-        public string   cstBisTy  { get; set; }
-        public string   pendWith  { get; set; }
-        public string   ltLgDist  { get; set; }
-        public string   apprRemk  { get; set; }
-        public string   ordInsFl  { get; set; }
-        public string   refOrdNo  { get; set; }
-        public string   isTilRtl  { get; set; }
-        public DateTime? ordExDat { get; set; }
-        public short    dsrParTy  { get; set; }
     }
 }
