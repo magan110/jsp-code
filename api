@@ -11,6 +11,7 @@ namespace MyFirstApi.Controllers
     public class DsrController : ControllerBase
     {
         private readonly DatabaseHelper _db;
+        public DsrController(DatabaseHelper db) => _db = db;
 
         // max‐length constants
         private const int LDocuNumb   = 16;
@@ -38,9 +39,9 @@ namespace MyFirstApi.Controllers
         private const int LRefOrdNo   = 16;
         private const int LIsTilRtl   = 1;
 
-        public DsrController(DatabaseHelper db) => _db = db;
-
-        // --- EXISTING CRUD ACTIONS ---
+        // ----------------------------------------
+        // STANDARD CRUD
+        // ----------------------------------------
 
         [HttpGet]
         public IActionResult GetAll()
@@ -63,7 +64,8 @@ namespace MyFirstApi.Controllers
             {
                 var rows = _db.WebSessBean(
                     "SELECT * FROM dptDSRActvt WHERE docuNumb = @docuNumb",
-                    new Dictionary<string, object> { ["@docuNumb"] = docuNumb });
+                    new Dictionary<string, object> { ["@docuNumb"] = docuNumb }
+                );
                 if (rows.Count == 0) return NotFound();
                 return Ok(rows[0]);
             }
@@ -81,7 +83,7 @@ namespace MyFirstApi.Controllers
 
             try
             {
-                var sql = @"
+                const string sql = @"
 INSERT INTO dptDSRActvt
   (docuNumb, docuDate,
    deptCode, statFlag, createId, updateId,
@@ -172,7 +174,7 @@ VALUES
 
             try
             {
-                var sql = @"
+                const string sql = @"
 UPDATE dptDSRActvt
    SET docuDate   = @docuDate,
        deptCode   = @deptCode,
@@ -282,7 +284,9 @@ UPDATE dptDSRActvt
             }
         }
 
-        // --- NEW OFFICE WORK ENDPOINT ---
+        // ----------------------------------------
+        // OFFICE WORK ENDPOINT
+        // ----------------------------------------
 
         public class OfficeWorkDto
         {
@@ -294,6 +298,9 @@ UPDATE dptDSRActvt
         }
 
         [HttpPost("officework")]
+        [ProducesResponseType(StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
         public IActionResult CreateOfficeWork([FromBody] OfficeWorkDto dto)
         {
             if (string.IsNullOrWhiteSpace(dto.WorkRelatedTo))
@@ -301,11 +308,10 @@ UPDATE dptDSRActvt
             if (string.IsNullOrWhiteSpace(dto.HoursSpent))
                 return BadRequest("HoursSpent is required.");
 
-            // build a 16‐char docuNumb
             var docuNumb = "OFFWK" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
             docuNumb = docuNumb.Substring(0, LDocuNumb);
 
-            var sql = @"
+            const string sql = @"
 INSERT INTO dptDSRActvt
   (docuNumb, docuDate,
    dsrParam, dsrRem01, dsrRem02,
@@ -335,7 +341,70 @@ VALUES
             }
         }
 
-        // --- VALIDATION HELPERS ---
+        // ----------------------------------------
+        // INTERNAL TEAM MEETING ENDPOINT
+        // ----------------------------------------
+
+        public class InternalTeamMeetingDto
+        {
+            public DateTime SubmissionDate   { get; set; }
+            public DateTime ReportDate       { get; set; }
+            public string   MeetWith         { get; set; } = "";
+            public string   DiscussionPoints { get; set; } = "";
+            public string   Learnings        { get; set; } = "";
+            public string   CreateId         { get; set; } = "SYSTEM";
+        }
+
+        [HttpPost("internalteammeeting")]
+        [ProducesResponseType(StatusCodes.Status201Created)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        public IActionResult CreateInternalTeamMeeting([FromBody] InternalTeamMeetingDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.MeetWith))
+                return BadRequest("MeetWith is required.");
+            if (string.IsNullOrWhiteSpace(dto.DiscussionPoints))
+                return BadRequest("DiscussionPoints is required.");
+            if (string.IsNullOrWhiteSpace(dto.Learnings))
+                return BadRequest("Learnings is required.");
+
+            var docuNumb = "INTMT" + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
+            docuNumb = docuNumb.Substring(0, LDocuNumb);
+
+            const string sql = @"
+INSERT INTO dptDSRActvt
+  (docuNumb, docuDate,
+   dsrParam, dsrRem01, dsrRem02, dsrRem03,
+   createDt, updateDt)
+VALUES
+  (@docuNumb, @docuDate,
+   '54',      @dsrRem01, @dsrRem02, @dsrRem03,
+   @createDt, GETDATE());";
+
+            var p = new Dictionary<string, object>
+            {
+                ["@docuNumb"]  = docuNumb,
+                ["@docuDate"]  = dto.ReportDate,
+                ["@dsrRem01"]  = dto.MeetWith,
+                ["@dsrRem02"]  = dto.DiscussionPoints,
+                ["@dsrRem03"]  = dto.Learnings,
+                ["@createDt"]  = dto.SubmissionDate
+            };
+
+            try
+            {
+                _db.WebSessBean(sql, p);
+                return CreatedAtAction(nameof(Get), new { docuNumb }, dto);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ex.Message);
+            }
+        }
+
+        // ----------------------------------------
+        // VALIDATION HELPERS
+        // ----------------------------------------
 
         private IActionResult Validate(DsrRequest req)
         {
@@ -349,7 +418,6 @@ VALUES
             if ((bad = Check("cusRtlFl", req.cusRtlFl, LCusRtlFl)) != null) return bad;
             if ((bad = Check("cusRtlCd", req.cusRtlCd, LCusRtlCd)) != null) return bad;
 
-            // remark fields
             for (int i = 1; i <= 8; i++)
             {
                 var val = (string)typeof(DsrRequest)
@@ -360,29 +428,24 @@ VALUES
             if ((bad = Check("dsrRem09", req.dsrRem09, LRemLong)) != null) return bad;
             if ((bad = Check("dsrRem10", req.dsrRem10, LRemShort)) != null) return bad;
 
-            // attachments & geo
             if ((bad = Check("atchNmId", req.atchNmId, LAtchNmId)) != null) return bad;
             if (string.IsNullOrEmpty(req.locaCapr)) return BadRequest("locaCapr is required.");
             if ((bad = Check("latitute", req.latitute, LLatLong)) != null) return bad;
             if ((bad = Check("lgtitute", req.lgtitute, LLatLong)) != null) return bad;
 
-            // area & route
             if ((bad = Check("areaCode", req.areaCode, LAreaCode)) != null) return bad;
             if ((bad = Check("cuRtType", req.cuRtType, LCuRtType)) != null) return bad;
 
-            // retail/location
             if ((bad = Check("retlStFl", req.retlStFl, LRetlStFl)) != null) return bad;
             if ((bad = Check("pinCodeN", req.pinCodeN, LPinCodeN)) != null) return bad;
             if ((bad = Check("cityName", req.cityName, LCityName)) != null) return bad;
             if ((bad = Check("district", req.district, LDistrict)) != null) return bad;
 
-            // business/pend
             if ((bad = Check("cstBisTy", req.cstBisTy, LCstBisTy)) != null) return bad;
             if ((bad = Check("pendWith", req.pendWith, LPendWith)) != null) return bad;
             if ((bad = Check("ltLgDist", req.ltLgDist, LLtLgDist)) != null) return bad;
             if ((bad = Check("apprRemk", req.apprRemk, LApprRemk)) != null) return bad;
 
-            // order flags/ref
             if ((bad = Check("ordInsFl", req.ordInsFl, LIsTilRtl)) != null) return bad;
             if ((bad = Check("refOrdNo", req.refOrdNo, LRefOrdNo)) != null) return bad;
             if ((bad = Check("isTilRtl", req.isTilRtl, LIsTilRtl)) != null) return bad;
