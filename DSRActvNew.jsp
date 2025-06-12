@@ -1529,8 +1529,8 @@ if((procType.equals("U")  || procType.equals("D")) && !docuNumb.equals(""))
 	}
 	sql = "select   prodQnty, projQnty, prodQtyV "
 		+ "from     dptDSRActvtDtl a  with (nolock) "
-		+" where    docuNumb = '" + docuNumb + "' "
-		+ "and		createId = '" + loginIdM + "' "
+		+" where    do= '" + logicuNumb = '" + docuNumb + "' "
+		+ "and		createId nIdM + "' "
 		+ "and		mrktData = '02' ";
 	rset = WebSessBean.selectRecord(sql);
 	if(rset.next())
