@@ -733,3 +733,79 @@ $(document).ready(function()
 <!-- Form footer Starts --->
 <jsp:include page="/Envr/JSP/FooterCom.jsp" flush="true"/>
 <!-- Form footer Ends --->
+
+
+DECLARE 
+    @CustomerCode   CHAR(10)   = '10010001',       -- your custCode
+    @StartDate      CHAR(8)    = '20250101',       -- YYYYMMDD
+    @EndDate        CHAR(8)    = '20250616';       -- YYYYMMDD
+
+;WITH LineItems AS (
+    -- all FI line items (both cleared & open) for this customer in the date range
+    SELECT 
+        BUKRS, KUNNR, BUDAT, BSCHL, DMBTR
+    FROM BSEG WITH(NOLOCK)
+    WHERE KUNNR      = @CustomerCode
+      AND BUDAT BETWEEN @StartDate AND @EndDate
+),
+OpenItems AS (
+    -- open (not yet cleared) items _before_ the start date
+    SELECT DMBTR
+    FROM BSEG WITH(NOLOCK)
+    WHERE KUNNR      = @CustomerCode
+      AND BUDAT     < @StartDate
+      AND XBLNR IS NULL            -- or however your system flags “open”
+),
+CustomerMaster AS (
+    -- basic customer info
+    SELECT 
+        KUNNR      AS Purchaser,
+        NAME1      AS PurchaserName,
+        ORT01      AS PurchaserCity
+    FROM KNA1 WITH(NOLOCK)
+    WHERE KUNNR = @CustomerCode
+),
+CreditMgmt AS (
+    -- credit limit from credit management data
+    SELECT 
+        KUNNR,
+        KLIMK      AS CreditLimit
+    FROM KNB1 WITH(NOLOCK)
+    WHERE KUNNR = @CustomerCode
+),
+SecurityDeposit AS (
+    -- if you have a custom deposit table (e.g. cdtControls)
+    SELECT 
+        crnDocNo AS Purchaser,
+        DepositAmt AS SecurityDepositAmt
+    FROM cdtControls WITH(NOLOCK)
+    WHERE crnDocNo = @CustomerCode
+)
+SELECT
+    CM.CreditLimit                AS [Credit limit],
+    SUM(OI.DMBTR)                 AS [Open Balance],
+    SUM(CASE WHEN LI.BSCHL IN ('01','11') THEN LI.DMBTR ELSE 0 END) AS [Total Debit],
+    SUM(CASE WHEN LI.BSCHL IN ('50','31') THEN LI.DMBTR ELSE 0 END) AS [Total Credit],
+    -- closing balance = open balance + debits – credits
+    SUM(OI.DMBTR)
+      + SUM(CASE WHEN LI.BSCHL IN ('01','11') THEN LI.DMBTR ELSE 0 END)
+      - SUM(CASE WHEN LI.BSCHL IN ('50','31') THEN LI.DMBTR ELSE 0 END)
+                                AS [Close Balance],
+    CMstr.Purchaser,
+    CMstr.PurchaserName,
+    CMstr.PurchaserCity,
+    SD.SecurityDepositAmt
+FROM LineItems    AS LI
+CROSS JOIN OpenItems AS OI        -- we want total of ALL open items before start
+INNER JOIN CustomerMaster AS CMstr
+    ON CMstr.Purchaser = @CustomerCode
+LEFT JOIN CreditMgmt     AS CM
+    ON CM.KUNNR     = @CustomerCode
+LEFT JOIN SecurityDeposit AS SD
+    ON SD.Purchaser = @CustomerCode
+GROUP BY
+    CM.CreditLimit,
+    CMstr.Purchaser,
+    CMstr.PurchaserName,
+    CMstr.PurchaserCity,
+    SD.SecurityDepositAmt;
