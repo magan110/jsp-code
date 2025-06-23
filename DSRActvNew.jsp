@@ -498,8 +498,8 @@ if(!rtlInTim.equals("IN"))
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js" ></script>
 <script>
-if("<%=zoneCode%>" == "N" && "<%=procType%>" == "A" && "<%=rtlInTim%>" == "IN")
-	location.href = "DSRInOutFlg.jsp";
+//if("<%=zoneCode%>" == "N" && "<%=procType%>" == "A" && "<%=rtlInTim%>" == "IN")
+//	location.href = "DSRInOutFlg.jsp";
 </script>
 <%
 try
@@ -1529,8 +1529,8 @@ if((procType.equals("U")  || procType.equals("D")) && !docuNumb.equals(""))
 	}
 	sql = "select   prodQnty, projQnty, prodQtyV "
 		+ "from     dptDSRActvtDtl a  with (nolock) "
-		+" where    do= '" + logicuNumb = '" + docuNumb + "' "
-		+ "and		createId nIdM + "' "
+		+" where    docuNumb = '" + docuNumb + "' "
+		+ "and		createId = '" + loginIdM + "' "
 		+ "and		mrktData = '02' ";
 	rset = WebSessBean.selectRecord(sql);
 	if(rset.next())
