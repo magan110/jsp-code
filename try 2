@@ -2,7 +2,6 @@ using Microsoft.AspNetCore.Mvc;
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace sparshWebService.Controllers
 {
@@ -33,37 +32,6 @@ namespace sparshWebService.Controllers
         public decimal SecurityDepositLacs { get; set; }
     }
 
-    // DTO for each sales row
-    public class SalesDataDto
-    {
-        public string  MrgRepDs      { get; set; }
-        public decimal InvnQnty      { get; set; }
-        public decimal InvnQntyAvg   { get; set; }
-        public decimal SalesQty      { get; set; }
-        public decimal SalesQtyAvg   { get; set; }
-    }
-
-    // DTO for credit‐limit details
-    public class CreditLimitDetailsDto
-    {
-        public decimal CreditLimitLacs     { get; set; }
-        public decimal SecurityDepositLacs { get; set; }
-        public decimal PenaltyLacs         { get; set; }
-        public decimal OpenOrderLacs       { get; set; }
-        public decimal OpenDeliveryLacs    { get; set; }
-        public decimal OpenBillingLacs     { get; set; }
-        public decimal BalanceLacs         { get; set; }
-        public int     AdhocCount          { get; set; }
-    }
-
-    // Full payload for the UI
-    public class Full360Dto
-    {
-        public Purchaser360Dto        Purchaser   { get; set; }
-        public List<SalesDataDto>     Sales       { get; set; }
-        public CreditLimitDetailsDto  CreditLimit { get; set; }
-    }
-
     [Route("api/[controller]")]
     [ApiController]
     public class Purchaser360Controller : ControllerBase
@@ -76,7 +44,7 @@ namespace sparshWebService.Controllers
         }
 
         /// <summary>
-        /// Returns Purchaser360Dto for a given custCode + areaCode.
+        /// Returns aggregated purchaser 360 details
         /// </summary>
         [HttpGet("getPurchaserDetails")]
         public IActionResult GetPurchaserDetails([FromQuery] string custCode, [FromQuery] string areaCode)
@@ -86,9 +54,14 @@ namespace sparshWebService.Controllers
 
             const string sql = @"
 WITH CustomerBase AS (
-    SELECT a.custClub, a.custName, a.custType, a.sapCusCd, b.genTrNtr
+    SELECT
+      a.custClub,
+      a.custName,
+      a.custType,
+      a.sapCusCd,
+      b.genTrNtr
     FROM dpmCustomer a WITH (NOLOCK)
-    JOIN bkmCustType b WITH (NOLOCK) 
+    JOIN bkmCustType b WITH (NOLOCK)
       ON a.custType = b.custType
     WHERE a.custCode = @CustCode
       AND a.areaCode = @AreaCode
@@ -122,16 +95,18 @@ LEFT JOIN dpmCustomer c WITH (NOLOCK)
   ON c.custCode = @CustCode AND c.isActive = 'Y'
 
 LEFT JOIN (
-    SELECT sapCusCd,
-           CASE WHEN isActive = 'Z' THEN 'Yes' ELSE 'No' END AS IntegrationStatus,
-           ISNULL(CONVERT(varchar(11), effectDt, 113), 'PENDING') AS IntegrationDate
+    SELECT
+      sapCusCd,
+      CASE WHEN isActive = 'Z' THEN 'Yes' ELSE 'No' END AS IntegrationStatus,
+      ISNULL(CONVERT(varchar(11), effectDt, 113), 'PENDING') AS IntegrationDate
     FROM dpmTallyCus WITH (NOLOCK)
     WHERE sapCusCd = (SELECT sapCusCd FROM CustomerBase)
 ) tc ON 1=1
 
 LEFT JOIN (
-    SELECT DISTRIBUTOR_CODE  AS sapCusCd,
-           ISNULL(CONVERT(varchar(11), MAX(lstInvDt), 113), '') AS salesSyncLastDate
+    SELECT
+      DISTRIBUTOR_CODE     AS sapCusCd,
+      ISNULL(CONVERT(varchar(11), MAX(lstInvDt), 113), '') AS salesSyncLastDate
     FROM (
       SELECT DISTRIBUTOR_CODE, DOC_DATE AS lstInvDt
         FROM sbvCNAprOnw WITH (NOLOCK) GROUP BY DISTRIBUTOR_CODE, DOC_DATE
@@ -140,7 +115,8 @@ LEFT JOIN (
         FROM Birla_White_DB.dbo.BW_Sales_CN_Tally WITH (NOLOCK) GROUP BY DISTRIBUTOR_CODE, DOC_DATE
     ) x
     GROUP BY DISTRIBUTOR_CODE
-) ss ON ss.sapCusCd = cb.sapCusCd
+) ss
+  ON ss.sapCusCd = cb.sapCusCd
 
 CROSS APPLY (
     SELECT
@@ -151,8 +127,7 @@ CROSS APPLY (
       UNION ALL
       SELECT 15 AS idx, CAST(securDep AS decimal(18,2))    AS val FROM dpmCustomer WHERE custCode = @CustCode
     ) t
-) fm;
-";
+) fm;";
 
             var parameters = new Dictionary<string, object>
             {
@@ -171,28 +146,24 @@ CROSS APPLY (
                 var r = rows[0];
                 var dto = new Purchaser360Dto
                 {
-                    CustClub               = r["custClub"]          as string,
-                    CustName               = r["custName"]          as string,
-                    CustType               = r["custType"]          as string,
-                    SapCusCd               = r["sapCusCd"]          as string,
-                    GenTrNtr               = r["genTrNtr"]          as string,
-
-                    BirthDate              = r["birthDate"]         as string,
-                    AnniversaryDate        = r["anniversaryDate"]   as string,
-                    FirstName              = r["firstName"]         as string,
-                    LastName               = r["lastName"]          as string,
-                    WifeName               = r["wifeName"]          as string,
-                    ChildNo1               = r["childNo1"]          as string,
-                    ChildNo2               = r["childNo2"]          as string,
-                    MobileNo               = r["mobileNo"]          as string,
-
-                    TallyIntegrationDone   = r["tallyIntegrationDone"] as string,
-                    TallyIntegrationDate   = r["tallyIntegrationDate"] as string,
-
-                    SalesSyncLastDate      = r["salesSyncLastDate"]   as string,
-
-                    CreditLimitLacs        = Convert.ToDecimal(r["creditLimitLacs"]),
-                    SecurityDepositLacs    = Convert.ToDecimal(r["securityDepositLacs"])
+                    CustClub                = r["custClub"]               as string,
+                    CustName                = r["custName"]               as string,
+                    CustType                = r["custType"]               as string,
+                    SapCusCd                = r["sapCusCd"]               as string,
+                    GenTrNtr                = r["genTrNtr"]               as string,
+                    BirthDate               = r["birthDate"]              as string,
+                    AnniversaryDate         = r["anniversaryDate"]        as string,
+                    FirstName               = r["firstName"]              as string,
+                    LastName                = r["lastName"]               as string,
+                    WifeName                = r["wifeName"]               as string,
+                    ChildNo1                = r["childNo1"]               as string,
+                    ChildNo2                = r["childNo2"]               as string,
+                    MobileNo                = r["mobileNo"]               as string,
+                    TallyIntegrationDone    = r["tallyIntegrationDone"]   as string,
+                    TallyIntegrationDate    = r["tallyIntegrationDate"]   as string,
+                    SalesSyncLastDate       = r["salesSyncLastDate"]      as string,
+                    CreditLimitLacs         = Convert.ToDecimal(r["creditLimitLacs"]),
+                    SecurityDepositLacs     = Convert.ToDecimal(r["securityDepositLacs"])
                 };
                 return Ok(dto);
             }
@@ -201,7 +172,7 @@ CROSS APPLY (
         }
 
         /// <summary>
-        /// Returns month-to-date Primary & Secondary sales
+        /// Returns MTD primary & secondary sales data
         /// </summary>
         [HttpGet("getSalesData")]
         public IActionResult GetSalesData([FromQuery] string custCode)
@@ -271,16 +242,13 @@ ORDER BY mrgRepDs DESC;";
             );
 
             if (salesRaw is List<Dictionary<string, object>> salesRows && salesRows.Count > 0)
-            {
-                // return raw dictionaries for flexibility
                 return Ok(salesRows);
-            }
 
             return NotFound("Sales data not found.");
         }
 
         /// <summary>
-        /// Returns just the credit-limit table from SAP (mapped into lacs).
+        /// Returns credit limit breakdown
         /// </summary>
         [HttpGet("getCreditLimitDetails")]
         public IActionResult GetCreditLimitDetails([FromQuery] string custCode)
@@ -290,14 +258,14 @@ ORDER BY mrgRepDs DESC;";
 
             const string sql = @"
 SELECT
-  CAST(credLimt AS decimal(18,2)) / 100000 AS creditLimitLacs,
-  CAST(securDep AS decimal(18,2)) / 100000 AS securityDepositLacs,
-  CAST(penalty AS decimal(18,2)) / 100000 AS penaltyLacs,
-  CAST(openOrder AS decimal(18,2)) / 100000 AS openOrderLacs,
+  CAST(credLimt     AS decimal(18,2)) / 100000 AS creditLimitLacs,
+  CAST(securDep     AS decimal(18,2)) / 100000 AS securityDepositLacs,
+  CAST(penalty      AS decimal(18,2)) / 100000 AS penaltyLacs,
+  CAST(openOrder    AS decimal(18,2)) / 100000 AS openOrderLacs,
   CAST(openDelivery AS decimal(18,2)) / 100000 AS openDeliveryLacs,
-  CAST(openBilling AS decimal(18,2)) / 100000 AS openBillingLacs,
-  CAST(balance   AS decimal(18,2)) / 100000 AS balanceLacs,
-  adhocCount
+  CAST(openBilling  AS decimal(18,2)) / 100000 AS openBillingLacs,
+  CAST(balance      AS decimal(18,2)) / 100000 AS balanceLacs,
+  adhocCount                               AS adhocCount
 FROM dpmCustomer WITH (NOLOCK)
 WHERE custCode = @CustCode;";
 
@@ -319,54 +287,49 @@ WHERE custCode = @CustCode;";
         }
 
         /// <summary>
-        /// Combines the above three calls into one payload.
+        /// Returns every column from dpmCustomer for the given custCode + areaCode
         /// </summary>
-        [HttpGet("getAll360")]
-        public IActionResult GetAll360([FromQuery] string custCode, [FromQuery] string areaCode)
+        [HttpGet("getCustomerMasterDetails")]
+        public IActionResult GetCustomerMasterDetails([FromQuery] string custCode, [FromQuery] string areaCode)
         {
-            // 1) Purchaser
-            var purRes = GetPurchaserDetails(custCode, areaCode) as OkObjectResult;
-            if (purRes == null) return purRes ?? NotFound("Purchaser not found.");
-            var purchaser = purRes.Value as Purchaser360Dto;
+            if (string.IsNullOrWhiteSpace(custCode) || string.IsNullOrWhiteSpace(areaCode))
+                return BadRequest("Customer Code and Area Code are required.");
 
-            // 2) Sales
-            var salesRes = GetSalesData(custCode) as OkObjectResult;
-            if (salesRes == null) return salesRes ?? NotFound("Sales data not found.");
-            var salesDicts = salesRes.Value as List<Dictionary<string, object>>;
-            var sales = salesDicts
-                .Select(r => new SalesDataDto {
-                    MrgRepDs    = r["mrgRepDs"].ToString(),
-                    InvnQnty    = Convert.ToDecimal(r["invnQnty"]),
-                    InvnQntyAvg = Convert.ToDecimal(r["invnQntyAvg"]),
-                    SalesQty    = Convert.ToDecimal(r["salesQty"]),
-                    SalesQtyAvg = Convert.ToDecimal(r["salesQtyAvg"])
-                })
-                .ToList();
+            const string sql = @"
+SELECT
+     custCode,   custName,   areaCode,  mergeCod,  custType,   custAdd1,   custAdd2,   custAdd3,   custAdd4,
+     custCity,   custPinC,   district,  contCode,  offTele1,   offTele2,   resTele1,   resTele2,   faxNumbr,
+     mobileNo,   emailAdd,   concEmpl,  securDep,  clNoOfSD,   credLimt,   credPerd,   orgnType,   itxPanNo,
+     frghtTrm,   serTaxFl,   apdEligb,  apdAutoC,  poolAcFl,   exmptTax,   vatRegTy,   cenStxNo,   locStxNo,
+     cFormFlg,   sezFlags,   sezRegNo,  exEccNum,  exRanOff,   exDivOff,   exColOff,   vrtAcNum,   vrtAcBnk,
+     vrtAcHdf,   custClub,   keyACust,  ubsStkFl,  unloadNo,   dTaxCode,   birthDat,   annivDat,   firstNam,
+     midleNam,   lastName,   wifeName,  childNo1,  childNo2,   childNo3,   childNo4,   isActive,   createId,
+     createDt,  updateId,   updateDt,  legalFlg,  sapCusCd,   sapCCGDp,   sapCCGFc,   sapCreDt,   prvIdDes,
+     arnNumbr,  tanNumbr,   taxClass,  gstUptDt,  supCstFl,   adStkFlg,   cusAgrFl,   locaCapr,   latitute,
+     lgtitute,  ubsMrgCd,   custCtUn,  custPnUn,  bankAcNo,   benfName,   bankBnNm,   bankBnDs,   bankBnNo,
+     bankIFSC,  kycVerFl,   kycVerDt,  rtDocCnt,  refMasCd,   mrktName,   trOvGt10,   schmEmpl,   locUpdNo,
+     cityCode,  rrlUrbFl,   lstLocDt,  lstLcUsr,  talStkUp,   alliedCd,   adStkFDt,  flFnDate,   posiCode,
+     ubsstkf1,  portCode,   currCode,  aaplFlag,  sapNwPrd,   refSapCd
+FROM dpmCustomer WITH (NOLOCK)
+WHERE custCode = @CustCode
+  AND areaCode = @AreaCode;";
 
-            // 3) Credit limits
-            var credRes = GetCreditLimitDetails(custCode) as OkObjectResult;
-            if (credRes == null) return credRes ?? NotFound("Credit details not found.");
-            var credRows = credRes.Value as List<Dictionary<string, object>>;
-            var c = credRows[0];
-            var credit = new CreditLimitDetailsDto {
-                CreditLimitLacs     = Convert.ToDecimal(c["creditLimitLacs"]),
-                SecurityDepositLacs = Convert.ToDecimal(c["securityDepositLacs"]),
-                PenaltyLacs         = Convert.ToDecimal(c["penaltyLacs"]),
-                OpenOrderLacs       = Convert.ToDecimal(c["openOrderLacs"]),
-                OpenDeliveryLacs    = Convert.ToDecimal(c["openDeliveryLacs"]),
-                OpenBillingLacs     = Convert.ToDecimal(c["openBillingLacs"]),
-                BalanceLacs         = Convert.ToDecimal(c["balanceLacs"]),
-                AdhocCount          = Convert.ToInt32(c["adhocCount"])
+            var parameters = new Dictionary<string, object>
+            {
+                { "@CustCode", custCode },
+                { "@AreaCode", areaCode }
             };
 
-            // 4) Bundle and return
-            var full = new Full360Dto {
-                Purchaser   = purchaser,
-                Sales       = sales,
-                CreditLimit = credit
-            };
+            var raw = _dbHelper.ExecuteSelectQueryPublic(
+                _dbHelper.BwliveConnectionString,
+                sql,
+                parameters
+            );
 
-            return Ok(full);
+            if (raw is List<Dictionary<string, object>> rows && rows.Count > 0)
+                return Ok(rows[0]);
+
+            return NotFound("Customer not found.");
         }
     }
 }
