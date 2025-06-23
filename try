@@ -1,0 +1,373 @@
+using Microsoft.AspNetCore.Mvc;
+
+using sparshWebService.DataAccess;
+
+using System;
+
+using System.Collections.Generic;
+
+using System.Threading.Tasks;
+
+namespace sparshWebService.Controllers
+
+{
+
+    [Route("api/[controller]")]
+
+    [ApiController]
+
+    public class PersonalVisitController : ControllerBase
+
+    {
+
+        private readonly DatabaseHelper _dbHelper;
+
+        public PersonalVisitController(DatabaseHelper dbHelper)
+
+        {
+
+            _dbHelper = dbHelper;
+
+        }
+
+        [HttpPost("captureLocation")]
+
+        public async Task<IActionResult> CaptureLocation([FromBody] LocationRequest request)
+
+        {
+
+            if (request == null || string.IsNullOrWhiteSpace(request.CustomerCode))
+
+            {
+
+                return BadRequest("Customer Code is required.");
+
+            }
+
+            try
+
+            {
+
+                string sqlQuery = @"SELECT latitute, lgtitute FROM bwlive.dbo.rtmRetailer WHERE retlCode = @CustomerCode";
+
+                var parameters = new Dictionary<string, object>
+
+                {
+
+                    { "@CustomerCode", request.CustomerCode }
+
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, sqlQuery, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+
+                {
+
+                    var latitude = resultList[0]["latitute"].ToString();
+
+                    var longitude = resultList[0]["lgtitute"].ToString();
+
+                    return Ok(new { Latitude = latitude, Longitude = longitude });
+
+                }
+
+                return NotFound("Customer location not found.");
+
+            }
+
+            catch (Exception ex)
+
+            {
+
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+
+            }
+
+        }
+
+        [HttpPost("validateDistance")]
+
+        public IActionResult ValidateDistance([FromBody] DistanceValidationRequest request)
+
+        {
+
+            if (request == null || request.CustomerLatitude == 0 || request.CustomerLongitude == 0 || request.UserLatitude == 0 || request.UserLongitude == 0)
+
+            {
+
+                return BadRequest("All latitude and longitude values are required.");
+
+            }
+
+            try
+
+            {
+
+                double distance = CalculateDistance(request.CustomerLatitude, request.CustomerLongitude, request.UserLatitude, request.UserLongitude);
+
+                if (distance <= 500)
+
+                {
+
+                    return Ok(new { Message = "You are within the allowed distance.", Distance = distance });
+
+                }
+
+                return BadRequest(new { Message = "You are not at the customer's location.", Distance = distance });
+
+            }
+
+            catch (Exception ex)
+
+            {
+
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+
+            }
+
+        }
+
+        [HttpGet("getCustomerDetails")]
+
+        public IActionResult GetCustomerDetails([FromQuery] string purchaserRetailerType, [FromQuery] string areaCode, [FromQuery] string codeSearch)
+
+        {
+
+            if (string.IsNullOrWhiteSpace(purchaserRetailerType))
+
+            {
+
+                return BadRequest("Purchaser/Retailer Type is required.");
+
+            }
+
+            if (string.IsNullOrWhiteSpace(areaCode))
+
+            {
+
+                return BadRequest("Area Code is required.");
+
+            }
+
+            if (string.IsNullOrWhiteSpace(codeSearch))
+
+            {
+
+                return BadRequest("Code Search is required.");
+
+            }
+
+            try
+
+            {
+
+                // Validate Purchaser/Retailer Type
+
+                string purchaserQuery = "SELECT DISTINCT PurchaserRetailerType FROM dbo.DsrRetailerInOut WHERE PurchaserRetailerType = @PurchaserRetailerType";
+
+                var purchaserParameters = new Dictionary<string, object>
+
+                {
+
+                    { "@PurchaserRetailerType", purchaserRetailerType }
+
+                };
+
+                var purchaserResult = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, purchaserQuery, purchaserParameters);
+
+                if (purchaserResult is List<Dictionary<string, object>> purchaserList && purchaserList.Count == 0)
+
+                {
+
+                    return NotFound("Invalid Purchaser/Retailer Type.");
+
+                }
+
+                // Validate Area Code
+
+                string areaQuery = "SELECT DISTINCT AreaCode FROM dbo.DsrRetailerInOut WHERE AreaCode = @AreaCode";
+
+                var areaParameters = new Dictionary<string, object>
+
+                {
+
+                    { "@AreaCode", areaCode }
+
+                };
+
+                var areaResult = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, areaQuery, areaParameters);
+
+                if (areaResult is List<Dictionary<string, object>> areaList && areaList.Count == 0)
+
+                {
+
+                    return NotFound("Invalid Area Code.");
+
+                }
+
+                // Validate Code Search and Get Customer Location
+
+                string locationQuery = "SELECT CustomerLatitude, CustomerLongitude FROM dbo.DsrRetailerInOut WHERE CodeSearch = @CodeSearch AND AreaCode = @AreaCode AND PurchaserRetailerType = @PurchaserRetailerType";
+
+                var locationParameters = new Dictionary<string, object>
+
+                {
+
+                    { "@CodeSearch", codeSearch },
+
+                    { "@AreaCode", areaCode },
+
+                    { "@PurchaserRetailerType", purchaserRetailerType }
+
+                };
+
+                var locationResult = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, locationQuery, locationParameters);
+
+                if (locationResult is List<Dictionary<string, object>> locationList && locationList.Count > 0)
+
+                {
+
+                    return Ok(locationList);
+
+                }
+
+                return NotFound("Customer location not found.");
+
+            }
+
+            catch (Exception ex)
+
+            {
+
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+
+            }
+
+        }
+
+        [HttpGet("getCustomerDetailsWithLocation")]
+        public IActionResult GetCustomerDetailsWithLocation([FromQuery] string purchaserRetailerType, [FromQuery] string areaCode, [FromQuery] string codeSearch)
+        {
+            if (string.IsNullOrWhiteSpace(purchaserRetailerType))
+            {
+                return BadRequest("Purchaser/Retailer Type is required.");
+            }
+
+            if (string.IsNullOrWhiteSpace(areaCode))
+            {
+                return BadRequest("Area Code is required.");
+            }
+
+            if (string.IsNullOrWhiteSpace(codeSearch))
+            {
+                return BadRequest("Code Search is required.");
+            }
+
+            try
+            {
+                string query = "SELECT CustomerLatitude, CustomerLongitude, CustomerName FROM dbo.DsrRetailerInOut WHERE CodeSearch = @CodeSearch AND AreaCode = @AreaCode AND PurchaserRetailerType = @PurchaserRetailerType";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@CodeSearch", codeSearch },
+                    { "@AreaCode", areaCode },
+                    { "@PurchaserRetailerType", purchaserRetailerType }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var customerLatitude = resultList[0]["CustomerLatitude"].ToString();
+                    var customerLongitude = resultList[0]["CustomerLongitude"].ToString();
+                    var customerName = resultList[0]["CustomerName"].ToString();
+
+                    return Ok(new { CustomerName = customerName, Latitude = customerLatitude, Longitude = customerLongitude });
+                }
+
+                return NotFound("Customer details not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpPost("calculateDistance")]
+        public IActionResult CalculateDistance([FromBody] DistanceValidationRequest request)
+        {
+            if (request == null || request.CustomerLatitude == 0 || request.CustomerLongitude == 0 || request.UserLatitude == 0 || request.UserLongitude == 0)
+            {
+                return BadRequest("All latitude and longitude values are required.");
+            }
+
+            try
+            {
+                double distance = CalculateDistance(request.CustomerLatitude, request.CustomerLongitude, request.UserLatitude, request.UserLongitude);
+                return Ok(new { Distance = distance });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        private double CalculateDistance(double lat1, double lon1, double lat2, double lon2)
+
+        {
+
+            var radlat1 = Math.PI * lat1 / 180;
+
+            var radlat2 = Math.PI * lat2 / 180;
+
+            var theta = lon1 - lon2;
+
+            var radtheta = Math.PI * theta / 180;
+
+            var dist = Math.Sin(radlat1) * Math.Sin(radlat2) + Math.Cos(radlat1) * Math.Cos(radlat2) * Math.Cos(radtheta);
+
+            if (dist > 1)
+
+            {
+
+                dist = 1;
+
+            }
+
+            dist = Math.Acos(dist);
+
+            dist = dist * 180 / Math.PI;
+
+            dist = dist * 60 * 1.1515;
+
+            dist = dist * 1.609344 * 1000; // Convert to meters
+
+            return dist;
+
+        }
+
+    }
+
+    public class LocationRequest
+
+    {
+
+        public string CustomerCode { get; set; }
+
+    }
+
+    public class DistanceValidationRequest
+
+    {
+
+        public double CustomerLatitude { get; set; }
+
+        public double CustomerLongitude { get; set; }
+
+        public double UserLatitude { get; set; }
+
+        public double UserLongitude { get; set; }
+
+    }
+
+}
