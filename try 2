@@ -1,0 +1,388 @@
+using Microsoft.AspNetCore.Mvc;
+
+using sparshWebService.DataAccess;
+
+using System;
+
+using System.Collections.Generic;
+
+using System.Threading.Tasks;
+
+namespace sparshWebService.Controllers
+
+{
+
+    [Route("api/[controller]")]
+
+    [ApiController]
+
+    public class PersonalVisitController : ControllerBase
+
+    {
+
+        private readonly DatabaseHelper _dbHelper;
+
+        public PersonalVisitController(DatabaseHelper dbHelper)
+
+        {
+
+            _dbHelper = dbHelper;
+
+        }
+
+        [HttpPost("validateDistance")]
+
+        public IActionResult ValidateDistance([FromBody] DistanceValidationRequest request)
+
+        {
+
+            if (request == null || request.CustomerLatitude == 0 || request.CustomerLongitude == 0 || request.UserLatitude == 0 || request.UserLongitude == 0)
+
+            {
+
+                return BadRequest("All latitude and longitude values are required.");
+
+            }
+
+            try
+
+            {
+
+                double distance = CalculateDistance(request.CustomerLatitude, request.CustomerLongitude, request.UserLatitude, request.UserLongitude);
+
+                if (distance <= 500)
+
+                {
+
+                    return Ok(new { Message = "You are within the allowed distance.", Distance = distance });
+
+                }
+
+                return BadRequest(new { Message = "You are not at the customer's location.", Distance = distance });
+
+            }
+
+            catch (Exception ex)
+
+            {
+
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+
+            }
+
+        }
+
+        [HttpPost("validateCustomerLocation")]
+        public IActionResult ValidateCustomerLocation([FromBody] DistanceValidationRequest request)
+        {
+            if (request == null || request.CustomerLatitude == 0 || request.CustomerLongitude == 0 || request.UserLatitude == 0 || request.UserLongitude == 0)
+            {
+                return BadRequest("All latitude and longitude values are required.");
+            }
+
+            try
+            {
+                double distance = CalculateDistance(request.CustomerLatitude, request.CustomerLongitude, request.UserLatitude, request.UserLongitude);
+                if (distance <= 500)
+                {
+                    return Ok(new { Message = "You are within the allowed distance.", Distance = distance });
+                }
+                return BadRequest(new { Message = "You are not at the customer's location.", Distance = distance });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("fetchRetailerDetails")]
+        public IActionResult FetchRetailerDetails([FromQuery] string cusRtlCd)
+        {
+            if (string.IsNullOrWhiteSpace(cusRtlCd))
+            {
+                return BadRequest("Customer/Retailer Code is required.");
+            }
+
+            try
+            {
+                string query = "SELECT retlCode, retlName, latitute, lgtitute FROM bwlive.dbo.rtmRetailer WHERE isActive = 'Y' AND retlCode = @CustomerCode UNION ALL SELECT custCode, custName, latitute, lgtitute FROM dpmCustomer a WITH (NOLOCK) WHERE custCode = @CustomerCode AND isActive = 'Y'";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@CustomerCode", cusRtlCd }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    return Ok(resultList);
+                }
+
+                return NotFound("Retailer details not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getCustomerDetails")]
+        public IActionResult GetCustomerDetails([FromQuery] string customerCode)
+        {
+            if (string.IsNullOrWhiteSpace(customerCode))
+            {
+                return BadRequest("Customer Code is required.");
+            }
+
+            try
+            {
+                string query = "SELECT retlCode, retlName, latitute, lgtitute FROM bwlive.dbo.rtmRetailer WHERE isActive = 'Y' AND retlCode = @CustomerCode UNION ALL SELECT custCode, custName, latitute, lgtitute FROM dpmCustomer a WITH (NOLOCK) WHERE custCode = @CustomerCode AND isActive = 'Y';";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@CustomerCode", customerCode }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    return Ok(resultList);
+                }
+
+                return NotFound("Customer details not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpPost("submitDSRActivity")]
+        public IActionResult SubmitDSRActivity([FromBody] DSRActivityRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.CustomerCode) || string.IsNullOrWhiteSpace(request.AreaCode))
+            {
+                return BadRequest("Customer Code and Area Code are required.");
+            }
+
+            try
+            {
+                string query = "INSERT INTO dbo.dptDSRActvt (CustomerCode, AreaCode, ActivityType, ProcessType, ReportDate) VALUES (@CustomerCode, @AreaCode, @ActivityType, @ProcessType, @ReportDate);";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@CustomerCode", request.CustomerCode },
+                    { "@AreaCode", request.AreaCode },
+                    { "@ActivityType", request.ActivityType },
+                    { "@ProcessType", request.ProcessType },
+                    { "@ReportDate", request.ReportDate }
+                };
+
+                int rowsAffected = _dbHelper.ExecuteCommandPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (rowsAffected > 0)
+                {
+                    return Ok("DSR Activity submitted successfully.");
+                }
+
+                return StatusCode(500, "Failed to submit DSR Activity.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getDSRActivityDetails")]
+        public IActionResult GetDSRActivityDetails([FromQuery] string documentNumber)
+        {
+            if (string.IsNullOrWhiteSpace(documentNumber))
+            {
+                return BadRequest("Document Number is required.");
+            }
+
+            try
+            {
+                string query = "SELECT * FROM dbo.dptDSRActvt WHERE DocumentNumber = @DocumentNumber;";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@DocumentNumber", documentNumber }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    return Ok(resultList);
+                }
+
+                return NotFound("DSR Activity details not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getRetailerTargetStatus")]
+        public IActionResult GetRetailerTargetStatus()
+        {
+            try
+            {
+                string query = "SELECT COUNT(*) AS TargetStatus FROM dbo.dptRetailerTarget WHERE IsComplete = 'Y';";
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, new Dictionary<string, object>());
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    return Ok(resultList);
+                }
+
+                return NotFound("Retailer target status not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getMarketMISEntryStatus")]
+        public IActionResult GetMarketMISEntryStatus()
+        {
+            try
+            {
+                string query = "SELECT COUNT(*) AS MarketMISStatus FROM dbo.dptMarketMIS WHERE IsComplete = 'Y';";
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, new Dictionary<string, object>());
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    return Ok(resultList);
+                }
+
+                return NotFound("Market MIS entry status not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getPurchaserRetailerTypes")]
+        public IActionResult GetPurchaserRetailerTypes()
+        {
+            try
+            {
+                string query = "SELECT DISTINCT cusRtlFl AS PurchaserRetailerType FROM dbo.dptDSRinOut";
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, new Dictionary<string, object>());
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var types = resultList.Select(r => r["PurchaserRetailerType"].ToString()).ToList();
+                    return Ok(types);
+                }
+
+                return NotFound("No Purchaser/Retailer Types found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getAreaCodes")]
+        public IActionResult GetAreaCodes()
+        {
+            try
+            {
+                string query = "SELECT DISTINCT areaCode AS AreaCode FROM dbo.rtmRetailer";
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, new Dictionary<string, object>());
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var areaCodes = resultList.Select(r => r["AreaCode"].ToString()).ToList();
+                    return Ok(areaCodes);
+                }
+
+                return NotFound("No Area Codes found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getCodeSearch")]
+        public IActionResult GetCodeSearch([FromQuery] string areaCode, [FromQuery] string purchaserRetailerType)
+        {
+            if (string.IsNullOrWhiteSpace(areaCode) || string.IsNullOrWhiteSpace(purchaserRetailerType))
+            {
+                return BadRequest("Area Code and Purchaser/Retailer Type are required.");
+            }
+
+            try
+            {
+                string query = "SELECT DISTINCT cusRtlCd AS CodeSearch FROM dbo.dptDSRinOut WHERE geoLatit = @AreaCode AND cusRtlFl = @PurchaserRetailerType";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@AreaCode", areaCode },
+                    { "@PurchaserRetailerType", purchaserRetailerType }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var codes = resultList.Select(r => r["CodeSearch"].ToString()).ToList();
+                    return Ok(codes);
+                }
+
+                return NotFound("No Code Search results found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        private double CalculateDistance(double lat1, double lon1, double lat2, double lon2)
+        {
+            var radlat1 = Math.PI * lat1 / 180;
+            var radlat2 = Math.PI * lat2 / 180;
+            var theta = lon1 - lon2;
+            var radtheta = Math.PI * theta / 180;
+            var dist = Math.Sin(radlat1) * Math.Sin(radlat2) + Math.Cos(radlat1) * Math.Cos(radlat2) * Math.Cos(radtheta);
+
+            if (dist > 1)
+            {
+                dist = 1;
+            }
+
+            dist = Math.Acos(dist);
+            dist = dist * 180 / Math.PI;
+            dist = dist * 60 * 1.1515;
+            dist = dist * 1.609344 * 1000; // Convert to meters
+
+            return dist;
+        }
+    }
+
+    public class LocationRequest
+    {
+        public string CustomerCode { get; set; }
+    }
+
+    public class DistanceValidationRequest
+    {
+        public double CustomerLatitude { get; set; }
+        public double CustomerLongitude { get; set; }
+        public double UserLatitude { get; set; }
+        public double UserLongitude { get; set; }
+    }
+
+    public class DSRActivityRequest
+    {
+        public string CustomerCode { get; set; }
+        public string AreaCode { get; set; }
+        public string ActivityType { get; set; }
+        public string ProcessType { get; set; }
+        public DateTime ReportDate { get; set; }
+    }
+}
