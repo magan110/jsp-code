@@ -1,199 +1,294 @@
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
+// File: DsrModule.cs
+// ===========================================
+// This single C# file defines:
+//  1) JsonDateConverter / JsonNullableDateConverter
+//  2) The DsrRequest model (with nested DTOs)
+//  3) The DsrController (API endpoint)
+// ===========================================
+
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.ComponentModel.DataAnnotations;
+using System.Data;
+using System.Data.SqlClient;
+using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
 
-namespace sparshWebService.Controllers
+namespace MyApp
 {
-    [Route("api/[controller]")]
-    [ApiController]
-    public class GrcLeadEntryController : ControllerBase
+    // --- 1) JSON DATE CONVERTERS ---
+    public class JsonDateConverter : JsonConverter<DateTime>
     {
-        private readonly DatabaseHelper _dbHelper;
+        private const string Format = "dd/MM/yyyy";
+        public override DateTime Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
+            => DateTime.ParseExact(reader.GetString()!, Format, CultureInfo.InvariantCulture);
 
-        public GrcLeadEntryController(DatabaseHelper dbHelper)
+        public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions opts)
+            => writer.WriteStringValue(value.ToString(Format));
+    }
+
+    public class JsonNullableDateConverter : JsonConverter<DateTime?>
+    {
+        private const string Format = "dd/MM/yyyy";
+        public override DateTime? Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
         {
-            _dbHelper = dbHelper;
+            var s = reader.GetString();
+            return string.IsNullOrEmpty(s)
+                ? (DateTime?)null
+                : DateTime.ParseExact(s, Format, CultureInfo.InvariantCulture);
         }
 
-        public class GrcLeadEntryRequest
-        {
-            public string DocuNumb   { get; set; }
-            public string ProcType   { get; set; }
-            public string SiteType   { get; set; }
-            public string LeadDate   { get; set; }
-            public decimal LeadQnty  { get; set; }
-            public string LeadMsrs   { get; set; }
-            public string SiteName   { get; set; }
-            public string MobileNo   { get; set; }
-            public string SiteAddr   { get; set; }
-            public string SiteRmrk   { get; set; }
-            public string AdhrNumb   { get; set; }
-            public string ArchtNam   { get; set; }
-            public string ItxPanNo   { get; set; }
-            public string GstnNumb   { get; set; }
-            public string EmailAdd   { get; set; }
-            public string District   { get; set; }
-            public string AreaCode   { get; set; }
-            public string SitePinC   { get; set; }
-            public string RetlPinC   { get; set; }
-            public string StateNam   { get; set; }
-            public string CityName   { get; set; }
-            public string SaleArea   { get; set; }
-            public string PrjctKnd   { get; set; }
-            public string DelvrPrd   { get; set; }
-            public string CntPrsnt   { get; set; }
-            public string StMobNum   { get; set; }
+        public override void Write(Utf8JsonWriter writer, DateTime? value, JsonSerializerOptions opts)
+            => writer.WriteStringValue(value?.ToString(Format));
+    }
 
-            public List<GrcLeadItem> Items { get; set; }
+
+    // --- 2) REQUEST MODEL ---
+    public class DsrRequest
+    {
+        // Header
+        [Required] public string ProcType    { get; set; }
+        [Required] public string DocuNumb    { get; set; }
+        [Required] public string DsrParam    { get; set; }
+        [Required] public string CusRtlFl    { get; set; }
+        [Required] public string AreaCode    { get; set; }
+        [Required] public string CusRtlCd    { get; set; }
+        public string        KycStatus      { get; set; }
+
+        [Required]
+        [JsonConverter(typeof(JsonDateConverter))]
+        public DateTime      ReportDate     { get; set; }
+
+        public string        MarketName     { get; set; }
+        public string        PrtDsCnt       { get; set; }
+        public string        PendIsue       { get; set; }
+        public string        PndIsuDt       { get; set; }
+        public string        IsuDetal       { get; set; }
+
+        public decimal       WcErlSlb       { get; set; }
+        public decimal       WpErlSlb       { get; set; }
+        public decimal       VpErlSlb       { get; set; }
+        public decimal       BwStkWcc       { get; set; }
+        public decimal       BwStkWcp       { get; set; }
+        public decimal       BwStkVap       { get; set; }
+
+        public string        SlWcVlum       { get; set; }
+        public string        SlWpVlum       { get; set; }
+        public string        JkAvgWcc       { get; set; }
+        public string        JkAvgWcp       { get; set; }
+        public string        AsAvgWcc       { get; set; }
+        public string        AsAvgWcp       { get; set; }
+        public string        OtAvgWcc       { get; set; }
+        public string        OtAvgWcp       { get; set; }
+
+        [JsonConverter(typeof(JsonNullableDateConverter))]
+        public DateTime?     OrdExDat       { get; set; }
+
+        public string        DsrRem05       { get; set; }
+        public string        GeoLatit       { get; set; }
+        public string        GeoLongt       { get; set; }
+        public string        IsTilRtl       { get; set; }
+        public decimal       TileStck       { get; set; }
+
+        // Detail grids
+        public List<OrderDto>         Orders     { get; set; }
+        public List<MarketSkuDto>     MarketSkus { get; set; }
+        public List<GiftDto>          Gifts      { get; set; }
+
+        public class OrderDto
+        {
+            public string RepoCatg { get; set; }
+            public string ProdCode { get; set; }
+            public decimal ProdQnty { get; set; }
+            public decimal ProjQnty { get; set; }
+            public string  ActnRemk { get; set; }
+
+            [JsonConverter(typeof(JsonNullableDateConverter))]
+            public DateTime? TargetDt { get; set; }
         }
 
-        public class GrcLeadItem
+        public class MarketSkuDto
         {
-            public string ProdCode  { get; set; }
-            public decimal SalesBag { get; set; }
-            public decimal SalesQty { get; set; }
+            public string BranName  { get; set; }
+            public string PrdCodMk  { get; set; }
+            public decimal BPriceVl { get; set; }
+            public decimal CPriceVl { get; set; }
         }
 
-        [HttpPost("submitLead")]
-        public IActionResult SubmitLead([FromBody] GrcLeadEntryRequest request)
+        public class GiftDto
         {
-            if (request == null
-                || string.IsNullOrWhiteSpace(request.MobileNo)
-                || string.IsNullOrWhiteSpace(request.SiteName))
-            {
-                return BadRequest("Mobile Number and Site Name are required.");
-            }
+            public string  MrtlCode  { get; set; }
+            public decimal IsueQnty { get; set; }
+        }
+    }
+
+
+    // --- 3) API CONTROLLER ---
+    [ApiController]
+    [Route("api/[controller]")]
+    public class DsrController : ControllerBase
+    {
+        private readonly string _connString;
+        public DsrController(IConfiguration cfg)
+            => _connString = cfg.GetConnectionString("DefaultConnection");
+
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] DsrRequest dto)
+        {
+            string createId = User.Identity?.Name ?? "UNKNOWN";
+
+            await using var conn = new SqlConnection(_connString);
+            await conn.OpenAsync();
+            await using var tx = conn.BeginTransaction();
 
             try
             {
-                const string masterSql = @"
-INSERT INTO bwlive.dbo.dptGrcLeadGn (
-    docuNumb, procType, siteType, leadDate, leadQnty, leadMsrs,
-    siteName, mobileNo, siteAddr, siteRmrk, adhrNumb, archtNam,
-    itxPanNo, gstnNumb, emailAdd, district, areaCode, sitePinC,
-    retlPinC, stateNam, cityName, saleArea, prjctKnd, delvrPrd,
-    cntPrsnt, stMobNum
-) VALUES (
-    @DocuNumb, @ProcType, @SiteType, @LeadDate, @LeadQnty, @LeadMsrs,
-    @SiteName, @MobileNo, @SiteAddr, @SiteRmrk, @AdhrNumb, @ArchtNam,
-    @ItxPanNo, @GstnNumb, @EmailAdd, @District, @AreaCode, @SitePinC,
-    @RetlPinC, @StateNam, @CityName, @SaleArea, @PrjctKnd, @DelvrPrd,
-    @CntPrsnt, @StMobNum
-);";
-
-                var masterParams = new Dictionary<string, object>
+                // 1) HEADER INSERT
+                const string hdrSql = @"
+INSERT INTO dptDSRActvt
+ (ProcessType,DocuNumb,DsrParam,CusRtlFl,AreaCode,CusRtlCd,
+  KycStatus,ReportDate,MarketName,PrtDsCnt,PendIsue,PndIsuDt,IsuDetal,
+  WcErlSlb,WpErlSlb,VpErlSlb,BwStkWcc,BwStkWcp,BwStkVap,
+  SlWcVlum,SlWpVlum,JkAvgWcc,JkAvgWcp,AsAvgWcc,AsAvgWcp,OtAvgWcc,OtAvgWcp,
+  OrdrExDat,DsrRem05,GeoLatit,GeoLongt,IsTilRtl,TileStck,CreateId )
+VALUES
+ (@ProcType,@DocuNumb,@DsrParam,@CusRtlFl,@AreaCode,@CusRtlCd,
+  @KycStatus,@ReportDate,@MarketName,@PrtDsCnt,@PendIsue,@PndIsuDt,@IsuDetal,
+  @WcErlSlb,@WpErlSlb,@VpErlSlb,@BwStkWcc,@BwStkWcp,@BwStkVap,
+  @SlWcVlum,@SlWpVlum,@JkAvgWcc,@JkAvgWcp,@AsAvgWcc,@AsAvgWcp,@OtAvgWcc,@OtAvgWcp,
+  @OrdrExDat,@DsrRem05,@GeoLatit,@GeoLongt,@IsTilRtl,@TileStck,@CreateId)";
+                await using (var hdrCmd = new SqlCommand(hdrSql, conn, tx))
                 {
-                    ["@DocuNumb"]  = request.DocuNumb,
-                    ["@ProcType"]  = request.ProcType,
-                    ["@SiteType"]  = request.SiteType,
-                    ["@LeadDate"]  = request.LeadDate,
-                    ["@LeadQnty"]  = request.LeadQnty,
-                    ["@LeadMsrs"]  = request.LeadMsrs,
-                    ["@SiteName"]  = request.SiteName,
-                    ["@MobileNo"]  = request.MobileNo,
-                    ["@SiteAddr"]  = request.SiteAddr,
-                    ["@SiteRmrk"]  = request.SiteRmrk,
-                    ["@AdhrNumb"]  = request.AdhrNumb,
-                    ["@ArchtNam"]  = request.ArchtNam,
-                    ["@ItxPanNo"]  = request.ItxPanNo,
-                    ["@GstnNumb"]  = request.GstnNumb,
-                    ["@EmailAdd"]  = request.EmailAdd,
-                    ["@District"]  = request.District,
-                    ["@AreaCode"]  = request.AreaCode,
-                    ["@SitePinC"]  = request.SitePinC,
-                    ["@RetlPinC"]  = request.RetlPinC,
-                    ["@StateNam"]  = request.StateNam,
-                    ["@CityName"]  = request.CityName,
-                    ["@SaleArea"]  = request.SaleArea,
-                    ["@PrjctKnd"]  = request.PrjctKnd,
-                    ["@DelvrPrd"]  = request.DelvrPrd,
-                    ["@CntPrsnt"]  = request.CntPrsnt,
-                    ["@StMobNum"]  = request.StMobNum
-                };
+                    hdrCmd.Parameters.AddWithValue("@ProcType",  dto.ProcType);
+                    hdrCmd.Parameters.AddWithValue("@DocuNumb",  dto.DocuNumb);
+                    hdrCmd.Parameters.AddWithValue("@DsrParam",  dto.DsrParam);
+                    hdrCmd.Parameters.AddWithValue("@CusRtlFl",  dto.CusRtlFl);
+                    hdrCmd.Parameters.AddWithValue("@AreaCode",  dto.AreaCode);
+                    hdrCmd.Parameters.AddWithValue("@CusRtlCd",  dto.CusRtlCd);
+                    hdrCmd.Parameters.AddWithValue("@KycStatus", (object?)dto.KycStatus ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@ReportDate", dto.ReportDate);
+                    hdrCmd.Parameters.AddWithValue("@MarketName", (object?)dto.MarketName ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@PrtDsCnt",   (object?)dto.PrtDsCnt   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@PendIsue",   (object?)dto.PendIsue   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@PndIsuDt",   (object?)dto.PndIsuDt   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@IsuDetal",   (object?)dto.IsuDetal   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@WcErlSlb",   dto.WcErlSlb);
+                    hdrCmd.Parameters.AddWithValue("@WpErlSlb",   dto.WpErlSlb);
+                    hdrCmd.Parameters.AddWithValue("@VpErlSlb",   dto.VpErlSlb);
+                    hdrCmd.Parameters.AddWithValue("@BwStkWcc",   dto.BwStkWcc);
+                    hdrCmd.Parameters.AddWithValue("@BwStkWcp",   dto.BwStkWcp);
+                    hdrCmd.Parameters.AddWithValue("@BwStkVap",   dto.BwStkVap);
+                    hdrCmd.Parameters.AddWithValue("@SlWcVlum",   (object?)dto.SlWcVlum   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@SlWpVlum",   (object?)dto.SlWpVlum   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@JkAvgWcc",   (object?)dto.JkAvgWcc   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@JkAvgWcp",   (object?)dto.JkAvgWcp   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@AsAvgWcc",   (object?)dto.AsAvgWcc   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@AsAvgWcp",   (object?)dto.AsAvgWcp   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@OtAvgWcc",   (object?)dto.OtAvgWcc   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@OtAvgWcp",   (object?)dto.OtAvgWcp   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@OrdrExDat",  dto.OrdExDat.HasValue ? (object)dto.OrdExDat.Value : DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@DsrRem05",   (object?)dto.DsrRem05   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@GeoLatit",   (object?)dto.GeoLatit   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@GeoLongt",   (object?)dto.GeoLongt   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@IsTilRtl",   (object?)dto.IsTilRtl   ?? DBNull.Value);
+                    hdrCmd.Parameters.AddWithValue("@TileStck",   dto.TileStck);
+                    hdrCmd.Parameters.AddWithValue("@CreateId",   createId);
+                    await hdrCmd.ExecuteNonQueryAsync();
+                }
 
-                _dbHelper.ExecuteCommandPublic(_dbHelper.BwliveConnectionString, masterSql, masterParams);
-
-                // Insert each dynamic row into a detail table
-                if (request.Items != null && request.Items.Any())
+                // 2) ORDERS (mrktData='05')
+                const string ordSql = @"
+INSERT INTO dptDSRActvtDtl
+ (DocuNumb,CreateId,RepoCatg,CatgPack,ProdQnty,ProjQnty,ActnRemk,TargetDt,MrktData)
+ VALUES
+ (@DocuNumb,@CreateId,@RepoCatg,@CatgPack,@ProdQnty,@ProjQnty,@ActnRemk,@TargetDt,'05')";
+                await using (var ordCmd = new SqlCommand(ordSql, conn, tx))
                 {
-                    const string detailSql = @"
-INSERT INTO bwlive.dbo.dptGrcLeadGnDtl (
-    docuNumb, prodCode, salesBag, salesQty
-) VALUES (
-    @DocuNumb, @ProdCode, @SalesBag, @SalesQty
-);";
+                    ordCmd.Parameters.Add("@DocuNumb", SqlDbType.VarChar);
+                    ordCmd.Parameters.Add("@CreateId", SqlDbType.VarChar);
+                    ordCmd.Parameters.Add("@RepoCatg", SqlDbType.VarChar);
+                    ordCmd.Parameters.Add("@CatgPack", SqlDbType.VarChar);
+                    ordCmd.Parameters.Add("@ProdQnty", SqlDbType.Decimal);
+                    ordCmd.Parameters.Add("@ProjQnty", SqlDbType.Decimal);
+                    ordCmd.Parameters.Add("@ActnRemk", SqlDbType.VarChar);
+                    ordCmd.Parameters.Add("@TargetDt", SqlDbType.Date);
 
-                    foreach (var item in request.Items)
+                    foreach (var o in dto.Orders ?? new List<DsrRequest.OrderDto>())
                     {
-                        var detailParams = new Dictionary<string, object>
-                        {
-                            ["@DocuNumb"] = request.DocuNumb,
-                            ["@ProdCode"] = item.ProdCode,
-                            ["@SalesBag"] = item.SalesBag,
-                            ["@SalesQty"] = item.SalesQty
-                        };
-                        _dbHelper.ExecuteCommandPublic(_dbHelper.BwliveConnectionString, detailSql, detailParams);
+                        ordCmd.Parameters["@DocuNumb"].Value = dto.DocuNumb;
+                        ordCmd.Parameters["@CreateId"].Value = createId;
+                        ordCmd.Parameters["@RepoCatg"].Value = o.RepoCatg;
+                        ordCmd.Parameters["@CatgPack"].Value = o.ProdCode;
+                        ordCmd.Parameters["@ProdQnty"].Value = o.ProdQnty;
+                        ordCmd.Parameters["@ProjQnty"].Value = o.ProjQnty;
+                        ordCmd.Parameters["@ActnRemk"].Value = o.ActnRemk ?? "";
+                        ordCmd.Parameters["@TargetDt"].Value =
+                            o.TargetDt.HasValue ? (object)o.TargetDt.Value : DBNull.Value;
+                        await ordCmd.ExecuteNonQueryAsync();
                     }
                 }
 
-                return Ok("Lead submitted successfully.");
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        [HttpGet("getLeadDetails")]
-        public IActionResult GetLeadDetails([FromQuery] string docuNumb)
-        {
-            if (string.IsNullOrWhiteSpace(docuNumb))
-                return BadRequest("Document Number is required.");
-
-            try
-            {
-                const string masterSql = @"
-SELECT
-    docuNumb, procType, siteType, leadDate, leadQnty, leadMsrs,
-    siteName, mobileNo, siteAddr, siteRmrk, adhrNumb, archtNam,
-    itxPanNo, gstnNumb, emailAdd, district, areaCode, sitePinC,
-    retlPinC, stateNam, cityName, saleArea, prjctKnd, delvrPrd,
-    cntPrsnt, stMobNum
-FROM bwlive.dbo.dptGrcLeadGn
-WHERE docuNumb = @DocuNumb;";
-
-                var masterParams = new Dictionary<string, object>
+                // 3) MARKET SKUs (mrktData='06')
+                const string mktSql = @"
+INSERT INTO dptDSRActvtDtl
+ (DocuNumb,CreateId,RepoCatg,CatgPack,ProdQnty,ProjQnty,MrktData)
+ VALUES
+ (@DocuNumb,@CreateId,@RepoCatg,@CatgPack,@BPriceVl,@CPriceVl,'06')";
+                await using (var mktCmd = new SqlCommand(mktSql, conn, tx))
                 {
-                    ["@DocuNumb"] = docuNumb
-                };
+                    mktCmd.Parameters.Add("@DocuNumb", SqlDbType.VarChar);
+                    mktCmd.Parameters.Add("@CreateId", SqlDbType.VarChar);
+                    mktCmd.Parameters.Add("@RepoCatg", SqlDbType.VarChar);
+                    mktCmd.Parameters.Add("@CatgPack", SqlDbType.VarChar);
+                    mktCmd.Parameters.Add("@BPriceVl", SqlDbType.Decimal);
+                    mktCmd.Parameters.Add("@CPriceVl", SqlDbType.Decimal);
 
-                var master = _dbHelper
-                    .ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, masterSql, masterParams)
-                    .Cast<Dictionary<string, object>>()
-                    .FirstOrDefault();
+                    foreach (var m in dto.MarketSkus ?? new List<DsrRequest.MarketSkuDto>())
+                    {
+                        mktCmd.Parameters["@DocuNumb"].Value = dto.DocuNumb;
+                        mktCmd.Parameters["@CreateId"].Value = createId;
+                        mktCmd.Parameters["@RepoCatg"].Value = m.BranName;
+                        mktCmd.Parameters["@CatgPack"].Value = m.PrdCodMk;
+                        mktCmd.Parameters["@BPriceVl"].Value = m.BPriceVl;
+                        mktCmd.Parameters["@CPriceVl"].Value = m.CPriceVl;
+                        await mktCmd.ExecuteNonQueryAsync();
+                    }
+                }
 
-                const string detailSql = @"
-SELECT
-    prodCode, salesBag, salesQty
-FROM bwlive.dbo.dptGrcLeadGnDtl
-WHERE docuNumb = @DocuNumb;";
+                // 4) GIFTS (mrktData='07')
+                const string gifSql = @"
+INSERT INTO dptDSRActvtDtl
+ (DocuNumb,CreateId,RepoCatg,ProdQnty,MrktData)
+ VALUES
+ (@DocuNumb,@CreateId,@MrtlCode,@IsueQnty,'07')";
+                await using (var gifCmd = new SqlCommand(gifSql, conn, tx))
+                {
+                    gifCmd.Parameters.Add("@DocuNumb", SqlDbType.VarChar);
+                    gifCmd.Parameters.Add("@CreateId", SqlDbType.VarChar);
+                    gifCmd.Parameters.Add("@MrtlCode", SqlDbType.VarChar);
+                    gifCmd.Parameters.Add("@IsueQnty", SqlDbType.Decimal);
 
-                var detail = _dbHelper
-                    .ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, detailSql, masterParams);
+                    foreach (var g in dto.Gifts ?? new List<DsrRequest.GiftDto>())
+                    {
+                        gifCmd.Parameters["@DocuNumb"].Value = dto.DocuNumb;
+                        gifCmd.Parameters["@CreateId"].Value = createId;
+                        gifCmd.Parameters["@MrtlCode"].Value = g.MrtlCode;
+                        gifCmd.Parameters["@IsueQnty"].Value = g.IsueQnty;
+                        await gifCmd.ExecuteNonQueryAsync();
+                    }
+                }
 
-                if (master == null)
-                    return NotFound("Lead details not found.");
-
-                return Ok(new {
-                    Master = master,
-                    Items  = detail
-                });
+                await tx.CommitAsync();
+                return Ok(new { success = true, docuNumb = dto.DocuNumb });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
+                await tx.RollbackAsync();
+                return StatusCode(500, new { success = false, error = ex.Message });
             }
         }
     }
