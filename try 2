@@ -1,139 +1,153 @@
-// File: DsrModule.cs
-// ===========================================
-// This single C# file defines:
-//  1) JsonDateConverter / JsonNullableDateConverter
-//   2) The DsrRequest model (with nested DTOs)
-//   3) The DsrController (API endpoint)
-// ===========================================
-
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
-using System.Globalization;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Http;
-using sparshWebService.DataAccess;
-using System.Data.SqlClient;
+using MyApp;
 
-namespace MyApp
+namespace sparshWebService.Controllers
 {
-    // --- 1) JSON DATE CONVERTERS ---
-    public class JsonDateConverter : JsonConverter<DateTime>
-    {
-        private const string Format = "dd/MM/yyyy";
-        public override DateTime Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
-            => DateTime.ParseExact(reader.GetString()!, Format, CultureInfo.InvariantCulture);
-
-        public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions opts)
-            => writer.WriteStringValue(value.ToString(Format));
-    }
-
-    public class JsonNullableDateConverter : JsonConverter<DateTime?>
-    {
-        private const string Format = "dd/MM/yyyy";
-        public override DateTime? Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
-        {
-            var s = reader.GetString();
-            return string.IsNullOrEmpty(s)
-                ? (DateTime?)null
-                : DateTime.ParseExact(s, Format, CultureInfo.InvariantCulture);
-        }
-
-        public override void Write(Utf8JsonWriter writer, DateTime? value, JsonSerializerOptions opts)
-            => writer.WriteStringValue(value?.ToString(Format));
-    }
-
-    // --- 2) REQUEST MODEL ---
-    public class DsrRequest
-    {
-        // Header
-        [Required] public string ProcType { get; set; }
-        [Required] public string DocuNumb { get; set; }
-        [Required] public string DsrParam { get; set; }
-        [Required] public string CusRtlFl { get; set; }
-        [Required] public string AreaCode { get; set; }
-        [Required] public string CusRtlCd { get; set; }
-        public string KycStatus { get; set; }
-
-        [Required]
-        [JsonConverter(typeof(JsonDateConverter))]
-        public DateTime ReportDate { get; set; }
-
-        public string MarketName { get; set; }
-        public string PrtDsCnt { get; set; }
-        public string PendIsue { get; set; }
-        public string PndIsuDt { get; set; }
-        public string IsuDetal { get; set; }
-
-        public decimal WcErlSlb { get; set; }
-        public decimal WpErlSlb { get; set; }
-        public decimal VpErlSlb { get; set; }
-        public decimal BwStkWcc { get; set; }
-        public decimal BwStkWcp { get; set; }
-        public decimal BwStkVap { get; set; }
-
-        public string SlWcVlum { get; set; }
-        public string SlWpVlum { get; set; }
-        public string JkAvgWcc { get; set; }
-        public string JkAvgWcp { get; set; }
-        public string AsAvgWcc { get; set; }
-        public string AsAvgWcp { get; set; }
-        public string OtAvgWcc { get; set; }
-        public string OtAvgWcp { get; set; }
-
-        [JsonConverter(typeof(JsonNullableDateConverter))]
-        public DateTime? OrdExDat { get; set; }
-
-        public string DsrRem05 { get; set; }
-        public string GeoLatit { get; set; }
-        public string GeoLongt { get; set; }
-        public string IsTilRtl { get; set; }
-        public decimal TileStck { get; set; }
-
-        // Detail grids
-        public List<OrderDto> Orders { get; set; }
-        public List<MarketSkuDto> MarketSkus { get; set; }
-        public List<GiftDto> Gifts { get; set; }
-
-        public class OrderDto
-        {
-            public string RepoCatg { get; set; }
-            public decimal ProdQnty { get; set; }
-            public decimal ProjQnty { get; set; }
-            public string ActnRemk { get; set; }
-
-            [JsonConverter(typeof(JsonNullableDateConverter))]
-            public DateTime? TargetDt { get; set; }
-        }
-
-        public class MarketSkuDto
-        {
-            public string BranName { get; set; }
-            public string PrdCodMk { get; set; }
-            public decimal BPriceVl { get; set; }
-            public decimal CPriceVl { get; set; }
-        }
-
-        public class GiftDto
-        {
-            public string MrtlCode { get; set; }
-            public decimal IsueQnty { get; set; }
-        }
-    }
-
-    // --- 3) API CONTROLLER ---
-    [ApiController]
     [Route("api/[controller]")]
-    public class DsrController : ControllerBase
+    [ApiController]
+    public class PersonalVisitController : ControllerBase
     {
-        private readonly DatabaseHelper _db;
+        private readonly DatabaseHelper _dbHelper;
 
-        public DsrController(DatabaseHelper db)
+        public PersonalVisitController(DatabaseHelper dbHelper)
         {
-            _db = db;
+            _dbHelper = dbHelper;
+        }
+
+        [HttpPost("validateDistance")]
+        public IActionResult ValidateDistance([FromBody] DistanceValidationRequest request)
+        {
+            if (request == null || request.CustomerLatitude == 0 || request.CustomerLongitude == 0 || request.UserLatitude == 0 || request.UserLongitude == 0)
+            {
+                return BadRequest("All latitude and longitude values are required.");
+            }
+
+            try
+            {
+                double distance = CalculateDistance(request.CustomerLatitude, request.CustomerLongitude, request.UserLatitude, request.UserLongitude);
+                if (distance <= 500)
+                {
+                    return Ok(new { Message = "You are within the allowed distance.", Distance = distance });
+                }
+
+                return BadRequest(new { Message = "You are not at the customer's location.", Distance = distance });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("fetchRetailerDetails")]
+        public IActionResult FetchRetailerDetails([FromQuery] string cusRtlCd)
+        {
+            if (string.IsNullOrWhiteSpace(cusRtlCd))
+            {
+                return BadRequest("Customer/Retailer Code is required.");
+            }
+
+            try
+            {
+                string query = "SELECT retlCode, retlName, latitute, lgtitute FROM bwlive.dbo.rtmRetailer WHERE isActive = 'Y' AND retlCode = @CustomerCode UNION ALL SELECT custCode, custName, latitute, lgtitute FROM dpmCustomer a WITH (NOLOCK) WHERE custCode = @CustomerCode AND isActive = 'Y'";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@CustomerCode", cusRtlCd }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    return Ok(resultList);
+                }
+
+                return NotFound("Retailer details not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getPurchaserRetailerTypes")]
+        public IActionResult GetPurchaserRetailerTypes()
+        {
+            try
+            {
+                string query = "SELECT DISTINCT cusRtlFl AS PurchaserRetailerType FROM dbo.dptDSRinOut";
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, new Dictionary<string, object>());
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var types = resultList.Select(r => r["PurchaserRetailerType"].ToString()).ToList();
+                    return Ok(types);
+                }
+
+                return NotFound("No Purchaser/Retailer Types found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getAreaCodes")]
+        public IActionResult GetAreaCodes()
+        {
+            try
+            {
+                string query = "SELECT DISTINCT areaCode AS AreaCode FROM dbo.rtmRetailer";
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, new Dictionary<string, object>());
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var areaCodes = resultList.Select(r => r["AreaCode"].ToString()).ToList();
+                    return Ok(areaCodes);
+                }
+
+                return NotFound("No Area Codes found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        [HttpGet("getCodeSearch")]
+        public IActionResult GetCodeSearch([FromQuery] string areaCode, [FromQuery] string purchaserRetailerType)
+        {
+            if (string.IsNullOrWhiteSpace(areaCode) || string.IsNullOrWhiteSpace(purchaserRetailerType))
+            {
+                return BadRequest("Area Code and Purchaser/Retailer Type are required.");
+            }
+
+            try
+            {
+                string query = "SELECT DISTINCT cusRtlCd AS CodeSearch FROM dbo.dptDSRinOut WHERE geoLatit = @AreaCode AND cusRtlFl = @PurchaserRetailerType";
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@AreaCode", areaCode },
+                    { "@PurchaserRetailerType", purchaserRetailerType }
+                };
+
+                var result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
+
+                if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
+                {
+                    var codes = resultList.Select(r => r["CodeSearch"].ToString()).ToList();
+                    return Ok(codes);
+                }
+
+                return NotFound("No Code Search results found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
         }
 
         [HttpPost("DsrVisit")]
@@ -145,8 +159,7 @@ namespace MyApp
             {
                 if (dto.ProcType == "A")
                 {
-                    const string insertActvtSql = @"
-INSERT INTO dptDSRActvt
+                    const string insertActvtSql = @"INSERT INTO dptDSRActvt
  (docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl,
   areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04,
   dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
@@ -184,137 +197,48 @@ VALUES
                         ["@TileStck"] = dto.TileStck
                     };
 
-                    _db.WebSessBean(insertActvtSql, actParams);
-
-                    // --- detail orders ---
-                    const string insertDtlSql = @"
-INSERT INTO dptDSRActvtDtl
- (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty,
-  actnRemk, targetDt, statFlag, createId, createDt)
-VALUES
- (@DocuNumb, @DocuSrNo, @RepoCatg, @ProdQnty, @ProjQnty,
-  @ActnRemk, @TargetDt, @StatFlag, @CreateId, GETDATE());";
-
-                    int srNo = 1;
-                    foreach (var order in dto.Orders)
-                    {
-                        var orderParams = new Dictionary<string, object>
-                        {
-                            ["@DocuNumb"] = dto.DocuNumb.Substring(0, Math.Min(dto.DocuNumb.Length, 16)),
-                            ["@DocuSrNo"] = srNo++,
-                            ["@RepoCatg"] = order.RepoCatg.Substring(0, Math.Min(order.RepoCatg.Length, 2)),
-                            ["@ProdQnty"] = order.ProdQnty,
-                            ["@ProjQnty"] = order.ProjQnty,
-                            ["@ActnRemk"] = order.ActnRemk.Substring(0, Math.Min(order.ActnRemk.Length, 100)),
-                            ["@TargetDt"] = order.TargetDt ?? (object)DBNull.Value,
-                            ["@StatFlag"] = "N",
-                            ["@CreateId"] = userId.Substring(0, Math.Min(userId.Length, 10))
-                        };
-
-                        _db.WebSessBean(insertDtlSql, orderParams);
-                    }
-
-                    // --- gift distribution ---
-                    const string insertGiftSql = @"
-INSERT INTO dptGiftDist
- (docuNumb, areaCode, custCode, mrtlCode, isueQnty,
-  statFlag, createId, createDt)
-VALUES
- (@DocuNumb, @AreaCode, @CustCode, @MrtlCode, @IsueQnty,
-  @StatFlag, @CreateId, GETDATE());";
-
-                    foreach (var gift in dto.Gifts)
-                    {
-                        var giftParams = new Dictionary<string, object>
-                        {
-                            ["@DocuNumb"] = dto.DocuNumb.Substring(0, Math.Min(dto.DocuNumb.Length, 16)),
-                            ["@AreaCode"] = dto.AreaCode.Substring(0, Math.Min(dto.AreaCode.Length, 3)),
-                            ["@CustCode"] = dto.CusRtlCd.Substring(0, Math.Min(dto.CusRtlCd.Length, 8)),
-                            ["@MrtlCode"] = gift.MrtlCode.Substring(0, Math.Min(gift.MrtlCode.Length, 5)),
-                            ["@IsueQnty"] = gift.IsueQnty,
-                            ["@StatFlag"] = "N",
-                            ["@CreateId"] = userId.Substring(0, Math.Min(userId.Length, 6))
-                        };
-
-                        _db.WebSessBean(insertGiftSql, giftParams);
-                    }
+                    _dbHelper.WebSessBean(insertActvtSql, actParams);
                 }
-                else if (dto.ProcType == "U")
-                {
-                    const string updateSql = @"
-UPDATE dptDSRActvt
-SET docuDate    = @DocuDate,
-    ordExDat    = @OrdExDat,
-    dsrParam    = @DsrParam,
-    cusRtlFl    = @CusRtlFl,
-    areaCode    = @AreaCode,
-    cusRtlCd    = @CusRtlCd,
-    dsrRem01    = @MarketName,
-    dsrRem02    = @PendIsue,
-    dsrRem03    = @PndIsuDt,
-    dsrRem04    = @IsuDetal,
-    dsrRem05    = @DsrRem05,
-    dsrRem06    = @BrndSlWc,
-    dsrRem07    = @BrndSlWp,
-    dsrRem08    = @PrtDsCnt,
-    dsrRem09    = @SlWcVlum,
-    dsrRem10    = @SlWpVlum,
-    latitute    = @GeoLatit,
-    lgtitute    = @GeoLongt,
-    tileStck    = @TileStck,
-    updateId    = @UpdateId,
-    updateDt    = GETDATE()
-WHERE docuNumb = @DocuNumb;";
-
-                    var updParams = new Dictionary<string, object>
-                    {
-                        ["@DocuNumb"] = dto.DocuNumb,
-                        ["@DocuDate"] = DateTime.Now,
-                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
-                        ["@DsrParam"] = dto.DsrParam,
-                        ["@CusRtlFl"] = dto.CusRtlFl,
-                        ["@AreaCode"] = dto.AreaCode,
-                        ["@CusRtlCd"] = dto.CusRtlCd,
-                        ["@MarketName"] = dto.MarketName ?? string.Empty,
-                        ["@PendIsue"] = dto.PendIsue ?? string.Empty,
-                        ["@PndIsuDt"] = dto.PndIsuDt ?? string.Empty,
-                        ["@IsuDetal"] = dto.IsuDetal ?? string.Empty,
-                        ["@DsrRem05"] = dto.DsrRem05 ?? string.Empty,
-                        ["@BrndSlWc"] = string.Empty,
-                        ["@BrndSlWp"] = string.Empty,
-                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? string.Empty,
-                        ["@SlWcVlum"] = dto.SlWcVlum ?? string.Empty,
-                        ["@SlWpVlum"] = dto.SlWpVlum ?? string.Empty,
-                        ["@GeoLatit"] = dto.GeoLatit ?? string.Empty,
-                        ["@GeoLongt"] = dto.GeoLongt ?? string.Empty,
-                        ["@TileStck"] = dto.TileStck,
-                        ["@UpdateId"] = userId
-                    };
-
-                    _db.WebSessBean(updateSql, updParams);
-                }
-                else if (dto.ProcType == "D")
-                {
-                    const string deleteSql = @"
-DELETE FROM dptDSRActvt
-WHERE docuNumb = @DocuNumb;";
-
-                    _db.WebSessBean(deleteSql, new Dictionary<string, object>
-                    {
-                        ["@DocuNumb"] = dto.DocuNumb
-                    });
-                }
-
                 return Ok(new { success = true });
-            }
-            catch (SqlException ex)
-            {
-                return StatusCode(StatusCodes.Status500InternalServerError, new { success = false, error = "Database connection error: " + ex.Message });
             }
             catch (Exception ex)
             {
                 return StatusCode(StatusCodes.Status500InternalServerError, new { success = false, error = ex.Message });
             }
         }
+
+        private double CalculateDistance(double lat1, double lon1, double lat2, double lon2)
+        {
+            var radlat1 = Math.PI * lat1 / 180;
+            var radlat2 = Math.PI * lat2 / 180;
+            var theta = lon1 - lon2;
+            var radtheta = Math.PI * theta / 180;
+            var dist = Math.Sin(radlat1) * Math.Sin(radlat2) + Math.Cos(radlat1) * Math.Cos(radlat2) * Math.Cos(radtheta);
+
+            if (dist > 1)
+            {
+                dist = 1;
+            }
+
+            dist = Math.Acos(dist);
+            dist = dist * 180 / Math.PI;
+            dist = dist * 60 * 1.1515;
+            dist = dist * 1.609344 * 1000; // Convert to meters
+
+            return dist;
+        }
+    }
+
+    public class LocationRequest
+    {
+        public string CustomerCode { get; set; }
+    }
+
+    public class DistanceValidationRequest
+    {
+        public double CustomerLatitude { get; set; }
+        public double CustomerLongitude { get; set; }
+        public double UserLatitude { get; set; }
+        public double UserLongitude { get; set; }
     }
 }
