@@ -2,21 +2,21 @@
 // ===========================================
 // This single C# file defines:
 //  1) JsonDateConverter / JsonNullableDateConverter
-//  2) The DsrRequest model (with nested DTOs)
-//  3) The DsrController (API endpoint)
+//   2) The DsrRequest model (with nested DTOs)
+//   3) The DsrController (API endpoint)
 // ===========================================
 
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
-using System.Data;
-using System.Data.SqlClient;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
+using Microsoft.AspNetCore.Http;
+using sparshWebService.DataAccess;
+using System.Data.SqlClient;
 
 namespace MyApp
 {
@@ -45,7 +45,6 @@ namespace MyApp
         public override void Write(Utf8JsonWriter writer, DateTime? value, JsonSerializerOptions opts)
             => writer.WriteStringValue(value?.ToString(Format));
     }
-
 
     // --- 2) REQUEST MODEL ---
     public class DsrRequest
@@ -102,7 +101,6 @@ namespace MyApp
         public class OrderDto
         {
             public string RepoCatg { get; set; }
-            public string ProdCode { get; set; }
             public decimal ProdQnty { get; set; }
             public decimal ProjQnty { get; set; }
             public string ActnRemk { get; set; }
@@ -126,304 +124,196 @@ namespace MyApp
         }
     }
 
-
     // --- 3) API CONTROLLER ---
     [ApiController]
     [Route("api/[controller]")]
     public class DsrController : ControllerBase
     {
-        private readonly string _connString;
-        public DsrController(IConfiguration cfg)
-            => _connString = cfg.GetConnectionString("Bwlive");
+        private readonly DatabaseHelper _db;
 
-        [HttpPost]
-        public async Task<IActionResult> Create([FromBody] DsrRequest dto)
+        public DsrController(DatabaseHelper db)
         {
-            string createId = User.Identity?.Name ?? "UNKNOWN";
-
-            await using var conn = new SqlConnection(_connString);
-            await conn.OpenAsync();
-            await using var tx = conn.BeginTransaction();
-
-            try
-            {
-                // HEADER INSERT
-                const string hdrSql = @"
-INSERT INTO dptDSRActvt
- (docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10, district, deptCode, pendWith, statFlag, createId, createDt, locaCapr, latitute, lgtitute, ltLgDist, pinCodeN, cityName, cstBisTy, cuRtType, isTilRtl, tileStck, rtlInTim)
-VALUES
- (@DocuNumb, @DocuDate, @OrdExDat, @DsrParTy, @DsrParam, @CusRtlFl, @AreaCode, @CusRtlCd, @MarketName, @PendIsue, @PndIsuDt, @IsuDetal, @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, @SlWcVlum, @SlWpVlum, @District, @DeptCode, @PendWith, @StatFlag, @CreateId, GETDATE(), @FinlRslt, @GeoLatit, @GeoLongt, @LtLgDist, @PinCodeN, @CityName, @CstBisTy, @CusRtTyp, @IsTilRtl, @TileStck, GETDATE());";
-
-                await using (var hdrCmd = new SqlCommand(hdrSql, conn, tx))
-                {
-                    hdrCmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                    hdrCmd.Parameters.AddWithValue("@DocuDate", DateTime.Now);
-                    hdrCmd.Parameters.AddWithValue("@OrdExDat", dto.OrdExDat ?? (object)DBNull.Value);
-                    hdrCmd.Parameters.AddWithValue("@DsrParTy", "83");
-                    hdrCmd.Parameters.AddWithValue("@DsrParam", dto.DsrParam);
-                    hdrCmd.Parameters.AddWithValue("@CusRtlFl", dto.CusRtlFl);
-                    hdrCmd.Parameters.AddWithValue("@AreaCode", dto.AreaCode);
-                    hdrCmd.Parameters.AddWithValue("@CusRtlCd", dto.CusRtlCd);
-                    hdrCmd.Parameters.AddWithValue("@MarketName", dto.MarketName ?? "");
-                    hdrCmd.Parameters.AddWithValue("@PendIsue", dto.PendIsue ?? "");
-                    hdrCmd.Parameters.AddWithValue("@PndIsuDt", dto.PndIsuDt ?? "");
-                    hdrCmd.Parameters.AddWithValue("@IsuDetal", dto.IsuDetal ?? "");
-                    hdrCmd.Parameters.AddWithValue("@DsrRem05", dto.DsrRem05 ?? "");
-                    hdrCmd.Parameters.AddWithValue("@BrndSlWc", "");
-                    hdrCmd.Parameters.AddWithValue("@BrndSlWp", "");
-                    hdrCmd.Parameters.AddWithValue("@PrtDsCnt", dto.PrtDsCnt ?? "");
-                    hdrCmd.Parameters.AddWithValue("@SlWcVlum", dto.SlWcVlum ?? "");
-                    hdrCmd.Parameters.AddWithValue("@SlWpVlum", dto.SlWpVlum ?? "");
-                    hdrCmd.Parameters.AddWithValue("@District", "");
-                    hdrCmd.Parameters.AddWithValue("@DeptCode", "");
-                    hdrCmd.Parameters.AddWithValue("@PendWith", "");
-                    hdrCmd.Parameters.AddWithValue("@StatFlag", "N");
-                    hdrCmd.Parameters.AddWithValue("@CreateId", createId);
-                    hdrCmd.Parameters.AddWithValue("@FinlRslt", "");
-                    hdrCmd.Parameters.AddWithValue("@GeoLatit", dto.GeoLatit ?? "");
-                    hdrCmd.Parameters.AddWithValue("@GeoLongt", dto.GeoLongt ?? "");
-                    hdrCmd.Parameters.AddWithValue("@LtLgDist", "");
-                    hdrCmd.Parameters.AddWithValue("@PinCodeN", "");
-                    hdrCmd.Parameters.AddWithValue("@CityName", "");
-                    hdrCmd.Parameters.AddWithValue("@CstBisTy", "");
-                    hdrCmd.Parameters.AddWithValue("@CusRtTyp", "RT");
-                    hdrCmd.Parameters.AddWithValue("@IsTilRtl", dto.IsTilRtl ?? "");
-                    hdrCmd.Parameters.AddWithValue("@TileStck", dto.TileStck);
-
-                    await hdrCmd.ExecuteNonQueryAsync();
-                }
-
-                // Logic for inserting into dptDSRActvtDtl
-                const string insertDtlSql = @"
-INSERT INTO dptDSRActvtDtl
- (docuNumb, repoCatg, prodCode, prodQnty, projQnty, actnRemk, targetDt)
-VALUES
- (@DocuNumb, @RepoCatg, @ProdCode, @ProdQnty, @ProjQnty, @ActnRemk, @TargetDt);";
-
-                foreach (var order in dto.Orders)
-                {
-                    await using (var cmd = new SqlCommand(insertDtlSql, conn, tx))
-                    {
-                        cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                        cmd.Parameters.AddWithValue("@RepoCatg", order.RepoCatg ?? "");
-                        cmd.Parameters.AddWithValue("@ProdCode", order.ProdCode ?? "");
-                        cmd.Parameters.AddWithValue("@ProdQnty", order.ProdQnty);
-                        cmd.Parameters.AddWithValue("@ProjQnty", order.ProjQnty);
-                        cmd.Parameters.AddWithValue("@ActnRemk", order.ActnRemk ?? "");
-                        cmd.Parameters.AddWithValue("@TargetDt", order.TargetDt ?? (object)DBNull.Value);
-
-                        await cmd.ExecuteNonQueryAsync();
-                    }
-                }
-
-                // Logic for inserting into dptGiftDist
-                const string insertGiftSql = @"
-INSERT INTO dptGiftDist
- (docuNumb, mrtlCode, isueQnty)
-VALUES
- (@DocuNumb, @MrtlCode, @IsueQnty);";
-
-                foreach (var gift in dto.Gifts)
-                {
-                    await using (var cmd = new SqlCommand(insertGiftSql, conn, tx))
-                    {
-                        cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                        cmd.Parameters.AddWithValue("@MrtlCode", gift.MrtlCode ?? "");
-                        cmd.Parameters.AddWithValue("@IsueQnty", gift.IsueQnty);
-
-                        await cmd.ExecuteNonQueryAsync();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                await tx.RollbackAsync();
-                return StatusCode(500, new { success = false, error = ex.Message });
-            }
-
-            return Ok(new { success = true });
+            _db = db;
         }
 
-        [HttpPost("ProcessDsr")]
-        public async Task<IActionResult> ProcessDsr([FromBody] DsrRequest dto)
+        [HttpPost("DsrVisit")]
+        public async Task<IActionResult> DsrVisit([FromBody] DsrRequest dto)
         {
-            string createId = User.Identity?.Name ?? "UNKNOWN";
-
-            await using var conn = new SqlConnection(_connString);
-            await conn.OpenAsync();
-            await using var tx = conn.BeginTransaction();
+            string userId = User.Identity?.Name ?? "UNKNOWN";
 
             try
             {
                 if (dto.ProcType == "A")
                 {
-                    // Insert into dptDSRActvt
                     const string insertActvtSql = @"
 INSERT INTO dptDSRActvt
- (docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10, district, deptCode, pendWith, statFlag, createId, createDt, locaCapr, latitute, lgtitute, ltLgDist, pinCodeN, cityName, cstBisTy, cuRtType, isTilRtl, tileStck, rtlInTim)
+ (docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl,
+  areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04,
+  dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
+  deptCode, statFlag, createId, createDt, isTilRtl, tileStck)
 VALUES
- (@DocuNumb, @DocuDate, @OrdExDat, @DsrParTy, @DsrParam, @CusRtlFl, @AreaCode, @CusRtlCd, @MarketName, @PendIsue, @PndIsuDt, @IsuDetal, @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, @SlWcVlum, @SlWpVlum, @District, @DeptCode, @PendWith, @StatFlag, @CreateId, GETDATE(), @FinlRslt, @GeoLatit, @GeoLongt, @LtLgDist, @PinCodeN, @CityName, @CstBisTy, @CusRtTyp, @IsTilRtl, @TileStck, GETDATE());";
+ (@DocuNumb, @DocuDate, @OrdExDat, @DsrParTy, @DsrParam, @CusRtlFl,
+  @AreaCode, @CusRtlCd, @MarketName, @PendIsue, @PndIsuDt, @IsuDetal,
+  @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, @SlWcVlum, @SlWpVlum,
+  @DeptCode, @StatFlag, @CreateId, GETDATE(), @IsTilRtl, @TileStck);";
 
-                    await using (var cmd = new SqlCommand(insertActvtSql, conn, tx))
+                    var actParams = new Dictionary<string, object>
                     {
-                        cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                        cmd.Parameters.AddWithValue("@DocuDate", DateTime.Now);
-                        cmd.Parameters.AddWithValue("@OrdExDat", dto.OrdExDat ?? (object)DBNull.Value);
-                        cmd.Parameters.AddWithValue("@DsrParTy", "83");
-                        cmd.Parameters.AddWithValue("@DsrParam", dto.DsrParam);
-                        cmd.Parameters.AddWithValue("@CusRtlFl", dto.CusRtlFl);
-                        cmd.Parameters.AddWithValue("@AreaCode", dto.AreaCode);
-                        cmd.Parameters.AddWithValue("@CusRtlCd", dto.CusRtlCd);
-                        cmd.Parameters.AddWithValue("@MarketName", dto.MarketName ?? "");
-                        cmd.Parameters.AddWithValue("@PendIsue", dto.PendIsue ?? "");
-                        cmd.Parameters.AddWithValue("@PndIsuDt", dto.PndIsuDt ?? "");
-                        cmd.Parameters.AddWithValue("@IsuDetal", dto.IsuDetal ?? "");
-                        cmd.Parameters.AddWithValue("@DsrRem05", dto.DsrRem05 ?? "");
-                        cmd.Parameters.AddWithValue("@BrndSlWc", "");
-                        cmd.Parameters.AddWithValue("@BrndSlWp", "");
-                        cmd.Parameters.AddWithValue("@PrtDsCnt", dto.PrtDsCnt ?? "");
-                        cmd.Parameters.AddWithValue("@SlWcVlum", dto.SlWcVlum ?? "");
-                        cmd.Parameters.AddWithValue("@SlWpVlum", dto.SlWpVlum ?? "");
-                        cmd.Parameters.AddWithValue("@District", "");
-                        cmd.Parameters.AddWithValue("@DeptCode", "");
-                        cmd.Parameters.AddWithValue("@PendWith", "");
-                        cmd.Parameters.AddWithValue("@StatFlag", "N");
-                        cmd.Parameters.AddWithValue("@CreateId", createId);
-                        cmd.Parameters.AddWithValue("@FinlRslt", "");
-                        cmd.Parameters.AddWithValue("@GeoLatit", dto.GeoLatit ?? "");
-                        cmd.Parameters.AddWithValue("@GeoLongt", dto.GeoLongt ?? "");
-                        cmd.Parameters.AddWithValue("@LtLgDist", "");
-                        cmd.Parameters.AddWithValue("@PinCodeN", "");
-                        cmd.Parameters.AddWithValue("@CityName", "");
-                        cmd.Parameters.AddWithValue("@CstBisTy", "");
-                        cmd.Parameters.AddWithValue("@CusRtTyp", "RT");
-                        cmd.Parameters.AddWithValue("@IsTilRtl", dto.IsTilRtl ?? "");
-                        cmd.Parameters.AddWithValue("@TileStck", dto.TileStck);
+                        ["@DocuNumb"] = dto.DocuNumb,
+                        ["@DocuDate"] = DateTime.Now,
+                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
+                        ["@DsrParTy"] = "83",
+                        ["@DsrParam"] = dto.DsrParam,
+                        ["@CusRtlFl"] = dto.CusRtlFl,
+                        ["@AreaCode"] = dto.AreaCode,
+                        ["@CusRtlCd"] = dto.CusRtlCd,
+                        ["@MarketName"] = dto.MarketName ?? string.Empty,
+                        ["@PendIsue"] = dto.PendIsue ?? string.Empty,
+                        ["@PndIsuDt"] = dto.PndIsuDt ?? string.Empty,
+                        ["@IsuDetal"] = dto.IsuDetal ?? string.Empty,
+                        ["@DsrRem05"] = dto.DsrRem05 ?? string.Empty,
+                        ["@BrndSlWc"] = string.Empty,
+                        ["@BrndSlWp"] = string.Empty,
+                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? string.Empty,
+                        ["@SlWcVlum"] = dto.SlWcVlum ?? string.Empty,
+                        ["@SlWpVlum"] = dto.SlWpVlum ?? string.Empty,
+                        ["@DeptCode"] = "DPT001",
+                        ["@StatFlag"] = "N",
+                        ["@CreateId"] = userId,
+                        ["@IsTilRtl"] = dto.IsTilRtl ?? string.Empty,
+                        ["@TileStck"] = dto.TileStck
+                    };
 
-                        await cmd.ExecuteNonQueryAsync();
-                    }
+                    _db.WebSessBean(insertActvtSql, actParams);
 
-                    // Additional logic for inserting into dptDSRActvtDtl
+                    // --- detail orders ---
                     const string insertDtlSql = @"
 INSERT INTO dptDSRActvtDtl
- (docuNumb, repoCatg, prodCode, prodQnty, projQnty, actnRemk, targetDt)
+ (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty,
+  actnRemk, targetDt, statFlag, createId, createDt)
 VALUES
- (@DocuNumb, @RepoCatg, @ProdCode, @ProdQnty, @ProjQnty, @ActnRemk, @TargetDt);";
+ (@DocuNumb, @DocuSrNo, @RepoCatg, @ProdQnty, @ProjQnty,
+  @ActnRemk, @TargetDt, @StatFlag, @CreateId, GETDATE());";
 
+                    int srNo = 1;
                     foreach (var order in dto.Orders)
                     {
-                        await using (var cmd = new SqlCommand(insertDtlSql, conn, tx))
+                        var orderParams = new Dictionary<string, object>
                         {
-                            cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                            cmd.Parameters.AddWithValue("@RepoCatg", order.RepoCatg ?? "");
-                            cmd.Parameters.AddWithValue("@ProdCode", order.ProdCode ?? "");
-                            cmd.Parameters.AddWithValue("@ProdQnty", order.ProdQnty);
-                            cmd.Parameters.AddWithValue("@ProjQnty", order.ProjQnty);
-                            cmd.Parameters.AddWithValue("@ActnRemk", order.ActnRemk ?? "");
-                            cmd.Parameters.AddWithValue("@TargetDt", order.TargetDt ?? (object)DBNull.Value);
+                            ["@DocuNumb"] = dto.DocuNumb.Substring(0, Math.Min(dto.DocuNumb.Length, 16)),
+                            ["@DocuSrNo"] = srNo++,
+                            ["@RepoCatg"] = order.RepoCatg.Substring(0, Math.Min(order.RepoCatg.Length, 2)),
+                            ["@ProdQnty"] = order.ProdQnty,
+                            ["@ProjQnty"] = order.ProjQnty,
+                            ["@ActnRemk"] = order.ActnRemk.Substring(0, Math.Min(order.ActnRemk.Length, 100)),
+                            ["@TargetDt"] = order.TargetDt ?? (object)DBNull.Value,
+                            ["@StatFlag"] = "N",
+                            ["@CreateId"] = userId.Substring(0, Math.Min(userId.Length, 10))
+                        };
 
-                            await cmd.ExecuteNonQueryAsync();
-                        }
+                        _db.WebSessBean(insertDtlSql, orderParams);
                     }
 
-                    // Additional logic for inserting into dptGiftDist
+                    // --- gift distribution ---
                     const string insertGiftSql = @"
 INSERT INTO dptGiftDist
- (docuNumb, mrtlCode, isueQnty)
+ (docuNumb, areaCode, custCode, mrtlCode, isueQnty,
+  statFlag, createId, createDt)
 VALUES
- (@DocuNumb, @MrtlCode, @IsueQnty);";
+ (@DocuNumb, @AreaCode, @CustCode, @MrtlCode, @IsueQnty,
+  @StatFlag, @CreateId, GETDATE());";
 
                     foreach (var gift in dto.Gifts)
                     {
-                        await using (var cmd = new SqlCommand(insertGiftSql, conn, tx))
+                        var giftParams = new Dictionary<string, object>
                         {
-                            cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                            cmd.Parameters.AddWithValue("@MrtlCode", gift.MrtlCode ?? "");
-                            cmd.Parameters.AddWithValue("@IsueQnty", gift.IsueQnty);
+                            ["@DocuNumb"] = dto.DocuNumb.Substring(0, Math.Min(dto.DocuNumb.Length, 16)),
+                            ["@AreaCode"] = dto.AreaCode.Substring(0, Math.Min(dto.AreaCode.Length, 3)),
+                            ["@CustCode"] = dto.CusRtlCd.Substring(0, Math.Min(dto.CusRtlCd.Length, 8)),
+                            ["@MrtlCode"] = gift.MrtlCode.Substring(0, Math.Min(gift.MrtlCode.Length, 5)),
+                            ["@IsueQnty"] = gift.IsueQnty,
+                            ["@StatFlag"] = "N",
+                            ["@CreateId"] = userId.Substring(0, Math.Min(userId.Length, 6))
+                        };
 
-                            await cmd.ExecuteNonQueryAsync();
-                        }
+                        _db.WebSessBean(insertGiftSql, giftParams);
                     }
-
-                    // Additional logic for inserting into dptDSRActvtDtl and dptGiftDist can be added similarly.
                 }
                 else if (dto.ProcType == "U")
                 {
-                    // Update logic
-                    const string updateActvtSql = @"
+                    const string updateSql = @"
 UPDATE dptDSRActvt
-SET docuDate = @DocuDate,
-    ordExDat = @OrdExDat,
-    dsrParam = @DsrParam,
-    cusRtlFl = @CusRtlFl,
-    areaCode = @AreaCode,
-    cusRtlCd = @CusRtlCd,
-    dsrRem01 = @MarketName,
-    dsrRem02 = @PendIsue,
-    dsrRem03 = @PndIsuDt,
-    dsrRem04 = @IsuDetal,
-    dsrRem05 = @DsrRem05,
-    dsrRem06 = @BrndSlWc,
-    dsrRem07 = @BrndSlWp,
-    dsrRem08 = @PrtDsCnt,
-    dsrRem09 = @SlWcVlum,
-    dsrRem10 = @SlWpVlum,
-    latitute = @GeoLatit,
-    lgtitute = @GeoLongt,
-    tileStck = @TileStck,
-    updateId = @UpdateId,
-    updateDt = GETDATE()
+SET docuDate    = @DocuDate,
+    ordExDat    = @OrdExDat,
+    dsrParam    = @DsrParam,
+    cusRtlFl    = @CusRtlFl,
+    areaCode    = @AreaCode,
+    cusRtlCd    = @CusRtlCd,
+    dsrRem01    = @MarketName,
+    dsrRem02    = @PendIsue,
+    dsrRem03    = @PndIsuDt,
+    dsrRem04    = @IsuDetal,
+    dsrRem05    = @DsrRem05,
+    dsrRem06    = @BrndSlWc,
+    dsrRem07    = @BrndSlWp,
+    dsrRem08    = @PrtDsCnt,
+    dsrRem09    = @SlWcVlum,
+    dsrRem10    = @SlWpVlum,
+    latitute    = @GeoLatit,
+    lgtitute    = @GeoLongt,
+    tileStck    = @TileStck,
+    updateId    = @UpdateId,
+    updateDt    = GETDATE()
 WHERE docuNumb = @DocuNumb;";
 
-                    await using (var cmd = new SqlCommand(updateActvtSql, conn, tx))
+                    var updParams = new Dictionary<string, object>
                     {
-                        cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-                        cmd.Parameters.AddWithValue("@DocuDate", DateTime.Now);
-                        cmd.Parameters.AddWithValue("@OrdExDat", dto.OrdExDat ?? (object)DBNull.Value);
-                        cmd.Parameters.AddWithValue("@DsrParam", dto.DsrParam);
-                        cmd.Parameters.AddWithValue("@CusRtlFl", dto.CusRtlFl);
-                        cmd.Parameters.AddWithValue("@AreaCode", dto.AreaCode);
-                        cmd.Parameters.AddWithValue("@CusRtlCd", dto.CusRtlCd);
-                        cmd.Parameters.AddWithValue("@MarketName", dto.MarketName ?? "");
-                        cmd.Parameters.AddWithValue("@PendIsue", dto.PendIsue ?? "");
-                        cmd.Parameters.AddWithValue("@PndIsuDt", dto.PndIsuDt ?? "");
-                        cmd.Parameters.AddWithValue("@IsuDetal", dto.IsuDetal ?? "");
-                        cmd.Parameters.AddWithValue("@DsrRem05", dto.DsrRem05 ?? "");
-                        cmd.Parameters.AddWithValue("@BrndSlWc", "");
-                        cmd.Parameters.AddWithValue("@BrndSlWp", "");
-                        cmd.Parameters.AddWithValue("@PrtDsCnt", dto.PrtDsCnt ?? "");
-                        cmd.Parameters.AddWithValue("@SlWcVlum", dto.SlWcVlum ?? "");
-                        cmd.Parameters.AddWithValue("@SlWpVlum", dto.SlWpVlum ?? "");
-                        cmd.Parameters.AddWithValue("@GeoLatit", dto.GeoLatit ?? "");
-                        cmd.Parameters.AddWithValue("@GeoLongt", dto.GeoLongt ?? "");
-                        cmd.Parameters.AddWithValue("@TileStck", dto.TileStck);
-                        cmd.Parameters.AddWithValue("@UpdateId", createId);
+                        ["@DocuNumb"] = dto.DocuNumb,
+                        ["@DocuDate"] = DateTime.Now,
+                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
+                        ["@DsrParam"] = dto.DsrParam,
+                        ["@CusRtlFl"] = dto.CusRtlFl,
+                        ["@AreaCode"] = dto.AreaCode,
+                        ["@CusRtlCd"] = dto.CusRtlCd,
+                        ["@MarketName"] = dto.MarketName ?? string.Empty,
+                        ["@PendIsue"] = dto.PendIsue ?? string.Empty,
+                        ["@PndIsuDt"] = dto.PndIsuDt ?? string.Empty,
+                        ["@IsuDetal"] = dto.IsuDetal ?? string.Empty,
+                        ["@DsrRem05"] = dto.DsrRem05 ?? string.Empty,
+                        ["@BrndSlWc"] = string.Empty,
+                        ["@BrndSlWp"] = string.Empty,
+                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? string.Empty,
+                        ["@SlWcVlum"] = dto.SlWcVlum ?? string.Empty,
+                        ["@SlWpVlum"] = dto.SlWpVlum ?? string.Empty,
+                        ["@GeoLatit"] = dto.GeoLatit ?? string.Empty,
+                        ["@GeoLongt"] = dto.GeoLongt ?? string.Empty,
+                        ["@TileStck"] = dto.TileStck,
+                        ["@UpdateId"] = userId
+                    };
 
-                        await cmd.ExecuteNonQueryAsync();
-                    }
+                    _db.WebSessBean(updateSql, updParams);
                 }
                 else if (dto.ProcType == "D")
                 {
-                    // Delete logic
-                    const string deleteActvtSql = @"
+                    const string deleteSql = @"
 DELETE FROM dptDSRActvt
 WHERE docuNumb = @DocuNumb;";
 
-                    await using (var cmd = new SqlCommand(deleteActvtSql, conn, tx))
+                    _db.WebSessBean(deleteSql, new Dictionary<string, object>
                     {
-                        cmd.Parameters.AddWithValue("@DocuNumb", dto.DocuNumb);
-
-                        await cmd.ExecuteNonQueryAsync();
-                    }
+                        ["@DocuNumb"] = dto.DocuNumb
+                    });
                 }
 
-                await tx.CommitAsync();
                 return Ok(new { success = true });
+            }
+            catch (SqlException ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, new { success = false, error = "Database connection error: " + ex.Message });
             }
             catch (Exception ex)
             {
-                await tx.RollbackAsync();
-                return StatusCode(500, new { success = false, error = ex.Message });
+                return StatusCode(StatusCodes.Status500InternalServerError, new { success = false, error = ex.Message });
             }
         }
     }
