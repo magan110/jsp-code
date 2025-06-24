@@ -238,7 +238,9 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // Updated query based on the JSP implementation to correctly filter by areaCode instead of geoLatit
+                List<string> codes = new List<string>();
+                
+                // First, try to get results from dptDSRinOut (for historical data)
                 string query = @"SELECT DISTINCT cusRtlCd AS CodeSearch 
                                 FROM dbo.dptDSRinOut 
                                 WHERE areaCode = @AreaCode AND cusRtlFl = @PurchaserRetailerType";
@@ -253,26 +255,24 @@ namespace sparshWebService.Controllers
 
                 if (result is List<Dictionary<string, object>> resultList && resultList.Count > 0)
                 {
-                    var codes = resultList.Select(r => r["CodeSearch"].ToString()).ToList();
-                    return Ok(codes);
+                    codes.AddRange(resultList.Select(r => r["CodeSearch"]?.ToString()).Where(c => !string.IsNullOrEmpty(c)));
                 }
 
-                // If no results found, try an alternative query based on the JSP implementation
+                // Based on the purchaser/retailer type, query appropriate tables for active entities
                 if (purchaserRetailerType == "C" || purchaserRetailerType == "D" ||
                     purchaserRetailerType == "RD" || purchaserRetailerType == "AD" ||
                     purchaserRetailerType == "UR")
                 {
                     // Query for customer types
                     query = @"SELECT DISTINCT custCode AS CodeSearch 
-                             FROM dbo.dpmCustomer 
+                             FROM dbo.dpmCustomer WITH (NOLOCK)
                              WHERE areaCode = @AreaCode AND isActive = 'Y'";
 
                     result = _dbHelper.ExecuteSelectQueryPublic(_dbHelper.BwliveConnectionString, query, parameters);
 
                     if (result is List<Dictionary<string, object>> customerList && customerList.Count > 0)
                     {
-                        var codes = customerList.Select(r => r["CodeSearch"].ToString()).ToList();
-                        return Ok(codes);
+                        codes.AddRange(customerList.Select(r => r["CodeSearch"]?.ToString()).Where(c => !string.IsNullOrEmpty(c)));
                     }
                 }
                 else if (purchaserRetailerType == "R" || purchaserRetailerType == "RR")
@@ -286,9 +286,16 @@ namespace sparshWebService.Controllers
 
                     if (result is List<Dictionary<string, object>> retailerList && retailerList.Count > 0)
                     {
-                        var codes = retailerList.Select(r => r["CodeSearch"].ToString()).ToList();
-                        return Ok(codes);
+                        codes.AddRange(retailerList.Select(r => r["CodeSearch"]?.ToString()).Where(c => !string.IsNullOrEmpty(c)));
                     }
+                }
+
+                // Remove duplicates and return the combined results
+                codes = codes.Distinct().ToList();
+
+                if (codes.Count > 0)
+                {
+                    return Ok(codes);
                 }
 
                 return NotFound("No Code Search results found.");
