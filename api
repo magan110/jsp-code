@@ -2,7 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
+using System.Linq;
 
 namespace sparshWebService.Controllers
 {
@@ -17,184 +17,321 @@ namespace sparshWebService.Controllers
             _db = db;
         }
 
-        // GET: api/DsrActivity/{docuNumb}
+        //---------------------------------------------------------------------
+        // 1) METADATA: drive all your Flutter dropdowns from the database
+        //---------------------------------------------------------------------
+        [HttpGet("Metadata")]
+        public IActionResult Metadata()
+        {
+            try
+            {
+                // 1. dsrParam options
+                var dsrParams = (_db.WebSessBean(
+                    "SELECT paramCode FROM DsrParamMaster WHERE isActive=1 ORDER BY sortOrder",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["paramCode"].ToString())
+                  .ToList();
+
+                // 2. Customer/Retailer flags (cusRtlFl)
+                var rtlFlags = (_db.WebSessBean(
+                    "SELECT flagCode FROM RetailerFlagMaster WHERE isActive=1 ORDER BY sortOrder",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["flagCode"].ToString())
+                  .ToList();
+
+                // 3. Area codes
+                var areaCodes = (_db.WebSessBean(
+                    "SELECT areaCode FROM AreaMaster WHERE isActive=1 ORDER BY areaName",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["areaCode"].ToString())
+                  .ToList();
+
+                // 4. Pending issue details
+                var pendingIssues = (_db.WebSessBean(
+                    "SELECT issueDetail FROM PendingIssueMaster WHERE isActive=1 ORDER BY sortOrder",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["issueDetail"].ToString())
+                  .ToList();
+
+                // 5. City reasons
+                var cityReasons = (_db.WebSessBean(
+                    "SELECT reasonText FROM CityReasonMaster WHERE isActive=1 ORDER BY sortOrder",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["reasonText"].ToString())
+                  .ToList();
+
+                // 6. Tile-adhesive options
+                var tileOptions = (_db.WebSessBean(
+                    "SELECT optionText FROM TileAdhesiveOptionMaster WHERE isActive=1 ORDER BY sortOrder",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["optionText"].ToString())
+                  .ToList();
+
+                // 7. Existing document numbers (for Update dropdown)
+                var docs = (_db.WebSessBean(
+                    @"SELECT DISTINCT docuNumb 
+                        FROM dptDSRActvt 
+                       WHERE YEAR(docuDate)=YEAR(GETDATE()) 
+                    ORDER BY docuNumb",
+                    new Dictionary<string, object>())
+                    as List<Dictionary<string, object>>)
+                  .Select(r => r["docuNumb"].ToString())
+                  .ToList();
+
+                return Ok(new
+                {
+                    DsrParams = dsrParams,
+                    RetailerFlags = rtlFlags,
+                    AreaCodes = areaCodes,
+                    PendingIssueDetails = pendingIssues,
+                    CityReasons = cityReasons,
+                    TileAdhesiveOptions = tileOptions,
+                    DocumentNumbers = docs
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Metadata error: {ex.Message}");
+            }
+        }
+
+        //---------------------------------------------------------------------
+        // 2) GET an existing header + detail rows for “Update” mode
+        //---------------------------------------------------------------------
         [HttpGet("{docuNumb}")]
         public IActionResult Get(string docuNumb)
         {
             if (string.IsNullOrWhiteSpace(docuNumb))
-                return BadRequest("docuNumb is required.");
+                return BadRequest("docuNumb required.");
 
             try
             {
-                // 1) Header
-                var headerSql = @"
-                    SELECT * 
-                      FROM dptDSRActvt 
-                     WHERE docuNumb = @docuNumb";
-                var header = _db.QuerySingleOrDefault(headerSql, new { docuNumb });
-                if (header == null)
-                    return NotFound();
+                // Header
+                var hdr = (_db.WebSessBean(
+                    @"SELECT * FROM dptDSRActvt WHERE docuNumb=@N",
+                    new Dictionary<string, object> { { "@N", docuNumb } })
+                  as List<Dictionary<string, object>>)
+                  .FirstOrDefault();
 
-                // 2) Activity Lines
-                var detailSql = @"
-                    SELECT docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, mrktData
-                      FROM dptDSRActvtDtl
-                     WHERE docuNumb = @docuNumb
-                     ORDER BY docuSrNo";
-                var lines = _db.Query(detailSql, new { docuNumb });
+                if (hdr == null) return NotFound();
+
+                // Detail rows
+                var dtl = (_db.WebSessBean(
+                    @"SELECT docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, 
+                             targetDt, mrktData 
+                        FROM dptDSRActvtDtl
+                       WHERE docuNumb=@N 
+                       ORDER BY docuSrNo",
+                    new Dictionary<string, object> { { "@N", docuNumb } })
+                  as List<Dictionary<string, object>>);
+
+                // Attachment IDs
+                var atch = (_db.WebSessBean(
+                    @"SELECT atchNmId FROM imagedata.dbo.cotDocAttch 
+                       WHERE docuNumb=@N",
+                    new Dictionary<string, object> { { "@N", docuNumb } })
+                  as List<Dictionary<string, object>>)
+                  .Select(r => r["atchNmId"].ToString())
+                  .ToList();
 
                 return Ok(new
                 {
-                    Header = header,
-                    Details = lines
+                    Header = hdr,
+                    Details = dtl,
+                    Attachments = atch
                 });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, ex.Message);
+                return StatusCode(500, $"Get error: {ex.Message}");
             }
         }
 
-        // POST: api/DsrActivity
-        // Single endpoint to Add or Update based on ProcType
-        [HttpPost]
-        public IActionResult Post([FromBody] DsrActivityDto dto)
+        //---------------------------------------------------------------------
+        // 3) Add or Update: handles both procType="A" and "U"
+        //---------------------------------------------------------------------
+        [HttpPost("SaveOrUpdate")]
+        public IActionResult SaveOrUpdate([FromBody] DsrActivityRequest r)
         {
-            if (dto == null || string.IsNullOrWhiteSpace(dto.ProcType))
-                return BadRequest("Invalid request payload.");
+            if (r == null || string.IsNullOrWhiteSpace(r.ProcType))
+                return BadRequest("Invalid payload.");
 
             try
             {
-                if (dto.ProcType == "A")
+                _db.WebSessBean("SET XACT_ABORT ON; BEGIN TRAN", null);
+
+                string docuNumb = r.ProcType == "A"
+                  ? GenerateDocumentNumber(r.DocuType, r.AreaCode)
+                  : r.DocuNumb;
+
+                if (r.ProcType == "A")
                 {
-                    // generate new document number
-                    dto.DocuNumb = GenerateDocuNumb(dto.AreaCode);
-                    dto.StatFlag = "N";
-                    dto.DsrParTy = "83";
-
-                    // 1) Insert header
-                    const string insertH = @"
-                        INSERT INTO dptDSRActvt
-                          (docuNumb, docuDate, dsrParTy, dsrParam, cusRtlFl, areaCode,
-                           cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
-                           dsrRem06, dsrRem07, dsrRem08, dsrRem09, district, deptCode,
-                           statFlag, createId, createDt, locaCapr, latitute, lgtitute,
-                           pinCodeN, cityName, cstBisTy, cuRtType)
-                        VALUES
-                          (@DocuNumb, @DocuDate, @DsrParTy, @DsrParam, @CusRtlFl, @AreaCode,
-                           @CusRtlCd, @DsrRem01, @DsrRem02, @DsrRem03, @DsrRem04, @DsrRem05,
-                           @DsrRem06, @DsrRem07, @DsrRem08, @DsrRem09, @District, @DeptCode,
-                           @StatFlag, @CreateId, GETDATE(), @LocaCapr, @Latitute, @Lgtitute,
-                           @PinCodeN, @CityName, @CstBisTy, @CuRtType)";
-                    _db.Execute(insertH, dto);
-
-                    // 2) Insert dynamic lists
-                    InsertDetailList(dto);
+                    // INSERT header
+                    const string insH = @"
+                      INSERT INTO dptDSRActvt 
+                        (docuNumb, docuDate, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd,
+                         dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07,
+                         dsrRem08, dsrRem09, district, deptCode, statFlag, createId, createDt,
+                         locaCapr, latitute, lgtitute, pinCodeN, cityName, cstBisTy, cuRtType)
+                      VALUES
+                        (@Doc, @Date, @ParTy, @Param, @Fl, @Area, @Cd,
+                         @R1, @R2, @R3, @R4, @R5, @R6, @R7,
+                         @R8, @R9, @Dist, @Dept, 'N', @User, GETDATE(),
+                         @Capr, @Lat, @Lng, @Pin, @City, @Bis, @Typ)";
+                    var pH = new Dictionary<string, object>
+                    {
+                        ["@Doc"] = docuNumb,
+                        ["@Date"] = r.DocuDate,
+                        ["@ParTy"] = "83",
+                        ["@Param"] = r.DsrParam,
+                        ["@Fl"] = r.CusRtlFl,
+                        ["@Area"] = r.AreaCode,
+                        ["@Cd"] = r.CusRtlCd,
+                        ["@R1"] = r.DsrRem01,
+                        ["@R2"] = r.DsrRem02,
+                        ["@R3"] = r.DsrRem03,
+                        ["@R4"] = r.DsrRem04,
+                        ["@R5"] = r.DsrRem05,
+                        ["@R6"] = r.DsrRem06,
+                        ["@R7"] = r.DsrRem07,
+                        ["@R8"] = r.DsrRem08,
+                        ["@R9"] = r.DsrRem09,
+                        ["@Dist"] = r.District,
+                        ["@Dept"] = r.DeptCode,
+                        ["@User"] = r.CreateId,
+                        ["@Capr"] = r.LocaCapr,
+                        ["@Lat"] = r.Latitude,
+                        ["@Lng"] = r.Longitude,
+                        ["@Pin"] = r.PinCodeN,
+                        ["@City"] = r.CityName,
+                        ["@Bis"] = r.CstBisTy,
+                        ["@Typ"] = r.CuRtType
+                    };
+                    _db.WebSessBean(insH, pH);
                 }
-                else if (dto.ProcType == "U")
+                else // Update
                 {
-                    // 1) Update header
-                    const string updateH = @"
-                        UPDATE dptDSRActvt
-                           SET dsrParTy  = @DsrParTy,
-                               dsrParam  = @DsrParam,
-                               docuDate  = @DocuDate,
-                               cusRtlFl  = @CusRtlFl,
-                               cusRtlCd  = @CusRtlCd,
-                               dsrRem01  = @DsrRem01,
-                               dsrRem02  = @DsrRem02,
-                               dsrRem03  = @DsrRem03,
-                               dsrRem04  = @DsrRem04,
-                               dsrRem05  = @DsrRem05,
-                               dsrRem06  = @DsrRem06,
-                               dsrRem07  = @DsrRem07,
-                               dsrRem08  = @DsrRem08,
-                               dsrRem09  = @DsrRem09,
-                               district  = @District,
-                               pinCodeN  = @PinCodeN,
-                               cityName  = @CityName,
-                               areaCode  = @AreaCode,
-                               cuRtType  = @CuRtType,
-                               updateId  = @UpdateId,
-                               updateDt  = GETDATE()
-                         WHERE docuNumb = @DocuNumb";
-                    _db.Execute(updateH, dto);
+                    const string updH = @"
+                      UPDATE dptDSRActvt SET
+                        dsrParTy=@ParTy, dsrParam=@Param, docuDate=@Date,
+                        cusRtlFl=@Fl, cusRtlCd=@Cd,
+                        dsrRem01=@R1, dsrRem02=@R2, dsrRem03=@R3,
+                        dsrRem04=@R4, dsrRem05=@R5, dsrRem06=@R6,
+                        dsrRem07=@R7, dsrRem08=@R8, dsrRem09=@R9,
+                        district=@Dist, pinCodeN=@Pin, cityName=@City,
+                        areaCode=@Area, cuRtType=@Typ,
+                        updateDt=GETDATE(), updateId=@User
+                      WHERE docuNumb=@Doc";
+                    var pH = new Dictionary<string, object>
+                    {
+                        ["@Doc"] = docuNumb,
+                        ["@ParTy"] = "83",
+                        ["@Param"] = r.DsrParam,
+                        ["@Date"] = r.DocuDate,
+                        ["@Fl"] = r.CusRtlFl,
+                        ["@Cd"] = r.CusRtlCd,
+                        ["@R1"] = r.DsrRem01,
+                        ["@R2"] = r.DsrRem02,
+                        ["@R3"] = r.DsrRem03,
+                        ["@R4"] = r.DsrRem04,
+                        ["@R5"] = r.DsrRem05,
+                        ["@R6"] = r.DsrRem06,
+                        ["@R7"] = r.DsrRem07,
+                        ["@R8"] = r.DsrRem08,
+                        ["@R9"] = r.DsrRem09,
+                        ["@Dist"] = r.District,
+                        ["@Pin"] = r.PinCodeN,
+                        ["@City"] = r.CityName,
+                        ["@Area"] = r.AreaCode,
+                        ["@Typ"] = r.CuRtType,
+                        ["@User"] = r.UpdateId
+                    };
+                    _db.WebSessBean(updH, pH);
 
-                    // 2) Delete old lines + re-insert
-                    _db.Execute("DELETE FROM dptDSRActvtDtl WHERE docuNumb = @DocuNumb", dto);
-                    InsertDetailList(dto);
-                }
-                else
-                {
-                    return BadRequest("Unknown ProcType");
+                    // delete old details
+                    _db.WebSessBean(
+                      "DELETE dptDSRActvtDtl WHERE docuNumb=@Doc",
+                      new Dictionary<string, object> { { "@Doc", docuNumb } });
                 }
 
-                return Ok(new
+                // insert details (both “normal” and mrktData=true rows)
+                int seq = 1;
+                foreach (var d in r.Details)
                 {
-                    success = true,
-                    message = dto.ProcType == "A"
-                        ? $"Document saved with {dto.DocuNumb}"
-                        : $"Document {dto.DocuNumb} updated"
-                });
+                    const string insD = @"
+                      INSERT INTO dptDSRActvtDtl
+                        (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty,
+                         projQnty, actnRemk, targetDt, mrktData, statFlag, createId, createDt)
+                      VALUES
+                        (@Doc, @No, @Cat, @Pack, @PQty,
+                         @Qty2, @Rem, @Tgt, @Mkt, 'N', @User, GETDATE())";
+                    var pD = new Dictionary<string, object>
+                    {
+                        ["@Doc"] = docuNumb,
+                        ["@No"] = seq++,
+                        ["@Cat"] = d.RepoCatg,
+                        ["@Pack"] = d.CatgPack ?? "",
+                        ["@PQty"] = d.ProdQnty,
+                        ["@Qty2"] = d.ProjQnty,
+                        ["@Rem"] = d.ActnRemk,
+                        ["@Tgt"] = d.TargetDt ?? (object)DBNull.Value,
+                        ["@Mkt"] = (d.IsMrktData ? "01" : "00"),
+                        ["@User"] = (r.ProcType == "A") ? r.CreateId : r.UpdateId
+                    };
+                    _db.WebSessBean(insD, pD);
+                }
+
+                // attach files: update imagedata.dbo.cotDocAttch
+                if (r.Attachments?.Any() == true)
+                {
+                    foreach (var fileId in r.Attachments)
+                    {
+                        _db.WebSessBean(
+                          @"UPDATE imagedata.dbo.cotDocAttch
+                            SET docuNumb=@Doc, updateDt=GETDATE()
+                          WHERE docuNumb=@File",
+                          new Dictionary<string, object>
+                          {
+                              ["@Doc"] = docuNumb,
+                              ["@File"] = fileId
+                          });
+                    }
+                }
+
+                _db.WebSessBean("COMMIT", null);
+                return Ok(new { success = true, docuNumb });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, ex.Message);
+                _db.WebSessBean("ROLLBACK", null);
+                return StatusCode(500, $"SaveOrUpdate error: {ex.Message}");
             }
         }
 
-        private void InsertDetailList(DsrActivityDto dto)
+        private string GenerateDocumentNumber(string docuType, string areaCode)
         {
-            const string insLine = @"
-                INSERT INTO dptDSRActvtDtl
-                  (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, mrktData, statFlag, createId, createDt)
-                VALUES
-                  (@DocuNumb, @SrNo,     @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty, @ActnRemk, @TargetDt, @MrktData, @StatFlag, @CreateId, GETDATE())";
-
-            int idx = 1;
-            foreach (var d in dto.ActivityDetails)
-            {
-                d.DocuNumb = dto.DocuNumb;
-                d.SrNo = idx++;
-                d.CreateId = dto.CreateId;
-                d.StatFlag = dto.StatFlag;
-                d.MrktData = null;  // or “01” for market entries
-                _db.Execute(insLine, d);
-            }
-
-            foreach (var m in dto.MarketSkus)
-            {
-                m.DocuNumb = dto.DocuNumb;
-                m.SrNo = idx++;
-                m.CreateId = dto.CreateId;
-                m.StatFlag = dto.StatFlag;
-                m.MrktData = "01";
-                _db.Execute(insLine, m);
-            }
-
-            foreach (var g in dto.Gifts)
-            {
-                g.DocuNumb = dto.DocuNumb;
-                g.SrNo = idx++;
-                g.CreateId = dto.CreateId;
-                g.StatFlag = dto.StatFlag;
-                g.MrktData = null;
-                _db.Execute(insLine, g);
-            }
+            // your existing logic, or:
+            return Guid.NewGuid().ToString("N").Substring(0, 8).ToUpper();
         }
-
-        private string GenerateDocuNumb(string areaCode)
-            => $"{DateTime.UtcNow:yyMMddHHmmss}-{areaCode}".ToUpper();
     }
 
-    // DTOs to bind all dynamic‐fields lists
-    public class DsrActivityDto
+    //------------------------------------------------------------------------
+    // Models
+    //------------------------------------------------------------------------
+    public class DsrActivityRequest
     {
-        public string ProcType { get; set; }    // “A” or “U”
+        public string ProcType { get; set; }   // "A" or "U"
         public string DocuType { get; set; } = "DSR";
-        public string DocuNumb { get; set; }
+        public string DocuNumb { get; set; }   // for Update
         public DateTime DocuDate { get; set; }
-        public string DsrParTy { get; set; }
+
+        // header fields from JSP/Flutter
         public string DsrParam { get; set; }
         public string CusRtlFl { get; set; }
         public string AreaCode { get; set; }
@@ -210,35 +347,28 @@ namespace sparshWebService.Controllers
         public string DsrRem09 { get; set; }
         public string District { get; set; }
         public string DeptCode { get; set; }
-        public string StatFlag { get; set; }
-        public string CreateId { get; set; }
-        public string UpdateId { get; set; }
         public string LocaCapr { get; set; }
-        public string Latitute { get; set; }
-        public string Lgtitute { get; set; }
+        public string Latitude { get; set; }
+        public string Longitude { get; set; }
         public string PinCodeN { get; set; }
         public string CityName { get; set; }
         public string CstBisTy { get; set; }
         public string CuRtType { get; set; }
+        public string CreateId { get; set; }   // loginIdM
+        public string UpdateId { get; set; }
 
-        // dynamic lists from your Flutter form
-        public List<DsrDetailLine> ActivityDetails { get; set; } = new();
-        public List<DsrDetailLine> MarketSkus { get; set; } = new();
-        public List<DsrDetailLine> Gifts { get; set; } = new();
+        public List<DsrDetailRequest> Details { get; set; }
+        public List<string> Attachments { get; set; }
     }
 
-    public class DsrDetailLine
+    public class DsrDetailRequest
     {
-        public string DocuNumb { get; set; }
-        public int SrNo { get; set; }
         public string RepoCatg { get; set; }
         public string CatgPack { get; set; }
-        public decimal ProdQnty { get; set; }
-        public decimal ProjQnty { get; set; }
+        public string ProdQnty { get; set; }
+        public string ProjQnty { get; set; }
         public string ActnRemk { get; set; }
-        public DateTime? TargetDt { get; set; }
-        public string MrktData { get; set; }   // null or “01”
-        public string StatFlag { get; set; }
-        public string CreateId { get; set; }
+        public string TargetDt { get; set; }
+        public bool IsMrktData { get; set; }   // true for market rows
     }
 }
