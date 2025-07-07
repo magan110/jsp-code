@@ -3,908 +3,242 @@ using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.Linq;
-using Microsoft.AspNetCore.Http;
-using System.Data.SqlClient;
-using System.ComponentModel.DataAnnotations;
-using System.Globalization;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace sparshWebService.Controllers
 {
-    // JSON DATE CONVERTERS
-    public class JsonDateConverter : JsonConverter<DateTime>
-    {
-        private const string Format = "dd/MM/yyyy";
-        public override DateTime Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
-            => DateTime.ParseExact(reader.GetString()!, Format, CultureInfo.InvariantCulture);
-
-        public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions opts)
-            => writer.WriteStringValue(value.ToString(Format));
-    }
-
-    public class JsonNullableDateConverter : JsonConverter<DateTime?>
-    {
-        private const string Format = "dd/MM/yyyy";
-        public override DateTime? Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
-        {
-            var s = reader.GetString();
-            return string.IsNullOrEmpty(s)
-                ? (DateTime?)null
-                : DateTime.ParseExact(s, Format, CultureInfo.InvariantCulture);
-        }
-        public override void Write(Utf8JsonWriter writer, DateTime? value, JsonSerializerOptions opts)
-            => writer.WriteStringValue(value?.ToString(Format));
-    }
-
-    // REQUEST MODEL
-    public class DsrRequest
-    {
-        [Required] public string ProcType { get; set; }
-        [Required] public string DocuNumb { get; set; }
-        [Required] public string DsrParam { get; set; }
-        [Required] public string CusRtlFl { get; set; }
-        [Required] public string AreaCode { get; set; }
-        [Required] public string CusRtlCd { get; set; }
-        public string KycStatus { get; set; }
-
-        [Required]
-        [JsonConverter(typeof(JsonDateConverter))]
-        public DateTime ReportDate { get; set; }
-
-        public string MarketName { get; set; }
-        public string PrtDsCnt { get; set; }
-        public string PendIsue { get; set; }
-        public string PndIsuDt { get; set; }
-        public string IsuDetal { get; set; }
-
-        public decimal WcErlSlb { get; set; }
-        public decimal WpErlSlb { get; set; }
-        public decimal VpErlSlb { get; set; }
-        public decimal BwStkWcc { get; set; }
-        public decimal BwStkWcp { get; set; }
-        public decimal BwStkVap { get; set; }
-
-        public string SlWcVlum { get; set; }
-        public string SlWpVlum { get; set; }
-        public string JkAvgWcc { get; set; }
-        public string JkAvgWcp { get; set; }
-        public string AsAvgWcc { get; set; }
-        public string AsAvgWcp { get; set; }
-        public string OtAvgWcc { get; set; }
-        public string OtAvgWcp { get; set; }
-
-        [JsonConverter(typeof(JsonNullableDateConverter))]
-        public DateTime? OrdExDat { get; set; }
-
-        public string DsrRem05 { get; set; }
-        public string GeoLatit { get; set; }
-        public string GeoLongt { get; set; }
-        public string IsTilRtl { get; set; }
-        public decimal TileStck { get; set; }
-
-        // Detail grids
-        public List<OrderDto> Orders { get; set; }
-        public List<MarketSkuDto> MarketSkus { get; set; }
-        public List<GiftDto> Gifts { get; set; }
-
-        public class OrderDto
-        {
-            public string RepoCatg { get; set; }
-            public decimal ProdQnty { get; set; }
-            public decimal ProjQnty { get; set; }
-            public string ActnRemk { get; set; }
-            [JsonConverter(typeof(JsonNullableDateConverter))]
-            public DateTime? TargetDt { get; set; }
-        }
-
-        public class MarketSkuDto
-        {
-            public string BranName { get; set; }
-            public string PrdCodMk { get; set; }
-            public decimal BPriceVl { get; set; }
-            public decimal CPriceVl { get; set; }
-        }
-
-        public class GiftDto
-        {
-            public string MrtlCode { get; set; }
-            public decimal IsueQnty { get; set; }
-        }
-    }
-
-    public class DistanceValidationRequest
-    {
-        public double CustomerLatitude { get; set; }
-        public double CustomerLongitude { get; set; }
-        public double UserLatitude { get; set; }
-        public double UserLongitude { get; set; }
-    }
-
-    public class LocationRequest
-    {
-        public string CustomerCode { get; set; }
-    }
-
     [Route("api/[controller]")]
     [ApiController]
-    public class PersonalVisitController : ControllerBase
+    public class DsrActivityController : ControllerBase
     {
-        private readonly DatabaseHelper _dbHelper;
+        private readonly DatabaseHelper _db;
 
-        public PersonalVisitController(DatabaseHelper dbHelper)
+        public DsrActivityController(DatabaseHelper db)
         {
-            _dbHelper = dbHelper;
+            _db = db;
         }
 
-        // POST /api/PersonalVisit/validateDistance
-        [HttpPost("validateDistance")]
-        public IActionResult ValidateDistance([FromBody] DistanceValidationRequest request)
+        // GET: api/DsrActivity/{docuNumb}
+        [HttpGet("{docuNumb}")]
+        public IActionResult Get(string docuNumb)
         {
-            if (request == null ||
-                request.CustomerLatitude == 0 ||
-                request.CustomerLongitude == 0 ||
-                request.UserLatitude == 0 ||
-                request.UserLongitude == 0)
-            {
-                return BadRequest("All latitude and longitude values are required.");
-            }
+            if (string.IsNullOrWhiteSpace(docuNumb))
+                return BadRequest("docuNumb is required.");
 
             try
             {
-                double distance = CalculateDistance(
-                    request.CustomerLatitude,
-                    request.CustomerLongitude,
-                    request.UserLatitude,
-                    request.UserLongitude);
+                // 1) Header
+                var headerSql = @"
+                    SELECT * 
+                      FROM dptDSRActvt 
+                     WHERE docuNumb = @docuNumb";
+                var header = _db.QuerySingleOrDefault(headerSql, new { docuNumb });
+                if (header == null)
+                    return NotFound();
 
-                if (distance <= 500)
-                    return Ok(new { Message = "You are within the allowed distance.", Distance = distance });
+                // 2) Activity Lines
+                var detailSql = @"
+                    SELECT docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, mrktData
+                      FROM dptDSRActvtDtl
+                     WHERE docuNumb = @docuNumb
+                     ORDER BY docuSrNo";
+                var lines = _db.Query(detailSql, new { docuNumb });
 
-                return BadRequest(new { Message = "You are not at the customer's location.", Distance = distance });
+                return Ok(new
+                {
+                    Header = header,
+                    Details = lines
+                });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
+                return StatusCode(500, ex.Message);
             }
         }
 
-        // GET /api/PersonalVisit/fetchRetailerDetails?cusRtlCd=...
-        [HttpGet("fetchRetailerDetails")]
-        public IActionResult FetchRetailerDetails([FromQuery] string cusRtlCd)
+        // POST: api/DsrActivity
+        // Single endpoint to Add or Update based on ProcType
+        [HttpPost]
+        public IActionResult Post([FromBody] DsrActivityDto dto)
         {
-            if (string.IsNullOrWhiteSpace(cusRtlCd))
-                return BadRequest("Customer/Retailer Code is required.");
-
-            try
-            {
-                const string query = @"
-SELECT retlCode, retlName, latitute, lgtitute
-  FROM bwlive.dbo.rtmRetailer
- WHERE isActive = 'Y' AND retlCode = @CustomerCode
-UNION ALL
-SELECT custCode, custName, latitute, lgtitute
-  FROM dpmCustomer WITH (NOLOCK)
- WHERE custCode = @CustomerCode AND isActive = 'Y';";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    ["@CustomerCode"] = cusRtlCd
-                };
-
-                var result = _dbHelper.WebSessBean(query, parameters)
-                             as List<Dictionary<string, object>>;
-
-                if (result != null && result.Count > 0)
-                    return Ok(result);
-
-                return NotFound("Retailer details not found.");
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        // GET /api/PersonalVisit/getPurchaserRetailerTypes
-        [HttpGet("getPurchaserRetailerTypes")]
-        public IActionResult GetPurchaserRetailerTypes()
-        {
-            try
-            {
-                var typeDescriptions = new Dictionary<string, string>
-                {
-                    { "C",  "Stockiest/Urban Stockiest" },
-                    { "D",  "Direct Dealer" },
-                    { "RD", "Rural Stockiest" },
-                    { "R",  "Retailer" },
-                    { "RR", "Rural Retailer" },
-                    { "07", "Registered Applicator" },
-                    { "08", "Painter" }
-                };
-
-                var types = typeDescriptions
-                    .Select(kvp => new { Code = kvp.Key, Description = kvp.Value })
-                    .ToList();
-
-                return Ok(types);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        // GET /api/PersonalVisit/getAreaCodes
-        [HttpGet("getAreaCodes")]
-        public IActionResult GetAreaCodes()
-        {
-            try
-            {
-                const string query = "SELECT DISTINCT areaCode AS AreaCode FROM dbo.rtmRetailer;";
-                var result = _dbHelper.WebSessBean(query, new Dictionary<string, object>())
-                             as List<Dictionary<string, object>>;
-
-                if (result != null && result.Count > 0)
-                {
-                    var areaCodeMapping = new Dictionary<string, string>
-                    {
-                        { "AGR", "Agra" },
-                        { "AHC", "Ahmedabad City" },
-                        { "AHD", "Ahmedabad Depot" },
-                        { "AHM", "Ahmedabad HO" },
-                        { "AJM", "Ajmer" },
-                        { "AKL", "Akola" },
-                        { "ALH", "Aligarh" },
-                        { "ALW", "Alwar" },
-                        { "AMB", "Ambala" },
-                        { "AMK", "Amritsar" },
-                        { "AMR", "Amravati" },
-                        { "ANA", "Anand" },
-                        { "AUR", "Aurangabad" },
-                        { "AZM", "Azamgarh" },
-                        { "BAL", "Balasore" },
-                        { "BBY", "Mumbai (Bombay)" },
-                        { "BER", "Berhampur" },
-                        { "BG3", "Birla White Gwalior Unit 3" },
-                        { "BG4", "Birla White Gwalior Unit 4" },
-                        { "BGL", "Bengaluru" },
-                        { "BGP", "Bhagalpur" },
-                        { "BHA", "Bhavnagar" },
-                        { "BHG", "Bhagalpur Depot" },
-                        { "BHO", "Bhopal" },
-                        { "BHV", "Bhavnagar Depot" },
-                        { "BIK", "Bikaner" },
-                        { "BIL", "Bilaspur" },
-                        { "BRL", "Bareilly" },
-                        { "CAL", "Kolkata (Calcutta)" },
-                        { "CAS", "Cochin Area Sales" },
-                        { "CBT", "Coimbatore" },
-                        { "CCT", "Cuttack" },
-                        { "CHA", "Chandigarh" },
-                        { "CHH", "Chhindwara" },
-                        { "CHN", "Chennai" },
-                        { "CHT", "Chittorgarh" },
-                        { "CLU", "Calicut" },
-                        { "COC", "Cochin" },
-                        { "CTK", "Cuttack Depot" },
-                        { "DAD", "Dadar" },
-                        { "DAL", "Daltonganj" },
-                        { "DAV", "Davangere" },
-                        { "DEH", "Dehradun" },
-                        { "DEL", "Delhi Depot" },
-                        { "DEO", "Deoghar" },
-                        { "DHA", "Dhar" },
-                        { "DHR", "Dharwad" },
-                        { "DHU", "Dhule" },
-                        { "DLC", "Delhi Cantt" },
-                        { "DLE", "Daltonganj Depot" },
-                        { "DLS", "Dalsinghsarai" },
-                        { "DLW", "Delhi West" },
-                        { "DUR", "Durg" },
-                        { "EXE", "Export East Division" },
-                        { "EXN", "Export North Division" },
-                        { "EXR", "Export Region" },
-                        { "EXT", "Export Territory" },
-                        { "FAI", "Faizabad" },
-                        { "FAR", "Faridabad" },
-                        { "GAN", "Ganganagar" },
-                        { "GAZ", "Ghaziabad" },
-                        { "GNA", "Gandhinagar" },
-                        { "GOA", "Goa" },
-                        { "GOD", "Godhra" },
-                        { "GOR", "Gorakhpur" },
-                        { "GRG", "Gurgaon" },
-                        { "GUL", "Gulbarga" },
-                        { "GUN", "Guntur" },
-                        { "GUW", "Guwahati Depot" },
-                        { "GWA", "Gwalior Depot" },
-                        { "GYA", "Gaya" },
-                        { "HAM", "Hamirpur" },
-                        { "HAN", "Hansi" },
-                        { "HIM", "Himmatnagar" },
-                        { "HUB", "Hubli" },
-                        { "HY2", "Hyderabad Depot 2" },
-                        { "HY3", "Hyderabad Depot 3" },
-                        { "HYD", "Hyderabad Depot" },
-                        { "IND", "Indore" },
-                        { "ITA", "Itarsi" },
-                        { "JAB", "Jabalpur" },
-                        { "JAG", "Jagdalpur" },
-                        { "JAL", "Jalandhar" },
-                        { "JAM", "Jamnagar" },
-                        { "JDP", "Jodhpur Depot" },
-                        { "JHA", "Jhansi" },
-                        { "JMU", "Jammu" },
-                        { "JNA", "Junagadh" },
-                        { "JOR", "Jorhat" },
-                        { "JPR", "Jaipur Depot" },
-                        { "JYP", "Jaypore" },
-                        { "KAN", "Kanpur" },
-                        { "KGR", "Kangra" },
-                        { "KHM", "Khammam" },
-                        { "KLH", "Kolhapur" },
-                        { "KNL", "Kurnool" },
-                        { "KOL", "Kolkata Depot" },
-                        { "KOT", "Kota" },
-                        { "KRI", "Krishna" },
-                        { "KTM", "Katni" },
-                        { "LAK", "Lucknow Depot" },
-                        { "LDH", "Ludhiana" },
-                        { "LKH", "Lakhimpur" },
-                        { "LKU", "Lalkuan" },
-                        { "MAL", "Malda" },
-                        { "MD2", "Mumbai Depot 2" },
-                        { "MDR", "Mandsaur" },
-                        { "MDS", "Madurai" },
-                        { "MEE", "Meerut" },
-                        { "MEH", "Mehsana" },
-                        { "MGL", "Mangalore" },
-                        { "MHB", "Mahbubnagar" },
-                        { "MHL", "Mahoba" },
-                        { "MMN", "Mominpura" },
-                        { "MOB", "Mumbai Suburban Depot" },
-                        { "MOR", "Moradabad" },
-                        { "MOT", "Motihari" },
-                        { "MRD", "Muradabad Depot" },
-                        { "MTH", "Mathura" },
-                        { "MUZ", "Muzaffarpur" },
-                        { "MYS", "Mysuru" },
-                        { "NEL", "Nellore" },
-                        { "NGP", "Nagpur Depot" },
-                        { "NIM", "Nimbahera" },
-                        { "NIZ", "Nizamabad" },
-                        { "NND", "Nanded" },
-                        { "NOI", "Noida Depot" },
-                        { "NSK", "Nashik" },
-                        { "ORA", "Orai" },
-                        { "PAC", "Pachora" },
-                        { "PAL", "Palanpur" },
-                        { "PAN", "Panipat" },
-                        { "PAT", "Patna Depot" },
-                        { "PCM", "Pachmarhi" },
-                        { "PNA", "Patan" },
-                        { "PNV", "Purnia" },
-                        { "PNY", "Pondicherry" },
-                        { "PON", "Ponneri" },
-                        { "PTL", "Patiala" },
-                        { "RAI", "Raipur Depot" },
-                        { "RAN", "Ranchi Depot" },
-                        { "RAT", "Ratlam" },
-                        { "RAU", "Rau" },
-                        { "RDP", "Raigarh" },
-                        { "REW", "Rewa" },
-                        { "RGD", "Rajgir" },
-                        { "RGR", "Raigarh Depot" },
-                        { "RJT", "Rajkot" },
-                        { "RNE", "Rohtak North East" },
-                        { "ROH", "Rohtak" },
-                        { "RRK", "Rourkela" },
-                        { "RTK", "Rohtak Depot" },
-                        { "SAG", "Sagar" },
-                        { "SAH", "Saharanpur" },
-                        { "SAT", "Satna" },
-                        { "SBL", "Sambalpur" },
-                        { "SGO", "Singrauli" },
-                        { "SHA", "Shahjahanpur" },
-                        { "SHI", "Shimla" },
-                        { "SHR", "Shirpur" },
-                        { "SIK", "Sikar" },
-                        { "SIW", "Siwan" },
-                        { "SL2", "Siliguri Depot 2" },
-                        { "SLG", "Siliguri" },
-                        { "SLM", "Salem" },
-                        { "SMP", "Samastipur" },
-                        { "SOL", "Solapur" },
-                        { "SRI", "Sri Ganganagar" },
-                        { "SRM", "Srirangam" },
-                        { "SRT", "Surat" },
-                        { "TAN", "Tanuku" },
-                        { "THN", "Thane" },
-                        { "THR", "Thiruvananthapuram" },
-                        { "TIR", "Tirupati" },
-                        { "TMK", "Tumkur" },
-                        { "TRI", "Tripura" },
-                        { "TRU", "Trichy" },
-                        { "TRV", "Trivandrum Depot" },
-                        { "UDP", "Udaipur" },
-                        { "VAD", "Vadodara" },
-                        { "VAL", "Valsad" },
-                        { "VAR", "Varanasi Depot" },
-                        { "VEL", "Vellore" },
-                        { "VZG", "Visakhapatnam Depot" },
-                        { "WAR", "Warangal" }
-                    };
-
-                    var areaCodes = result.Select(r => new
-                    {
-                        Code = r["AreaCode"].ToString(),
-                        Name = areaCodeMapping.ContainsKey(r["AreaCode"].ToString())
-                            ? areaCodeMapping[r["AreaCode"].ToString()]
-                            : r["AreaCode"].ToString()
-                    }).ToList();
-
-                    return Ok(areaCodes);
-                }
-
-                return NotFound("No Area Codes found.");
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        // GET /api/PersonalVisit/getCodeSearch?areaCode=...&purchaserRetailerType=...
-        [HttpGet("getCodeSearch")]
-        public IActionResult GetCodeSearch([FromQuery] string areaCode, [FromQuery] string purchaserRetailerType)
-        {
-            if (string.IsNullOrWhiteSpace(areaCode) || string.IsNullOrWhiteSpace(purchaserRetailerType))
-                return BadRequest("Area Code and Purchaser/Retailer Type are required.");
-
-            try
-            {
-                var codes = new List<string>();
-
-                // 1) historical codes
-                const string histSql = @"
-SELECT DISTINCT d.cusRtlCd AS CodeSearch
-  FROM dbo.dptDSRinOut d
-  JOIN dbo.rtmRetailer r ON d.cusRtlCd = r.retlCode
- WHERE r.areaCode = @AreaCode
-   AND d.cusRtlFl = @PurchaserRetailerType;";
-
-                var histParams = new Dictionary<string, object>
-                {
-                    ["@AreaCode"] = areaCode,
-                    ["@PurchaserRetailerType"] = purchaserRetailerType
-                };
-
-                var histRes = _dbHelper.WebSessBean(histSql, histParams)
-                              as List<Dictionary<string, object>>;
-
-                if (histRes?.Count > 0)
-                    codes.AddRange(histRes.Select(r => r["CodeSearch"]?.ToString()));
-
-                // 2) active customers or retailers
-                string activeSql;
-                if (new[] { "C", "D", "RD", "AD", "UR" }.Contains(purchaserRetailerType))
-                {
-                    activeSql = @"
-SELECT DISTINCT custCode AS CodeSearch 
-  FROM dbo.dpmCustomer WITH (NOLOCK)
- WHERE areaCode = @AreaCode
-   AND isActive = 'Y';";
-                }
-                else // "R" or "RR"
-                {
-                    activeSql = @"
-SELECT DISTINCT retlCode AS CodeSearch
-  FROM dbo.rtmRetailer
- WHERE areaCode = @AreaCode
-   AND isActive = 'Y';";
-                }
-
-                var activeRes = _dbHelper.WebSessBean(activeSql, histParams)
-                              as List<Dictionary<string, object>>;
-
-                if (activeRes?.Count > 0)
-                    codes.AddRange(activeRes.Select(r => r["CodeSearch"]?.ToString()));
-
-                codes = codes.Distinct().ToList();
-
-                if (codes.Count > 0)
-                    return Ok(codes);
-
-                return NotFound("No Code Search results found.");
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        // POST /api/PersonalVisit/DsrVisit
-        [HttpPost("DsrVisit")]
-        public async Task<IActionResult> DsrVisit([FromBody] DsrRequest dto)
-        {
-            var userId = User.Identity?.Name ?? "UNKNOWN";
+            if (dto == null || string.IsNullOrWhiteSpace(dto.ProcType))
+                return BadRequest("Invalid request payload.");
 
             try
             {
                 if (dto.ProcType == "A")
                 {
-                    // INSERT header
-                    const string insertActvtSql = @"INSERT INTO dptDSRActvt
- (docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl,
-  areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04,
-  dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
-  deptCode, statFlag, createId, createDt, isTilRtl, tileStck)
-VALUES
- (@DocuNumb, GETDATE(), @OrdExDat, '83', @DsrParam, @CusRtlFl,
-  @AreaCode, @CusRtlCd, @MarketName, @PendIsue, @PndIsuDt, @IsuDetal,
-  @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, @SlWcVlum, @SlWpVlum,
-  @DeptCode, 'N', @CreateId, GETDATE(), @IsTilRtl, @TileStck);";
+                    // generate new document number
+                    dto.DocuNumb = GenerateDocuNumb(dto.AreaCode);
+                    dto.StatFlag = "N";
+                    dto.DsrParTy = "83";
 
-                    var actParams = new Dictionary<string, object>
-                    {
-                        ["@DocuNumb"] = dto.DocuNumb,
-                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
-                        ["@DsrParam"] = dto.DsrParam,
-                        ["@CusRtlFl"] = dto.CusRtlFl,
-                        ["@AreaCode"] = dto.AreaCode,
-                        ["@CusRtlCd"] = dto.CusRtlCd,
-                        ["@MarketName"] = dto.MarketName ?? "",
-                        ["@PendIsue"] = dto.PendIsue ?? "",
-                        ["@PndIsuDt"] = dto.PndIsuDt ?? "",
-                        ["@IsuDetal"] = dto.IsuDetal ?? "",
-                        ["@DsrRem05"] = dto.DsrRem05 ?? "",
-                        ["@BrndSlWc"] = "",           // fill if needed
-                        ["@BrndSlWp"] = "",           // fill if needed
-                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? "",
-                        ["@SlWcVlum"] = dto.SlWcVlum ?? "",
-                        ["@SlWpVlum"] = dto.SlWpVlum ?? "",
-                        ["@DeptCode"] = "DPT001",
-                        ["@CreateId"] = userId,
-                        ["@IsTilRtl"] = dto.IsTilRtl ?? "",
-                        ["@TileStck"] = dto.TileStck
-                    };
-                    _dbHelper.WebSessBean(insertActvtSql, actParams);
+                    // 1) Insert header
+                    const string insertH = @"
+                        INSERT INTO dptDSRActvt
+                          (docuNumb, docuDate, dsrParTy, dsrParam, cusRtlFl, areaCode,
+                           cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
+                           dsrRem06, dsrRem07, dsrRem08, dsrRem09, district, deptCode,
+                           statFlag, createId, createDt, locaCapr, latitute, lgtitute,
+                           pinCodeN, cityName, cstBisTy, cuRtType)
+                        VALUES
+                          (@DocuNumb, @DocuDate, @DsrParTy, @DsrParam, @CusRtlFl, @AreaCode,
+                           @CusRtlCd, @DsrRem01, @DsrRem02, @DsrRem03, @DsrRem04, @DsrRem05,
+                           @DsrRem06, @DsrRem07, @DsrRem08, @DsrRem09, @District, @DeptCode,
+                           @StatFlag, @CreateId, GETDATE(), @LocaCapr, @Latitute, @Lgtitute,
+                           @PinCodeN, @CityName, @CstBisTy, @CuRtType)";
+                    _db.Execute(insertH, dto);
 
-                    // INSERT orders
-                    if (dto.Orders?.Count > 0)
-                    {
-                        const string insertDtlSql = @"
-INSERT INTO dptDSRActvtDtl
- (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty,
-  actnRemk, targetDt, statFlag, createId, createDt)
-VALUES
- (@DocuNumb, @DocuSrNo, @RepoCatg, @ProdQnty, @ProjQnty,
-  @ActnRemk, @TargetDt, 'N', @CreateId, GETDATE());";
-
-                        int srNo = 1;
-                        foreach (var o in dto.Orders)
-                        {
-                            var p = new Dictionary<string, object>
-                            {
-                                ["@DocuNumb"] = dto.DocuNumb,
-                                ["@DocuSrNo"] = srNo++,
-                                ["@RepoCatg"] = o.RepoCatg,
-                                ["@ProdQnty"] = o.ProdQnty,
-                                ["@ProjQnty"] = o.ProjQnty,
-                                ["@ActnRemk"] = o.ActnRemk,
-                                ["@TargetDt"] = o.TargetDt ?? (object)DBNull.Value,
-                                ["@CreateId"] = userId
-                            };
-                            _dbHelper.WebSessBean(insertDtlSql, p);
-                        }
-                    }
-
-                    // INSERT gifts
-                    if (dto.Gifts?.Count > 0)
-                    {
-                        const string insertGiftSql = @"
-INSERT INTO dptGiftDist
- (docuNumb, areaCode, custCode, mrtlCode, isueQnty,
-  statFlag, createId, createDt)
-VALUES
- (@DocuNumb, @AreaCode, @CustCode, @MrtlCode, @IsueQnty,
-  'N', @CreateId, GETDATE());";
-
-                        foreach (var g in dto.Gifts)
-                        {
-                            var gp = new Dictionary<string, object>
-                            {
-                                ["@DocuNumb"] = dto.DocuNumb,
-                                ["@AreaCode"] = dto.AreaCode,
-                                ["@CustCode"] = dto.CusRtlCd,
-                                ["@MrtlCode"] = g.MrtlCode,
-                                ["@IsueQnty"] = g.IsueQnty,
-                                ["@CreateId"] = userId
-                            };
-                            _dbHelper.WebSessBean(insertGiftSql, gp);
-                        }
-                    }
+                    // 2) Insert dynamic lists
+                    InsertDetailList(dto);
                 }
                 else if (dto.ProcType == "U")
                 {
-                    const string updateSql = @"
-UPDATE dptDSRActvt
-   SET ordExDat   = @OrdExDat,
-       dsrParam   = @DsrParam,
-       cusRtlFl   = @CusRtlFl,
-       areaCode   = @AreaCode,
-       cusRtlCd   = @CusRtlCd,
-       dsrRem01   = @MarketName,
-       dsrRem02   = @PendIsue,
-       dsrRem03   = @PndIsuDt,
-       dsrRem04   = @IsuDetal,
-       dsrRem05   = @DsrRem05,
-       dsrRem08   = @PrtDsCnt,
-       dsrRem09   = @SlWcVlum,
-       dsrRem10   = @SlWpVlum,
-       latitute   = @GeoLatit,
-       lgtitute   = @GeoLongt,
-       tileStck   = @TileStck,
-       updateId   = @UpdateId,
-       updateDt   = GETDATE()
- WHERE docuNumb = @DocuNumb;";
+                    // 1) Update header
+                    const string updateH = @"
+                        UPDATE dptDSRActvt
+                           SET dsrParTy  = @DsrParTy,
+                               dsrParam  = @DsrParam,
+                               docuDate  = @DocuDate,
+                               cusRtlFl  = @CusRtlFl,
+                               cusRtlCd  = @CusRtlCd,
+                               dsrRem01  = @DsrRem01,
+                               dsrRem02  = @DsrRem02,
+                               dsrRem03  = @DsrRem03,
+                               dsrRem04  = @DsrRem04,
+                               dsrRem05  = @DsrRem05,
+                               dsrRem06  = @DsrRem06,
+                               dsrRem07  = @DsrRem07,
+                               dsrRem08  = @DsrRem08,
+                               dsrRem09  = @DsrRem09,
+                               district  = @District,
+                               pinCodeN  = @PinCodeN,
+                               cityName  = @CityName,
+                               areaCode  = @AreaCode,
+                               cuRtType  = @CuRtType,
+                               updateId  = @UpdateId,
+                               updateDt  = GETDATE()
+                         WHERE docuNumb = @DocuNumb";
+                    _db.Execute(updateH, dto);
 
-                    var up = new Dictionary<string, object>
-                    {
-                        ["@DocuNumb"] = dto.DocuNumb,
-                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
-                        ["@DsrParam"] = dto.DsrParam,
-                        ["@CusRtlFl"] = dto.CusRtlFl,
-                        ["@AreaCode"] = dto.AreaCode,
-                        ["@CusRtlCd"] = dto.CusRtlCd,
-                        ["@MarketName"] = dto.MarketName ?? "",
-                        ["@PendIsue"] = dto.PendIsue ?? "",
-                        ["@PndIsuDt"] = dto.PndIsuDt ?? "",
-                        ["@IsuDetal"] = dto.IsuDetal ?? "",
-                        ["@DsrRem05"] = dto.DsrRem05 ?? "",
-                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? "",
-                        ["@SlWcVlum"] = dto.SlWcVlum ?? "",
-                        ["@SlWpVlum"] = dto.SlWpVlum ?? "",
-                        ["@GeoLatit"] = dto.GeoLatit ?? "",
-                        ["@GeoLongt"] = dto.GeoLongt ?? "",
-                        ["@TileStck"] = dto.TileStck,
-                        ["@UpdateId"] = userId
-                    };
-                    _dbHelper.WebSessBean(updateSql, up);
+                    // 2) Delete old lines + re-insert
+                    _db.Execute("DELETE FROM dptDSRActvtDtl WHERE docuNumb = @DocuNumb", dto);
+                    InsertDetailList(dto);
                 }
-                else if (dto.ProcType == "D")
+                else
                 {
-                    const string deleteSql = @"DELETE FROM dptDSRActvt WHERE docuNumb = @DocuNumb;";
-                    _dbHelper.WebSessBean(deleteSql, new Dictionary<string, object>
-                    {
-                        ["@DocuNumb"] = dto.DocuNumb
-                    });
+                    return BadRequest("Unknown ProcType");
                 }
 
-                return Ok(new { success = true });
-            }
-            catch (SqlException ex)
-            {
-                return StatusCode(StatusCodes.Status500InternalServerError,
-                    new { success = false, error = "Database connection error: " + ex.Message });
+                return Ok(new
+                {
+                    success = true,
+                    message = dto.ProcType == "A"
+                        ? $"Document saved with {dto.DocuNumb}"
+                        : $"Document {dto.DocuNumb} updated"
+                });
             }
             catch (Exception ex)
             {
-                return StatusCode(StatusCodes.Status500InternalServerError,
-                    new { success = false, error = ex.Message });
+                return StatusCode(500, ex.Message);
             }
         }
 
-        // GET /api/PersonalVisit/DsrVisit?procType=…&docuNumb=…
-        [HttpGet("DsrVisit")]
-        public IActionResult GetDsrVisit(
-            [FromQuery][Required] string procType,
-            [FromQuery][Required] string docuNumb)
+        private void InsertDetailList(DsrActivityDto dto)
         {
-            if (string.IsNullOrWhiteSpace(procType) || string.IsNullOrWhiteSpace(docuNumb))
-                return BadRequest("procType and docuNumb are required.");
+            const string insLine = @"
+                INSERT INTO dptDSRActvtDtl
+                  (docuNumb, docuSrNo, repoCatg, catgPack, prodQnty, projQnty, actnRemk, targetDt, mrktData, statFlag, createId, createDt)
+                VALUES
+                  (@DocuNumb, @SrNo,     @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty, @ActnRemk, @TargetDt, @MrktData, @StatFlag, @CreateId, GETDATE())";
 
-            try
+            int idx = 1;
+            foreach (var d in dto.ActivityDetails)
             {
-                const string hdrSql = @"
-SELECT 
-    procType, docuNumb, dsrParam, cusRtlFl, areaCode, cusRtlCd,
-    dsrRem05 AS DsrRem05,
-    dsrRem01 AS MarketName, dsrRem02 AS PendIsue, dsrRem03 AS PndIsuDt, dsrRem04 AS IsuDetal,
-    wcErlSlb, wpErlSlb, vpErlSlb,
-    bwStkWcc, bwStkWcp, bwStkVap,
-    dsrRem09 AS SlWcVlum, dsrRem10 AS SlWpVlum,
-    ordExDat, dsrRem05, geoLatit, geoLongt,
-    isTilRtl, tileStck
-  FROM dbo.dptDSRActvt
- WHERE procType = @procType
-   AND docuNumb = @docuNumb;";
-
-                var hdrParams = new Dictionary<string, object>
-                {
-                    ["@procType"] = procType,
-                    ["@docuNumb"] = docuNumb
-                };
-
-                var hdrRs = _dbHelper.WebSessBean(hdrSql, hdrParams)
-                             as List<Dictionary<string, object>>;
-                if (hdrRs == null || hdrRs.Count == 0)
-                    return NotFound("DSR visit not found.");
-
-                var h = hdrRs[0];
-                var baseParams = new Dictionary<string, object> { ["@docuNumb"] = docuNumb };
-
-                // orders (mrktData='05')
-                var orders = (_dbHelper.WebSessBean(@"
-SELECT repoCatg, prodQnty, projQnty, actnRemk, targetDt
-  FROM dbo.dptDSRActvtDtl
- WHERE docuNumb = @docuNumb
-   AND mrktData = '05'
- ORDER BY docuSrNo;", baseParams)
-                    as List<Dictionary<string, object>>)
-                    ?.Select(r => new DsrRequest.OrderDto
-                    {
-                        RepoCatg = r["repoCatg"].ToString()!,
-                        ProdQnty = Convert.ToDecimal(r["prodQnty"]!),
-                        ProjQnty = Convert.ToDecimal(r["projQnty"]!),
-                        ActnRemk = r["actnRemk"].ToString()!,
-                        TargetDt = r["targetDt"] == null
-                                       ? (DateTime?)null
-                                       : Convert.ToDateTime(r["targetDt"])
-                    })
-                    .ToList() ?? new List<DsrRequest.OrderDto>();
-
-                // market SKUs (mrktData='06')
-                var skus = (_dbHelper.WebSessBean(@"
-SELECT repoCatg, prodQnty, projQnty, actnRemk
-  FROM dbo.dptDSRActvtDtl
- WHERE docuNumb = @docuNumb
-   AND mrktData = '06'
- ORDER BY docuSrNo;", baseParams)
-                   as List<Dictionary<string, object>>)
-                   ?.Select(r => new DsrRequest.MarketSkuDto
-                   {
-                       BranName = r["repoCatg"].ToString()!,
-                       PrdCodMk = r["prodQnty"].ToString()!,
-                       BPriceVl = Convert.ToDecimal(r["projQnty"]!),
-                       CPriceVl = Convert.ToDecimal(r["actnRemk"]!)
-                   })
-                   .ToList() ?? new List<DsrRequest.MarketSkuDto>();
-
-                // gifts (mrktData='07')
-                var gifts = (_dbHelper.WebSessBean(@"
-SELECT repoCatg, prodQnty
-  FROM dbo.dptDSRActvtDtl
- WHERE docuNumb = @docuNumb
-   AND mrktData = '07'
- ORDER BY docuSrNo;", baseParams)
-                    as List<Dictionary<string, object>>)
-                    ?.Select(r => new DsrRequest.GiftDto
-                    {
-                        MrtlCode = r["repoCatg"].ToString()!,
-                        IsueQnty = Convert.ToDecimal(r["prodQnty"]!)
-                    })
-                    .ToList() ?? new List<DsrRequest.GiftDto>();
-
-                // map into DTO
-                var dto = new DsrRequest
-                {
-                    ProcType = h["procType"].ToString()!,
-                    DocuNumb = h["docuNumb"].ToString()!,
-                    DsrParam = h["dsrParam"].ToString()!,
-                    CusRtlFl = h["cusRtlFl"].ToString()!,
-                    AreaCode = h["areaCode"].ToString()!,
-                    CusRtlCd = h["cusRtlCd"].ToString()!,
-                    ReportDate = h["ordExDat"] == null
-                                   ? DateTime.Now
-                                   : Convert.ToDateTime(h["ordExDat"]),
-                    MarketName = h["MarketName"].ToString()!,
-                    PrtDsCnt = h["PrtDsCnt"].ToString()!,
-                    PendIsue = h["PendIsue"].ToString()!,
-                    PndIsuDt = h["PndIsuDt"].ToString()!,
-                    IsuDetal = h["IsuDetal"].ToString()!,
-
-                    WcErlSlb = Convert.ToDecimal(h["wcErlSlb"]!),
-                    WpErlSlb = Convert.ToDecimal(h["wpErlSlb"]!),
-                    VpErlSlb = Convert.ToDecimal(h["vpErlSlb"]!),
-
-                    BwStkWcc = Convert.ToDecimal(h["bwStkWcc"]!),
-                    BwStkWcp = Convert.ToDecimal(h["bwStkWcp"]!),
-                    BwStkVap = Convert.ToDecimal(h["bwStkVap"]!),
-
-                    SlWcVlum = h["SlWcVlum"].ToString(),
-                    SlWpVlum = h["SlWpVlum"].ToString(),
-
-                    OrdExDat = h["ordExDat"] == null
-                                   ? (DateTime?)null
-                                   : Convert.ToDateTime(h["ordExDat"]),
-
-                    DsrRem05 = h["DsrRem05"].ToString(),
-                    GeoLatit = h["geoLatit"].ToString(),
-                    GeoLongt = h["geoLongt"].ToString(),
-                    IsTilRtl = h["isTilRtl"].ToString(),
-                    TileStck = Convert.ToDecimal(h["tileStck"]!),
-
-                    Orders = orders,
-                    MarketSkus = skus,
-                    Gifts = gifts
-                };
-
-                return Ok(dto);
+                d.DocuNumb = dto.DocuNumb;
+                d.SrNo = idx++;
+                d.CreateId = dto.CreateId;
+                d.StatFlag = dto.StatFlag;
+                d.MrktData = null;  // or “01” for market entries
+                _db.Execute(insLine, d);
             }
-            catch (Exception ex)
+
+            foreach (var m in dto.MarketSkus)
             {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
+                m.DocuNumb = dto.DocuNumb;
+                m.SrNo = idx++;
+                m.CreateId = dto.CreateId;
+                m.StatFlag = dto.StatFlag;
+                m.MrktData = "01";
+                _db.Execute(insLine, m);
+            }
+
+            foreach (var g in dto.Gifts)
+            {
+                g.DocuNumb = dto.DocuNumb;
+                g.SrNo = idx++;
+                g.CreateId = dto.CreateId;
+                g.StatFlag = dto.StatFlag;
+                g.MrktData = null;
+                _db.Execute(insLine, g);
             }
         }
 
-        // GET /api/PersonalVisit/getVisitPage?loginId=...
-        [HttpGet("getVisitPage")]
-        public IActionResult GetVisitPage([FromQuery] string loginId)
-        {
-            if (string.IsNullOrEmpty(loginId))
-                return BadRequest("Login ID is required.");
+        private string GenerateDocuNumb(string areaCode)
+            => $"{DateTime.UtcNow:yyMMddHHmmss}-{areaCode}".ToUpper();
+    }
 
-            try
-            {
-                // 1) get role
-                const string roleQuery = @"
-SELECT TOP 1 roleCode
-  FROM wcmEmplRole
- WHERE loginIdM = @LoginId
-   AND isActive = 'Y';";
+    // DTOs to bind all dynamic‐fields lists
+    public class DsrActivityDto
+    {
+        public string ProcType { get; set; }    // “A” or “U”
+        public string DocuType { get; set; } = "DSR";
+        public string DocuNumb { get; set; }
+        public DateTime DocuDate { get; set; }
+        public string DsrParTy { get; set; }
+        public string DsrParam { get; set; }
+        public string CusRtlFl { get; set; }
+        public string AreaCode { get; set; }
+        public string CusRtlCd { get; set; }
+        public string DsrRem01 { get; set; }
+        public string DsrRem02 { get; set; }
+        public string DsrRem03 { get; set; }
+        public string DsrRem04 { get; set; }
+        public string DsrRem05 { get; set; }
+        public string DsrRem06 { get; set; }
+        public string DsrRem07 { get; set; }
+        public string DsrRem08 { get; set; }
+        public string DsrRem09 { get; set; }
+        public string District { get; set; }
+        public string DeptCode { get; set; }
+        public string StatFlag { get; set; }
+        public string CreateId { get; set; }
+        public string UpdateId { get; set; }
+        public string LocaCapr { get; set; }
+        public string Latitute { get; set; }
+        public string Lgtitute { get; set; }
+        public string PinCodeN { get; set; }
+        public string CityName { get; set; }
+        public string CstBisTy { get; set; }
+        public string CuRtType { get; set; }
 
-                var roleRes = _dbHelper.WebSessBean(roleQuery, new Dictionary<string, object>
-                {
-                    ["@LoginId"] = loginId
-                }) as List<Dictionary<string, object>>;
+        // dynamic lists from your Flutter form
+        public List<DsrDetailLine> ActivityDetails { get; set; } = new();
+        public List<DsrDetailLine> MarketSkus { get; set; } = new();
+        public List<DsrDetailLine> Gifts { get; set; } = new();
+    }
 
-                var roleCode = (roleRes?.Count > 0)
-                    ? roleRes[0]["roleCode"].ToString()
-                    : null;
-
-                // 2) get page mapping
-                const string pageQuery = @"
-SELECT jspPagId
-  FROM wcmPgJspMas
- WHERE roleCode = @RoleCode
-   AND isActive = 'Y';";
-
-                var pageRes = _dbHelper.WebSessBean(pageQuery, new Dictionary<string, object>
-                {
-                    ["@RoleCode"] = roleCode
-                }) as List<Dictionary<string, object>>;
-
-                if (pageRes?.Any(r => r["jspPagId"].ToString() == "PersonalVisit") == true)
-                    return Ok(new { page = "PersonalVisit" });
-
-                return Ok(new { page = "DSRVisit" });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { error = ex.Message });
-            }
-        }
-
-        // distance calculation helper (in meters)
-        private double CalculateDistance(double lat1, double lon1, double lat2, double lon2)
-        {
-            var radlat1 = Math.PI * lat1 / 180;
-            var radlat2 = Math.PI * lat2 / 180;
-            var theta = lon1 - lon2;
-            var radtheta = Math.PI * theta / 180;
-            var dist = Math.Sin(radlat1) * Math.Sin(radlat2)
-                        + Math.Cos(radlat1) * Math.Cos(radlat2) * Math.Cos(radtheta);
-
-            if (dist > 1) dist = 1;
-            dist = Math.Acos(dist);
-            dist = dist * 180 / Math.PI;
-            dist = dist * 60 * 1.1515;           // miles
-            dist = dist * 1.609344 * 1000;       // convert to meters
-
-            return dist;
-        }
+    public class DsrDetailLine
+    {
+        public string DocuNumb { get; set; }
+        public int SrNo { get; set; }
+        public string RepoCatg { get; set; }
+        public string CatgPack { get; set; }
+        public decimal ProdQnty { get; set; }
+        public decimal ProjQnty { get; set; }
+        public string ActnRemk { get; set; }
+        public DateTime? TargetDt { get; set; }
+        public string MrktData { get; set; }   // null or “01”
+        public string StatFlag { get; set; }
+        public string CreateId { get; set; }
     }
 }
