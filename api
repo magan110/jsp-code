@@ -1,438 +1,910 @@
 using Microsoft.AspNetCore.Mvc;
-
-using Microsoft.AspNetCore.Http;
-
 using sparshWebService.DataAccess;
-
 using System;
-
 using System.Collections.Generic;
-
+using System.Threading.Tasks;
 using System.Linq;
+using Microsoft.AspNetCore.Http;
+using System.Data.SqlClient;
+using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
-namespace MyFirstApi.Controllers
-
+namespace sparshWebService.Controllers
 {
-
-    /// <summary>
-
-    /// DTO carrying only the fields relevant to the chosen activity.
-
-    /// </summary>
-
-    public class DsrEntryDto
-
+    // JSON DATE CONVERTERS
+    public class JsonDateConverter : JsonConverter<DateTime>
     {
+        private const string Format = "dd/MM/yyyy";
+        public override DateTime Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
+            => DateTime.ParseExact(reader.GetString()!, Format, CultureInfo.InvariantCulture);
 
-        public string ActivityType { get; set; }  // e.g. "Office Work"
+        public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions opts)
+            => writer.WriteStringValue(value.ToString(Format));
+    }
 
-        public DateTime SubmissionDate { get; set; }  // → createDt
+    public class JsonNullableDateConverter : JsonConverter<DateTime?>
+    {
+        private const string Format = "dd/MM/yyyy";
+        public override DateTime? Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions opts)
+        {
+            var s = reader.GetString();
+            return string.IsNullOrEmpty(s)
+                ? (DateTime?)null
+                : DateTime.ParseExact(s, Format, CultureInfo.InvariantCulture);
+        }
+        public override void Write(Utf8JsonWriter writer, DateTime? value, JsonSerializerOptions opts)
+            => writer.WriteStringValue(value?.ToString(Format));
+    }
 
-        public DateTime ReportDate { get; set; }  // → docuDate
+    // REQUEST MODEL
+    public class DsrRequest
+    {
+        [Required] public string ProcType { get; set; }
+        [Required] public string DocuNumb { get; set; }
+        [Required] public string DsrParam { get; set; }
+        [Required] public string CusRtlFl { get; set; }
+        [Required] public string AreaCode { get; set; }
+        [Required] public string CusRtlCd { get; set; }
+        public string KycStatus { get; set; }
 
-        public string CreateId { get; set; } = "SYSTEM";
+        [Required]
+        [JsonConverter(typeof(JsonDateConverter))]
+        public DateTime ReportDate { get; set; }
 
-        public string AreaCode { get; set; } = "";
+        public string MarketName { get; set; }
+        public string PrtDsCnt { get; set; }
+        public string PendIsue { get; set; }
+        public string PndIsuDt { get; set; }
+        public string IsuDetal { get; set; }
 
-        public string Purchaser { get; set; } = "";        // cusRtlFl
+        public decimal WcErlSlb { get; set; }
+        public decimal WpErlSlb { get; set; }
+        public decimal VpErlSlb { get; set; }
+        public decimal BwStkWcc { get; set; }
+        public decimal BwStkWcp { get; set; }
+        public decimal BwStkVap { get; set; }
 
-        public string PurchaserCode { get; set; } = "";
+        public string SlWcVlum { get; set; }
+        public string SlWpVlum { get; set; }
+        public string JkAvgWcc { get; set; }
+        public string JkAvgWcp { get; set; }
+        public string AsAvgWcc { get; set; }
+        public string AsAvgWcp { get; set; }
+        public string OtAvgWcc { get; set; }
+        public string OtAvgWcp { get; set; }
 
-        public string dsrRem01 { get; set; }
+        [JsonConverter(typeof(JsonNullableDateConverter))]
+        public DateTime? OrdExDat { get; set; }
 
-        public string dsrRem02 { get; set; }
+        public string DsrRem05 { get; set; }
+        public string GeoLatit { get; set; }
+        public string GeoLongt { get; set; }
+        public string IsTilRtl { get; set; }
+        public decimal TileStck { get; set; }
 
-        public string dsrRem03 { get; set; }
+        // Detail grids
+        public List<OrderDto> Orders { get; set; }
+        public List<MarketSkuDto> MarketSkus { get; set; }
+        public List<GiftDto> Gifts { get; set; }
 
-        public string dsrRem04 { get; set; }
+        public class OrderDto
+        {
+            public string RepoCatg { get; set; }
+            public decimal ProdQnty { get; set; }
+            public decimal ProjQnty { get; set; }
+            public string ActnRemk { get; set; }
+            [JsonConverter(typeof(JsonNullableDateConverter))]
+            public DateTime? TargetDt { get; set; }
+        }
 
-        public string dsrRem05 { get; set; }
+        public class MarketSkuDto
+        {
+            public string BranName { get; set; }
+            public string PrdCodMk { get; set; }
+            public decimal BPriceVl { get; set; }
+            public decimal CPriceVl { get; set; }
+        }
 
-        public string dsrRem06 { get; set; }
+        public class GiftDto
+        {
+            public string MrtlCode { get; set; }
+            public decimal IsueQnty { get; set; }
+        }
+    }
 
-        public string dsrRem07 { get; set; }
+    public class DistanceValidationRequest
+    {
+        public double CustomerLatitude { get; set; }
+        public double CustomerLongitude { get; set; }
+        public double UserLatitude { get; set; }
+        public double UserLongitude { get; set; }
+    }
 
-        public string dsrRem08 { get; set; }
-
-
+    public class LocationRequest
+    {
+        public string CustomerCode { get; set; }
     }
 
     [Route("api/[controller]")]
-
     [ApiController]
-
-    public class DsrTryController : ControllerBase
-
+    public class PersonalVisitController : ControllerBase
     {
+        private readonly DatabaseHelper _dbHelper;
 
-        private readonly DatabaseHelper _db;
-
-        public DsrTryController(DatabaseHelper db) => _db = db;
-
-        [HttpPost]
-
-        [ProducesResponseType(StatusCodes.Status201Created)]
-
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-
-        public IActionResult Submit([FromBody] DsrEntryDto dto)
-
+        public PersonalVisitController(DatabaseHelper dbHelper)
         {
-
-            if (dto == null || string.IsNullOrWhiteSpace(dto.ActivityType))
-
-                return BadRequest("ActivityType is required.");
-
-            var activityMap = new Dictionary<string, (string Prefix, string Param, short ParTy)>(StringComparer.OrdinalIgnoreCase)
-
-            {
-
-                /*
-
-                 * dsrParam = 59
-
-                 * 
-
-                 * 
-
-                 */
-
-                ["Visit to Stockiest(Trade Purchaser) / Retailer"] = ("VSTOPR", "01", 83),
-
-                ["Phone Call with Stockiest / Retailer / Applicator"] = ("PHSRAP", "02", 83),
-
-                ["Site Visit (03)"] = ("SITEVI", "03", 83),
-
-                ["Tele Call"] = ("TELECL", "04", 83),
-
-                ["Personal Visit"] = ("PERSVI", "05", 83),
-
-                ["Architects / Engineers"] = ("ARCHEN", "06", 83),
-
-                ["Sampling"] = ("SAMPLI", "07", 83),
-
-                ["SP Retailer Shop In/Out"] = ("SPRSIO", "08", 83),
-
-                ["Site Visit (11)"] = ("SITEVI", "11", 83),
-
-                ["Phone Call with Builder /Stockist"] = ("PHBUI", "12", 83),
-
-                ["Meetings with Contractor / Stockist"] = ("MECO", "13", 83),
-
-                ["Site Visit (21)"] = ("SITEVI", "21", 83),
-
-                ["Phone Call with Purchaser / Retailer"] = ("PHPURR", "22", 83),
-
-                ["Meeting with IHB / Builder team"] = ("IHEBUI", "23", 83),
-
-                ["Visit to Get / Check Sampling at Site"] = ("CHSMP", "31", 83),
-
-                ["Visited to Stockiest / Retailer"] = ("VSTRTL", "41", 83),
-
-                ["Meeting with New Purchaser(Trade Purchaser) / Retailer"] = ("NEWPUR", "50", 83),
-
-                ["BTL Activities"] = ("BTLACT", "51", 83),
-
-                ["Internal Team Meetings / Review Meetings"] = ("INTTMS", "52", 83),
-
-                ["Office Work"] = ("OFFWOR", "53", 83),
-
-                ["On Leave / Holiday / Off Day"] = ("LEAVEH", "54", 83),
-
-                ["Work From Home"] = ("WFHOME", "55", 83),
-
-                ["Any Other Activity"] = ("ANYOTH", "60", 83),
-
-                ["Phone Call with Unregistered Purchasers"] = ("UNREGPC", "61", 83),
-
-            };
-
-            var match = activityMap.FirstOrDefault(kvp =>
-
-                dto.ActivityType.StartsWith(kvp.Key, StringComparison.OrdinalIgnoreCase));
-
-            if (match.Key == null)
-
-                return BadRequest($"Unknown ActivityType '{dto.ActivityType}'.");
-
-            var meta = match.Value;
-
-            var rawNum = meta.Prefix + DateTime.UtcNow.ToString("yyMMddHHmmss").PadRight(11, '0');
-
-            var docuNumb = rawNum.Substring(0, 16);
-
-            var rem = new string[11];
-
-            for (int i = 1; i <= 10; i++) rem[i] = string.Empty;
-
-            if (dto.ActivityType.StartsWith("Office Work", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Internal Team Meetings", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Meeting with New Purchaser(Trade Purchaser) / Retailer", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-                rem[4] = dto.dsrRem04 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Phone Call with Builder /Stockist", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-                rem[4] = dto.dsrRem04 ?? string.Empty;
-
-                rem[5] = dto.dsrRem05 ?? string.Empty;
-
-                rem[6] = dto.dsrRem06 ?? string.Empty;
-
-                rem[7] = dto.dsrRem07 ?? string.Empty;
-
-                rem[8] = dto.dsrRem08 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Meetings with Contractor / Stockist", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-                rem[4] = dto.dsrRem04 ?? string.Empty;
-
-                rem[5] = dto.dsrRem05 ?? string.Empty;
-
-                rem[6] = dto.dsrRem06 ?? string.Empty;
-
-                rem[7] = dto.dsrRem07 ?? string.Empty;
-
-                rem[8] = dto.dsrRem08 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Visit to Get / Check Sampling at Site", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-                rem[4] = dto.dsrRem04 ?? string.Empty;
-
-                rem[5] = dto.dsrRem05 ?? string.Empty;
-
-                rem[6] = dto.dsrRem06 ?? string.Empty;
-
-                rem[7] = dto.dsrRem07 ?? string.Empty;
-
-                rem[8] = dto.dsrRem08 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("BTL Activities", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-                rem[4] = dto.dsrRem04 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("On Leave / Holiday / Off Day", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Work From Home", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-            }
-
-            else if (dto.ActivityType.StartsWith("Any Other Activity", StringComparison.OrdinalIgnoreCase))
-
-            {
-
-                rem[1] = dto.dsrRem01 ?? string.Empty;
-
-                rem[2] = dto.dsrRem02 ?? string.Empty;
-
-                rem[3] = dto.dsrRem03 ?? string.Empty;
-
-                rem[4] = dto.dsrRem04 ?? string.Empty;
-
-            }
-            const string sql = @"
-
-INSERT INTO dptDSRActvt
-
-  (docuNumb, dsrParam, docuDate,
-
-   cusRtlFl, cusRtlCd,
-
-   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
-
-   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
-
-   deptCode, statFlag,
-
-   createId, createDt,
-
-   updateId, updateDt,
-
-   dsrParTy,
-
-   atchNmId, locaCapr, latitute, lgtitute, cuRtType, areaCode,
-
-   retlStFl, pinCodeN, cityName, district, cstBisTy,
-
-   ordExDat,
-
-   pendWith, ltLgDist, apprRemk, ordInsFl, refOrdNo, isTilRtl,
-
-   tileStck, rtlInTim, rtOutTim)
-
-VALUES
-
-  (@docuNumb, @dsrParam, @reportDate,
-
-   @cusRtlFl, @custRtlCd,
-
-   @r1,@r2,@r3,@r4,@r5,
-
-   @r6,@r7,@r8,@r9,@r10,
-
-   '', '',
-
-   @createId, @submissionDate,
-
-   '', NULL,
-
-   @dsrParTy,
-
-   '', '', '', '', '', @areaCode,
-
-   '', '', '', '', '',
-
-   NULL,
-
-   '', '', '', '', '', '',
-
-   NULL, NULL, NULL);";
-
-            var parameters = new Dictionary<string, object>
-
-            {
-
-                ["@docuNumb"] = docuNumb,
-
-                ["@dsrParam"] = meta.Param,
-
-                ["@reportDate"] = dto.ReportDate,
-
-                ["@cusRtlFl"] = dto.Purchaser,
-
-                ["@custRtlCd"] = dto.PurchaserCode,
-
-                ["@submissionDate"] = dto.SubmissionDate,
-
-                ["@createId"] = dto.CreateId,
-
-                ["@dsrParTy"] = meta.ParTy,
-
-                ["@areaCode"] = dto.AreaCode,
-
-                ["@r1"] = rem[1],
-
-                ["@r2"] = rem[2],
-
-                ["@r3"] = rem[3],
-
-                ["@r4"] = rem[4],
-
-                ["@r5"] = rem[5],
-
-                ["@r6"] = rem[6],
-
-                ["@r7"] = rem[7],
-
-                ["@r8"] = rem[8],
-
-                ["@r9"] = rem[9],
-
-                ["@r10"] = rem[10],
-
-            };
-
-            try
-
-            {
-
-                _db.WebSessBean(sql, parameters);
-
-                return CreatedAtAction(nameof(Submit), new { docuNumb }, dto);
-
-            }
-
-            catch (Exception ex)
-
-            {
-
-                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
-
-            }
-
+            _dbHelper = dbHelper;
         }
 
+        // POST /api/PersonalVisit/validateDistance
+        [HttpPost("validateDistance")]
+        public IActionResult ValidateDistance([FromBody] DistanceValidationRequest request)
+        {
+            if (request == null ||
+                request.CustomerLatitude == 0 ||
+                request.CustomerLongitude == 0 ||
+                request.UserLatitude == 0 ||
+                request.UserLongitude == 0)
+            {
+                return BadRequest("All latitude and longitude values are required.");
+            }
+
+            try
+            {
+                double distance = CalculateDistance(
+                    request.CustomerLatitude,
+                    request.CustomerLongitude,
+                    request.UserLatitude,
+                    request.UserLongitude);
+
+                if (distance <= 500)
+                    return Ok(new { Message = "You are within the allowed distance.", Distance = distance });
+
+                return BadRequest(new { Message = "You are not at the customer's location.", Distance = distance });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        // GET /api/PersonalVisit/fetchRetailerDetails?cusRtlCd=...
+        [HttpGet("fetchRetailerDetails")]
+        public IActionResult FetchRetailerDetails([FromQuery] string cusRtlCd)
+        {
+            if (string.IsNullOrWhiteSpace(cusRtlCd))
+                return BadRequest("Customer/Retailer Code is required.");
+
+            try
+            {
+                const string query = @"
+SELECT retlCode, retlName, latitute, lgtitute
+  FROM bwlive.dbo.rtmRetailer
+ WHERE isActive = 'Y' AND retlCode = @CustomerCode
+UNION ALL
+SELECT custCode, custName, latitute, lgtitute
+  FROM dpmCustomer WITH (NOLOCK)
+ WHERE custCode = @CustomerCode AND isActive = 'Y';";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    ["@CustomerCode"] = cusRtlCd
+                };
+
+                var result = _dbHelper.WebSessBean(query, parameters)
+                             as List<Dictionary<string, object>>;
+
+                if (result != null && result.Count > 0)
+                    return Ok(result);
+
+                return NotFound("Retailer details not found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        // GET /api/PersonalVisit/getPurchaserRetailerTypes
+        [HttpGet("getPurchaserRetailerTypes")]
+        public IActionResult GetPurchaserRetailerTypes()
+        {
+            try
+            {
+                var typeDescriptions = new Dictionary<string, string>
+                {
+                    { "C",  "Stockiest/Urban Stockiest" },
+                    { "D",  "Direct Dealer" },
+                    { "RD", "Rural Stockiest" },
+                    { "R",  "Retailer" },
+                    { "RR", "Rural Retailer" },
+                    { "07", "Registered Applicator" },
+                    { "08", "Painter" }
+                };
+
+                var types = typeDescriptions
+                    .Select(kvp => new { Code = kvp.Key, Description = kvp.Value })
+                    .ToList();
+
+                return Ok(types);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        // GET /api/PersonalVisit/getAreaCodes
+        [HttpGet("getAreaCodes")]
+        public IActionResult GetAreaCodes()
+        {
+            try
+            {
+                const string query = "SELECT DISTINCT areaCode AS AreaCode FROM dbo.rtmRetailer;";
+                var result = _dbHelper.WebSessBean(query, new Dictionary<string, object>())
+                             as List<Dictionary<string, object>>;
+
+                if (result != null && result.Count > 0)
+                {
+                    var areaCodeMapping = new Dictionary<string, string>
+                    {
+                        { "AGR", "Agra" },
+                        { "AHC", "Ahmedabad City" },
+                        { "AHD", "Ahmedabad Depot" },
+                        { "AHM", "Ahmedabad HO" },
+                        { "AJM", "Ajmer" },
+                        { "AKL", "Akola" },
+                        { "ALH", "Aligarh" },
+                        { "ALW", "Alwar" },
+                        { "AMB", "Ambala" },
+                        { "AMK", "Amritsar" },
+                        { "AMR", "Amravati" },
+                        { "ANA", "Anand" },
+                        { "AUR", "Aurangabad" },
+                        { "AZM", "Azamgarh" },
+                        { "BAL", "Balasore" },
+                        { "BBY", "Mumbai (Bombay)" },
+                        { "BER", "Berhampur" },
+                        { "BG3", "Birla White Gwalior Unit 3" },
+                        { "BG4", "Birla White Gwalior Unit 4" },
+                        { "BGL", "Bengaluru" },
+                        { "BGP", "Bhagalpur" },
+                        { "BHA", "Bhavnagar" },
+                        { "BHG", "Bhagalpur Depot" },
+                        { "BHO", "Bhopal" },
+                        { "BHV", "Bhavnagar Depot" },
+                        { "BIK", "Bikaner" },
+                        { "BIL", "Bilaspur" },
+                        { "BRL", "Bareilly" },
+                        { "CAL", "Kolkata (Calcutta)" },
+                        { "CAS", "Cochin Area Sales" },
+                        { "CBT", "Coimbatore" },
+                        { "CCT", "Cuttack" },
+                        { "CHA", "Chandigarh" },
+                        { "CHH", "Chhindwara" },
+                        { "CHN", "Chennai" },
+                        { "CHT", "Chittorgarh" },
+                        { "CLU", "Calicut" },
+                        { "COC", "Cochin" },
+                        { "CTK", "Cuttack Depot" },
+                        { "DAD", "Dadar" },
+                        { "DAL", "Daltonganj" },
+                        { "DAV", "Davangere" },
+                        { "DEH", "Dehradun" },
+                        { "DEL", "Delhi Depot" },
+                        { "DEO", "Deoghar" },
+                        { "DHA", "Dhar" },
+                        { "DHR", "Dharwad" },
+                        { "DHU", "Dhule" },
+                        { "DLC", "Delhi Cantt" },
+                        { "DLE", "Daltonganj Depot" },
+                        { "DLS", "Dalsinghsarai" },
+                        { "DLW", "Delhi West" },
+                        { "DUR", "Durg" },
+                        { "EXE", "Export East Division" },
+                        { "EXN", "Export North Division" },
+                        { "EXR", "Export Region" },
+                        { "EXT", "Export Territory" },
+                        { "FAI", "Faizabad" },
+                        { "FAR", "Faridabad" },
+                        { "GAN", "Ganganagar" },
+                        { "GAZ", "Ghaziabad" },
+                        { "GNA", "Gandhinagar" },
+                        { "GOA", "Goa" },
+                        { "GOD", "Godhra" },
+                        { "GOR", "Gorakhpur" },
+                        { "GRG", "Gurgaon" },
+                        { "GUL", "Gulbarga" },
+                        { "GUN", "Guntur" },
+                        { "GUW", "Guwahati Depot" },
+                        { "GWA", "Gwalior Depot" },
+                        { "GYA", "Gaya" },
+                        { "HAM", "Hamirpur" },
+                        { "HAN", "Hansi" },
+                        { "HIM", "Himmatnagar" },
+                        { "HUB", "Hubli" },
+                        { "HY2", "Hyderabad Depot 2" },
+                        { "HY3", "Hyderabad Depot 3" },
+                        { "HYD", "Hyderabad Depot" },
+                        { "IND", "Indore" },
+                        { "ITA", "Itarsi" },
+                        { "JAB", "Jabalpur" },
+                        { "JAG", "Jagdalpur" },
+                        { "JAL", "Jalandhar" },
+                        { "JAM", "Jamnagar" },
+                        { "JDP", "Jodhpur Depot" },
+                        { "JHA", "Jhansi" },
+                        { "JMU", "Jammu" },
+                        { "JNA", "Junagadh" },
+                        { "JOR", "Jorhat" },
+                        { "JPR", "Jaipur Depot" },
+                        { "JYP", "Jaypore" },
+                        { "KAN", "Kanpur" },
+                        { "KGR", "Kangra" },
+                        { "KHM", "Khammam" },
+                        { "KLH", "Kolhapur" },
+                        { "KNL", "Kurnool" },
+                        { "KOL", "Kolkata Depot" },
+                        { "KOT", "Kota" },
+                        { "KRI", "Krishna" },
+                        { "KTM", "Katni" },
+                        { "LAK", "Lucknow Depot" },
+                        { "LDH", "Ludhiana" },
+                        { "LKH", "Lakhimpur" },
+                        { "LKU", "Lalkuan" },
+                        { "MAL", "Malda" },
+                        { "MD2", "Mumbai Depot 2" },
+                        { "MDR", "Mandsaur" },
+                        { "MDS", "Madurai" },
+                        { "MEE", "Meerut" },
+                        { "MEH", "Mehsana" },
+                        { "MGL", "Mangalore" },
+                        { "MHB", "Mahbubnagar" },
+                        { "MHL", "Mahoba" },
+                        { "MMN", "Mominpura" },
+                        { "MOB", "Mumbai Suburban Depot" },
+                        { "MOR", "Moradabad" },
+                        { "MOT", "Motihari" },
+                        { "MRD", "Muradabad Depot" },
+                        { "MTH", "Mathura" },
+                        { "MUZ", "Muzaffarpur" },
+                        { "MYS", "Mysuru" },
+                        { "NEL", "Nellore" },
+                        { "NGP", "Nagpur Depot" },
+                        { "NIM", "Nimbahera" },
+                        { "NIZ", "Nizamabad" },
+                        { "NND", "Nanded" },
+                        { "NOI", "Noida Depot" },
+                        { "NSK", "Nashik" },
+                        { "ORA", "Orai" },
+                        { "PAC", "Pachora" },
+                        { "PAL", "Palanpur" },
+                        { "PAN", "Panipat" },
+                        { "PAT", "Patna Depot" },
+                        { "PCM", "Pachmarhi" },
+                        { "PNA", "Patan" },
+                        { "PNV", "Purnia" },
+                        { "PNY", "Pondicherry" },
+                        { "PON", "Ponneri" },
+                        { "PTL", "Patiala" },
+                        { "RAI", "Raipur Depot" },
+                        { "RAN", "Ranchi Depot" },
+                        { "RAT", "Ratlam" },
+                        { "RAU", "Rau" },
+                        { "RDP", "Raigarh" },
+                        { "REW", "Rewa" },
+                        { "RGD", "Rajgir" },
+                        { "RGR", "Raigarh Depot" },
+                        { "RJT", "Rajkot" },
+                        { "RNE", "Rohtak North East" },
+                        { "ROH", "Rohtak" },
+                        { "RRK", "Rourkela" },
+                        { "RTK", "Rohtak Depot" },
+                        { "SAG", "Sagar" },
+                        { "SAH", "Saharanpur" },
+                        { "SAT", "Satna" },
+                        { "SBL", "Sambalpur" },
+                        { "SGO", "Singrauli" },
+                        { "SHA", "Shahjahanpur" },
+                        { "SHI", "Shimla" },
+                        { "SHR", "Shirpur" },
+                        { "SIK", "Sikar" },
+                        { "SIW", "Siwan" },
+                        { "SL2", "Siliguri Depot 2" },
+                        { "SLG", "Siliguri" },
+                        { "SLM", "Salem" },
+                        { "SMP", "Samastipur" },
+                        { "SOL", "Solapur" },
+                        { "SRI", "Sri Ganganagar" },
+                        { "SRM", "Srirangam" },
+                        { "SRT", "Surat" },
+                        { "TAN", "Tanuku" },
+                        { "THN", "Thane" },
+                        { "THR", "Thiruvananthapuram" },
+                        { "TIR", "Tirupati" },
+                        { "TMK", "Tumkur" },
+                        { "TRI", "Tripura" },
+                        { "TRU", "Trichy" },
+                        { "TRV", "Trivandrum Depot" },
+                        { "UDP", "Udaipur" },
+                        { "VAD", "Vadodara" },
+                        { "VAL", "Valsad" },
+                        { "VAR", "Varanasi Depot" },
+                        { "VEL", "Vellore" },
+                        { "VZG", "Visakhapatnam Depot" },
+                        { "WAR", "Warangal" }
+                    };
+
+                    var areaCodes = result.Select(r => new
+                    {
+                        Code = r["AreaCode"].ToString(),
+                        Name = areaCodeMapping.ContainsKey(r["AreaCode"].ToString())
+                            ? areaCodeMapping[r["AreaCode"].ToString()]
+                            : r["AreaCode"].ToString()
+                    }).ToList();
+
+                    return Ok(areaCodes);
+                }
+
+                return NotFound("No Area Codes found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        // GET /api/PersonalVisit/getCodeSearch?areaCode=...&purchaserRetailerType=...
+        [HttpGet("getCodeSearch")]
+        public IActionResult GetCodeSearch([FromQuery] string areaCode, [FromQuery] string purchaserRetailerType)
+        {
+            if (string.IsNullOrWhiteSpace(areaCode) || string.IsNullOrWhiteSpace(purchaserRetailerType))
+                return BadRequest("Area Code and Purchaser/Retailer Type are required.");
+
+            try
+            {
+                var codes = new List<string>();
+
+                // 1) historical codes
+                const string histSql = @"
+SELECT DISTINCT d.cusRtlCd AS CodeSearch
+  FROM dbo.dptDSRinOut d
+  JOIN dbo.rtmRetailer r ON d.cusRtlCd = r.retlCode
+ WHERE r.areaCode = @AreaCode
+   AND d.cusRtlFl = @PurchaserRetailerType;";
+
+                var histParams = new Dictionary<string, object>
+                {
+                    ["@AreaCode"] = areaCode,
+                    ["@PurchaserRetailerType"] = purchaserRetailerType
+                };
+
+                var histRes = _dbHelper.WebSessBean(histSql, histParams)
+                              as List<Dictionary<string, object>>;
+
+                if (histRes?.Count > 0)
+                    codes.AddRange(histRes.Select(r => r["CodeSearch"]?.ToString()));
+
+                // 2) active customers or retailers
+                string activeSql;
+                if (new[] { "C", "D", "RD", "AD", "UR" }.Contains(purchaserRetailerType))
+                {
+                    activeSql = @"
+SELECT DISTINCT custCode AS CodeSearch 
+  FROM dbo.dpmCustomer WITH (NOLOCK)
+ WHERE areaCode = @AreaCode
+   AND isActive = 'Y';";
+                }
+                else // "R" or "RR"
+                {
+                    activeSql = @"
+SELECT DISTINCT retlCode AS CodeSearch
+  FROM dbo.rtmRetailer
+ WHERE areaCode = @AreaCode
+   AND isActive = 'Y';";
+                }
+
+                var activeRes = _dbHelper.WebSessBean(activeSql, histParams)
+                              as List<Dictionary<string, object>>;
+
+                if (activeRes?.Count > 0)
+                    codes.AddRange(activeRes.Select(r => r["CodeSearch"]?.ToString()));
+
+                codes = codes.Distinct().ToList();
+
+                if (codes.Count > 0)
+                    return Ok(codes);
+
+                return NotFound("No Code Search results found.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        // POST /api/PersonalVisit/DsrVisit
+        [HttpPost("DsrVisit")]
+        public async Task<IActionResult> DsrVisit([FromBody] DsrRequest dto)
+        {
+            var userId = User.Identity?.Name ?? "UNKNOWN";
+
+            try
+            {
+                if (dto.ProcType == "A")
+                {
+                    // INSERT header
+                    const string insertActvtSql = @"INSERT INTO dptDSRActvt
+ (docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl,
+  areaCode, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04,
+  dsrRem05, dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrRem10,
+  deptCode, statFlag, createId, createDt, isTilRtl, tileStck)
+VALUES
+ (@DocuNumb, GETDATE(), @OrdExDat, '83', @DsrParam, @CusRtlFl,
+  @AreaCode, @CusRtlCd, @MarketName, @PendIsue, @PndIsuDt, @IsuDetal,
+  @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, @SlWcVlum, @SlWpVlum,
+  @DeptCode, 'N', @CreateId, GETDATE(), @IsTilRtl, @TileStck);";
+
+                    var actParams = new Dictionary<string, object>
+                    {
+                        ["@DocuNumb"] = dto.DocuNumb,
+                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
+                        ["@DsrParam"] = dto.DsrParam,
+                        ["@CusRtlFl"] = dto.CusRtlFl,
+                        ["@AreaCode"] = dto.AreaCode,
+                        ["@CusRtlCd"] = dto.CusRtlCd,
+                        ["@MarketName"] = dto.MarketName ?? "",
+                        ["@PendIsue"] = dto.PendIsue ?? "",
+                        ["@PndIsuDt"] = dto.PndIsuDt ?? "",
+                        ["@IsuDetal"] = dto.IsuDetal ?? "",
+                        ["@DsrRem05"] = dto.DsrRem05 ?? "",
+                        ["@BrndSlWc"] = "",           // fill if needed
+                        ["@BrndSlWp"] = "",           // fill if needed
+                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? "",
+                        ["@SlWcVlum"] = dto.SlWcVlum ?? "",
+                        ["@SlWpVlum"] = dto.SlWpVlum ?? "",
+                        ["@DeptCode"] = "DPT001",
+                        ["@CreateId"] = userId,
+                        ["@IsTilRtl"] = dto.IsTilRtl ?? "",
+                        ["@TileStck"] = dto.TileStck
+                    };
+                    _dbHelper.WebSessBean(insertActvtSql, actParams);
+
+                    // INSERT orders
+                    if (dto.Orders?.Count > 0)
+                    {
+                        const string insertDtlSql = @"
+INSERT INTO dptDSRActvtDtl
+ (docuNumb, docuSrNo, repoCatg, prodQnty, projQnty,
+  actnRemk, targetDt, statFlag, createId, createDt)
+VALUES
+ (@DocuNumb, @DocuSrNo, @RepoCatg, @ProdQnty, @ProjQnty,
+  @ActnRemk, @TargetDt, 'N', @CreateId, GETDATE());";
+
+                        int srNo = 1;
+                        foreach (var o in dto.Orders)
+                        {
+                            var p = new Dictionary<string, object>
+                            {
+                                ["@DocuNumb"] = dto.DocuNumb,
+                                ["@DocuSrNo"] = srNo++,
+                                ["@RepoCatg"] = o.RepoCatg,
+                                ["@ProdQnty"] = o.ProdQnty,
+                                ["@ProjQnty"] = o.ProjQnty,
+                                ["@ActnRemk"] = o.ActnRemk,
+                                ["@TargetDt"] = o.TargetDt ?? (object)DBNull.Value,
+                                ["@CreateId"] = userId
+                            };
+                            _dbHelper.WebSessBean(insertDtlSql, p);
+                        }
+                    }
+
+                    // INSERT gifts
+                    if (dto.Gifts?.Count > 0)
+                    {
+                        const string insertGiftSql = @"
+INSERT INTO dptGiftDist
+ (docuNumb, areaCode, custCode, mrtlCode, isueQnty,
+  statFlag, createId, createDt)
+VALUES
+ (@DocuNumb, @AreaCode, @CustCode, @MrtlCode, @IsueQnty,
+  'N', @CreateId, GETDATE());";
+
+                        foreach (var g in dto.Gifts)
+                        {
+                            var gp = new Dictionary<string, object>
+                            {
+                                ["@DocuNumb"] = dto.DocuNumb,
+                                ["@AreaCode"] = dto.AreaCode,
+                                ["@CustCode"] = dto.CusRtlCd,
+                                ["@MrtlCode"] = g.MrtlCode,
+                                ["@IsueQnty"] = g.IsueQnty,
+                                ["@CreateId"] = userId
+                            };
+                            _dbHelper.WebSessBean(insertGiftSql, gp);
+                        }
+                    }
+                }
+                else if (dto.ProcType == "U")
+                {
+                    const string updateSql = @"
+UPDATE dptDSRActvt
+   SET ordExDat   = @OrdExDat,
+       dsrParam   = @DsrParam,
+       cusRtlFl   = @CusRtlFl,
+       areaCode   = @AreaCode,
+       cusRtlCd   = @CusRtlCd,
+       dsrRem01   = @MarketName,
+       dsrRem02   = @PendIsue,
+       dsrRem03   = @PndIsuDt,
+       dsrRem04   = @IsuDetal,
+       dsrRem05   = @DsrRem05,
+       dsrRem08   = @PrtDsCnt,
+       dsrRem09   = @SlWcVlum,
+       dsrRem10   = @SlWpVlum,
+       latitute   = @GeoLatit,
+       lgtitute   = @GeoLongt,
+       tileStck   = @TileStck,
+       updateId   = @UpdateId,
+       updateDt   = GETDATE()
+ WHERE docuNumb = @DocuNumb;";
+
+                    var up = new Dictionary<string, object>
+                    {
+                        ["@DocuNumb"] = dto.DocuNumb,
+                        ["@OrdExDat"] = dto.OrdExDat ?? (object)DBNull.Value,
+                        ["@DsrParam"] = dto.DsrParam,
+                        ["@CusRtlFl"] = dto.CusRtlFl,
+                        ["@AreaCode"] = dto.AreaCode,
+                        ["@CusRtlCd"] = dto.CusRtlCd,
+                        ["@MarketName"] = dto.MarketName ?? "",
+                        ["@PendIsue"] = dto.PendIsue ?? "",
+                        ["@PndIsuDt"] = dto.PndIsuDt ?? "",
+                        ["@IsuDetal"] = dto.IsuDetal ?? "",
+                        ["@DsrRem05"] = dto.DsrRem05 ?? "",
+                        ["@PrtDsCnt"] = dto.PrtDsCnt ?? "",
+                        ["@SlWcVlum"] = dto.SlWcVlum ?? "",
+                        ["@SlWpVlum"] = dto.SlWpVlum ?? "",
+                        ["@GeoLatit"] = dto.GeoLatit ?? "",
+                        ["@GeoLongt"] = dto.GeoLongt ?? "",
+                        ["@TileStck"] = dto.TileStck,
+                        ["@UpdateId"] = userId
+                    };
+                    _dbHelper.WebSessBean(updateSql, up);
+                }
+                else if (dto.ProcType == "D")
+                {
+                    const string deleteSql = @"DELETE FROM dptDSRActvt WHERE docuNumb = @DocuNumb;";
+                    _dbHelper.WebSessBean(deleteSql, new Dictionary<string, object>
+                    {
+                        ["@DocuNumb"] = dto.DocuNumb
+                    });
+                }
+
+                return Ok(new { success = true });
+            }
+            catch (SqlException ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError,
+                    new { success = false, error = "Database connection error: " + ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError,
+                    new { success = false, error = ex.Message });
+            }
+        }
+
+        // GET /api/PersonalVisit/DsrVisit?procType=…&docuNumb=…
+        [HttpGet("DsrVisit")]
+        public IActionResult GetDsrVisit(
+            [FromQuery][Required] string procType,
+            [FromQuery][Required] string docuNumb)
+        {
+            if (string.IsNullOrWhiteSpace(procType) || string.IsNullOrWhiteSpace(docuNumb))
+                return BadRequest("procType and docuNumb are required.");
+
+            try
+            {
+                const string hdrSql = @"
+SELECT 
+    procType, docuNumb, dsrParam, cusRtlFl, areaCode, cusRtlCd,
+    dsrRem05 AS DsrRem05,
+    dsrRem01 AS MarketName, dsrRem02 AS PendIsue, dsrRem03 AS PndIsuDt, dsrRem04 AS IsuDetal,
+    wcErlSlb, wpErlSlb, vpErlSlb,
+    bwStkWcc, bwStkWcp, bwStkVap,
+    dsrRem09 AS SlWcVlum, dsrRem10 AS SlWpVlum,
+    ordExDat, dsrRem05, geoLatit, geoLongt,
+    isTilRtl, tileStck
+  FROM dbo.dptDSRActvt
+ WHERE procType = @procType
+   AND docuNumb = @docuNumb;";
+
+                var hdrParams = new Dictionary<string, object>
+                {
+                    ["@procType"] = procType,
+                    ["@docuNumb"] = docuNumb
+                };
+
+                var hdrRs = _dbHelper.WebSessBean(hdrSql, hdrParams)
+                             as List<Dictionary<string, object>>;
+                if (hdrRs == null || hdrRs.Count == 0)
+                    return NotFound("DSR visit not found.");
+
+                var h = hdrRs[0];
+                var baseParams = new Dictionary<string, object> { ["@docuNumb"] = docuNumb };
+
+                // orders (mrktData='05')
+                var orders = (_dbHelper.WebSessBean(@"
+SELECT repoCatg, prodQnty, projQnty, actnRemk, targetDt
+  FROM dbo.dptDSRActvtDtl
+ WHERE docuNumb = @docuNumb
+   AND mrktData = '05'
+ ORDER BY docuSrNo;", baseParams)
+                    as List<Dictionary<string, object>>)
+                    ?.Select(r => new DsrRequest.OrderDto
+                    {
+                        RepoCatg = r["repoCatg"].ToString()!,
+                        ProdQnty = Convert.ToDecimal(r["prodQnty"]!),
+                        ProjQnty = Convert.ToDecimal(r["projQnty"]!),
+                        ActnRemk = r["actnRemk"].ToString()!,
+                        TargetDt = r["targetDt"] == null
+                                       ? (DateTime?)null
+                                       : Convert.ToDateTime(r["targetDt"])
+                    })
+                    .ToList() ?? new List<DsrRequest.OrderDto>();
+
+                // market SKUs (mrktData='06')
+                var skus = (_dbHelper.WebSessBean(@"
+SELECT repoCatg, prodQnty, projQnty, actnRemk
+  FROM dbo.dptDSRActvtDtl
+ WHERE docuNumb = @docuNumb
+   AND mrktData = '06'
+ ORDER BY docuSrNo;", baseParams)
+                   as List<Dictionary<string, object>>)
+                   ?.Select(r => new DsrRequest.MarketSkuDto
+                   {
+                       BranName = r["repoCatg"].ToString()!,
+                       PrdCodMk = r["prodQnty"].ToString()!,
+                       BPriceVl = Convert.ToDecimal(r["projQnty"]!),
+                       CPriceVl = Convert.ToDecimal(r["actnRemk"]!)
+                   })
+                   .ToList() ?? new List<DsrRequest.MarketSkuDto>();
+
+                // gifts (mrktData='07')
+                var gifts = (_dbHelper.WebSessBean(@"
+SELECT repoCatg, prodQnty
+  FROM dbo.dptDSRActvtDtl
+ WHERE docuNumb = @docuNumb
+   AND mrktData = '07'
+ ORDER BY docuSrNo;", baseParams)
+                    as List<Dictionary<string, object>>)
+                    ?.Select(r => new DsrRequest.GiftDto
+                    {
+                        MrtlCode = r["repoCatg"].ToString()!,
+                        IsueQnty = Convert.ToDecimal(r["prodQnty"]!)
+                    })
+                    .ToList() ?? new List<DsrRequest.GiftDto>();
+
+                // map into DTO
+                var dto = new DsrRequest
+                {
+                    ProcType = h["procType"].ToString()!,
+                    DocuNumb = h["docuNumb"].ToString()!,
+                    DsrParam = h["dsrParam"].ToString()!,
+                    CusRtlFl = h["cusRtlFl"].ToString()!,
+                    AreaCode = h["areaCode"].ToString()!,
+                    CusRtlCd = h["cusRtlCd"].ToString()!,
+                    ReportDate = h["ordExDat"] == null
+                                   ? DateTime.Now
+                                   : Convert.ToDateTime(h["ordExDat"]),
+                    MarketName = h["MarketName"].ToString()!,
+                    PrtDsCnt = h["PrtDsCnt"].ToString()!,
+                    PendIsue = h["PendIsue"].ToString()!,
+                    PndIsuDt = h["PndIsuDt"].ToString()!,
+                    IsuDetal = h["IsuDetal"].ToString()!,
+
+                    WcErlSlb = Convert.ToDecimal(h["wcErlSlb"]!),
+                    WpErlSlb = Convert.ToDecimal(h["wpErlSlb"]!),
+                    VpErlSlb = Convert.ToDecimal(h["vpErlSlb"]!),
+
+                    BwStkWcc = Convert.ToDecimal(h["bwStkWcc"]!),
+                    BwStkWcp = Convert.ToDecimal(h["bwStkWcp"]!),
+                    BwStkVap = Convert.ToDecimal(h["bwStkVap"]!),
+
+                    SlWcVlum = h["SlWcVlum"].ToString(),
+                    SlWpVlum = h["SlWpVlum"].ToString(),
+
+                    OrdExDat = h["ordExDat"] == null
+                                   ? (DateTime?)null
+                                   : Convert.ToDateTime(h["ordExDat"]),
+
+                    DsrRem05 = h["DsrRem05"].ToString(),
+                    GeoLatit = h["geoLatit"].ToString(),
+                    GeoLongt = h["geoLongt"].ToString(),
+                    IsTilRtl = h["isTilRtl"].ToString(),
+                    TileStck = Convert.ToDecimal(h["tileStck"]!),
+
+                    Orders = orders,
+                    MarketSkus = skus,
+                    Gifts = gifts
+                };
+
+                return Ok(dto);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+
+        // GET /api/PersonalVisit/getVisitPage?loginId=...
+        [HttpGet("getVisitPage")]
+        public IActionResult GetVisitPage([FromQuery] string loginId)
+        {
+            if (string.IsNullOrEmpty(loginId))
+                return BadRequest("Login ID is required.");
+
+            try
+            {
+                // 1) get role
+                const string roleQuery = @"
+SELECT TOP 1 roleCode
+  FROM wcmEmplRole
+ WHERE loginIdM = @LoginId
+   AND isActive = 'Y';";
+
+                var roleRes = _dbHelper.WebSessBean(roleQuery, new Dictionary<string, object>
+                {
+                    ["@LoginId"] = loginId
+                }) as List<Dictionary<string, object>>;
+
+                var roleCode = (roleRes?.Count > 0)
+                    ? roleRes[0]["roleCode"].ToString()
+                    : null;
+
+                // 2) get page mapping
+                const string pageQuery = @"
+SELECT jspPagId
+  FROM wcmPgJspMas
+ WHERE roleCode = @RoleCode
+   AND isActive = 'Y';";
+
+                var pageRes = _dbHelper.WebSessBean(pageQuery, new Dictionary<string, object>
+                {
+                    ["@RoleCode"] = roleCode
+                }) as List<Dictionary<string, object>>;
+
+                if (pageRes?.Any(r => r["jspPagId"].ToString() == "PersonalVisit") == true)
+                    return Ok(new { page = "PersonalVisit" });
+
+                return Ok(new { page = "DSRVisit" });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        // distance calculation helper (in meters)
+        private double CalculateDistance(double lat1, double lon1, double lat2, double lon2)
+        {
+            var radlat1 = Math.PI * lat1 / 180;
+            var radlat2 = Math.PI * lat2 / 180;
+            var theta = lon1 - lon2;
+            var radtheta = Math.PI * theta / 180;
+            var dist = Math.Sin(radlat1) * Math.Sin(radlat2)
+                        + Math.Cos(radlat1) * Math.Cos(radlat2) * Math.Cos(radtheta);
+
+            if (dist > 1) dist = 1;
+            dist = Math.Acos(dist);
+            dist = dist * 180 / Math.PI;
+            dist = dist * 60 * 1.1515;           // miles
+            dist = dist * 1.609344 * 1000;       // convert to meters
+
+            return dist;
+        }
     }
-
 }
-
