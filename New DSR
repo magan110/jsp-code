@@ -1,425 +1,953 @@
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Http;
-using sparshWebService.DataAccess;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.IdentityModel.Tokens;
 using System;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
 using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
 
 namespace MyFirstApi.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
+    [Authorize]
     public class DsrController : ControllerBase
     {
-        private readonly DatabaseHelper _db;
+        private readonly IConfiguration _configuration;
+        private readonly string _issuer;
+        private readonly string _connectionString;
 
-        // max‐length constants
-        private const int LDocuNumb = 16;
-        private const int LDsrParam = 2;
-        private const int LCusRtlFl = 2;
-        private const int LCusRtlCd = 8;
-        private const int LDeptCode = 6;
-        private const int LStatFlag = 1;
-        private const int LCreateId = 10;
-        private const int LUpdateId = 10;
-        private const int LRemLong = 500;
-        private const int LRemShort = 50;
-        private const int LAtchNmId = 100;
-        private const int LLatLong = 30;
-        private const int LAreaCode = 3;
-        private const int LCuRtType = 2;
-        private const int LRetlStFl = 1;
-        private const int LPinCodeN = 6;
-        private const int LCityName = 40;
-        private const int LDistrict = 35;
-        private const int LCstBisTy = 2;
-        private const int LPendWith = 10;
-        private const int LLtLgDist = 100;
-        private const int LApprRemk = 100;
-        private const int LRefOrdNo = 16;
-        private const int LIsTilRtl = 1;
-
-        public DsrController(DatabaseHelper db) => _db = db;
-
-        [HttpGet]
-        [ProducesResponseType(StatusCodes.Status200OK)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult GetAll()
+        public DsrController(IConfiguration configuration)
         {
-            try
-            {
-                var rows = _db.WebSessBean("SELECT * FROM dptDSRActvt", new Dictionary<string, object>());
-                return Ok(rows);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
+            _configuration = configuration;
+            _issuer = "Birla White IT";
+            _connectionString = _configuration.GetConnectionString("DefaultConnection");
         }
 
-        [HttpGet("{docuNumb}")]
-        [ProducesResponseType(StatusCodes.Status200OK)]
-        [ProducesResponseType(StatusCodes.Status404NotFound)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult Get(string docuNumb)
+        // Helper method to get database connection
+        private SqlConnection GetConnection()
         {
-            try
-            {
-                var rows = _db.WebSessBean(
-                    "SELECT * FROM dptDSRActvt WHERE docuNumb = @docuNumb",
-                    new Dictionary<string, object> { ["@docuNumb"] = docuNumb });
-                if (rows.Count == 0) return NotFound();
-                return Ok(rows[0]);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
+            return new SqlConnection(_connectionString);
         }
 
-        [HttpPost]
-        [Produces("application/json")]
-        [ProducesResponseType(typeof(DsrRequest), StatusCodes.Status201Created)]
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public ActionResult<DsrRequest> Create([FromBody] DsrRequest req)
+        // Helper method to execute SQL queries
+        private DataTable ExecuteQuery(string query, SqlParameter[] parameters = null)
         {
-            var bad = Validate(req);
-            if (bad != null) return null;
-
-            try
+            using (var connection = GetConnection())
             {
-                var sql = @"
-INSERT INTO dptDSRActvt
-  (docuNumb, docuDate,
-   deptCode, statFlag, createId, updateId,
-   dsrParam, cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02, dsrRem03, dsrRem04,
-   dsrRem05, dsrRem06, dsrRem07, dsrRem08,
-   dsrRem09, dsrRem10,
-   atchNmId, locaCapr, latitute, lgtitute,
-   areaCode, cuRtType,
-   retlStFl, pinCodeN, cityName, district,
-   cstBisTy, pendWith, ltLgDist, apprRemk,
-   ordInsFl, refOrdNo, isTilRtl,
-   ordExDat,
-   dsrParTy,
-   createDt, updateDt)
-VALUES
-  (@docuNumb, @docuDate,
-   @deptCode, @statFlag, @createId, @updateId,
-   @dsrParam, @cusRtlFl, @cusRtlCd,
-   @dsrRem01, @dsrRem02, @dsrRem03, @dsrRem04,
-   @dsrRem05, @dsrRem06, @dsrRem07, @dsrRem08,
-   @dsrRem09, @dsrRem10,
-   @atchNmId, @locaCapr, @latitute, @lgtitute,
-   @areaCode, @cuRtType,
-   @retlStFl, @pinCodeN, @cityName, @district,
-   @cstBisTy, @pendWith, @ltLgDist, @apprRemk,
-   @ordInsFl, @refOrdNo, @isTilRtl,
-   @ordExDat,
-   @dsrParTy,
-   GETDATE(), GETDATE());";
-
-                var p = new Dictionary<string, object>
+                using (var command = new SqlCommand(query, connection))
                 {
-                    ["@docuNumb"] = req.docuNumb,
-                    ["@docuDate"] = req.docuDate,
-                    ["@deptCode"] = req.deptCode,
-                    ["@statFlag"] = req.statFlag,
-                    ["@createId"] = req.createId,
-                    ["@updateId"] = req.updateId,
+                    if (parameters != null)
+                    {
+                        command.Parameters.AddRange(parameters);
+                    }
 
-                    ["@dsrParam"] = req.dsrParam,
-                    ["@cusRtlFl"] = req.cusRtlFl,
-                    ["@cusRtlCd"] = req.cusRtlCd,
+                    using (var adapter = new SqlDataAdapter(command))
+                    {
+                        var dataTable = new DataTable();
+                        adapter.Fill(dataTable);
+                        return dataTable;
+                    }
+                }
+            }
+        }
 
-                    ["@dsrRem01"] = req.dsrRem01,
-                    ["@dsrRem02"] = req.dsrRem02,
-                    ["@dsrRem03"] = req.dsrRem03,
-                    ["@dsrRem04"] = req.dsrRem04,
-                    ["@dsrRem05"] = req.dsrRem05,
-                    ["@dsrRem06"] = req.dsrRem06,
-                    ["@dsrRem07"] = req.dsrRem07,
-                    ["@dsrRem08"] = req.dsrRem08,
-                    ["@dsrRem09"] = req.dsrRem09,
-                    ["@dsrRem10"] = req.dsrRem10,
+        // Helper method to execute non-query commands
+        private int ExecuteNonQuery(string query, SqlParameter[] parameters = null)
+        {
+            using (var connection = GetConnection())
+            {
+                using (var command = new SqlCommand(query, connection))
+                {
+                    if (parameters != null)
+                    {
+                        command.Parameters.AddRange(parameters);
+                    }
 
-                    ["@atchNmId"] = req.atchNmId,
-                    ["@locaCapr"] = req.locaCapr,
-                    ["@latitute"] = req.latitute,
-                    ["@lgtitute"] = req.lgtitute,
+                    connection.Open();
+                    return command.ExecuteNonQuery();
+                }
+            }
+        }
 
-                    ["@areaCode"] = req.areaCode,
-                    ["@cuRtType"] = req.cuRtType,
+        // GET: api/Dsr/ValidateUser
+        [HttpGet("ValidateUser")]
+        public IActionResult ValidateUser()
+        {
+            var userId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            var userName = User.FindFirstValue(ClaimTypes.Name);
+            
+            // Get user details from database
+            string sql = "SELECT loginIdM, emplName, deptCode, stateCod, areaCode FROM covLoginMas WHERE loginIdM = @loginIdM AND isActive = 'Y'";
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@loginIdM", userId)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            if (result.Rows.Count == 0)
+            {
+                return NotFound("User not found or inactive");
+            }
+            
+            var userRow = result.Rows[0];
+            var userDetails = new
+            {
+                LoginId = userRow["loginIdM"].ToString(),
+                Name = userRow["emplName"].ToString(),
+                DeptCode = userRow["deptCode"].ToString(),
+                StateCode = userRow["stateCod"].ToString(),
+                AreaCode = userRow["areaCode"].ToString()
+            };
+            
+            return Ok(userDetails);
+        }
 
-                    ["@retlStFl"] = req.retlStFl,
-                    ["@pinCodeN"] = req.pinCodeN,
-                    ["@cityName"] = req.cityName,
-                    ["@district"] = req.district,
+        // GET: api/Dsr/AreaCodes
+        [HttpGet("AreaCodes")]
+        public IActionResult GetAreaCodes(string loginId)
+        {
+            string sql = "SELECT areaCode, AreaDesc FROM bkmAreaMast WHERE retlArHd = @loginIdM AND isActive = 'Y' AND isnull(isOnlyDp,'N') <> 'Y'";
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@loginIdM", loginId)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            var areaCodes = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                areaCodes.Add(new
+                {
+                    AreaCode = row["areaCode"].ToString(),
+                    AreaDesc = row["areaDesc"].ToString()
+                });
+            }
+            
+            return Ok(areaCodes);
+        }
 
-                    ["@cstBisTy"] = req.cstBisTy,
-                    ["@pendWith"] = req.pendWith,
-                    ["@ltLgDist"] = req.ltLgDist,
-                    ["@apprRemk"] = req.apprRemk,
+        // GET: api/Dsr/ActivityTypes
+        [HttpGet("ActivityTypes")]
+        public IActionResult GetActivityTypes(string deptCode)
+        {
+            string sql = "";
+            
+            if (deptCode == "KKR115") // Advt Required
+            {
+                sql = "SELECT paramCod, paramDes FROM wcmParametr WHERE paramTyp = 83 AND paramCod <> '00000' AND paramCod NOT IN ('31', '51','01','02','04') AND (paramCod IN ('02') OR paramAd5 IN ('', @deptCode))";
+            }
+            else if (deptCode == "KKR162") // VAP Team
+            {
+                sql = "SELECT paramCod, paramDes FROM wcmParametr WHERE paramTyp = 83 AND paramCod <> '00000' AND paramCod NOT IN ('01','02','04') AND (paramAd3 IN (@deptCode) OR paramAd5 = '')";
+            }
+            else if (deptCode == "KKR166") // VAP Team
+            {
+                sql = "SELECT paramCod, paramDes FROM wcmParametr WHERE paramTyp = 83 AND paramCod <> '00000' AND (paramAd4 IN (@deptCode) OR paramAd5 IN ('', @deptCode)) AND paramCod NOT IN ('01','02','04')";
+            }
+            else
+            {
+                sql = "SELECT paramCod, paramDes FROM wcmParametr WHERE paramTyp = 83 AND paramCod <> '00000' AND paramAd4 NOT IN (@deptCode) AND paramAd5 IN ('', @deptCode) AND paramCod NOT IN ('01','02','04')";
+            }
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@deptCode", deptCode)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            var activityTypes = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                activityTypes.Add(new
+                {
+                    ParamCode = row["paramCod"].ToString(),
+                    ParamDesc = row["paramDes"].ToString()
+                });
+            }
+            
+            return Ok(activityTypes);
+        }
 
-                    ["@ordInsFl"] = req.ordInsFl,
-                    ["@refOrdNo"] = req.refOrdNo,
-                    ["@isTilRtl"] = req.isTilRtl,
+        // GET: api/Dsr/CustomerTypes
+        [HttpGet("CustomerTypes")]
+        public IActionResult GetCustomerTypes(string dsrParam)
+        {
+            string sql = "SELECT 'C', 'Stockiest/ Urbon Stockiest' UNION SELECT 'D', 'Direct Dealer' UNION SELECT 'RD', 'Rural Stockiest' UNION SELECT 'R', 'Retailer' UNION SELECT 'RR', 'Rural Retailer' UNION SELECT '07', 'Registered Applicator' UNION SELECT '08', 'Painter'";
+            
+            if (dsrParam == "50" || dsrParam == "61")
+            {
+                sql = "SELECT 'C', 'Purchaser' UNION SELECT 'D', 'Direct Dealer' UNION SELECT 'RD', 'Rural Stockiest' UNION SELECT 'R', 'Retailer' UNION SELECT '3', 'Contractor' UNION SELECT '7', 'Applicator' UNION SELECT 'RR', 'Rural Retailer' UNION SELECT '07', 'Registered Applicator' UNION SELECT '08', 'Painter'";
+            }
+            
+            var result = ExecuteQuery(sql);
+            
+            var customerTypes = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                customerTypes.Add(new
+                {
+                    Code = row[0].ToString(),
+                    Description = row[1].ToString()
+                });
+            }
+            
+            return Ok(customerTypes);
+        }
 
-                    ["@ordExDat"] = req.ordExDat ?? (object)DBNull.Value,
+        // GET: api/Dsr/DocumentTypes
+        [HttpGet("DocumentTypes")]
+        public IActionResult GetDocumentTypes()
+        {
+            string sql = "SELECT '1BF', 'Before' UNION SELECT '2AF', 'After' UNION SELECT 'ADH', 'More Image'";
+            
+            var result = ExecuteQuery(sql);
+            
+            var documentTypes = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                documentTypes.Add(new
+                {
+                    Code = row[0].ToString(),
+                    Description = row[1].ToString()
+                });
+            }
+            
+            return Ok(documentTypes);
+        }
 
-                    ["@dsrParTy"] = req.dsrParTy
+        // GET: api/Dsr/Products
+        [HttpGet("Products")]
+        public IActionResult GetProducts()
+        {
+            string sql = "SELECT repoCatg, repoDesc FROM bkmRepoCatg WHERE isActive = 'Y' AND repoCatg IN ('01', '02', '03', '09','12', '15','17','18','19','20')";
+            
+            var result = ExecuteQuery(sql);
+            
+            var products = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                products.Add(new
+                {
+                    RepoCatg = row["repoCatg"].ToString(),
+                    RepoDesc = row["repoDesc"].ToString()
+                });
+            }
+            
+            return Ok(products);
+        }
+
+        // GET: api/Dsr/CounterTypes
+        [HttpGet("CounterTypes")]
+        public IActionResult GetCounterTypes()
+        {
+            string sql = "SELECT '03', 'Gypsum counter' UNION ALL SELECT '01', 'Paint Counter' UNION ALL SELECT '02', 'Non Paint Counter' UNION ALL SELECT '04', 'Other'";
+            
+            var result = ExecuteQuery(sql);
+            
+            var counterTypes = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                counterTypes.Add(new
+                {
+                    Code = row[0].ToString(),
+                    Description = row[1].ToString()
+                });
+            }
+            
+            return Ok(counterTypes);
+        }
+
+        // GET: api/Dsr/PinCodes
+        [HttpGet("PinCodes")]
+        public IActionResult GetPinCodes(string areaCode, string pinCode)
+        {
+            string sql = "SELECT DISTINCT pinCodeN + '~' + cityName + '~' + district AS pinCodeData FROM bkmPinCode WHERE pinCodeN LIKE @pinCode + '%'";
+            
+            if (!string.IsNullOrEmpty(areaCode))
+            {
+                sql = "SELECT DISTINCT pinCodeN + '~' + cityName + '~' + district AS pinCodeData FROM bkmPinCode WHERE areaCode = @areaCode AND pinCodeN LIKE @pinCode + '%'";
+            }
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@areaCode", areaCode ?? (object)DBNull.Value),
+                new SqlParameter("@pinCode", pinCode)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            var pinCodes = new List<string>();
+            foreach (DataRow row in result.Rows)
+            {
+                pinCodes.Add(row["pinCodeData"].ToString());
+            }
+            
+            return Ok(pinCodes);
+        }
+
+        // GET: api/Dsr/Customers
+        [HttpGet("Customers")]
+        public IActionResult GetCustomers(string areaCode, string customerType, string searchTerm)
+        {
+            string sql = "";
+            List<SqlParameter> parameters = new List<SqlParameter>();
+            
+            parameters.Add(new SqlParameter("@areaCode", areaCode));
+            parameters.Add(new SqlParameter("@searchTerm", "%" + searchTerm + "%"));
+            
+            if (customerType == "C" || customerType == "RD" || customerType == "AD")
+            {
+                sql = "SELECT custCode, custName FROM dpmCustomer WHERE areaCode = @areaCode AND custName LIKE @searchTerm AND isActive = 'Y'";
+            }
+            else if (customerType == "R" || customerType == "RR")
+            {
+                sql = "SELECT retlCode, retlName FROM rtmRetailer WHERE areaCode = @areaCode AND retlName LIKE @searchTerm AND isActive = 'Y'";
+            }
+            else
+            {
+                return BadRequest("Invalid customer type");
+            }
+            
+            var result = ExecuteQuery(sql, parameters.ToArray());
+            
+            var customers = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                customers.Add(new
+                {
+                    Code = row[0].ToString(),
+                    Name = row[1].ToString()
+                });
+            }
+            
+            return Ok(customers);
+        }
+
+        // GET: api/Dsr/MobileData
+        [HttpGet("MobileData")]
+        public IActionResult GetMobileData(string mobileNumber, string areaCode)
+        {
+            string sql = "SELECT TOP 1 a.dsrRem01, a.dsrRem08, a.cuRtType, a.dsrRem03, a.areaCode, a.pinCodeN, a.cityName, a.district, a.cusRtlCd, b.stateCod FROM dptDSRActvt a WITH (NOLOCK), bkmAreaStZn b WITH (NOLOCK) WHERE a.areaCode = b.areaCode AND a.dsrRem08 = @mobileNumber AND a.areaCode = @areaCode AND statFlag NOT IN ('C', 'R') ORDER BY a.createDt DESC";
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@mobileNumber", mobileNumber),
+                new SqlParameter("@areaCode", areaCode)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            if (result.Rows.Count == 0)
+            {
+                return NotFound("Mobile number not found");
+            }
+            
+            var row = result.Rows[0];
+            var mobileData = new
+            {
+                DsrRem01 = row["dsrRem01"].ToString(),
+                DsrRem08 = row["dsrRem08"].ToString(),
+                CuRtType = row["cuRtType"].ToString(),
+                DsrRem03 = row["dsrRem03"].ToString(),
+                AreaCode = row["areaCode"].ToString(),
+                PinCodeN = row["pinCodeN"].ToString(),
+                CityName = row["cityName"].ToString(),
+                District = row["district"].ToString(),
+                CusRtlCd = row["cusRtlCd"].ToString(),
+                StateCod = row["stateCod"].ToString()
+            };
+            
+            return Ok(mobileData);
+        }
+
+        // POST: api/Dsr/ValidateDocumentDate
+        [HttpPost("ValidateDocumentDate")]
+        public IActionResult ValidateDocumentDate([FromBody] DocumentDateModel model)
+        {
+            string sql = "SELECT dbo.cofValidDsrDt(@loginId, @docDate, 'D') AS isValid";
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@loginId", model.LoginId),
+                new SqlParameter("@docDate", model.DocumentDate)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            if (result.Rows.Count == 0)
+            {
+                return BadRequest("Invalid request");
+            }
+            
+            var isValid = result.Rows[0]["isValid"].ToString();
+            
+            return Ok(new { IsValid = isValid });
+        }
+
+        // GET: api/Dsr/Documents
+        [HttpGet("Documents")]
+        public IActionResult GetDocuments(string loginId)
+        {
+            string sql = "SELECT DISTINCT TOP 30 docuNumb, dbo.wcfParamDes(dsrParam, 'dsrParNw') + ' ~ ' + docuNumb + ' ~ ' + CONVERT(char(10), docuDate, 103) AS docInfo FROM dptDSRActvt WHERE docuDate > GETDATE() - 4 AND createId = @loginId ORDER BY docuNumb DESC";
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@loginId", loginId)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            var documents = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                documents.Add(new
+                {
+                    DocumentNumber = row["docuNumb"].ToString(),
+                    DocumentInfo = row["docInfo"].ToString()
+                });
+            }
+            
+            return Ok(documents);
+        }
+
+        // GET: api/Dsr/DocumentDetails
+        [HttpGet("DocumentDetails")]
+        public IActionResult GetDocumentDetails(string documentNumber, string loginId)
+        {
+            string sql = "SELECT docuNumb, CONVERT(char(10), docuDate, 103) AS docuDate, dsrParam, cusRtlFl, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, areaCode, ISNULL(cuRtType, '') AS cuRtType FROM dptDSRActvt WHERE docuNumb = @docuNumb AND createId = @loginId";
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@docuNumb", documentNumber),
+                new SqlParameter("@loginId", loginId)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            if (result.Rows.Count == 0)
+            {
+                return NotFound("Document not found");
+            }
+            
+            var row = result.Rows[0];
+            var documentDetails = new
+            {
+                DocumentNumber = row["docuNumb"].ToString(),
+                DocumentDate = row["docuDate"].ToString(),
+                DsrParam = row["dsrParam"].ToString(),
+                CusRtlFl = row["cusRtlFl"].ToString(),
+                CusRtlCd = row["cusRtlCd"].ToString(),
+                DsrRem01 = row["dsrRem01"].ToString(),
+                DsrRem02 = row["dsrRem02"].ToString(),
+                DsrRem03 = row["dsrRem03"].ToString(),
+                DsrRem04 = row["dsrRem04"].ToString(),
+                DsrRem05 = row["dsrRem05"].ToString(),
+                DsrRem06 = row["dsrRem06"].ToString(),
+                DsrRem07 = row["dsrRem07"].ToString(),
+                DsrRem08 = row["dsrRem08"].ToString(),
+                AreaCode = row["areaCode"].ToString(),
+                CuRtType = row["cuRtType"].ToString()
+            };
+            
+            return Ok(documentDetails);
+        }
+
+        // GET: api/Dsr/DocumentDetailItems
+        [HttpGet("DocumentDetailItems")]
+        public IActionResult GetDocumentDetailItems(string documentNumber, string loginId)
+        {
+            string sql = "SELECT a.repoCatg, a.repoDesc, ISNULL(prodQnty, 0) AS prodQnty, ISNULL(projQnty, 0) AS projQnty, ISNULL(actnRemk, '') AS actnRemk, ISNULL(CONVERT(char(10), targetDt, 103), '') AS targetDt FROM bkmRepoCatg a WITH (NOLOCK) LEFT JOIN dptDSRActvtDtl b WITH (NOLOCK) ON a.repoCatg = b.repoCatg AND docuNumb = @docuNumb AND b.createId = @loginId WHERE a.repoCatg IN ('01', '02', '03', '09','12','15','17','18','19') AND a.isActive = 'Y'";
+            
+            var parameters = new SqlParameter[]
+            {
+                new SqlParameter("@docuNumb", documentNumber),
+                new SqlParameter("@loginId", loginId)
+            };
+            
+            var result = ExecuteQuery(sql, parameters);
+            
+            var documentItems = new List<object>();
+            foreach (DataRow row in result.Rows)
+            {
+                documentItems.Add(new
+                {
+                    RepoCatg = row["repoCatg"].ToString(),
+                    RepoDesc = row["repoDesc"].ToString(),
+                    ProdQnty = Convert.ToDecimal(row["prodQnty"]),
+                    ProjQnty = Convert.ToDecimal(row["projQnty"]),
+                    ActnRemk = row["actnRemk"].ToString(),
+                    TargetDt = row["targetDt"].ToString()
+                });
+            }
+            
+            return Ok(documentItems);
+        }
+
+        // POST: api/Dsr/SaveDocument
+        [HttpPost("SaveDocument")]
+        public IActionResult SaveDocument([FromBody] DsrDocumentModel model)
+        {
+            try
+            {
+                // Generate document number if not provided
+                if (string.IsNullOrEmpty(model.DocumentNumber))
+                {
+                    model.DocumentNumber = GenerateDocumentNumber(model.LoginId, model.DocumentDate);
+                }
+
+                // Begin transaction
+                using (var connection = GetConnection())
+                {
+                    connection.Open();
+                    using (var transaction = connection.BeginTransaction())
+                    {
+                        try
+                        {
+                            // Save header
+                            string headerSql = @"INSERT INTO dptDSRActvt (docuNumb, docuDate, dsrParam, cusRtlFl, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, areaCode, cuRtType, createId, createDt, deptCode, geoLatit, geoLongt, dsrRem09, cstBisTy, cityName, district, pinCodeN, custCdRt, statFlag) 
+                                           VALUES (@docuNumb, @docuDate, @dsrParam, @cusRtlFl, @cusRtlCd, @dsrRem01, @dsrRem02, @dsrRem03, @dsrRem04, @dsrRem05, @dsrRem06, @dsrRem07, @dsrRem08, @areaCode, @cuRtType, @createId, GETDATE(), @deptCode, @geoLatit, @geoLongt, @dsrRem09, @cstBisTy, @cityName, @district, @pinCodeN, @custCdRt, 'A')";
+
+                            var headerParams = new SqlParameter[]
+                            {
+                                new SqlParameter("@docuNumb", model.DocumentNumber),
+                                new SqlParameter("@docuDate", model.DocumentDate),
+                                new SqlParameter("@dsrParam", model.DsrParam),
+                                new SqlParameter("@cusRtlFl", model.CusRtlFl ?? (object)DBNull.Value),
+                                new SqlParameter("@cusRtlCd", model.CusRtlCd ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem01", model.DsrRem01 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem02", model.DsrRem02 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem03", model.DsrRem03 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem04", model.DsrRem04 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem05", model.DsrRem05 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem06", model.DsrRem06 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem07", model.DsrRem07 ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem08", model.DsrRem08 ?? (object)DBNull.Value),
+                                new SqlParameter("@areaCode", model.AreaCode ?? (object)DBNull.Value),
+                                new SqlParameter("@cuRtType", model.CuRtType ?? (object)DBNull.Value),
+                                new SqlParameter("@createId", model.LoginId),
+                                new SqlParameter("@deptCode", model.DeptCode),
+                                new SqlParameter("@geoLatit", model.GeoLatit ?? (object)DBNull.Value),
+                                new SqlParameter("@geoLongt", model.GeoLongt ?? (object)DBNull.Value),
+                                new SqlParameter("@dsrRem09", model.DsrRem09 ?? (object)DBNull.Value),
+                                new SqlParameter("@cstBisTy", model.CstBisTy ?? (object)DBNull.Value),
+                                new SqlParameter("@cityName", model.CityName ?? (object)DBNull.Value),
+                                new SqlParameter("@district", model.District ?? (object)DBNull.Value),
+                                new SqlParameter("@pinCodeN", model.PinCodeN ?? (object)DBNull.Value),
+                                new SqlParameter("@custCdRt", model.CustCdRt ?? (object)DBNull.Value)
+                            };
+
+                            using (var command = new SqlCommand(headerSql, connection, transaction))
+                            {
+                                command.Parameters.AddRange(headerParams);
+                                command.ExecuteNonQuery();
+                            }
+
+                            // Delete existing details if updating
+                            if (model.ProcType == "U")
+                            {
+                                string deleteSql = "DELETE FROM dptDSRActvtDtl WHERE docuNumb = @docuNumb AND createId = @loginId";
+                                var deleteParams = new SqlParameter[]
+                                {
+                                    new SqlParameter("@docuNumb", model.DocumentNumber),
+                                    new SqlParameter("@loginId", model.LoginId)
+                                };
+
+                                using (var command = new SqlCommand(deleteSql, connection, transaction))
+                                {
+                                    command.Parameters.AddRange(deleteParams);
+                                    command.ExecuteNonQuery();
+                                }
+                            }
+
+                            // Save details
+                            if (model.DocumentItems != null && model.DocumentItems.Count > 0)
+                            {
+                                foreach (var item in model.DocumentItems)
+                                {
+                                    string detailSql = @"INSERT INTO dptDSRActvtDtl (docuNumb, docuSrNo, repoCatg, repoDesc, prodQnty, projQnty, actnRemk, targetDt, createId, createDt, statFlag) 
+                                                      VALUES (@docuNumb, @docuSrNo, @repoCatg, @repoDesc, @prodQnty, @projQnty, @actnRemk, @targetDt, @createId, GETDATE(), 'A')";
+
+                                    var detailParams = new SqlParameter[]
+                                    {
+                                        new SqlParameter("@docuNumb", model.DocumentNumber),
+                                        new SqlParameter("@docuSrNo", item.DocSrNo),
+                                        new SqlParameter("@repoCatg", item.RepoCatg ?? (object)DBNull.Value),
+                                        new SqlParameter("@repoDesc", item.RepoDesc ?? (object)DBNull.Value),
+                                        new SqlParameter("@prodQnty", item.ProdQnty),
+                                        new SqlParameter("@projQnty", item.ProjQnty),
+                                        new SqlParameter("@actnRemk", item.ActnRemk ?? (object)DBNull.Value),
+                                        new SqlParameter("@targetDt", string.IsNullOrEmpty(item.TargetDt) ? (object)DBNull.Value : DateTime.Parse(item.TargetDt)),
+                                        new SqlParameter("@createId", model.LoginId)
+                                    };
+
+                                    using (var command = new SqlCommand(detailSql, connection, transaction))
+                                    {
+                                        command.Parameters.AddRange(detailParams);
+                                        command.ExecuteNonQuery();
+                                    }
+                                }
+                            }
+
+                            // Commit transaction
+                            transaction.Commit();
+
+                            return Ok(new { DocumentNumber = model.DocumentNumber, Message = "Document saved successfully" });
+                        }
+                        catch (Exception)
+                        {
+                            // Rollback transaction on error
+                            transaction.Rollback();
+                            throw;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"An error occurred while saving the document: {ex.Message}");
+            }
+        }
+
+        // Helper method to generate document number
+        private string GenerateDocumentNumber(string loginId, string documentDate)
+        {
+            // Format: DSR + YYYYMM + 3 digit sequence
+            string datePart = DateTime.Parse(documentDate).ToString("yyyyMM");
+            
+            string sql = "SELECT ISNULL(MAX(CAST(SUBSTRING(docuNumb, 10, 3) AS INT)), 0) + 1 AS nextSeq FROM dptDSRActvt WHERE docuNumb LIKE 'DSR" + datePart + "%'";
+            
+            var result = ExecuteQuery(sql);
+            
+            int nextSeq = 1;
+            if (result.Rows.Count > 0)
+            {
+                nextSeq = Convert.ToInt32(result.Rows[0]["nextSeq"]);
+            }
+            
+            return "DSR" + datePart + nextSeq.ToString("000");
+        }
+
+        // GET: api/Dsr/CheckPermissions
+        [HttpGet("CheckPermissions")]
+        public IActionResult CheckPermissions(string loginId)
+        {
+            try
+            {
+                // Check DSR Entry Allowed
+                string sql = @"SELECT COUNT(DISTINCT a.areaCode) AS msAreCnt, COUNT(DISTINCT b.areaCode) AS trAreCnt
+                              FROM bkmAreaMast a WITH (NOLOCK) 
+                              LEFT OUTER JOIN dptMktIntel b WITH (NOLOCK) ON a.areaCode = b.areaCode AND b.mnthYear = dbo.cofPrevMnYr(CONVERT(varchar(6), GETDATE(), 112), GETDATE())
+                              WHERE a.retlArHd = @loginId AND a.areaCode NOT IN ('EXB','EXC','EXE','EXG','EXN','EXR','EXT','EXR','EXT','EXR','KKR', 'KAT', 'DLC','PNY','BKM','HAM','JAG') AND a.isActive = 'Y' AND ISNULL(a.isOnlyDp,'N') <> 'Y'";
+
+                var parameters = new SqlParameter[]
+                {
+                    new SqlParameter("@loginId", loginId)
                 };
 
-                _db.WebSessBean(sql, p);
-                return CreatedAtAction(nameof(Get), new { docuNumb = req.docuNumb }, req);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-
-        [HttpPut("{docuNumb}")]
-        [ProducesResponseType(StatusCodes.Status204NoContent)]
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status404NotFound)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult Update(string docuNumb, [FromBody] DsrRequest req)
-        {
-            var bad = Validate(req);
-            if (bad != null) return bad;
-
-            try
-            {
-                var sql = @"
-UPDATE dptDSRActvt
-   SET docuDate  = @docuDate,
-       deptCode  = @deptCode,
-       statFlag  = @statFlag,
-       updateId  = @updateId,
-       dsrParam  = @dsrParam,
-       cusRtlFl  = @cusRtlFl,
-       cusRtlCd  = @cusRtlCd,
-       dsrRem01  = @dsrRem01,
-       dsrRem02  = @dsrRem02,
-       dsrRem03  = @dsrRem03,
-       dsrRem04  = @dsrRem04,
-       dsrRem05  = @dsrRem05,
-       dsrRem06  = @dsrRem06,
-       dsrRem07  = @dsrRem07,
-       dsrRem08  = @dsrRem08,
-       dsrRem09  = @dsrRem09,
-       dsrRem10  = @dsrRem10,
-       atchNmId  = @atchNmId,
-       locaCapr  = @locaCapr,
-       latitute  = @latitute,
-       lgtitute  = @lgtitute,
-       areaCode  = @areaCode,
-       cuRtType  = @cuRtType,
-       retlStFl  = @retlStFl,
-       pinCodeN  = @pinCodeN,
-       cityName  = @cityName,
-       district  = @district,
-       cstBisTy  = @cstBisTy,
-       pendWith  = @pendWith,
-       ltLgDist  = @ltLgDist,
-       apprRemk  = @apprRemk,
-       ordInsFl  = @ordInsFl,
-       refOrdNo  = @refOrdNo,
-       isTilRtl  = @isTilRtl,
-       ordExDat  = @ordExDat,
-       dsrParTy  = @dsrParTy,
-       updateDt  = GETDATE()
- WHERE docuNumb = @docuNumb;";
-
-                var p = new Dictionary<string, object>
+                var result = ExecuteQuery(sql, parameters);
+                
+                bool dsrEntAl = true;
+                if (result.Rows.Count > 0)
                 {
-                    ["@docuNumb"] = docuNumb,
-                    ["@docuDate"] = req.docuDate,
-                    ["@deptCode"] = req.deptCode,
-                    ["@statFlag"] = req.statFlag,
-                    ["@updateId"] = req.updateId,
+                    var row = result.Rows[0];
+                    int msAreCnt = Convert.ToInt32(row["msAreCnt"]);
+                    int trAreCnt = Convert.ToInt32(row["trAreCnt"]);
+                    
+                    if (msAreCnt > 0 && msAreCnt != trAreCnt)
+                    {
+                        dsrEntAl = false;
+                    }
+                }
 
-                    ["@dsrParam"] = req.dsrParam,
-                    ["@cusRtlFl"] = req.cusRtlFl,
-                    ["@cusRtlCd"] = req.cusRtlCd,
+                // Check DSR Stock Allowed
+                sql = @"SELECT COUNT(DISTINCT a.areaCode) AS msAreCnt, COUNT(DISTINCT b.areaCode) AS trAreCnt
+                        FROM bkmAreaMast a WITH (NOLOCK) 
+                        LEFT OUTER JOIN (
+                            SELECT DISTINCT a.mnthYear, b.areaCode
+                            FROM dptStkTgtRc a WITH (NOLOCK), dpmCustomer b WITH (NOLOCK)
+                            WHERE mnthYear = CONVERT(varchar(6), GETDATE(), 112) AND a.custCode = b.custCode AND a.repoCatg = '01'
+                        ) b ON a.areaCode = b.areaCode AND b.mnthYear = CONVERT(varchar(6), GETDATE(), 112)
+                        WHERE a.areaCode NOT IN ('EXB','EXC','EXE','EXG','EXN','EXR','EXT','EXR','EXR','EXT','KKR','EXT', 'KAT', 'DLC','HAM','KGR','SHI','SGO','DHU','JAG')
+                        AND a.retlArHd = @loginId AND a.areaCode NOT IN ('EXB','EXC','EXE','EXG','EXN','EXR','EXT','EXR','EXR','EXT','KKR', 'KAT', 'DLC','PNY','BKM','HAM','JAG','HAM','KGR','SHI','SGO','DHU','JAG') 
+                        AND a.isActive = 'Y' AND ISNULL(a.isOnlyDp,'N') <> 'Y'";
 
-                    ["@dsrRem01"] = req.dsrRem01,
-                    ["@dsrRem02"] = req.dsrRem02,
-                    ["@dsrRem03"] = req.dsrRem03,
-                    ["@dsrRem04"] = req.dsrRem04,
-                    ["@dsrRem05"] = req.dsrRem05,
-                    ["@dsrRem06"] = req.dsrRem06,
-                    ["@dsrRem07"] = req.dsrRem07,
-                    ["@dsrRem08"] = req.dsrRem08,
-                    ["@dsrRem09"] = req.dsrRem09,
-                    ["@dsrRem10"] = req.dsrRem10,
+                result = ExecuteQuery(sql, parameters);
+                
+                bool dsrStkAl = true;
+                if (result.Rows.Count > 0)
+                {
+                    var row = result.Rows[0];
+                    int msAreCnt = Convert.ToInt32(row["msAreCnt"]);
+                    int trAreCnt = Convert.ToInt32(row["trAreCnt"]);
+                    
+                    if (msAreCnt > 0 && msAreCnt != trAreCnt)
+                    {
+                        dsrStkAl = false;
+                    }
+                }
 
-                    ["@atchNmId"] = req.atchNmId,
-                    ["@locaCapr"] = req.locaCapr,
-                    ["@latitute"] = req.latitute,
-                    ["@lgtitute"] = req.lgtitute,
+                // Check if second stock check is needed
+                if (dsrStkAl)
+                {
+                    sql = @"SELECT COUNT(DISTINCT a.areaCode) AS msAreCnt, COUNT(DISTINCT b.areaCode) AS trAreCnt
+                            FROM bkmAreaMast a WITH (NOLOCK) 
+                            LEFT OUTER JOIN (
+                                SELECT DISTINCT a.mnthYear, b.areaCode
+                                FROM dptStkTgtRc a WITH (NOLOCK), dpmCustomer b WITH (NOLOCK)
+                                WHERE mnthYear = CONVERT(varchar(6), GETDATE(), 112) AND a.custCode = b.custCode AND a.repoCatg = '02'
+                            ) b ON a.areaCode = b.areaCode AND b.mnthYear = CONVERT(varchar(6), GETDATE(), 112)
+                            WHERE a.areaCode NOT IN ('EXB','EXC','EXE','EXG','EXN','EXR','EXT','EXR','EXR','EXT','KKR','EXT', 'KAT', 'DLC','HAM','KGR','SHI','SGO','DHU','JAG')
+                            AND a.retlArHd = @loginId AND a.areaCode NOT IN ('EXB','EXC','EXE','EXG','EXN','EXR','EXT','EXR','EXR','EXT','KKR', 'KAT', 'DLC','PNY','BKM','HAM','JAG','HAM','KGR','SHI','SGO','DHU','JAG') 
+                            AND a.isActive = 'Y' AND ISNULL(a.isOnlyDp,'N') <> 'Y'";
 
-                    ["@areaCode"] = req.areaCode,
-                    ["@cuRtType"] = req.cuRtType,
+                    result = ExecuteQuery(sql, parameters);
+                    
+                    if (result.Rows.Count > 0)
+                    {
+                        var row = result.Rows[0];
+                        int msAreCnt = Convert.ToInt32(row["msAreCnt"]);
+                        int trAreCnt = Convert.ToInt32(row["trAreCnt"]);
+                        
+                        if (msAreCnt > 0 && msAreCnt != trAreCnt)
+                        {
+                            dsrStkAl = false;
+                        }
+                    }
+                }
 
-                    ["@retlStFl"] = req.retlStFl,
-                    ["@pinCodeN"] = req.pinCodeN,
-                    ["@cityName"] = req.cityName,
-                    ["@district"] = req.district,
+                // Get zone code
+                sql = "SELECT zoneCode FROM bkmAreaStZn WHERE areaCode = (SELECT areaCode FROM covLoginMas WHERE loginIdM = @loginId)";
+                result = ExecuteQuery(sql, parameters);
+                
+                string zoneCode = "";
+                if (result.Rows.Count > 0)
+                {
+                    zoneCode = result.Rows[0]["zoneCode"].ToString();
+                }
 
-                    ["@cstBisTy"] = req.cstBisTy,
-                    ["@pendWith"] = req.pendWith,
-                    ["@ltLgDist"] = req.ltLgDist,
-                    ["@apprRemk"] = req.apprRemk,
+                // Check retail target flag
+                bool rtlTrgFl = false;
+                if (zoneCode == "C")
+                {
+                    sql = @"SELECT SUM(mapedRtlCnt) AS ttlMpdRt, SUM(trgtEntCt) AS ttlMpdUq, SUM(cmt01) AS targtCmt, SUM(cmt02) AS targtPty, SUM(cmt03) AS targtVAP,
+                            dbo.cofCalcPerc('normPerc', SUM(cmt01), SUM(mapedRtlCnt)) AS 'Cmt-%',
+                            dbo.cofCalcPerc('normPerc', SUM(cmt02), SUM(mapedRtlCnt)) AS 'Puty-%',
+                            dbo.cofCalcPerc('normPerc', SUM(cmt03), SUM(mapedRtlCnt)) AS 'Vap-%'
+                            FROM (
+                                SELECT b.loginIdM, b.emplName, COUNT(*) AS mapedRtlCnt, 0 AS trgtEntCt, 0 AS cmt01, 0 AS cmt02, 0 AS cmt03, 0 AS ttlCnt
+                                FROM rtmRetailer a WITH (NOLOCK), prmEmployee b WITH (NOLOCK), bkmAreaStZn c WITH (NOLOCK)
+                                WHERE a.concEmpl = b.loginIdM AND b.areaCode = c.areaCode AND a.isActive = 'Y' AND b.position <> 'EM05' AND b.isActive = 'Y' AND c.zoneCode = 'C' AND a.createDt < CONVERT(varchar(11), DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE())-1, 0), 113) AND b.loginIdM = @loginId
+                                GROUP BY b.loginIdM, b.emplName
+                                UNION ALL
+                                SELECT b.loginIdM, b.emplName, 0, COUNT(DISTINCT a.retlCode) AS trgtEntCt, 
+                                       SUM(CASE WHEN repoCatg = '01' THEN 1 ELSE 0 END) AS cmt01,
+                                       SUM(CASE WHEN repoCatg = '02' THEN 1 ELSE 0 END) AS cmt02,
+                                       SUM(CASE WHEN repoCatg = '03' THEN 1 ELSE 0 END) AS cmt03, COUNT(*) AS ttlCnt
+                                FROM rtmRetailer a WITH (NOLOCK), prmEmployee b WITH (NOLOCK), bkmAreaStZn c WITH (NOLOCK), dptCusRtlTg d WITH (NOLOCK)
+                                WHERE a.concEmpl = b.loginIdM AND b.areaCode = c.areaCode AND a.retlCode = d.cusRtlCd AND b.position <> 'EM05' AND d.cusRtlFl = 'R' AND d.mnthYear = CONVERT(varchar(6), getdate(), 112) AND d.statFlag NOT IN ('C','R') AND a.isActive = 'Y' AND b.isActive = 'Y' AND c.zoneCode = 'C' AND b.loginIdM = @loginId
+                                GROUP BY b.loginIdM, b.emplName
+                            ) x
+                            WHERE x.loginIdM = @loginId AND x.loginIdM <> '2603'
+                            GROUP BY loginIdM, emplName";
 
-                    ["@ordInsFl"] = req.ordInsFl,
-                    ["@refOrdNo"] = req.refOrdNo,
-                    ["@isTilRtl"] = req.isTilRtl,
+                    result = ExecuteQuery(sql, parameters);
+                    
+                    if (result.Rows.Count > 0)
+                    {
+                        var row = result.Rows[0];
+                        int ttlMpdRt = Convert.ToInt32(row["ttlMpdRt"]);
+                        double trgCmtPr = Convert.ToDouble(row["Cmt-%"]);
+                        double trgPtyPr = Convert.ToDouble(row["Puty-%"]);
+                        double trgVapPr = Convert.ToDouble(row["Vap-%"]);
+                        
+                        if (ttlMpdRt > 0 && (trgCmtPr < 100 || trgPtyPr < 100 || trgVapPr < 100))
+                        {
+                            dsrEntAl = false;
+                            rtlTrgFl = true;
+                        }
+                    }
+                }
 
-                    ["@ordExDat"] = req.ordExDat ?? (object)DBNull.Value,
+                // Get area description
+                sql = "SELECT AreaDesc FROM bkmAreaMast WITH (NOLOCK) WHERE retlArHd = @loginId AND isActive = 'Y' AND ISNULL(isOnlyDp,'N') <> 'Y'";
+                result = ExecuteQuery(sql, parameters);
+                
+                string areaDesc = "";
+                if (result.Rows.Count > 0)
+                {
+                    var areaDescList = new List<string>();
+                    foreach (DataRow row in result.Rows)
+                    {
+                        areaDescList.Add(row["AreaDesc"].ToString());
+                    }
+                    areaDesc = string.Join(", ", areaDescList);
+                }
 
-                    ["@dsrParTy"] = req.dsrParTy
+                var permissions = new
+                {
+                    DsrEntAl = dsrEntAl,
+                    DsrStkAl = dsrStkAl,
+                    RtlTrgFl = rtlTrgFl,
+                    AreaDesc = areaDesc
                 };
 
-                var rows = _db.WebSessBean(sql, p).Count;
-                if (rows == 0) return NotFound();
-                return NoContent();
+                return Ok(permissions);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, ex.Message);
+                return StatusCode(500, $"An error occurred while checking permissions: {ex.Message}");
             }
         }
 
-        [HttpDelete("{docuNumb}")]
-        [ProducesResponseType(StatusCodes.Status204NoContent)]
-        [ProducesResponseType(StatusCodes.Status404NotFound)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult Delete(string docuNumb)
+        // GET: api/Dsr/MarketMappingData
+        [HttpGet("MarketMappingData")]
+        public IActionResult GetMarketMappingData(string customerCode)
         {
             try
             {
-                var rows = _db.WebSessBean(
-                    "DELETE FROM dptDSRActvt WHERE docuNumb = @docuNumb",
-                    new Dictionary<string, object> { ["@docuNumb"] = docuNumb }
-                ).Count;
-                if (rows == 0) return NotFound();
-                return NoContent();
+                string sql = @"SELECT TOP 2 a.repoCatg, repoDesc, a.prodQnty, a.projQnty, CONVERT(varchar(10), c.docuDate, 103) AS docuDate
+                              FROM dptDSRActvtDtl a WITH (NOLOCK), bkmRepoCatg b WITH (NOLOCK), dptDSRActvt c WITH (NOLOCK)
+                              WHERE a.repoCatg = b.repoCatg AND a.docuNumb = c.docuNumb AND a.repoCatg IN ('01', '02')
+                              AND mrktData = '01' AND (prodQnty > 0 OR projQnty > 0) AND a.createId = @customerCode
+                              ORDER BY a.createDt DESC";
+
+                var parameters = new SqlParameter[]
+                {
+                    new SqlParameter("@customerCode", customerCode)
+                };
+
+                var result = ExecuteQuery(sql, parameters);
+                
+                var marketMappingData = new List<object>();
+                foreach (DataRow row in result.Rows)
+                {
+                    marketMappingData.Add(new
+                    {
+                        RepoCatg = row["repoCatg"].ToString(),
+                        RepoDesc = row["repoDesc"].ToString(),
+                        ProdQnty = Convert.ToDecimal(row["prodQnty"]),
+                        ProjQnty = Convert.ToDecimal(row["projQnty"]),
+                        DocDate = row["docuDate"].ToString()
+                    });
+                }
+
+                return Ok(marketMappingData);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, ex.Message);
+                return StatusCode(500, $"An error occurred while fetching market mapping data: {ex.Message}");
             }
         }
 
-        // Validates required fields and max‐lengths
-        private IActionResult Validate(DsrRequest req)
+        // GET: api/Dsr/SnopStatus
+        [HttpGet("SnopStatus")]
+        public IActionResult GetSnopStatus(string loginId)
         {
-            IActionResult bad;
+            try
+            {
+                string sql = @"SELECT 'SnOP', nwMtKgLt, COUNT(DISTINCT CASE WHEN noOfEntry > 0 THEN areaCode ELSE NULL END) AS entryCount, 
+                              COUNT(DISTINCT areaCode) AS totalCount, 
+                              CASE WHEN SUM(noOfEntry) > 0 THEN 'Done' ELSE 'Pending' END AS status
+                              FROM (
+                                  SELECT c.stLgcCod, c.retlStHd, a.areaCode, d.nwMtKgLt, COUNT(*) AS noOfEntry
+                                  FROM dptAreaDemd a WITH (NOLOCK), bkmAreaMast b WITH (NOLOCK), bkmStateLgc c WITH (NOLOCK), bkmCatgPack d WITH (NOLOCK)
+                                  WHERE a.areaCode = b.areaCode AND b.stLgcCod = c.stLgcCod AND a.mnthYear = dbo.cofNextYrMn(CONVERT(varchar(6), GETDATE(), 112))
+                                  AND a.catPckCd = d.catPckCd AND a.statFlag NOT IN ('C','R')
+                                  GROUP BY c.stLgcCod, c.retlStHd, a.areaCode, d.nwMtKgLt
+                                  UNION ALL
+                                  SELECT c.stLgcCod, c.retlStHd, b.areaCode, d.nwMtKgLt, 0
+                                  FROM bkmAreaMast b WITH (NOLOCK), bkmStateLgc c WITH (NOLOCK), bkmCatgPack d WITH (NOLOCK)
+                                  WHERE b.stLgcCod = c.stLgcCod AND d.isActive = 'Y' AND b.isActive = 'Y' 
+                                  AND b.areaCode NOT IN ('EXB','EXC','EXE','EXG','EXN','EXR','EXT','EXR','EXT','EXR','KKR', 'KAT', 'DLC','PNY','BKM','NAT','KAT','JPF')
+                                  AND d.prodCdDs IS NOT NULL
+                                  GROUP BY c.stLgcCod, c.retlStHd, b.areaCode, d.nwMtKgLt
+                              ) x
+                              WHERE retlStHd = @loginId AND DAY(GETDATE()) >= 19
+                              GROUP BY stLgcCod, nwMtKgLt";
 
-            // keys & flags
-            if ((bad = Check("docuNumb", req.docuNumb, LDocuNumb)) != null) return bad;
-            if ((bad = Check("deptCode", req.deptCode, LDeptCode)) != null) return bad;
-            if ((bad = Check("statFlag", req.statFlag, LStatFlag)) != null) return bad;
-            if ((bad = Check("createId", req.createId, LCreateId)) != null) return bad;
-            if ((bad = Check("updateId", req.updateId, LUpdateId)) != null) return bad;
+                var parameters = new SqlParameter[]
+                {
+                    new SqlParameter("@loginId", loginId)
+                };
 
-            // DSR fields
-            if ((bad = Check("dsrParam", req.dsrParam, LDsrParam)) != null) return bad;
-            if ((bad = Check("cusRtlFl", req.cusRtlFl, LCusRtlFl)) != null) return bad;
-            if ((bad = Check("cusRtlCd", req.cusRtlCd, LCusRtlCd)) != null) return bad;
+                var result = ExecuteQuery(sql, parameters);
+                
+                var snopStatusList = new List<object>();
+                foreach (DataRow row in result.Rows)
+                {
+                    snopStatusList.Add(new
+                    {
+                        Type = row["SnOP"].ToString(),
+                        Unit = row["nwMtKgLt"].ToString(),
+                        EntryCount = Convert.ToInt32(row["entryCount"]),
+                        TotalCount = Convert.ToInt32(row["totalCount"]),
+                        Status = row["status"].ToString()
+                    });
+                }
 
-            // remarks
-            for (int i = 1; i <= 8; i++)
-                if ((bad = Check($"dsrRem0{i}", (string)typeof(DsrRequest).GetProperty($"dsrRem0{i}")!.GetValue(req), LRemLong)) != null)
-                    return bad;
-            if ((bad = Check("dsrRem09", req.dsrRem09, LRemLong)) != null) return bad;
-            if ((bad = Check("dsrRem10", req.dsrRem10, LRemShort)) != null) return bad;
-
-            // attachments & geo
-            if ((bad = Check("atchNmId", req.atchNmId, LAtchNmId)) != null) return bad;
-            if (string.IsNullOrEmpty(req.locaCapr)) return BadRequest("locaCapr is required.");
-            if ((bad = Check("latitute", req.latitute, LLatLong)) != null) return bad;
-            if ((bad = Check("lgtitute", req.lgtitute, LLatLong)) != null) return bad;
-
-            // area & route
-            if ((bad = Check("areaCode", req.areaCode, LAreaCode)) != null) return bad;
-            if ((bad = Check("cuRtType", req.cuRtType, LCuRtType)) != null) return bad;
-
-            // retail/location
-            if ((bad = Check("retlStFl", req.retlStFl, LRetlStFl)) != null) return bad;
-            if ((bad = Check("pinCodeN", req.pinCodeN, LPinCodeN)) != null) return bad;
-            if ((bad = Check("cityName", req.cityName, LCityName)) != null) return bad;
-            if ((bad = Check("district", req.district, LDistrict)) != null) return bad;
-
-            // business/pend
-            if ((bad = Check("cstBisTy", req.cstBisTy, LCstBisTy)) != null) return bad;
-            if ((bad = Check("pendWith", req.pendWith, LPendWith)) != null) return bad;
-            if ((bad = Check("ltLgDist", req.ltLgDist, LLtLgDist)) != null) return bad;
-            if ((bad = Check("apprRemk", req.apprRemk, LApprRemk)) != null) return bad;
-
-            // order flags/ref
-            if ((bad = Check("ordInsFl", req.ordInsFl, LIsTilRtl)) != null) return bad;
-            if ((bad = Check("refOrdNo", req.refOrdNo, LRefOrdNo)) != null) return bad;
-            if ((bad = Check("isTilRtl", req.isTilRtl, LIsTilRtl)) != null) return bad;
-
-            // dsrParTy
-            if (req.dsrParTy <= 0) return BadRequest("dsrParTy must be > 0.");
-
-            return null;
-        }
-
-        private IActionResult Check(string name, string value, int maxLen)
-        {
-            if (string.IsNullOrEmpty(value))
-                return BadRequest($"{name} is required.");
-            if (value.Length > maxLen)
-                return BadRequest($"{name} must be ≤ {maxLen} chars (you sent {value.Length}).");
-            return null;
+                return Ok(snopStatusList);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"An error occurred while fetching SnOP status: {ex.Message}");
+            }
         }
     }
 
-    public class DsrRequest
+    // Model classes
+    public class DocumentDateModel
     {
-        public string docuNumb { get; set; }
-        public DateTime docuDate { get; set; }
-        public string deptCode { get; set; }
-        public string statFlag { get; set; }
-        public string createId { get; set; }
-        public string updateId { get; set; }
-        public string dsrParam { get; set; }
-        public string cusRtlFl { get; set; }
-        public string cusRtlCd { get; set; }
-        public string dsrRem01 { get; set; }
-        public string dsrRem02 { get; set; }
-        public string dsrRem03 { get; set; }
-        public string dsrRem04 { get; set; }
-        public string dsrRem05 { get; set; }
-        public string dsrRem06 { get; set; }
-        public string dsrRem07 { get; set; }
-        public string dsrRem08 { get; set; }
-        public string dsrRem09 { get; set; }
-        public string dsrRem10 { get; set; }
-        public string atchNmId { get; set; }
-        public string locaCapr { get; set; }
-        public string latitute { get; set; }
-        public string lgtitute { get; set; }
-        public string areaCode { get; set; }
-        public string cuRtType { get; set; }
-        public string retlStFl { get; set; }
-        public string pinCodeN { get; set; }
-        public string cityName { get; set; }
-        public string district { get; set; }
-        public string cstBisTy { get; set; }
-        public string pendWith { get; set; }
-        public string ltLgDist { get; set; }
-        public string apprRemk { get; set; }
-        public string ordInsFl { get; set; }
-        public string refOrdNo { get; set; }
-        public string isTilRtl { get; set; }
-        public DateTime? ordExDat { get; set; }
-        public short dsrParTy { get; set; }
+        public string LoginId { get; set; }
+        public string DocumentDate { get; set; }
+    }
+
+    public class DsrDocumentModel
+    {
+        public string ProcType { get; set; } // A for Add, U for Update
+        public string DocumentNumber { get; set; }
+        public string DocumentDate { get; set; }
+        public string DsrParam { get; set; }
+        public string CusRtlFl { get; set; }
+        public string CusRtlCd { get; set; }
+        public string DsrRem01 { get; set; }
+        public string DsrRem02 { get; set; }
+        public string DsrRem03 { get; set; }
+        public string DsrRem04 { get; set; }
+        public string DsrRem05 { get; set; }
+        public string DsrRem06 { get; set; }
+        public string DsrRem07 { get; set; }
+        public string DsrRem08 { get; set; }
+        public string AreaCode { get; set; }
+        public string CuRtType { get; set; }
+        public string LoginId { get; set; }
+        public string DeptCode { get; set; }
+        public string GeoLatit { get; set; }
+        public string GeoLongt { get; set; }
+        public string DsrRem09 { get; set; }
+        public string CstBisTy { get; set; }
+        public string CityName { get; set; }
+        public string District { get; set; }
+        public string PinCodeN { get; set; }
+        public string CustCdRt { get; set; }
+        public List<DsrDocumentItemModel> DocumentItems { get; set; }
+    }
+
+    public class DsrDocumentItemModel
+    {
+        public int DocSrNo { get; set; }
+        public string RepoCatg { get; set; }
+        public string RepoDesc { get; set; }
+        public decimal ProdQnty { get; set; }
+        public decimal ProjQnty { get; set; }
+        public string ActnRemk { get; set; }
+        public string TargetDt { get; set; }
     }
 }
