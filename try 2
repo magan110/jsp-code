@@ -1285,3 +1285,963 @@ public void ConfigureServices(IServiceCollection services)
         );
     });
 }
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Threading.Tasks;
+
+[ApiController]
+[Route("api/[controller]")]
+public class DSRController : ControllerBase
+{
+    private readonly ILogger<DSRController> _logger;
+    private readonly string _bwliveConnectionString;
+    private readonly string _itKhariaConnectionString;
+    private readonly string _imageDataConnectionString;
+
+    public DSRController(ILogger<DSRController> logger, IConfiguration configuration)
+    {
+        _logger = logger;
+        _bwliveConnectionString = configuration.GetConnectionString("BwLiveConnection") ?? "";
+        _itKhariaConnectionString = configuration.GetConnectionString("ItKhariaConnection") ?? "";
+        _imageDataConnectionString = configuration.GetConnectionString("ImageDataConnection") ?? "";
+    }
+
+    #region Data Models
+
+    public class DSRModel
+    {
+        public string ProcType { get; set; } = "A";
+        public string DocuNumb { get; set; } = "";
+        public string DocuDate { get; set; } = "";
+        public string OrdExDat { get; set; } = "";
+        public string DsrParam { get; set; } = "04";
+        public string CusRtlFl { get; set; } = "";
+        public string AreaCode { get; set; } = "";
+        public string CusRtlCd { get; set; } = "";
+        public string MrktName { get; set; } = "";
+        public string PendIsue { get; set; } = "N";
+        public string PndIsuDt { get; set; } = "";
+        public string IsuDetal { get; set; } = "";
+        public string DsrRem05 { get; set; } = "";
+        public List<string> BrndSlWc { get; set; } = new List<string>();
+        public List<string> BrndSlWp { get; set; } = new List<string>();
+        public string PrtDsCnt { get; set; } = "N";
+        public decimal? SlWcVlum { get; set; }
+        public decimal? SlWpVlum { get; set; }
+        public string DeptCode { get; set; } = "";
+        public string PendWith { get; set; } = "";
+        public string CreateId { get; set; } = "2948";
+        public string FinlRslt { get; set; } = "";
+        public string GeoLatit { get; set; } = "";
+        public string GeoLongt { get; set; } = "";
+        public string LtLgDist { get; set; } = "";
+        public string CityName { get; set; } = "";
+        public string CusRtTyp { get; set; } = "";
+        public string IsTilRtl { get; set; } = "NO";
+        public decimal? TileStck { get; set; }
+        public decimal? WcErlSlb { get; set; }
+        public decimal? WpErlSlb { get; set; }
+        public decimal? VpErlSlb { get; set; }
+        public decimal? BwStkWcc { get; set; }
+        public decimal? BwStkWcp { get; set; }
+        public decimal? BwStkVap { get; set; }
+        public decimal? JkAvgWcc { get; set; }
+        public decimal? JkAvgWcp { get; set; }
+        public decimal? AsAvgWcc { get; set; }
+        public decimal? AsAvgWcp { get; set; }
+        public decimal? OtAvgWcc { get; set; }
+        public decimal? OtAvgWcp { get; set; }
+        public List<ActivityDetail> ActivityDetails { get; set; } = new List<ActivityDetail>();
+        public List<Product> Products { get; set; } = new List<Product>();
+        public List<MarketIntelligence> MarketIntelligence { get; set; } = new List<MarketIntelligence>();
+        public List<GiftDistribution> GiftDistribution { get; set; } = new List<GiftDistribution>();
+    }
+
+    public class ActivityDetail
+    {
+        public string SeqNumb { get; set; } = "";
+        public string DocuNumb { get; set; } = "";
+        public string RepoCatg { get; set; } = "";
+        public string CatgPack { get; set; } = "";
+        public decimal? ProdQnty { get; set; }
+        public decimal? ProjQnty { get; set; }
+        public string ActnRemk { get; set; } = "";
+        public string MrktData { get; set; } = "";
+        public DateTime? TargetDt { get; set; }
+        public string StatFlag { get; set; } = "N";
+    }
+
+    public class Product
+    {
+        public string RepoCatg { get; set; } = "";
+        public string CatgPkPr { get; set; } = "";
+        public decimal? ProdQnty { get; set; }
+        public decimal? ProjQnty { get; set; }
+        public string ActnRemk { get; set; } = "";
+    }
+
+    public class MarketIntelligence
+    {
+        public string BrandName { get; set; } = "";
+        public string ProductCode { get; set; } = "";
+        public decimal? PriceB { get; set; }
+        public decimal? PriceC { get; set; }
+    }
+
+    public class GiftDistribution
+    {
+        public string MrtlCode { get; set; } = "";
+        public decimal? IsueQnty { get; set; }
+        public string Naration { get; set; } = "";
+    }
+
+    #endregion
+
+    #region Database Operations
+
+    private async Task<List<Dictionary<string, object>>> ExecuteSelectQueryAsync(
+        string connectionString, 
+        string query, 
+        Dictionary<string, object> parameters = null)
+    {
+        var resultList = new List<Dictionary<string, object>>();
+        using (var conn = new SqlConnection(connectionString))
+        using (var cmd = new SqlCommand(query, conn))
+        {
+            if (parameters != null)
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
+                }
+            }
+            
+            await conn.OpenAsync();
+            using (var reader = await cmd.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    var row = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        row[reader.GetName(i)] = reader[i] == DBNull.Value ? null : reader[i];
+                    }
+                    resultList.Add(row);
+                }
+            }
+        }
+        return resultList;
+    }
+
+    private async Task<int> ExecuteCommandAsync(
+        string connectionString, 
+        string query, 
+        Dictionary<string, object> parameters = null)
+    {
+        using (var conn = new SqlConnection(connectionString))
+        using (var cmd = new SqlCommand(query, conn))
+        {
+            if (parameters != null)
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
+                }
+            }
+            
+            await conn.OpenAsync();
+            return await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    private async Task<IDbTransaction> BeginTransactionAsync(string connectionString)
+    {
+        var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        return connection.BeginTransaction();
+    }
+
+    #endregion
+
+    #region Dropdown Data Methods
+
+    [HttpGet("GetCustomerTypes")]
+    public async Task<IActionResult> GetCustomerTypes()
+    {
+        try
+        {
+            var query = @"
+                SELECT 'C' AS value, 'Stockiest/ Urbon Stockiest' AS text
+                UNION SELECT 'D', 'Direct Dealer'
+                UNION SELECT 'RD', 'Rural Stockiest'
+                UNION SELECT 'R', 'Retailer'
+                UNION SELECT 'RR', 'Rural Retailer'
+                UNION SELECT '07', 'Registered Applicator'
+                UNION SELECT '08', 'Painter'";
+            
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting customer types");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetAreas")]
+    public async Task<IActionResult> GetAreas()
+    {
+        try
+        {
+            var query = @"
+                SELECT areaCode AS value, areaDesc AS text 
+                FROM bkmAreaMast WITH (NOLOCK) 
+                WHERE isActive = 'Y' AND isnull(isOnlyDp, 'N') <> 'Y'
+                ORDER BY areaDesc";
+            
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting areas");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetPurchaserCodes")]
+    public async Task<IActionResult> GetPurchaserCodes(
+        [FromQuery] string areaCode, 
+        [FromQuery] string purchaserType, 
+        [FromQuery] string searchText = "")
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(areaCode) || string.IsNullOrEmpty(purchaserType))
+            {
+                return BadRequest(new { success = false, message = "Area code and purchaser type are required" });
+            }
+
+            string query;
+            Dictionary<string, object> parameters = new Dictionary<string, object>
+            {
+                { "@areaCode", areaCode },
+                { "@searchText", $"%{searchText}%" }
+            };
+
+            if (purchaserType == "R" || purchaserType == "RR")
+            {
+                query = @"
+                    SELECT retlCode AS value, 
+                           retlCode + ' - ' + retlName AS text,
+                           retlName AS name,
+                           retlAddr AS address,
+                           isnull(kycStatus, '') AS kycStatus,
+                           retlAddr AS marketName
+                    FROM rtmRetailer WITH (NOLOCK)
+                    WHERE areaCode = @areaCode 
+                      AND isActive = 'Y'
+                      AND (retlCode LIKE @searchText OR retlName LIKE @searchText)";
+            }
+            else
+            {
+                query = @"
+                    SELECT custCode AS value, 
+                           custCode + ' - ' + custName AS text,
+                           custName AS name,
+                           custAddr AS address,
+                           isnull(kycStatus, '') AS kycStatus,
+                           custAddr AS marketName
+                    FROM dpmCustomer WITH (NOLOCK)
+                    WHERE areaCode = @areaCode 
+                      AND isActive = 'Y'
+                      AND (custCode LIKE @searchText OR custName LIKE @searchText)";
+            }
+
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query, parameters);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting purchaser codes");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetProductCategories")]
+    public async Task<IActionResult> GetProductCategories()
+    {
+        try
+        {
+            var query = @"
+                SELECT Code AS value, Description AS text 
+                FROM bkmRepoCatg WITH (NOLOCK)
+                WHERE isActive = 'Y'
+                ORDER BY Description";
+            
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting product categories");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("products/{category}/skus")]
+    public async Task<IActionResult> GetProducts(string category)
+    {
+        try
+        {
+            var query = @"
+                SELECT catPckCd AS Code, 
+                       catPckCd + ' - ' + repoDesc AS Description
+                FROM bkmCatgPack WITH (NOLOCK)
+                WHERE repoCatg = @category AND isActive = 'Y'
+                ORDER BY repoDesc";
+            
+            var parameters = new Dictionary<string, object> { { "@category", category } };
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query, parameters);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting products for category {category}", category);
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetBrands")]
+    public async Task<IActionResult> GetBrands()
+    {
+        try
+        {
+            var query = @"
+                SELECT 'BW' AS value, 'Birla White' AS text
+                UNION SELECT 'JK', 'JK Cement'
+                UNION SELECT 'RK', 'Ramco'
+                UNION SELECT 'OT', 'Others'";
+            
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting brands");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetGiftTypes")]
+    public async Task<IActionResult> GetGiftTypes()
+    {
+        try
+        {
+            var query = @"
+                SELECT mrtlCode AS value, mrtlDesc AS text 
+                FROM bkmMaterial WITH (NOLOCK)
+                WHERE isActive = 'Y'
+                ORDER BY mrtlDesc";
+            
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting gift types");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetExceptionReasons")]
+    public async Task<IActionResult> GetExceptionReasons()
+    {
+        try
+        {
+            var query = @"
+                SELECT 'Network Issue' AS value, 'Network Issue' AS text
+                UNION SELECT 'Battery Low', 'Battery Low'
+                UNION SELECT 'Mobile Not working', 'Mobile Not working'
+                UNION SELECT 'Location not capturing', 'Location not capturing'
+                UNION SELECT 'Wrong Location OF Retailer', 'Wrong Location OF Retailer'
+                UNION SELECT 'Wrong Location Captured', 'Wrong Location Captured'";
+            
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting exception reasons");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    #endregion
+
+    #region Customer Details and History
+
+    [HttpGet("GetCustomerDetails/{customerCode}/{customerType}/{areaCode}")]
+    public async Task<IActionResult> GetCustomerDetails(string customerCode, string customerType, string areaCode)
+    {
+        try
+        {
+            string query;
+            Dictionary<string, object> parameters = new Dictionary<string, object>
+            {
+                { "@customerCode", customerCode },
+                { "@areaCode", areaCode }
+            };
+
+            if (customerType == "R" || customerType == "RR")
+            {
+                query = @"
+                    SELECT retlCode AS code, retlName AS name, retlAddr AS address, 
+                           isnull(kycStatus, '') AS kycStatus, retlAddr AS marketName
+                    FROM rtmRetailer WITH (NOLOCK)
+                    WHERE retlCode = @customerCode AND areaCode = @areaCode AND isActive = 'Y'";
+            }
+            else
+            {
+                query = @"
+                    SELECT custCode AS code, custName AS name, custAddr AS address, 
+                           isnull(kycStatus, '') AS kycStatus, custAddr AS marketName
+                    FROM dpmCustomer WITH (NOLOCK)
+                    WHERE custCode = @customerCode AND areaCode = @areaCode AND isActive = 'Y'";
+            }
+
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query, parameters);
+            
+            if (result.Count == 0)
+            {
+                return NotFound(new { success = false, message = "Customer not found" });
+            }
+
+            return Ok(new { success = true, data = result[0] });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting customer details");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetCustomerSalesHistory")]
+    public async Task<IActionResult> GetCustomerSalesHistory(
+        [FromQuery] string customerCode, 
+        [FromQuery] string customerType)
+    {
+        try
+        {
+            // Get last 3 months average
+            var avgQuery = @"
+                SELECT 
+                    SUM(CASE WHEN repoCatg = '01' THEN prodQnty ELSE 0 END) AS wc,
+                    SUM(CASE WHEN repoCatg = '02' THEN prodQnty ELSE 0 END) AS wcp,
+                    SUM(CASE WHEN repoCatg = '03' THEN prodQnty ELSE 0 END) AS vap
+                FROM dptDSRActvtDtl WITH (NOLOCK)
+                WHERE docuNumb IN (
+                    SELECT docuNumb 
+                    FROM dptDSRActvt WITH (NOLOCK)
+                    WHERE cusRtlCd = @customerCode 
+                      AND cusRtlFl = @customerType
+                      AND docuDate >= DATEADD(MONTH, -3, GETDATE())
+                ) AND mrktData = '01'";
+            
+            var avgParams = new Dictionary<string, object>
+            {
+                { "@customerCode", customerCode },
+                { "@customerType", customerType }
+            };
+            
+            var avgResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, avgQuery, avgParams);
+            
+            // Get current month data
+            var currentQuery = @"
+                SELECT 
+                    SUM(CASE WHEN repoCatg = '01' THEN prodQnty ELSE 0 END) AS wcCurrent,
+                    SUM(CASE WHEN repoCatg = '02' THEN prodQnty ELSE 0 END) AS wcpCurrent,
+                    SUM(CASE WHEN repoCatg = '03' THEN prodQnty ELSE 0 END) AS vapCurrent
+                FROM dptDSRActvtDtl WITH (NOLOCK)
+                WHERE docuNumb IN (
+                    SELECT docuNumb 
+                    FROM dptDSRActvt WITH (NOLOCK)
+                    WHERE cusRtlCd = @customerCode 
+                      AND cusRtlFl = @customerType
+                      AND MONTH(docuDate) = MONTH(GETDATE())
+                      AND YEAR(docuDate) = YEAR(GETDATE())
+                ) AND mrktData = '01'";
+            
+            var currentResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, currentQuery, avgParams);
+            
+            // Get stock data
+            var stockQuery = @"
+                SELECT 
+                    wcStock AS wc,
+                    wcpStock AS wcp,
+                    vapStock AS vap
+                FROM dpmCustomer WITH (NOLOCK)
+                WHERE custCode = @customerCode AND isActive = 'Y'";
+            
+            var stockResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, stockQuery, new Dictionary<string, object> { { "@customerCode", customerCode } });
+            
+            var result = new Dictionary<string, object>
+            {
+                ["last3MonthsAverage"] = avgResult.Count > 0 ? avgResult[0] : new Dictionary<string, object>(),
+                ["currentMonth"] = currentResult.Count > 0 ? currentResult[0] : new Dictionary<string, object>(),
+                ["stock"] = stockResult.Count > 0 ? stockResult[0] : new Dictionary<string, object>()
+            };
+            
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting customer sales history");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    #endregion
+
+    #region DSR Operations
+
+    [HttpGet("GetPendingDSR/{loginId}")]
+    public async Task<IActionResult> GetPendingDSR(string loginId)
+    {
+        try
+        {
+            var query = @"
+                SELECT TOP 30 
+                    docuNumb AS value,
+                    dbo.wcfParamDes(dsrParam, 'dsrParNw') + ' ~ ' + docuNumb + ' ~ ' + CONVERT(varchar(10), docuDate, 103) AS text,
+                    docuDate
+                FROM dptDSRActvt WITH (NOLOCK)
+                WHERE createId = @loginId 
+                  AND docuDate > GETDATE() - 4
+                  AND statFlag NOT IN ('C', 'R')
+                ORDER BY docuNumb DESC";
+            
+            var parameters = new Dictionary<string, object> { { "@loginId", loginId } };
+            var result = await ExecuteSelectQueryAsync(_bwliveConnectionString, query, parameters);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting pending DSR entries");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetDSRForEdit/{docuNumb}/{loginId}")]
+    public async Task<IActionResult> GetDSRForEdit(string docuNumb, string loginId)
+    {
+        try
+        {
+            // Get main DSR record
+            var mainQuery = @"
+                SELECT 
+                    docuNumb, CONVERT(varchar(10), docuDate, 103) AS docuDate, 
+                    dsrParam, cusRtlFl, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, 
+                    dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, areaCode, 
+                    ISNULL(cuRtType, '') AS cuRtType
+                FROM dptDSRActvt WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb AND createId = @loginId";
+            
+            var mainParams = new Dictionary<string, object>
+            {
+                { "@docuNumb", docuNumb },
+                { "@loginId", loginId }
+            };
+            
+            var mainResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, mainQuery, mainParams);
+            
+            if (mainResult.Count == 0)
+            {
+                return NotFound(new { success = false, message = "DSR not found" });
+            }
+            
+            var mainData = mainResult[0];
+            
+            // Get activity details
+            var activityQuery = @"
+                SELECT 
+                    repoCatg, catgPack, prodQnty, projQnty, actnRemk, 
+                    ISNULL(CONVERT(varchar(10), targetDt, 103), '') AS targetDt, mrktData
+                FROM dptDSRActvtDtl WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb AND createId = @loginId
+                ORDER BY seqNumb";
+            
+            var activityResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, activityQuery, mainParams);
+            
+            // Get market intelligence
+            var marketQuery = @"
+                SELECT brandName, productCode, priceB, priceC
+                FROM dptMktIntel WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb";
+            
+            var marketResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, marketQuery, new Dictionary<string, object> { { "@docuNumb", docuNumb } });
+            
+            // Get gift distribution
+            var giftQuery = @"
+                SELECT mrtlCode, isueQnty, naration
+                FROM dptGiftDist WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb
+                ORDER BY seqNumb";
+            
+            var giftResult = await ExecuteSelectQueryAsync(_bwliveConnectionString, giftQuery, new Dictionary<string, object> { { "@docuNumb", docuNumb } });
+            
+            var result = new Dictionary<string, object>
+            {
+                ["header"] = mainData,
+                ["activityDetails"] = activityResult,
+                ["marketIntelligence"] = marketResult,
+                ["giftDistribution"] = giftResult
+            };
+            
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting DSR for edit");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpPost("SaveDSR")]
+    public async Task<IActionResult> SaveDSR([FromBody] DSRModel model)
+    {
+        try
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(new { success = false, message = "Invalid data provided", errors = ModelState.Values.SelectMany(v => v.Errors) });
+            }
+            
+            // Generate document number if needed
+            if (model.ProcType == "A" && string.IsNullOrEmpty(model.DocuNumb))
+            {
+                model.DocuNumb = await GenerateDocumentNumberAsync(model.AreaCode);
+            }
+            
+            // Begin transaction
+            using (var transaction = await BeginTransactionAsync(_bwliveConnectionString))
+            {
+                try
+                {
+                    // Save main DSR record
+                    await SaveMainDSRAsync(model, transaction);
+                    
+                    // Delete existing details for update/delete operations
+                    if (model.ProcType != "A")
+                    {
+                        await DeleteExistingDetailsAsync(model.DocuNumb, transaction);
+                    }
+                    
+                    // Save activity details
+                    await SaveActivityDetailsAsync(model, transaction);
+                    
+                    // Save market intelligence
+                    await SaveMarketIntelligenceAsync(model, transaction);
+                    
+                    // Save gift distribution
+                    await SaveGiftDistributionAsync(model, transaction);
+                    
+                    // Commit transaction
+                    await transaction.CommitAsync();
+                    
+                    return Ok(new { success = true, message = "DSR saved successfully", docuNumb = model.DocuNumb });
+                }
+                catch (Exception ex)
+                {
+                    // Rollback transaction
+                    await transaction.RollbackAsync();
+                    _logger.LogError(ex, "Error saving DSR");
+                    return StatusCode(500, new { success = false, message = $"Failed to save DSR: {ex.Message}" });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing DSR save request");
+            return StatusCode(500, new { success = false, message = $"Internal server error: {ex.Message}" });
+        }
+    }
+
+    #endregion
+
+    #region Helper Methods
+
+    private async Task<string> GenerateDocumentNumberAsync(string areaCode)
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+            var timestamp = now.ToString("yyMMddHHmmss");
+            var areaCodePadded = areaCode.PadRight(3, '0').Substring(0, 3);
+            return $"{areaCodePadded}DSR{timestamp}";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error generating document number");
+            throw;
+        }
+    }
+
+    private async Task SaveMainDSRAsync(DSRModel model, IDbTransaction transaction)
+    {
+        var parameters = new Dictionary<string, object>
+        {
+            { "@ProcType", model.ProcType },
+            { "@DocuNumb", model.DocuNumb },
+            { "@DocuDate", model.DocuDate },
+            { "@OrdExDat", model.OrdExDat },
+            { "@DsrParam", model.DsrParam },
+            { "@CusRtlFl", model.CusRtlFl },
+            { "@AreaCode", model.AreaCode },
+            { "@CusRtlCd", model.CusRtlCd },
+            { "@MrktName", model.MrktName },
+            { "@PendIsue", model.PendIsue },
+            { "@PndIsuDt", model.PndIsuDt },
+            { "@IsuDetal", model.IsuDetal },
+            { "@DsrRem05", model.DsrRem05 },
+            { "@BrndSlWc", model.BrndSlWc != null ? string.Join(",", model.BrndSlWc) : "" },
+            { "@BrndSlWp", model.BrndSlWp != null ? string.Join(",", model.BrndSlWp) : "" },
+            { "@PrtDsCnt", model.PrtDsCnt },
+            { "@SlWcVlum", model.SlWcVlum ?? (object)DBNull.Value },
+            { "@SlWpVlum", model.SlWpVlum ?? (object)DBNull.Value },
+            { "@DeptCode", model.DeptCode },
+            { "@PendWith", model.PendWith },
+            { "@CreateId", model.CreateId },
+            { "@FinlRslt", model.FinlRslt },
+            { "@GeoLatit", model.GeoLatit },
+            { "@GeoLongt", model.GeoLongt },
+            { "@LtLgDist", model.LtLgDist },
+            { "@CityName", model.CityName },
+            { "@CusRtTyp", model.CusRtTyp },
+            { "@IsTilRtl", model.IsTilRtl },
+            { "@TileStck", model.TileStck ?? (object)DBNull.Value },
+            { "@WcErlSlb", model.WcErlSlb ?? (object)DBNull.Value },
+            { "@WpErlSlb", model.WpErlSlb ?? (object)DBNull.Value },
+            { "@VpErlSlb", model.VpErlSlb ?? (object)DBNull.Value },
+            { "@BwStkWcc", model.BwStkWcc ?? (object)DBNull.Value },
+            { "@BwStkWcp", model.BwStkWcp ?? (object)DBNull.Value },
+            { "@BwStkVap", model.BwStkVap ?? (object)DBNull.Value },
+            { "@JkAvgWcc", model.JkAvgWcc ?? (object)DBNull.Value },
+            { "@JkAvgWcp", model.JkAvgWcp ?? (object)DBNull.Value },
+            { "@AsAvgWcc", model.AsAvgWcc ?? (object)DBNull.Value },
+            { "@AsAvgWcp", model.AsAvgWcp ?? (object)DBNull.Value },
+            { "@OtAvgWcc", model.OtAvgWcc ?? (object)DBNull.Value },
+            { "@OtAvgWcp", model.OtAvgWcp ?? (object)DBNull.Value }
+        };
+        
+        string query;
+        
+        if (model.ProcType == "A")
+        {
+            query = @"
+                INSERT INTO dptDSRActvt 
+                (ProcType, DocuNumb, DocuDate, OrdExDat, DsrParam, CusRtlFl, AreaCode, CusRtlCd, 
+                 MrktName, PendIsue, PndIsuDt, IsuDetal, DsrRem05, BrndSlWc, BrndSlWp, PrtDsCnt, 
+                 SlWcVlum, SlWpVlum, DeptCode, PendWith, CreateId, FinlRslt, GeoLatit, GeoLongt, 
+                 LtLgDist, CityName, CusRtTyp, IsTilRtl, TileStck, WcErlSlb, WpErlSlb, VpErlSlb, 
+                 BwStkWcc, BwStkWcp, BwStkVap, JkAvgWcc, JkAvgWcp, AsAvgWcc, AsAvgWcp, OtAvgWcc, OtAvgWcp)
+                VALUES 
+                (@ProcType, @DocuNumb, @DocuDate, @OrdExDat, @DsrParam, @CusRtlFl, @AreaCode, @CusRtlCd, 
+                 @MrktName, @PendIsue, @PndIsuDt, @IsuDetal, @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, 
+                 @SlWcVlum, @SlWpVlum, @DeptCode, @PendWith, @CreateId, @FinlRslt, @GeoLatit, @GeoLongt, 
+                 @LtLgDist, @CityName, @CusRtTyp, @IsTilRtl, @TileStck, @WcErlSlb, @WpErlSlb, @VpErlSlb, 
+                 @BwStkWcc, @BwStkWcp, @BwStkVap, @JkAvgWcc, @JkAvgWcp, @AsAvgWcc, @AsAvgWcp, @OtAvgWcc, @OtAvgWcp)";
+        }
+        else
+        {
+            query = @"
+                UPDATE dptDSRActvt SET
+                    DocuDate = @DocuDate,
+                    OrdExDat = @OrdExDat,
+                    DsrParam = @DsrParam,
+                    CusRtlFl = @CusRtlFl,
+                    AreaCode = @AreaCode,
+                    CusRtlCd = @CusRtlCd,
+                    MrktName = @MrktName,
+                    PendIsue = @PendIsue,
+                    PndIsuDt = @PndIsuDt,
+                    IsuDetal = @IsuDetal,
+                    DsrRem05 = @DsrRem05,
+                    BrndSlWc = @BrndSlWc,
+                    BrndSlWp = @BrndSlWp,
+                    PrtDsCnt = @PrtDsCnt,
+                    SlWcVlum = @SlWcVlum,
+                    SlWpVlum = @SlWpVlum,
+                    DeptCode = @DeptCode,
+                    PendWith = @PendWith,
+                    FinlRslt = @FinlRslt,
+                    GeoLatit = @GeoLatit,
+                    GeoLongt = @GeoLongt,
+                    LtLgDist = @LtLgDist,
+                    CityName = @CityName,
+                    CusRtTyp = @CusRtTyp,
+                    IsTilRtl = @IsTilRtl,
+                    TileStck = @TileStck,
+                    WcErlSlb = @WcErlSlb,
+                    WpErlSlb = @WpErlSlb,
+                    VpErlSlb = @VpErlSlb,
+                    BwStkWcc = @BwStkWcc,
+                    BwStkWcp = @BwStkWcp,
+                    BwStkVap = @BwStkVap,
+                    JkAvgWcc = @JkAvgWcc,
+                    JkAvgWcp = @JkAvgWcp,
+                    AsAvgWcc = @AsAvgWcc,
+                    AsAvgWcp = @AsAvgWcp,
+                    OtAvgWcc = @OtAvgWcc,
+                    OtAvgWcp = @OtAvgWcp
+                WHERE DocuNumb = @DocuNumb AND CreateId = @CreateId";
+        }
+        
+        await ExecuteCommandAsync(_bwliveConnectionString, query, parameters, transaction);
+    }
+
+    private async Task DeleteExistingDetailsAsync(string docuNumb, IDbTransaction transaction)
+    {
+        var parameters = new Dictionary<string, object> { { "@DocuNumb", docuNumb } };
+        
+        // Delete activity details
+        await ExecuteCommandAsync(
+            _bwliveConnectionString, 
+            "DELETE FROM dptDSRActvtDtl WHERE DocuNumb = @DocuNumb", 
+            parameters, transaction);
+        
+        // Delete market intelligence
+        await ExecuteCommandAsync(
+            _bwliveConnectionString, 
+            "DELETE FROM dptMktIntel WHERE DocuNumb = @DocuNumb", 
+            parameters, transaction);
+        
+        // Delete gift distribution
+        await ExecuteCommandAsync(
+            _bwliveConnectionString, 
+            "DELETE FROM dptGiftDist WHERE DocuNumb = @DocuNumb", 
+            parameters, transaction);
+    }
+
+    private async Task SaveActivityDetailsAsync(DSRModel model, IDbTransaction transaction)
+    {
+        var seqNumber = 1;
+        
+        // Save products and gifts from activity details
+        foreach (var detail in model.ActivityDetails)
+        {
+            var parameters = new Dictionary<string, object>
+            {
+                { "@DocuNumb", model.DocuNumb },
+                { "@SeqNumb", seqNumber.ToString().PadLeft(3, '0') },
+                { "@RepoCatg", detail.RepoCatg },
+                { "@CatgPack", detail.CatgPack },
+                { "@ProdQnty", detail.ProdQnty ?? (object)DBNull.Value },
+                { "@ProjQnty", detail.ProjQnty ?? (object)DBNull.Value },
+                { "@ActnRemk", detail.ActnRemk },
+                { "@MrktData", detail.MrktData },
+                { "@TargetDt", detail.TargetDt ?? (object)DBNull.Value },
+                { "@StatFlag", detail.StatFlag },
+                { "@CreateId", model.CreateId }
+            };
+            
+            var query = @"
+                INSERT INTO dptDSRActvtDtl 
+                (DocuNumb, SeqNumb, RepoCatg, CatgPack, ProdQnty, ProjQnty, ActnRemk, MrktData, TargetDt, StatFlag, CreateId, CreateDt)
+                VALUES 
+                (@DocuNumb, @SeqNumb, @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty, @ActnRemk, @MrktData, @TargetDt, @StatFlag, @CreateId, GETDATE())";
+            
+            await ExecuteCommandAsync(_bwliveConnectionString, query, parameters, transaction);
+            seqNumber++;
+        }
+    }
+
+    private async Task SaveMarketIntelligenceAsync(DSRModel model, IDbTransaction transaction)
+    {
+        if (model.MarketIntelligence == null) return;
+        
+        foreach (var intel in model.MarketIntelligence)
+        {
+            var parameters = new Dictionary<string, object>
+            {
+                { "@DocuNumb", model.DocuNumb },
+                { "@BrandName", intel.BrandName },
+                { "@ProductCode", intel.ProductCode },
+                { "@PriceB", intel.PriceB ?? (object)DBNull.Value },
+                { "@PriceC", intel.PriceC ?? (object)DBNull.Value },
+                { "@CreateId", model.CreateId }
+            };
+            
+            var query = @"
+                INSERT INTO dptMktIntel 
+                (DocuNumb, BrandName, ProductCode, PriceB, PriceC, CreateId, CreateDt)
+                VALUES 
+                (@DocuNumb, @BrandName, @ProductCode, @PriceB, @PriceC, @CreateId, GETDATE())";
+            
+            await ExecuteCommandAsync(_bwliveConnectionString, query, parameters, transaction);
+        }
+    }
+
+    private async Task SaveGiftDistributionAsync(DSRModel model, IDbTransaction transaction)
+    {
+        if (model.GiftDistribution == null) return;
+        
+        var seqNumber = 1;
+        foreach (var gift in model.GiftDistribution)
+        {
+            var parameters = new Dictionary<string, object>
+            {
+                { "@DocuNumb", model.DocuNumb },
+                { "@SeqNumb", seqNumber.ToString().PadLeft(3, '0') },
+                { "@MrtlCode", gift.MrtlCode },
+                { "@IsueQnty", gift.IsueQnty ?? (object)DBNull.Value },
+                { "@Naration", gift.Naration },
+                { "@CreateId", model.CreateId }
+            };
+            
+            var query = @"
+                INSERT INTO dptGiftDist 
+                (DocuNumb, SeqNumb, MrtlCode, IsueQnty, Naration, CreateId, CreateDt)
+                VALUES 
+                (@DocuNumb, @SeqNumb, @MrtlCode, @IsueQnty, @Naration, @CreateId, GETDATE())";
+            
+            await ExecuteCommandAsync(_bwliveConnectionString, query, parameters, transaction);
+            seqNumber++;
+        }
+    }
+
+    private async Task ExecuteCommandAsync(string connectionString, string query, Dictionary<string, object> parameters, IDbTransaction transaction)
+    {
+        using (var cmd = new SqlCommand(query, (SqlConnection)transaction.Connection))
+        {
+            cmd.Transaction = (SqlTransaction)transaction;
+            
+            if (parameters != null)
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
+                }
+            }
+            
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    #endregion
+}
