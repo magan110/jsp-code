@@ -1,170 +1,1287 @@
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
+// DatabaseHelperExtensions.cs
+using System.Data;
+using System.Threading.Tasks;
 
-namespace sparshWebService.DataAccess
+public static class DatabaseHelperExtensions
 {
-    public class DatabaseHelper
+    public static async Task<List<Dictionary<string, object>>> ExecuteSelectQueryAsync(
+        this DatabaseHelper dbHelper, 
+        string connectionString, 
+        string query, 
+        Dictionary<string, object> parameters = null)
     {
-        private readonly string _bwliveConnectionString;
-        private readonly string _itKhariaConnectionString;
-        private readonly string _imageDataConnectionString;
-
-        public DatabaseHelper(string bwliveConnectionString, string itKhariaConnectionString, string imageDataConnectionString)
+        var resultList = new List<Dictionary<string, object>>();
+        using (var conn = new SqlConnection(connectionString))
+        using (var cmd = new SqlCommand(query, conn))
         {
-            _bwliveConnectionString = bwliveConnectionString;
-            _itKhariaConnectionString = itKhariaConnectionString;
-            _imageDataConnectionString = imageDataConnectionString;
-        }
-
-        // General method to execute SELECT queries for any connection string
-        private List<Dictionary<string, object>> ExecuteSelectQuery(string connectionString, string query, Dictionary<string, object> parameters)
-        {
-            var resultList = new List<Dictionary<string, object>>();
-
-            using (var conn = new SqlConnection(connectionString))
-            using (var cmd = new SqlCommand(query, conn))
+            if (parameters != null)
             {
                 foreach (var param in parameters)
                 {
-                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
                 }
-
-                conn.Open();
-                using (var reader = cmd.ExecuteReader())
+            }
+            
+            await conn.OpenAsync();
+            using (var reader = await cmd.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
                 {
-                    while (reader.Read())
+                    var row = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++)
                     {
-                        var row = new Dictionary<string, object>();
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            row[reader.GetName(i)] = reader[i];
-                        }
-                        resultList.Add(row);
+                        row[reader.GetName(i)] = reader[i] == DBNull.Value ? null : reader[i];
                     }
+                    resultList.Add(row);
                 }
             }
-
-            return resultList;
         }
+        return resultList;
+    }
 
-        // General method to execute INSERT, UPDATE, or DELETE queries for any connection string
-        private int ExecuteCommand(string connectionString, string query, Dictionary<string, object> parameters)
+    public static async Task<int> ExecuteCommandAsync(
+        this DatabaseHelper dbHelper, 
+        string connectionString, 
+        string query, 
+        Dictionary<string, object> parameters = null)
+    {
+        using (var conn = new SqlConnection(connectionString))
+        using (var cmd = new SqlCommand(query, conn))
         {
-            using (var conn = new SqlConnection(connectionString))
-            using (var cmd = new SqlCommand(query, conn))
+            if (parameters != null)
             {
                 foreach (var param in parameters)
                 {
-                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
                 }
-
-                conn.Open();
-                return cmd.ExecuteNonQuery(); // Returns the number of rows affected
             }
-        }
-
-        // Function to handle queries for bwlive database (WebSessBean)
-        public List<Dictionary<string, object>> WebSessBean(string query, Dictionary<string, object> parameters)
-        {
-            return ExecuteSelectQuery(_bwliveConnectionString, query, parameters);
-        }
-
-        // Function to handle queries for itKharia database (KkrSessBean)
-        public List<Dictionary<string, object>> KkrSessBean(string query, Dictionary<string, object> parameters)
-        {
-            return ExecuteSelectQuery(_itKhariaConnectionString, query, parameters);
-        }
-
-        // Function to handle queries for imageData database (ImgSessBean)
-        public List<Dictionary<string, object>> ImgSessBean(string query, Dictionary<string, object> parameters)
-        {
-            return ExecuteSelectQuery(_imageDataConnectionString, query, parameters);
-        }
-
-        // Retrieve SecretKey for a given PartnerID from the RegisteredUsers table (itKharia)
-        public string GetSecretKey(string partnerId)
-        {
-            var query = "SELECT secrtKey FROM prmApiPrtnr WHERE partnrId = @PartnerID";
-            var parameters = new Dictionary<string, object>
-            {
-                { "@PartnerID", partnerId }
-            };
-
-            var result = KkrSessBean(query, parameters);
-            if (result.Count > 0)
-            {
-                return result[0]["secrtKey"]?.ToString();
-            }
-
-            throw new Exception("SecretKey not found for the given PartnerID.");
-        }
-        public List<string> GetAllowedAPIs(string partnerId)
-        {
-            var query = @"SELECT allwdAPI 
-                  FROM prmApiPrtnr 
-                  WHERE partnrId = @PartnerID";
-            var parameters = new Dictionary<string, object>
-    {
-        { "@PartnerID", partnerId }
-    };
-
-            var result = KkrSessBean(query, parameters);
-            if (result.Count > 0)
-            {
-                var allowedApis = result[0]["allwdAPI"]?.ToString();
-                return allowedApis?.Split(',').Select(api => api.Trim().ToLower()).ToList();
-            }
-
-            throw new Exception("No APIs found for the given PartnerID.");
-        }
-
-        // Log API requests into the comApiLogs table (itKharia)
-        public void InsertIntoLog(string partnerId, string endpoint, string responseStatus, int statCode, object requestBody)
-        {
-            var checkQuery = "SELECT COUNT(*) AS Count FROM prmApiPrtnr WHERE partnrId = @PartnerID";
-            var checkParams = new Dictionary<string, object>
-    {
-        { "@PartnerID", partnerId }
-    };
-
-            var exists = KkrSessBean(checkQuery, checkParams);
-            if (exists.Count == 0 || Convert.ToInt32(exists[0]["Count"]) == 0)
-            {
-                Console.WriteLine($"Warning: PartnerID '{partnerId}' does not exist. Log insertion skipped.");
-                return;
-            }
-            // Extract up to 8 properties from the request body
-            var bodyDict = requestBody?.GetType().GetProperties()
-                .Where(p => p.GetValue(requestBody) != null)
-                .Select(p => $"{p.Name}={p.GetValue(requestBody)}")
-                .Take(8)
-                .ToList() ?? new List<string>();
-
-            // Fill missing fields with empty strings
-            while (bodyDict.Count < 8)
-                bodyDict.Add("");
-
-            var insertQuery = @"
-        INSERT INTO comApiLogs (PartnerID, Endpoint, ResponseStatus, statCode, ReqsBod1, ReqsBod2, ReqsBod3, ReqsBod4, ReqsBod5, ReqsBod6, ReqsBod7, ReqsBod8)
-        VALUES (@PartnerID, @Endpoint, @ResponseStatus, @StatCode, @ReqsBod1, @ReqsBod2, @ReqsBod3, @ReqsBod4, @ReqsBod5, @ReqsBod6, @ReqsBod7, @ReqsBod8)";
-
-            var insertParams = new Dictionary<string, object>
-    {
-        { "@PartnerID", partnerId },
-        { "@Endpoint", endpoint },
-        { "@ResponseStatus", responseStatus },
-        { "@StatCode", statCode },
-        { "@ReqsBod1", bodyDict[0] },
-        { "@ReqsBod2", bodyDict[1] },
-        { "@ReqsBod3", bodyDict[2] },
-        { "@ReqsBod4", bodyDict[3] },
-        { "@ReqsBod5", bodyDict[4] },
-        { "@ReqsBod6", bodyDict[5] },
-        { "@ReqsBod7", bodyDict[6] },
-        { "@ReqsBod8", bodyDict[7] }
-    };
-            ExecuteCommand(_itKhariaConnectionString, insertQuery, insertParams);
+            
+            await conn.OpenAsync();
+            return await cmd.ExecuteNonQueryAsync();
         }
     }
+
+    public static async Task<T> ExecuteScalarAsync<T>(
+        this DatabaseHelper dbHelper, 
+        string connectionString, 
+        string query, 
+        Dictionary<string, object> parameters = null)
+    {
+        using (var conn = new SqlConnection(connectionString))
+        using (var cmd = new SqlCommand(query, conn))
+        {
+            if (parameters != null)
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
+                }
+            }
+            
+            await conn.OpenAsync();
+            var result = await cmd.ExecuteScalarAsync();
+            if (result == DBNull.Value || result == null)
+                return default(T);
+            
+            return (T)Convert.ChangeType(result, typeof(T));
+        }
+    }
+}
+
+
+
+
+
+
+// DSRActivityController.cs
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Threading.Tasks;
+
+[ApiController]
+[Route("api/[controller]")]
+public class DSRActivityController : ControllerBase
+{
+    private readonly DatabaseHelper _dbHelper;
+    private readonly ILogger<DSRActivityController> _logger;
+
+    public DSRActivityController(DatabaseHelper dbHelper, ILogger<DSRActivityController> logger)
+    {
+        _dbHelper = dbHelper;
+        _logger = logger;
+    }
+
+    #region Dropdown Data Methods
+
+    [HttpGet("GetCustomerTypes")]
+    public async Task<IActionResult> GetCustomerTypes()
+    {
+        try
+        {
+            var query = @"
+                SELECT 'C' AS value, 'Stockiest/ Urbon Stockiest' AS text
+                UNION SELECT 'D', 'Direct Dealer'
+                UNION SELECT 'RD', 'Rural Stockiest'
+                UNION SELECT 'R', 'Retailer'
+                UNION SELECT 'RR', 'Rural Retailer'
+                UNION SELECT '07', 'Registered Applicator'
+                UNION SELECT '08', 'Painter'";
+            
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting customer types");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetAreas")]
+    public async Task<IActionResult> GetAreas()
+    {
+        try
+        {
+            var query = @"
+                SELECT areaCode AS value, areaDesc AS text 
+                FROM bkmAreaMast WITH (NOLOCK) 
+                WHERE isActive = 'Y' AND isnull(isOnlyDp, 'N') <> 'Y'
+                ORDER BY areaDesc";
+            
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting areas");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetPurchaserCodes")]
+    public async Task<IActionResult> GetPurchaserCodes(
+        [FromQuery] string areaCode, 
+        [FromQuery] string purchaserType, 
+        [FromQuery] string searchText = "")
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(areaCode) || string.IsNullOrEmpty(purchaserType))
+            {
+                return BadRequest(new { success = false, message = "Area code and purchaser type are required" });
+            }
+
+            string query;
+            Dictionary<string, object> parameters = new Dictionary<string, object>
+            {
+                { "@areaCode", areaCode },
+                { "@searchText", $"%{searchText}%" }
+            };
+
+            if (purchaserType == "R" || purchaserType == "RR")
+            {
+                query = @"
+                    SELECT retlCode AS value, 
+                           retlCode + ' - ' + retlName AS text,
+                           retlName AS name,
+                           retlAddr AS address,
+                           isnull(kycStatus, '') AS kycStatus,
+                           retlAddr AS marketName
+                    FROM rtmRetailer WITH (NOLOCK)
+                    WHERE areaCode = @areaCode 
+                      AND isActive = 'Y'
+                      AND (retlCode LIKE @searchText OR retlName LIKE @searchText)";
+            }
+            else
+            {
+                query = @"
+                    SELECT custCode AS value, 
+                           custCode + ' - ' + custName AS text,
+                           custName AS name,
+                           custAddr AS address,
+                           isnull(kycStatus, '') AS kycStatus,
+                           custAddr AS marketName
+                    FROM dpmCustomer WITH (NOLOCK)
+                    WHERE areaCode = @areaCode 
+                      AND isActive = 'Y'
+                      AND (custCode LIKE @searchText OR custName LIKE @searchText)";
+            }
+
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query, parameters);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting purchaser codes");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetProductCategories")]
+    public async Task<IActionResult> GetProductCategories()
+    {
+        try
+        {
+            var query = @"
+                SELECT Code AS value, Description AS text 
+                FROM bkmRepoCatg WITH (NOLOCK)
+                WHERE isActive = 'Y'
+                ORDER BY Description";
+            
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting product categories");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("products/{category}/skus")]
+    public async Task<IActionResult> GetProducts(string category)
+    {
+        try
+        {
+            var query = @"
+                SELECT catPckCd AS Code, 
+                       catPckCd + ' - ' + repoDesc AS Description
+                FROM bkmCatgPack WITH (NOLOCK)
+                WHERE repoCatg = @category AND isActive = 'Y'
+                ORDER BY repoDesc";
+            
+            var parameters = new Dictionary<string, object> { { "@category", category } };
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query, parameters);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting products for category {category}", category);
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetBrands")]
+    public async Task<IActionResult> GetBrands()
+    {
+        try
+        {
+            var query = @"
+                SELECT 'BW' AS value, 'Birla White' AS text
+                UNION SELECT 'JK', 'JK Cement'
+                UNION SELECT 'RK', 'Ramco'
+                UNION SELECT 'OT', 'Others'";
+            
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting brands");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetGiftTypes")]
+    public async Task<IActionResult> GetGiftTypes()
+    {
+        try
+        {
+            var query = @"
+                SELECT mrtlCode AS value, mrtlDesc AS text 
+                FROM bkmMaterial WITH (NOLOCK)
+                WHERE isActive = 'Y'
+                ORDER BY mrtlDesc";
+            
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting gift types");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetExceptionReasons")]
+    public async Task<IActionResult> GetExceptionReasons()
+    {
+        try
+        {
+            var query = @"
+                SELECT 'Network Issue' AS value, 'Network Issue' AS text
+                UNION SELECT 'Battery Low', 'Battery Low'
+                UNION SELECT 'Mobile Not working', 'Mobile Not working'
+                UNION SELECT 'Location not capturing', 'Location not capturing'
+                UNION SELECT 'Wrong Location OF Retailer', 'Wrong Location OF Retailer'
+                UNION SELECT 'Wrong Location Captured', 'Wrong Location Captured'";
+            
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting exception reasons");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    #endregion
+
+    #region Customer Details and History
+
+    [HttpGet("GetCustomerDetails/{customerCode}/{customerType}/{areaCode}")]
+    public async Task<IActionResult> GetCustomerDetails(string customerCode, string customerType, string areaCode)
+    {
+        try
+        {
+            string query;
+            Dictionary<string, object> parameters = new Dictionary<string, object>
+            {
+                { "@customerCode", customerCode },
+                { "@areaCode", areaCode }
+            };
+
+            if (customerType == "R" || customerType == "RR")
+            {
+                query = @"
+                    SELECT retlCode AS code, retlName AS name, retlAddr AS address, 
+                           isnull(kycStatus, '') AS kycStatus, retlAddr AS marketName
+                    FROM rtmRetailer WITH (NOLOCK)
+                    WHERE retlCode = @customerCode AND areaCode = @areaCode AND isActive = 'Y'";
+            }
+            else
+            {
+                query = @"
+                    SELECT custCode AS code, custName AS name, custAddr AS address, 
+                           isnull(kycStatus, '') AS kycStatus, custAddr AS marketName
+                    FROM dpmCustomer WITH (NOLOCK)
+                    WHERE custCode = @customerCode AND areaCode = @areaCode AND isActive = 'Y'";
+            }
+
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query, parameters);
+            
+            if (result.Count == 0)
+            {
+                return NotFound(new { success = false, message = "Customer not found" });
+            }
+
+            return Ok(new { success = true, data = result[0] });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting customer details");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetCustomerSalesHistory")]
+    public async Task<IActionResult> GetCustomerSalesHistory(
+        [FromQuery] string customerCode, 
+        [FromQuery] string customerType)
+    {
+        try
+        {
+            // Get last 3 months average
+            var avgQuery = @"
+                SELECT 
+                    SUM(CASE WHEN repoCatg = '01' THEN prodQnty ELSE 0 END) AS wc,
+                    SUM(CASE WHEN repoCatg = '02' THEN prodQnty ELSE 0 END) AS wcp,
+                    SUM(CASE WHEN repoCatg = '03' THEN prodQnty ELSE 0 END) AS vap
+                FROM dptDSRActvtDtl WITH (NOLOCK)
+                WHERE docuNumb IN (
+                    SELECT docuNumb 
+                    FROM dptDSRActvt WITH (NOLOCK)
+                    WHERE cusRtlCd = @customerCode 
+                      AND cusRtlFl = @customerType
+                      AND docuDate >= DATEADD(MONTH, -3, GETDATE())
+                ) AND mrktData = '01'";
+            
+            var avgParams = new Dictionary<string, object>
+            {
+                { "@customerCode", customerCode },
+                { "@customerType", customerType }
+            };
+            
+            var avgResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, avgQuery, avgParams);
+            
+            // Get current month data
+            var currentQuery = @"
+                SELECT 
+                    SUM(CASE WHEN repoCatg = '01' THEN prodQnty ELSE 0 END) AS wcCurrent,
+                    SUM(CASE WHEN repoCatg = '02' THEN prodQnty ELSE 0 END) AS wcpCurrent,
+                    SUM(CASE WHEN repoCatg = '03' THEN prodQnty ELSE 0 END) AS vapCurrent
+                FROM dptDSRActvtDtl WITH (NOLOCK)
+                WHERE docuNumb IN (
+                    SELECT docuNumb 
+                    FROM dptDSRActvt WITH (NOLOCK)
+                    WHERE cusRtlCd = @customerCode 
+                      AND cusRtlFl = @customerType
+                      AND MONTH(docuDate) = MONTH(GETDATE())
+                      AND YEAR(docuDate) = YEAR(GETDATE())
+                ) AND mrktData = '01'";
+            
+            var currentResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, currentQuery, avgParams);
+            
+            // Get stock data
+            var stockQuery = @"
+                SELECT 
+                    wcStock AS wc,
+                    wcpStock AS wcp,
+                    vapStock AS vap
+                FROM dpmCustomer WITH (NOLOCK)
+                WHERE custCode = @customerCode AND isActive = 'Y'";
+            
+            var stockResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, stockQuery, new Dictionary<string, object> { { "@customerCode", customerCode } });
+            
+            var result = new Dictionary<string, object>
+            {
+                ["last3MonthsAverage"] = avgResult.Count > 0 ? avgResult[0] : new Dictionary<string, object>(),
+                ["currentMonth"] = currentResult.Count > 0 ? currentResult[0] : new Dictionary<string, object>(),
+                ["stock"] = stockResult.Count > 0 ? stockResult[0] : new Dictionary<string, object>()
+            };
+            
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting customer sales history");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    #endregion
+
+    #region DSR Operations
+
+    [HttpGet("GetPendingDSR/{loginId}")]
+    public async Task<IActionResult> GetPendingDSR(string loginId)
+    {
+        try
+        {
+            var query = @"
+                SELECT TOP 30 
+                    docuNumb AS value,
+                    dbo.wcfParamDes(dsrParam, 'dsrParNw') + ' ~ ' + docuNumb + ' ~ ' + CONVERT(varchar(10), docuDate, 103) AS text,
+                    docuDate
+                FROM dptDSRActvt WITH (NOLOCK)
+                WHERE createId = @loginId 
+                  AND docuDate > GETDATE() - 4
+                  AND statFlag NOT IN ('C', 'R')
+                ORDER BY docuNumb DESC";
+            
+            var parameters = new Dictionary<string, object> { { "@loginId", loginId } };
+            var result = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, query, parameters);
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting pending DSR entries");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpGet("GetDSRForEdit/{docuNumb}/{loginId}")]
+    public async Task<IActionResult> GetDSRForEdit(string docuNumb, string loginId)
+    {
+        try
+        {
+            // Get main DSR record
+            var mainQuery = @"
+                SELECT 
+                    docuNumb, CONVERT(varchar(10), docuDate, 103) AS docuDate, 
+                    dsrParam, cusRtlFl, cusRtlCd, dsrRem01, dsrRem02, dsrRem03, 
+                    dsrRem04, dsrRem05, dsrRem06, dsrRem07, dsrRem08, areaCode, 
+                    ISNULL(cuRtType, '') AS cuRtType
+                FROM dptDSRActvt WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb AND createId = @loginId";
+            
+            var mainParams = new Dictionary<string, object>
+            {
+                { "@docuNumb", docuNumb },
+                { "@loginId", loginId }
+            };
+            
+            var mainResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, mainQuery, mainParams);
+            
+            if (mainResult.Count == 0)
+            {
+                return NotFound(new { success = false, message = "DSR not found" });
+            }
+            
+            var mainData = mainResult[0];
+            
+            // Get activity details
+            var activityQuery = @"
+                SELECT 
+                    repoCatg, catgPack, prodQnty, projQnty, actnRemk, 
+                    ISNULL(CONVERT(varchar(10), targetDt, 103), '') AS targetDt, mrktData
+                FROM dptDSRActvtDtl WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb AND createId = @loginId
+                ORDER BY seqNumb";
+            
+            var activityResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, activityQuery, mainParams);
+            
+            // Get market intelligence
+            var marketQuery = @"
+                SELECT brandName, productCode, priceB, priceC
+                FROM dptMktIntel WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb";
+            
+            var marketResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, marketQuery, new Dictionary<string, object> { { "@docuNumb", docuNumb } });
+            
+            // Get gift distribution
+            var giftQuery = @"
+                SELECT mrtlCode, isueQnty, naration
+                FROM dptGiftDist WITH (NOLOCK)
+                WHERE docuNumb = @docuNumb
+                ORDER BY seqNumb";
+            
+            var giftResult = await _dbHelper.ExecuteSelectQueryAsync(_dbHelper._bwliveConnectionString, giftQuery, new Dictionary<string, object> { { "@docuNumb", docuNumb } });
+            
+            var result = new Dictionary<string, object>
+            {
+                ["header"] = mainData,
+                ["activityDetails"] = activityResult,
+                ["marketIntelligence"] = marketResult,
+                ["giftDistribution"] = giftResult
+            };
+            
+            return Ok(new { success = true, data = result });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting DSR for edit");
+            return StatusCode(500, new { success = false, message = ex.Message });
+        }
+    }
+
+    [HttpPost("SaveDSR")]
+    public async Task<IActionResult> SaveDSR([FromBody] DSRModel model)
+    {
+        try
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(new { success = false, message = "Invalid data provided", errors = ModelState.Values.SelectMany(v => v.Errors) });
+            }
+            
+            // Generate document number if needed
+            if (model.ProcType == "A" && string.IsNullOrEmpty(model.DocuNumb))
+            {
+                model.DocuNumb = await GenerateDocumentNumberAsync(model.AreaCode);
+            }
+            
+            // Begin transaction
+            using (var transaction = await _dbHelper.BeginTransactionAsync(_dbHelper._bwliveConnectionString))
+            {
+                try
+                {
+                    // Save main DSR record
+                    await SaveMainDSRAsync(model);
+                    
+                    // Delete existing details for update/delete operations
+                    if (model.ProcType != "A")
+                    {
+                        await DeleteExistingDetailsAsync(model.DocuNumb);
+                    }
+                    
+                    // Save activity details
+                    await SaveActivityDetailsAsync(model);
+                    
+                    // Save market intelligence
+                    await SaveMarketIntelligenceAsync(model);
+                    
+                    // Save gift distribution
+                    await SaveGiftDistributionAsync(model);
+                    
+                    // Commit transaction
+                    await transaction.CommitAsync();
+                    
+                    return Ok(new { success = true, message = "DSR saved successfully", docuNumb = model.DocuNumb });
+                }
+                catch (Exception ex)
+                {
+                    // Rollback transaction
+                    await transaction.RollbackAsync();
+                    _logger.LogError(ex, "Error saving DSR");
+                    return StatusCode(500, new { success = false, message = $"Failed to save DSR: {ex.Message}" });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing DSR save request");
+            return StatusCode(500, new { success = false, message = $"Internal server error: {ex.Message}" });
+        }
+    }
+
+    #endregion
+
+    #region Helper Methods
+
+    private async Task<string> GenerateDocumentNumberAsync(string areaCode)
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+            var timestamp = now.ToString("yyMMddHHmmss");
+            var areaCodePadded = areaCode.PadRight(3, '0').Substring(0, 3);
+            return $"{areaCodePadded}DSR{timestamp}";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error generating document number");
+            throw;
+        }
+    }
+
+    private async Task SaveMainDSRAsync(DSRModel model)
+    {
+        var parameters = new Dictionary<string, object>
+        {
+            { "@ProcType", model.ProcType },
+            { "@DocuNumb", model.DocuNumb },
+            { "@DocuDate", model.DocuDate },
+            { "@OrdExDat", model.OrdExDat },
+            { "@DsrParam", model.DsrParam },
+            { "@CusRtlFl", model.CusRtlFl },
+            { "@AreaCode", model.AreaCode },
+            { "@CusRtlCd", model.CusRtlCd },
+            { "@MrktName", model.MrktName },
+            { "@PendIsue", model.PendIsue },
+            { "@PndIsuDt", model.PndIsuDt },
+            { "@IsuDetal", model.IsuDetal },
+            { "@DsrRem05", model.DsrRem05 },
+            { "@BrndSlWc", model.BrndSlWc != null ? string.Join(",", model.BrndSlWc) : "" },
+            { "@BrndSlWp", model.BrndSlWp != null ? string.Join(",", model.BrndSlWp) : "" },
+            { "@PrtDsCnt", model.PrtDsCnt },
+            { "@SlWcVlum", model.SlWcVlum ?? (object)DBNull.Value },
+            { "@SlWpVlum", model.SlWpVlum ?? (object)DBNull.Value },
+            { "@DeptCode", model.DeptCode },
+            { "@PendWith", model.PendWith },
+            { "@CreateId", model.CreateId },
+            { "@FinlRslt", model.FinlRslt },
+            { "@GeoLatit", model.GeoLatit },
+            { "@GeoLongt", model.GeoLongt },
+            { "@LtLgDist", model.LtLgDist },
+            { "@CityName", model.CityName },
+            { "@CusRtTyp", model.CusRtTyp },
+            { "@IsTilRtl", model.IsTilRtl },
+            { "@TileStck", model.TileStck ?? (object)DBNull.Value },
+            { "@WcErlSlb", model.WcErlSlb ?? (object)DBNull.Value },
+            { "@WpErlSlb", model.WpErlSlb ?? (object)DBNull.Value },
+            { "@VpErlSlb", model.VpErlSlb ?? (object)DBNull.Value },
+            { "@BwStkWcc", model.BwStkWcc ?? (object)DBNull.Value },
+            { "@BwStkWcp", model.BwStkWcp ?? (object)DBNull.Value },
+            { "@BwStkVap", model.BwStkVap ?? (object)DBNull.Value },
+            { "@JkAvgWcc", model.JkAvgWcc ?? (object)DBNull.Value },
+            { "@JkAvgWcp", model.JkAvgWcp ?? (object)DBNull.Value },
+            { "@AsAvgWcc", model.AsAvgWcc ?? (object)DBNull.Value },
+            { "@AsAvgWcp", model.AsAvgWcp ?? (object)DBNull.Value },
+            { "@OtAvgWcc", model.OtAvgWcc ?? (object)DBNull.Value },
+            { "@OtAvgWcp", model.OtAvgWcp ?? (object)DBNull.Value }
+        };
+        
+        string query;
+        
+        if (model.ProcType == "A")
+        {
+            query = @"
+                INSERT INTO dptDSRActvt 
+                (ProcType, DocuNumb, DocuDate, OrdExDat, DsrParam, CusRtlFl, AreaCode, CusRtlCd, 
+                 MrktName, PendIsue, PndIsuDt, IsuDetal, DsrRem05, BrndSlWc, BrndSlWp, PrtDsCnt, 
+                 SlWcVlum, SlWpVlum, DeptCode, PendWith, CreateId, FinlRslt, GeoLatit, GeoLongt, 
+                 LtLgDist, CityName, CusRtTyp, IsTilRtl, TileStck, WcErlSlb, WpErlSlb, VpErlSlb, 
+                 BwStkWcc, BwStkWcp, BwStkVap, JkAvgWcc, JkAvgWcp, AsAvgWcc, AsAvgWcp, OtAvgWcc, OtAvgWcp)
+                VALUES 
+                (@ProcType, @DocuNumb, @DocuDate, @OrdExDat, @DsrParam, @CusRtlFl, @AreaCode, @CusRtlCd, 
+                 @MrktName, @PendIsue, @PndIsuDt, @IsuDetal, @DsrRem05, @BrndSlWc, @BrndSlWp, @PrtDsCnt, 
+                 @SlWcVlum, @SlWpVlum, @DeptCode, @PendWith, @CreateId, @FinlRslt, @GeoLatit, @GeoLongt, 
+                 @LtLgDist, @CityName, @CusRtTyp, @IsTilRtl, @TileStck, @WcErlSlb, @WpErlSlb, @VpErlSlb, 
+                 @BwStkWcc, @BwStkWcp, @BwStkVap, @JkAvgWcc, @JkAvgWcp, @AsAvgWcc, @AsAvgWcp, @OtAvgWcc, @OtAvgWcp)";
+        }
+        else
+        {
+            query = @"
+                UPDATE dptDSRActvt SET
+                    DocuDate = @DocuDate,
+                    OrdExDat = @OrdExDat,
+                    DsrParam = @DsrParam,
+                    CusRtlFl = @CusRtlFl,
+                    AreaCode = @AreaCode,
+                    CusRtlCd = @CusRtlCd,
+                    MrktName = @MrktName,
+                    PendIsue = @PendIsue,
+                    PndIsuDt = @PndIsuDt,
+                    IsuDetal = @IsuDetal,
+                    DsrRem05 = @DsrRem05,
+                    BrndSlWc = @BrndSlWc,
+                    BrndSlWp = @BrndSlWp,
+                    PrtDsCnt = @PrtDsCnt,
+                    SlWcVlum = @SlWcVlum,
+                    SlWpVlum = @SlWpVlum,
+                    DeptCode = @DeptCode,
+                    PendWith = @PendWith,
+                    FinlRslt = @FinlRslt,
+                    GeoLatit = @GeoLatit,
+                    GeoLongt = @GeoLongt,
+                    LtLgDist = @LtLgDist,
+                    CityName = @CityName,
+                    CusRtTyp = @CusRtTyp,
+                    IsTilRtl = @IsTilRtl,
+                    TileStck = @TileStck,
+                    WcErlSlb = @WcErlSlb,
+                    WpErlSlb = @WpErlSlb,
+                    VpErlSlb = @VpErlSlb,
+                    BwStkWcc = @BwStkWcc,
+                    BwStkWcp = @BwStkWcp,
+                    BwStkVap = @BwStkVap,
+                    JkAvgWcc = @JkAvgWcc,
+                    JkAvgWcp = @JkAvgWcp,
+                    AsAvgWcc = @AsAvgWcc,
+                    AsAvgWcp = @AsAvgWcp,
+                    OtAvgWcc = @OtAvgWcc,
+                    OtAvgWcp = @OtAvgWcp
+                WHERE DocuNumb = @DocuNumb AND CreateId = @CreateId";
+        }
+        
+        await _dbHelper.ExecuteCommandAsync(_dbHelper._bwliveConnectionString, query, parameters);
+    }
+
+    private async Task DeleteExistingDetailsAsync(string docuNumb)
+    {
+        var parameters = new Dictionary<string, object> { { "@DocuNumb", docuNumb } };
+        
+        // Delete activity details
+        await _dbHelper.ExecuteCommandAsync(
+            _dbHelper._bwliveConnectionString, 
+            "DELETE FROM dptDSRActvtDtl WHERE DocuNumb = @DocuNumb", 
+            parameters);
+        
+        // Delete market intelligence
+        await _dbHelper.ExecuteCommandAsync(
+            _dbHelper._bwliveConnectionString, 
+            "DELETE FROM dptMktIntel WHERE DocuNumb = @DocuNumb", 
+            parameters);
+        
+        // Delete gift distribution
+        await _dbHelper.ExecuteCommandAsync(
+            _dbHelper._bwliveConnectionString, 
+            "DELETE FROM dptGiftDist WHERE DocuNumb = @DocuNumb", 
+            parameters);
+    }
+
+    private async Task SaveActivityDetailsAsync(DSRModel model)
+    {
+        var seqNumber = 1;
+        
+        // Save products
+        if (model.Products != null)
+        {
+            foreach (var product in model.Products)
+            {
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@DocuNumb", model.DocuNumb },
+                    { "@SeqNumb", seqNumber.ToString().PadLeft(3, '0') },
+                    { "@RepoCatg", product.RepoCatg },
+                    { "@CatgPack", product.CatgPkPr },
+                    { "@ProdQnty", product.ProdQnty ?? (object)DBNull.Value },
+                    { "@ProjQnty", product.ProjQnty ?? (object)DBNull.Value },
+                    { "@ActnRemk", product.ActnRemk },
+                    { "@MrktData", "05" },
+                    { "@TargetDt", product.TargetDt ?? (object)DBNull.Value },
+                    { "@StatFlag", "N" },
+                    { "@CreateId", model.CreateId }
+                };
+                
+                var query = @"
+                    INSERT INTO dptDSRActvtDtl 
+                    (DocuNumb, SeqNumb, RepoCatg, CatgPack, ProdQnty, ProjQnty, ActnRemk, MrktData, TargetDt, StatFlag, CreateId, CreateDt)
+                    VALUES 
+                    (@DocuNumb, @SeqNumb, @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty, @ActnRemk, @MrktData, @TargetDt, @StatFlag, @CreateId, GETDATE())";
+                
+                await _dbHelper.ExecuteCommandAsync(_dbHelper._bwliveConnectionString, query, parameters);
+                seqNumber++;
+            }
+        }
+        
+        // Save gifts
+        if (model.GiftDistribution != null)
+        {
+            foreach (var gift in model.GiftDistribution)
+            {
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@DocuNumb", model.DocuNumb },
+                    { "@SeqNumb", seqNumber.ToString().PadLeft(3, '0') },
+                    { "@RepoCatg", gift.MrtlCode },
+                    { "@CatgPack", gift.MrtlCode },
+                    { "@ProdQnty", gift.IsueQnty ?? (object)DBNull.Value },
+                    { "@ProjQnty", 0 },
+                    { "@ActnRemk", gift.Naration },
+                    { "@MrktData", "06" },
+                    { "@TargetDt", DBNull.Value },
+                    { "@StatFlag", "N" },
+                    { "@CreateId", model.CreateId }
+                };
+                
+                var query = @"
+                    INSERT INTO dptDSRActvtDtl 
+                    (DocuNumb, SeqNumb, RepoCatg, CatgPack, ProdQnty, ProjQnty, ActnRemk, MrktData, TargetDt, StatFlag, CreateId, CreateDt)
+                    VALUES 
+                    (@DocuNumb, @SeqNumb, @RepoCatg, @CatgPack, @ProdQnty, @ProjQnty, @ActnRemk, @MrktData, @TargetDt, @StatFlag, @CreateId, GETDATE())";
+                
+                await _dbHelper.ExecuteCommandAsync(_dbHelper._bwliveConnectionString, query, parameters);
+                seqNumber++;
+            }
+        }
+    }
+
+    private async Task SaveMarketIntelligenceAsync(DSRModel model)
+    {
+        if (model.MarketIntelligence == null) return;
+        
+        foreach (var intel in model.MarketIntelligence)
+        {
+            var parameters = new Dictionary<string, object>
+            {
+                { "@DocuNumb", model.DocuNumb },
+                { "@BrandName", intel.BrandName },
+                { "@ProductCode", intel.ProductCode },
+                { "@PriceB", intel.PriceB ?? (object)DBNull.Value },
+                { "@PriceC", intel.PriceC ?? (object)DBNull.Value },
+                { "@CreateId", model.CreateId }
+            };
+            
+            var query = @"
+                INSERT INTO dptMktIntel 
+                (DocuNumb, BrandName, ProductCode, PriceB, PriceC, CreateId, CreateDt)
+                VALUES 
+                (@DocuNumb, @BrandName, @ProductCode, @PriceB, @PriceC, @CreateId, GETDATE())";
+            
+            await _dbHelper.ExecuteCommandAsync(_dbHelper._bwliveConnectionString, query, parameters);
+        }
+    }
+
+    private async Task SaveGiftDistributionAsync(DSRModel model)
+    {
+        if (model.GiftDistribution == null) return;
+        
+        var seqNumber = 1;
+        foreach (var gift in model.GiftDistribution)
+        {
+            var parameters = new Dictionary<string, object>
+            {
+                { "@DocuNumb", model.DocuNumb },
+                { "@SeqNumb", seqNumber.ToString().PadLeft(3, '0') },
+                { "@MrtlCode", gift.MrtlCode },
+                { "@IsueQnty", gift.IsueQnty ?? (object)DBNull.Value },
+                { "@Naration", gift.Naration },
+                { "@CreateId", model.CreateId }
+            };
+            
+            var query = @"
+                INSERT INTO dptGiftDist 
+                (DocuNumb, SeqNumb, MrtlCode, IsueQnty, Naration, CreateId, CreateDt)
+                VALUES 
+                (@DocuNumb, @SeqNumb, @MrtlCode, @IsueQnty, @Naration, @CreateId, GETDATE())";
+            
+            await _dbHelper.ExecuteCommandAsync(_dbHelper._bwliveConnectionString, query, parameters);
+            seqNumber++;
+        }
+    }
+
+    #endregion
+}
+
+
+
+
+
+
+
+// DSRModels.cs
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+
+public class DSRModel
+{
+    [Required]
+    public string ProcType { get; set; }
+    
+    public string DocuNumb { get; set; }
+    
+    [Required]
+    public string DocuDate { get; set; }
+    
+    public string OrdExDat { get; set; }
+    
+    [Required]
+    public string DsrParam { get; set; }
+    
+    public string CusRtlFl { get; set; }
+    
+    public string AreaCode { get; set; }
+    
+    public string CusRtlCd { get; set; }
+    
+    public string MrktName { get; set; }
+    
+    public string PendIsue { get; set; }
+    
+    public string PndIsuDt { get; set; }
+    
+    public string IsuDetal { get; set; }
+    
+    public string DsrRem05 { get; set; }
+    
+    public List<string> BrndSlWc { get; set; } = new List<string>();
+    
+    public List<string> BrndSlWp { get; set; } = new List<string>();
+    
+    public string PrtDsCnt { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WC Industry Volume must be a positive number")]
+    public decimal? SlWcVlum { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WCP Industry Volume must be a positive number")]
+    public decimal? SlWpVlum { get; set; }
+    
+    public string DeptCode { get; set; }
+    
+    public string PendWith { get; set; }
+    
+    public string CreateId { get; set; }
+    
+    public string FinlRslt { get; set; }
+    
+    public string GeoLatit { get; set; }
+    
+    public string GeoLongt { get; set; }
+    
+    public string LtLgDist { get; set; }
+    
+    public string CityName { get; set; }
+    
+    public string CusRtTyp { get; set; }
+    
+    public string IsTilRtl { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Tile Adhesive Stock must be a positive number")]
+    public decimal? TileStck { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WC Enrolment must be a positive number")]
+    public decimal? WcErlSlb { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WCP Enrolment must be a positive number")]
+    public decimal? WpErlSlb { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "VAP Enrolment must be a positive number")]
+    public decimal? VpErlSlb { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "BW WC Stock must be a positive number")]
+    public decimal? BwStkWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "BW WCP Stock must be a positive number")]
+    public decimal? BwStkWcp { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "BW VAP Stock must be a positive number")]
+    public decimal? BwStkVap { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "JK WC Average must be a positive number")]
+    public decimal? JkAvgWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "JK WCP Average must be a positive number")]
+    public decimal? JkAvgWcp { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "AS WC Average must be a positive number")]
+    public decimal? AsAvgWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "AS WCP Average must be a positive number")]
+    public decimal? AsAvgWcp { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "OT WC Average must be a positive number")]
+    public decimal? OtAvgWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "OT WCP Average must be a positive number")]
+    public decimal? OtAvgWcp { get; set; }
+    
+    public List<ProductModel> Products { get; set; } = new List<ProductModel>();
+    public List<MarketIntelligenceModel> MarketIntelligence { get; set; } = new List<MarketIntelligenceModel>();
+    public List<GiftDistributionModel> GiftDistribution { get; set; } = new List<GiftDistributionModel>();
+}
+
+public class ProductModel
+{
+    [Required]
+    public string RepoCatg { get; set; }
+    
+    [Required]
+    public string CatgPkPr { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Product Quantity must be a positive number")]
+    public decimal? ProdQnty { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Projected Quantity must be a positive number")]
+    public decimal? ProjQnty { get; set; }
+    
+    public string ActnRemk { get; set; }
+    
+    public DateTime? TargetDt { get; set; }
+}
+
+public class MarketIntelligenceModel
+{
+    [Required]
+    public string BrandName { get; set; }
+    
+    [Required]
+    public string ProductCode { get; set; }
+    
+    public decimal? PriceB { get; set; }
+    
+    public decimal? PriceC { get; set; }
+}
+
+public class GiftDistributionModel
+{
+    [Required]
+    public string MrtlCode { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Issue Quantity must be a positive number")]
+    public decimal? IsueQnty { get; set; }
+    
+    public string Naration { get; set; }
+}
+
+
+
+
+
+
+// DSRModels.cs
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+
+public class DSRModel
+{
+    [Required]
+    public string ProcType { get; set; }
+    
+    public string DocuNumb { get; set; }
+    
+    [Required]
+    public string DocuDate { get; set; }
+    
+    public string OrdExDat { get; set; }
+    
+    [Required]
+    public string DsrParam { get; set; }
+    
+    public string CusRtlFl { get; set; }
+    
+    public string AreaCode { get; set; }
+    
+    public string CusRtlCd { get; set; }
+    
+    public string MrktName { get; set; }
+    
+    public string PendIsue { get; set; }
+    
+    public string PndIsuDt { get; set; }
+    
+    public string IsuDetal { get; set; }
+    
+    public string DsrRem05 { get; set; }
+    
+    public List<string> BrndSlWc { get; set; } = new List<string>();
+    
+    public List<string> BrndSlWp { get; set; } = new List<string>();
+    
+    public string PrtDsCnt { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WC Industry Volume must be a positive number")]
+    public decimal? SlWcVlum { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WCP Industry Volume must be a positive number")]
+    public decimal? SlWpVlum { get; set; }
+    
+    public string DeptCode { get; set; }
+    
+    public string PendWith { get; set; }
+    
+    public string CreateId { get; set; }
+    
+    public string FinlRslt { get; set; }
+    
+    public string GeoLatit { get; set; }
+    
+    public string GeoLongt { get; set; }
+    
+    public string LtLgDist { get; set; }
+    
+    public string CityName { get; set; }
+    
+    public string CusRtTyp { get; set; }
+    
+    public string IsTilRtl { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Tile Adhesive Stock must be a positive number")]
+    public decimal? TileStck { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WC Enrolment must be a positive number")]
+    public decimal? WcErlSlb { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "WCP Enrolment must be a positive number")]
+    public decimal? WpErlSlb { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "VAP Enrolment must be a positive number")]
+    public decimal? VpErlSlb { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "BW WC Stock must be a positive number")]
+    public decimal? BwStkWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "BW WCP Stock must be a positive number")]
+    public decimal? BwStkWcp { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "BW VAP Stock must be a positive number")]
+    public decimal? BwStkVap { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "JK WC Average must be a positive number")]
+    public decimal? JkAvgWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "JK WCP Average must be a positive number")]
+    public decimal? JkAvgWcp { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "AS WC Average must be a positive number")]
+    public decimal? AsAvgWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "AS WCP Average must be a positive number")]
+    public decimal? AsAvgWcp { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "OT WC Average must be a positive number")]
+    public decimal? OtAvgWcc { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "OT WCP Average must be a positive number")]
+    public decimal? OtAvgWcp { get; set; }
+    
+    public List<ProductModel> Products { get; set; } = new List<ProductModel>();
+    public List<MarketIntelligenceModel> MarketIntelligence { get; set; } = new List<MarketIntelligenceModel>();
+    public List<GiftDistributionModel> GiftDistribution { get; set; } = new List<GiftDistributionModel>();
+}
+
+public class ProductModel
+{
+    [Required]
+    public string RepoCatg { get; set; }
+    
+    [Required]
+    public string CatgPkPr { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Product Quantity must be a positive number")]
+    public decimal? ProdQnty { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Projected Quantity must be a positive number")]
+    public decimal? ProjQnty { get; set; }
+    
+    public string ActnRemk { get; set; }
+    
+    public DateTime? TargetDt { get; set; }
+}
+
+public class MarketIntelligenceModel
+{
+    [Required]
+    public string BrandName { get; set; }
+    
+    [Required]
+    public string ProductCode { get; set; }
+    
+    public decimal? PriceB { get; set; }
+    
+    public decimal? PriceC { get; set; }
+}
+
+public class GiftDistributionModel
+{
+    [Required]
+    public string MrtlCode { get; set; }
+    
+    [Range(0, double.MaxValue, ErrorMessage = "Issue Quantity must be a positive number")]
+    public decimal? IsueQnty { get; set; }
+    
+    public string Naration { get; set; }
+}
+
+
+
+
+// Add these methods to DatabaseHelper.cs
+using System.Data.SqlClient;
+using System.Threading.Tasks;
+
+public class DatabaseHelper
+{
+    // ... existing code ...
+
+    public async Task<IDbTransaction> BeginTransactionAsync(string connectionString)
+    {
+        var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        var transaction = connection.BeginTransaction();
+        return transaction;
+    }
+}
+
+public static class TransactionExtensions
+{
+    public static async Task CommitAsync(this IDbTransaction transaction)
+    {
+        if (transaction is SqlTransaction sqlTransaction)
+        {
+            await sqlTransaction.CommitAsync();
+        }
+        else
+        {
+            transaction.Commit();
+        }
+    }
+
+    public static async Task RollbackAsync(this IDbTransaction transaction)
+    {
+        if (transaction is SqlTransaction sqlTransaction)
+        {
+            await sqlTransaction.RollbackAsync();
+        }
+        else
+        {
+            transaction.Rollback();
+        }
+    }
+}
+
+
+
+
+// Startup.cs
+public void ConfigureServices(IServiceCollection services)
+{
+    // ... existing services ...
+    
+    // Add DatabaseHelper
+    services.AddSingleton<DatabaseHelper>(sp => 
+    {
+        var configuration = sp.GetRequiredService<IConfiguration>();
+        return new DatabaseHelper(
+            configuration.GetConnectionString("BwLiveConnection"),
+            configuration.GetConnectionString("ItKhariaConnection"),
+            configuration.GetConnectionString("ImageDataConnection")
+        );
+    });
 }
