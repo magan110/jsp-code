@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Transactions;
 
 namespace sparshWebService.Controllers
 {
@@ -109,9 +110,10 @@ ORDER BY m.areaCode";
                     return NotFound(new { success = false, message = "No Area Codes found." });
 
                 var list = rows
-                    .Select(r => new {
-                        value = r["value"].ToString(),
-                        text = r["text"].ToString()
+                    .Select(r => new
+                    {
+                        value = r.TryGetValue("value", out var v) ? v?.ToString() ?? "" : "",
+                        text = r.TryGetValue("text", out var t) ? t?.ToString() ?? "" : ""
                     })
                     .ToList();
                 return Ok(new { success = true, data = list });
@@ -127,7 +129,7 @@ ORDER BY m.areaCode";
         /// Get Customers/Retailers based on area and customer type
         /// </summary>
         [HttpGet("GetCustomers")]
-        public IActionResult GetCustomers(string areaCode, string customerType, string searchText = "")
+        public IActionResult GetCustomers([FromQuery] string areaCode, [FromQuery] string customerType, [FromQuery] string searchText = "")
         {
             try
             {
@@ -205,7 +207,7 @@ ORDER BY m.areaCode";
         /// Get Product categories dropdown
         /// </summary>
         [HttpGet("GetProductCategories")]
-        public IActionResult GetProducts()
+        public IActionResult GetProductCategories()
         {
             const string sql = @"
 SELECT
@@ -217,7 +219,7 @@ ORDER BY repoCatg";
             var rows = _dbHelper.WebSessBean(sql, new Dictionary<string, object>())
                        as List<Dictionary<string, object>>;
             if (rows == null || !rows.Any())
-                return NotFound("No products found.");
+                return NotFound(new { success = false, message = "No products found." });
 
             var options = rows.Select(r => new DropdownOption
             {
@@ -225,7 +227,7 @@ ORDER BY repoCatg";
                 Description = r["Description"]?.ToString() ?? ""
             }).ToList();
 
-            return Ok(options);
+            return Ok(new { success = true, data = options });
         }
 
         [HttpGet("products/{repoCatg}/skus")]
@@ -245,7 +247,7 @@ ORDER BY prodDesc";
             }) as List<Dictionary<string, object>>;
 
             if (rows == null || !rows.Any())
-                return NotFound($"No SKUs found for product category '{repoCatg}'.");
+                return NotFound(new { success = false, message = $"No SKUs found for product category '{repoCatg}'." });
 
             var skus = rows.Select(r => new DropdownOption
             {
@@ -253,7 +255,7 @@ ORDER BY prodDesc";
                 Description = r["Description"]?.ToString() ?? ""
             }).ToList();
 
-            return Ok(skus);
+            return Ok(new { success = true, data = skus });
         }
 
         /// <summary>
@@ -281,19 +283,19 @@ ORDER BY prodDesc";
         }
 
         /// <summary>
-        /// Get Exception Reasons dropdown
+        /// Get Exception Reasons dropdown (data-driven)
         /// </summary>
         [HttpGet("GetExceptionReasons")]
         public IActionResult GetExceptionReasons()
         {
             try
             {
-                var sql = @"SELECT '01' as value, 'Network Issue' as text 
-                           UNION SELECT '02', 'Battery Low' 
-                           UNION SELECT '03', 'Mobile Not working' 
-                           UNION SELECT '04', 'Location not capturing' 
-                           UNION SELECT '05', 'Wrong Location OF Retailer' 
-                           UNION SELECT '06', 'Wrong Location Captured'";
+                var sql = @"SELECT paramCod as value, paramDes as text 
+                           FROM wcmParametr WITH(NOLOCK) 
+                           WHERE paramTyp = '118' 
+                             AND paramCod <> '00000' 
+                             AND isActive = 'Y'
+                           ORDER BY paramDes";
                 var reasons = _dbHelper.WebSessBean(sql, new Dictionary<string, object>());
                 return Ok(new { success = true, data = reasons });
             }
@@ -336,7 +338,7 @@ ORDER BY prodDesc";
         /// Get Purchaser Codes based on area code and purchaser/retailer type
         /// </summary>
         [HttpGet("GetPurchaserCodes")]
-        public IActionResult GetPurchaserCodes(string areaCode, string purchaserType, string searchText = "")
+        public IActionResult GetPurchaserCodes([FromQuery] string areaCode, [FromQuery] string purchaserType, [FromQuery] string searchText = "")
         {
             try
             {
@@ -675,54 +677,93 @@ ORDER BY prodDesc";
         }
 
         /// <summary>
-        /// Get customer sales history
+        /// Get customer sales history (3-month avg + current month)
         /// </summary>
         [HttpGet("GetCustomerSalesHistory")]
-        public IActionResult GetCustomerSalesHistory(string customerCode, string customerType)
+        public IActionResult GetCustomerSalesHistory([FromQuery] string customerCode, [FromQuery] string customerType)
         {
             try
             {
+                // 3-month average
+                string avgSql;
+                var p = new Dictionary<string, object> { ["@customerCode"] = customerCode };
+
+                if (customerType == "R" || customerType == "RR")
+                {
+                    avgSql = @"SELECT 
+                                 ISNULL(AVG(CASE WHEN mrgRepCt = '01' THEN CAST(salesQty as decimal(18,2)) END), 0) as wc,
+                                 ISNULL(AVG(CASE WHEN mrgRepCt = '02' THEN CAST(salesQty as decimal(18,2)) END), 0) as wcp,
+                                 ISNULL(AVG(CASE WHEN mrgRepCt = '03' THEN CAST(salesQty as decimal(18,2)) END), 0) as vap
+                               FROM sbvTlySlsDt WITH(NOLOCK)
+                               WHERE retlCode = @customerCode
+                                 AND rtlInvDt >= DATEADD(MONTH, -3, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
+                                 AND rtlInvDt <  DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)";
+                }
+                else
+                {
+                    avgSql = @"SELECT 
+                                 ISNULL(AVG(CASE WHEN c.mrgRepCt = '01' THEN CAST(a.invnQnty as decimal(18,2)) END), 0) as wc,
+                                 ISNULL(AVG(CASE WHEN c.mrgRepCt = '02' THEN CAST(a.invnQnty as decimal(18,2)) END), 0) as wcp,
+                                 ISNULL(AVG(CASE WHEN c.mrgRepCt = '03' THEN CAST(a.invnQnty as decimal(18,2)) END), 0) as vap
+                               FROM dpsCustSlDt a WITH(NOLOCK)
+                               INNER JOIN bkmProducts b WITH(NOLOCK) ON a.prodCode = b.prodCode
+                               INNER JOIN bkmRepoCatg c WITH(NOLOCK) ON b.repoCatg = c.repoCatg
+                               WHERE a.custCode = @customerCode
+                                 AND a.invMnTyp = 'NS'
+                                 AND a.invDocDt >= DATEADD(MONTH, -3, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
+                                 AND a.invDocDt <  DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)";
+                }
+
+                var avg = (_dbHelper.WebSessBean(avgSql, p) as List<Dictionary<string, object>>)?.FirstOrDefault();
+
+                // current month
+                string curSql;
+                if (customerType == "R" || customerType == "RR")
+                {
+                    curSql = @"SELECT 
+                                 ISNULL(SUM(CASE WHEN mrgRepCt = '01' THEN CAST(salesQty as decimal(18,2)) END), 0) as wc,
+                                 ISNULL(SUM(CASE WHEN mrgRepCt = '02' THEN CAST(salesQty as decimal(18,2)) END), 0) as wcp,
+                                 ISNULL(SUM(CASE WHEN mrgRepCt = '03' THEN CAST(salesQty as decimal(18,2)) END), 0) as vap
+                               FROM sbvTlySlsDt WITH(NOLOCK)
+                               WHERE retlCode = @customerCode
+                                 AND rtlInvDt >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+                                 AND rtlInvDt <  DATEADD(MONTH, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))";
+                }
+                else
+                {
+                    curSql = @"SELECT 
+                                 ISNULL(SUM(CASE WHEN c.mrgRepCt = '01' THEN CAST(a.invnQnty as decimal(18,2)) END), 0) as wc,
+                                 ISNULL(SUM(CASE WHEN c.mrgRepCt = '02' THEN CAST(a.invnQnty as decimal(18,2)) END), 0) as wcp,
+                                 ISNULL(SUM(CASE WHEN c.mrgRepCt = '03' THEN CAST(a.invnQnty as decimal(18,2)) END), 0) as vap
+                               FROM dpsCustSlDt a WITH(NOLOCK)
+                               INNER JOIN bkmProducts b WITH(NOLOCK) ON a.prodCode = b.prodCode
+                               INNER JOIN bkmRepoCatg c WITH(NOLOCK) ON b.repoCatg = c.repoCatg
+                               WHERE a.custCode = @customerCode
+                                 AND a.invMnTyp = 'NS'
+                                 AND a.invDocDt >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+                                 AND a.invDocDt <  DATEADD(MONTH, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))";
+                }
+
+                var cur = (_dbHelper.WebSessBean(curSql, p) as List<Dictionary<string, object>>)?.FirstOrDefault();
+
                 var result = new
                 {
-                    last3MonthsAverage = new { wc = "0.00", wcp = "0.00", vap = "0.00" },
-                    currentMonth = new { wc = "0.00", wcp = "0.00", vap = "0.00" },
+                    last3MonthsAverage = new
+                    {
+                        wc = SafeParseDecimal(avg?["wc"]?.ToString()),
+                        wcp = SafeParseDecimal(avg?["wcp"]?.ToString()),
+                        vap = SafeParseDecimal(avg?["vap"]?.ToString())
+                    },
+                    currentMonth = new
+                    {
+                        wc = SafeParseDecimal(cur?["wc"]?.ToString()),
+                        wcp = SafeParseDecimal(cur?["wcp"]?.ToString()),
+                        vap = SafeParseDecimal(cur?["vap"]?.ToString())
+                    },
                     lastBilling = new List<object>(),
                     stock = new { wc = "0.00", wcp = "0.00", vap = "0.00" }
                 };
 
-                string sql = "";
-                var parameters = new Dictionary<string, object>
-                {
-                    ["@customerCode"] = customerCode
-                };
-
-                if (customerType == "R" || customerType == "RR")
-                {
-                    // For Retailers - get from Tally sales data
-                    sql = @"SELECT ISNULL(SUM(CASE WHEN mrgRepCt = '01' THEN salesQty ELSE 0 END), 0)/3 as wc,
-                                   ISNULL(SUM(CASE WHEN mrgRepCt = '02' THEN salesQty ELSE 0 END), 0)/3 as wcp,
-                                   ISNULL(SUM(CASE WHEN mrgRepCt = '03' THEN salesQty ELSE 0 END), 0)/3 as vap
-                            FROM sbvTlySlsDt WITH(NOLOCK)
-                            WHERE retlCode = @customerCode
-                            AND rtlInvDt BETWEEN CONVERT(varchar(11), DATEADD(mm, -4, DATEADD(dd, +1, EOMONTH(GETDATE()))), 106) 
-                                             AND CONVERT(varchar(11), DATEADD(ss, -1, DATEADD(month, DATEDIFF(month, 0, GETDATE()), 0)), 113)";
-                }
-                else
-                {
-                    // For Customers - get from invoice data
-                    sql = @"SELECT ISNULL(SUM(CASE WHEN mrgRepCt = '01' THEN invnQnty ELSE 0 END), 0)/3 as wc,
-                                   ISNULL(SUM(CASE WHEN mrgRepCt = '02' THEN invnQnty ELSE 0 END), 0)/3 as wcp,
-                                   ISNULL(SUM(CASE WHEN mrgRepCt = '03' THEN invnQnty ELSE 0 END), 0)/3 as vap
-                            FROM dpsCustSlDt a WITH(NOLOCK), bkmProducts b WITH(NOLOCK), bkmRepoCatg c WITH(NOLOCK)
-                            WHERE a.prodCode = b.prodCode
-                            AND b.repoCatg = c.repoCatg
-                            AND a.invMnTyp = 'NS'
-                            AND a.invDocDt BETWEEN CONVERT(varchar(11), DATEADD(mm, -4, DATEADD(dd, +1, EOMONTH(GETDATE()))), 106) 
-                                               AND CONVERT(varchar(11), DATEADD(ss, -1, DATEADD(month, DATEDIFF(month, 0, GETDATE()), 0)), 113)
-                            AND a.custCode = @customerCode";
-                }
-
-                var salesHistory = _dbHelper.WebSessBean(sql, parameters);
                 return Ok(new { success = true, data = result });
             }
             catch (Exception ex)
@@ -1043,13 +1084,18 @@ ORDER BY prodDesc";
         }
 
         /// <summary>
-        /// Save DSR Entry (Add/Update)
+        /// Save DSR Entry (Add/Update/Delete) - transactional
         /// </summary>
         [HttpPost("SaveDSR")]
         public IActionResult SaveDSR([FromBody] DSRSaveRequest request)
         {
             try
             {
+                using var scope = new TransactionScope(
+                    TransactionScopeOption.Required,
+                    new TransactionOptions { IsolationLevel = IsolationLevel.ReadCommitted },
+                    TransactionScopeAsyncFlowOption.Enabled);
+
                 string docuNumb = request.DocuNumb ?? "";
                 string message = "";
 
@@ -1058,7 +1104,7 @@ ORDER BY prodDesc";
                     // Generate document number
                     docuNumb = GenerateDocumentNumber("DSR", request.AreaCode ?? "");
 
-                    // Insert main DSR record with more conservative field sizes
+                    // Insert main DSR record
                     var insertHeaderSql = @"
                         INSERT INTO dptDSRActvt (
                             docuNumb, docuDate, ordExDat, dsrParTy, dsrParam, cusRtlFl, areaCode, cusRtlCd,
@@ -1074,40 +1120,7 @@ ORDER BY prodDesc";
                         )";
 
                     var headerParams = CreateHeaderParameters(request, docuNumb);
-
-                    try
-                    {
-                        _dbHelper.WebSessBean(insertHeaderSql, headerParams);
-                    }
-                    catch (Exception dbEx)
-                    {
-                        // Return detailed error info for debugging
-                        return BadRequest(new
-                        {
-                            success = false,
-                            message = $"Database error: {dbEx.Message}",
-                            debugInfo = new
-                            {
-                                docuNumb = headerParams["@docuNumb"],
-                                cusRtlCd = headerParams["@cusRtlCd"],
-                                mrktName = headerParams["@mrktName"],
-                                isuDetal = headerParams["@isuDetal"],
-                                finlRslt = headerParams["@finlRslt"],
-                                brndSlWc = headerParams["@brndSlWc"],
-                                brndSlWp = headerParams["@brndSlWp"]
-                            },
-                            parameterLengths = new
-                            {
-                                docuNumb_length = docuNumb.Length,
-                                cusRtlCd_length = headerParams["@cusRtlCd"].ToString().Length,
-                                mrktName_length = headerParams["@mrktName"].ToString().Length,
-                                isuDetal_length = headerParams["@isuDetal"].ToString().Length,
-                                finlRslt_length = headerParams["@finlRslt"]?.ToString()?.Length ?? 0,
-                                brndSlWc_length = headerParams["@brndSlWc"]?.ToString()?.Length ?? 0,
-                                brndSlWp_length = headerParams["@brndSlWp"]?.ToString()?.Length ?? 0
-                            }
-                        });
-                    }
+                    _dbHelper.WebSessBean(insertHeaderSql, headerParams);
 
                     message = $"DSR Entry created successfully. Document No: {docuNumb}";
                 }
@@ -1148,7 +1161,7 @@ ORDER BY prodDesc";
                         WHERE docuNumb = @docuNumb AND createId = @createId";
 
                     var headerParams = CreateHeaderParameters(request, docuNumb);
-                    var updateResult = _dbHelper.WebSessBean(updateHeaderSql, headerParams);
+                    _dbHelper.WebSessBean(updateHeaderSql, headerParams);
 
                     // Delete existing detail records for this document
                     var deleteDetailsSql = @"DELETE FROM dptDSRActvtDtl WHERE docuNumb = @docuNumb AND createId = @createId";
@@ -1157,7 +1170,6 @@ ORDER BY prodDesc";
                         ["@docuNumb"] = docuNumb,
                         ["@createId"] = request.CreateId
                     };
-
                     _dbHelper.WebSessBean(deleteDetailsSql, deleteDetailsParams);
 
                     // Delete existing gift distribution records for this document
@@ -1167,7 +1179,6 @@ ORDER BY prodDesc";
                         ["@docuNumb"] = docuNumb,
                         ["@createId"] = request.CreateId
                     };
-
                     _dbHelper.WebSessBean(deleteGiftsSql, deleteGiftsParams);
 
                     message = $"DSR Entry updated successfully. Document No: {docuNumb}";
@@ -1237,15 +1248,18 @@ ORDER BY prodDesc";
 
                     _dbHelper.WebSessBean(deleteGiftsSql, deleteParams);
 
+                    scope.Complete();
                     return Ok(new { success = true, message = $"DSR Entry deleted successfully. Document No: {docuNumb}" });
+                }
+                else
+                {
+                    return BadRequest(new { success = false, message = "Invalid ProcType" });
                 }
 
                 // Insert detail records (for Add and Update)
-                if (request.ProcType != "D")
-                {
-                    InsertDSRDetails(docuNumb, request);
-                }
+                InsertDSRDetails(docuNumb, request);
 
+                scope.Complete();
                 return Ok(new { success = true, message = message, docuNumb = docuNumb });
             }
             catch (Exception ex)
@@ -1318,7 +1332,7 @@ ORDER BY prodDesc";
         /// Get DSR List with filtering options
         /// </summary>
         [HttpGet("GetDSRList/{loginId}")]
-        public IActionResult GetDSRList(string loginId, string? status = "", string? dateFrom = "", string? dateTo = "", int pageSize = 20, int pageNumber = 1)
+        public IActionResult GetDSRList(string loginId, [FromQuery] string? status = "", [FromQuery] string? dateFrom = "", [FromQuery] string? dateTo = "", [FromQuery] int pageSize = 20, [FromQuery] int pageNumber = 1)
         {
             try
             {
@@ -1639,7 +1653,7 @@ ORDER BY prodDesc";
                 ["@district"] = TruncateString(request.District ?? "", 35), // dptDSRActvt.district: varchar(35)
                 ["@deptCode"] = TruncateString(request.DeptCode ?? "", 6), // dptDSRActvt.deptCode: char(6)
                 ["@pendWith"] = TruncateString(request.PendWith ?? "", 10), // dptDSRActvt.pendWith: varchar(10)
-                ["@statFlag"] = TruncateString(string.IsNullOrEmpty(request.CityName) ? "N" : "F", 1), // dptDSRActvt.statFlag: char(1)
+                ["@statFlag"] = TruncateString(string.IsNullOrWhiteSpace(request.StatFlag) ? "N" : request.StatFlag!, 1), // respect client (N/F)
                 ["@createId"] = TruncateString(request.CreateId ?? "2948", 10), // dptDSRActvt.createId: varchar(10)
                 ["@finlRslt"] = TruncateString(request.FinlRslt ?? "", -1), // dptDSRActvt.locaCapr: varchar(max)
                 ["@geoLatit"] = TruncateString(request.GeoLatit ?? "", 30), // dptDSRActvt.latitute: varchar(30)
