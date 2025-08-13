@@ -52,8 +52,6 @@ namespace MyFirstApi.Controllers
         // ←— NEW: the document number to update (only sent in PUT/update scenarios)
         public string? DocuNumb { get; set; }
 
-
-
         /// <summary>
         /// Regular detail rows.
         /// </summary>
@@ -216,7 +214,7 @@ SELECT deptCode, areaCode
             };
             var match = activityMap.FirstOrDefault(kvp =>
                 dto.ActivityType.StartsWith(kvp.Key, StringComparison.OrdinalIgnoreCase));
-            if (match.Key == null)
+            if (string.IsNullOrWhiteSpace(match.Key))
                 return BadRequest($"Unknown ActivityType '{dto.ActivityType}'.");
             var meta = match.Value;
 
@@ -385,7 +383,7 @@ VALUES
         //{
         //    if (dto == null || string.IsNullOrWhiteSpace(dto.AreaCode))
         //        return BadRequest("AreaCode is required.");
-
+        //
         //    try
         //    {
         //        const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
@@ -399,10 +397,10 @@ VALUES
         //        var docuNumb = r1?.FirstOrDefault()?["docuNumb"]?.ToString();
         //        if (string.IsNullOrWhiteSpace(docuNumb))
         //            return StatusCode(500, "Failed to generate document number.");
-
+        //
         //        const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
         //        _db.WebSessBean(updSql, genParams);
-
+        //
         //        return Ok(new { DocumentNumber = docuNumb });
         //    }
         //    catch (Exception ex)
@@ -496,15 +494,11 @@ SELECT docuNumb
             // must supply the document number to update
             if (string.IsNullOrWhiteSpace(dto.Details?.FirstOrDefault()?.RepoCatg) && string.IsNullOrWhiteSpace(dto.ProcessType))
                 return BadRequest("ProcessType is required.");
-            //if (string.IsNullOrWhiteSpace(dto.AreaCode))
-            //    return BadRequest("AreaCode is required.");
-            // we expect the Flutter side to pass DocuNumb in a custom field:
-            // let's assume you've added `public string DocuNumb { get; set; }` to DsrEntryDto
             var docuNumb = dto.DocuNumb;
             if (string.IsNullOrWhiteSpace(docuNumb))
                 return BadRequest("You must supply a DocuNumb to update.");
 
-            // 1️⃣ Re‑lookup deptCode / areaCode
+            // 1️⃣ Re-lookup deptCode / areaCode
             const string empSql = @"
 SELECT deptCode, areaCode
   FROM prmEmployee 
@@ -570,7 +564,7 @@ DELETE FROM dptDSRActvtDtl
                     ["@docuNumb"] = docuNumb
                 });
 
-                // 4️⃣ Re‑insert all incoming Details
+                // 4️⃣ Re-insert all incoming Details
                 for (var i = 0; i < dto.Details.Count; i++)
                 {
                     var d = dto.Details[i];
@@ -684,124 +678,78 @@ SELECT *
         }
 
         [HttpPost("submitExceptions")]
-
         [ProducesResponseType(201)]
-
         [ProducesResponseType(200)]
-
         [ProducesResponseType(400)]
-
         [ProducesResponseType(409)]
-
         [ProducesResponseType(500)]
-
         public IActionResult SubmitExceptions([FromBody] ExceptionSubmitModel model)
-
         {
-
             if (model == null) return BadRequest("Request body is missing.");
-
             if (string.IsNullOrWhiteSpace(model.ProcType) || string.IsNullOrWhiteSpace(model.CreateId))
-
                 return BadRequest("ProcType and CreateId are required.");
-
             if (model.Items == null || model.Items.Count == 0)
-
                 return BadRequest("You must supply at least one exception in 'items'.");
 
             var procType = model.ProcType.Trim().ToUpperInvariant();
-
             if (procType != "N" && procType != "A")
-
                 return BadRequest("ProcType must be 'N' (new) or 'A' (approval).");
 
             var today = DateTime.Today;
-
             var errors = new List<string>();
 
             // First pass: validate everything & pre-read any rows we need.
-
             var prepared = new List<(string Kind, ExceptionItem item, DateTime excpDat1, IDictionary<string, object>? existingRow)>();
 
             foreach (var item in model.Items)
-
             {
-
                 if (item == null) { errors.Add("Item is null."); continue; }
-
                 if (string.IsNullOrWhiteSpace(item.UserCode))
-
                 { errors.Add("UserCode is required."); continue; }
 
                 var excpType = (item.ExcpType ?? "D").Trim().ToUpperInvariant();
-
                 if (excpType != "D")
-
                 { errors.Add($"ExcpType '{item.ExcpType}' not allowed. Only 'D' is permitted."); continue; }
 
                 if (!TryParseDate(item.ExcpDate, out var excpDat1))
-
                 { errors.Add($"ExcpDate '{item.ExcpDate}' is invalid. Use dd/MM/yyyy or yyyy-MM-dd."); continue; }
 
                 if (excpDat1 > today)
-
                 { errors.Add($"ExcpDate {excpDat1:dd/MM/yyyy} cannot be in the future."); continue; }
 
                 // Exceptions are for DSR dates older than 3 days (JSP guidance)
-
                 if (excpDat1 >= today.AddDays(-3))
-
                 { errors.Add($"ExcpDate {excpDat1:dd/MM/yyyy} is within last 3 days; exception not required."); continue; }
 
                 var excpRemk = (item.ExcpRemk ?? "").Trim();
-
                 if (excpRemk.Length > 50)
-
                 { errors.Add("ExcpRemk cannot exceed 50 characters."); continue; }
 
                 if (procType == "N")
-
                 {
-
                     // New exception must be raised for self (JSP does that)
-
                     if (!item.UserCode.Equals(model.CreateId, StringComparison.OrdinalIgnoreCase))
-
                     { errors.Add("New exception must be raised for self (UserCode must equal CreateId)."); continue; }
 
                     // PendWith: keep from payload for now (matches your current endpoint usage)
-
                     if (string.IsNullOrWhiteSpace(item.PendWith))
-
                     { errors.Add("PendWith is required for new exceptions (server can compute later)."); continue; }
 
                     // Check if one already exists for same user/type/date
-
                     const string checkSql = @"
-
                 select top 1 statFlag, excpDat2
-
                 from dptGenExcpn with (nolock)
-
                 where usrCdExc = @UserCode and excpType = @ExcpType and excpDat1 = @ExcpDat1";
-
                     var existing = _db.WebSessBean(checkSql, new Dictionary<string, object>
                     {
-
                         ["@UserCode"] = item.UserCode,
-
                         ["@ExcpType"] = excpType,
-
                         ["@ExcpDat1"] = excpDat1
-
                     });
 
                     IDictionary<string, object>? row = (existing != null && existing.Count > 0) ? existing[0] : null;
-
                     if (row != null)
-
                     {
-
                         var statFlag = row.ContainsKey("statFlag") ? row["statFlag"]?.ToString() : null;
 
                         DateTime? excpDat2 = null;
@@ -810,244 +758,133 @@ SELECT *
                             if (DateTime.TryParse(row["excpDat2"].ToString(), out DateTime parsed))
                                 excpDat2 = parsed;
                         }
-
                     }
 
                     prepared.Add(("NEW", item, excpDat1, row));
-
                 }
-
                 else // Approvals
-
                 {
-
                     var desired = (item.StatFlag ?? "").Trim().ToUpperInvariant();
-
                     if (desired != "A" && desired != "R")
-
                     { errors.Add("For approvals, StatFlag must be 'A' or 'R'."); continue; }
 
                     // Ensure the pending row exists and is assigned to this approver
-
                     const string findPendingSql = @"
-
                 select top 1 statFlag
-
                 from dptGenExcpn with (nolock)
-
                 where usrCdExc=@UserCode and excpType=@ExcpType and excpDat1=@ExcpDat1
-
                   and pendWith=@ApproverId and statFlag='N'";
-
                     var pending = _db.WebSessBean(findPendingSql, new Dictionary<string, object>
                     {
-
                         ["@UserCode"] = item.UserCode,
-
                         ["@ExcpType"] = excpType,
-
                         ["@ExcpDat1"] = excpDat1,
-
                         ["@ApproverId"] = model.CreateId
-
                     });
 
                     if (pending == null || pending.Count == 0)
-
                     { errors.Add($"No pending request for {excpDat1:dd/MM/yyyy} assigned to you."); continue; }
 
                     prepared.Add(("APPR", item, excpDat1, null));
-
                 }
-
             }
 
             if (errors.Count > 0)
-
                 return BadRequest(new { message = "Validation failed.", errors });
 
             // Second pass: perform DML
-
             try
-
             {
-
                 foreach (var p in prepared)
-
                 {
-
                     var excpType = (p.item.ExcpType ?? "D").Trim().ToUpperInvariant();
 
                     if (p.Kind == "NEW")
-
                     {
-
                         // If we had a previously rejected/expired approved row, reset it; else insert fresh.
-
                         if (p.existingRow != null)
-
                         {
-
                             const string updSql = @"
-
                         update dptGenExcpn
-
                            set excpRemk = @ExcpRemk,
-
                                pendWith = @PendWith,
-
                                statFlag = 'N',
-
                                createId = @CreateId,
-
                                createDt = GETDATE(),
-
                                excpDat2 = NULL
-
                          where usrCdExc=@UserCode and excpType=@ExcpType and excpDat1=@ExcpDat1";
-
                             _db.WebSessBean(updSql, new Dictionary<string, object>
                             {
-
                                 ["@ExcpRemk"] = (p.item.ExcpRemk ?? "").Trim(),
-
                                 ["@PendWith"] = p.item.PendWith,
-
                                 ["@CreateId"] = model.CreateId,
-
                                 ["@UserCode"] = p.item.UserCode,
-
                                 ["@ExcpType"] = excpType,
-
                                 ["@ExcpDat1"] = p.excpDat1
-
                             });
-
                         }
-
                         else
-
                         {
-
                             const string insSql = @"
-
                         insert into dptGenExcpn
-
                           (usrCdExc, excpType, excpDat1, excpDat2, usrTyExc, excpRemk, pendWith, statFlag, createId, createDt)
-
                         values
-
                           (@UserCode, @ExcpType, @ExcpDat1, NULL, 'E', @ExcpRemk, @PendWith, 'N', @CreateId, GETDATE())";
-
                             _db.WebSessBean(insSql, new Dictionary<string, object>
                             {
-
                                 ["@UserCode"] = p.item.UserCode,
-
                                 ["@ExcpType"] = excpType,
-
                                 ["@ExcpDat1"] = p.excpDat1,
-
                                 ["@ExcpRemk"] = (p.item.ExcpRemk ?? "").Trim(),
-
                                 ["@PendWith"] = p.item.PendWith,
-
                                 ["@CreateId"] = model.CreateId
-
                             });
-
                         }
-
                     }
-
                     else // APPR
-
                     {
-
                         var desired = (p.item.StatFlag ?? "").Trim().ToUpperInvariant();
-
                         const string approveSql = @"
-
                     update dptGenExcpn
-
                        set statFlag = @NewStatus,
-
                            excpDat2 = case when @NewStatus='A' then dateadd(day,3,cast(getdate() as date)) else NULL end
-
                      where usrCdExc=@UserCode
-
                        and excpType=@ExcpType
-
                        and excpDat1=@ExcpDat1
-
                        and pendWith=@ApproverId
-
                        and statFlag='N'";
-
                         _db.WebSessBean(approveSql, new Dictionary<string, object>
                         {
-
                             ["@NewStatus"] = desired,
-
                             ["@UserCode"] = p.item.UserCode,
-
                             ["@ExcpType"] = excpType,
-
                             ["@ExcpDat1"] = p.excpDat1,
-
                             ["@ApproverId"] = model.CreateId
-
                         });
-
                     }
-
                 }
 
                 // Return 201 for new, 200 for approvals
-
                 return StatusCode(procType == "N" ? 201 : 200);
-
             }
-
             catch (Exception ex)
-
             {
-
                 return StatusCode(500, $"Error saving exceptions: {ex.Message}");
-
             }
-
         }
 
         // --- helpers ---
-
         private static bool TryParseDate(string input, out DateTime date)
-
         {
-
             var formats = new[] { "dd/MM/yyyy", "d/M/yyyy", "yyyy-MM-dd" };
-
             return DateTime.TryParseExact(
-
                 input,
-
                 formats,
-
                 System.Globalization.CultureInfo.InvariantCulture,
-
                 System.Globalization.DateTimeStyles.None,
-
                 out date
-
             );
-
         }
-
-
-
-        
-
-
 
         [HttpGet("getPurchaserCode")]
         public IActionResult GetPurchaserCode(
@@ -1121,9 +958,8 @@ SELECT
             {
                 return StatusCode(500, $"Internal server error: {ex.Message}");
             }
-
-
         }
+
         [HttpGet("getApprovalAuthority")]
         public IActionResult GetApprovalAuthority([FromQuery] string loginId)
         {
@@ -1156,11 +992,6 @@ SELECT emplName
 
             return Ok(new { ApproverId = approverId, ApproverName = approverName });
         }
-
-        /// <summary>
-        /// 2️⃣ Exception Type dropdown (already had getExceptionMetadata)
-        /// </summary>
-        // → use your existing GetExceptionMetadata endpoint
 
         /// <summary>
         /// 3️⃣ Employee list for the add/approval table
@@ -1262,6 +1093,7 @@ ORDER BY createDt DESC";
             // return raw dictionary list or project into a strongly‐typed DTO
             return Ok(rows);
         }
+
         [HttpGet("getExceptionMetadata")]
         public IActionResult GetExceptionMetadata([FromQuery] string procType = "N")
         {
@@ -1301,6 +1133,292 @@ ORDER BY createDt DESC";
             }
         }
 
-    }
+        // -------------------------------
+        // NEW: Autofill + Update endpoints
+        // -------------------------------
 
+        // map dsrParam -> friendly name (subset covering your Submit map)
+        private static readonly Dictionary<string, string> ParamToActivity =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["53"] = "Office Work",
+                ["52"] = "Internal Team Meetings",
+                ["50"] = "Meeting with New Purchaser",
+                ["12"] = "Phone Call with Builder",
+                ["13"] = "Meetings with Contractor / Stockist",
+                ["31"] = "Visit to Get / Check Sampling at Site",
+                ["51"] = "BTL Activities",
+                ["54"] = "On Leave / Holiday / Off Day",
+                ["60"] = "Any Other Activity",
+                ["61"] = "Phone Call with Unregistered Purchasers",
+                ["55"] = "Work From Home",
+            };
+
+        private static string TryGet(IDictionary<string, object> row, string key) =>
+            row.ContainsKey(key) && row[key] != null ? row[key].ToString() : "";
+
+        private static decimal TryGetDec(IDictionary<string, object> row, string key)
+        {
+            if (!row.ContainsKey(key) || row[key] == null) return 0m;
+            if (decimal.TryParse(row[key].ToString(), out var d)) return d;
+            return 0m;
+        }
+
+        private static DateTime? TryGetDt(IDictionary<string, object> row, string key)
+        {
+            if (!row.ContainsKey(key) || row[key] == null) return null;
+            if (DateTime.TryParse(row[key].ToString(), out var dt)) return dt;
+            return null;
+        }
+
+        /// <summary>
+        /// GET api/DsrTry/autofill/{docuNumb}?createId=2948
+        /// Returns a fully populated DsrEntryDto: master + Details + MarketDetails.
+        /// </summary>
+        [HttpGet("autofill/{docuNumb}")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        public IActionResult Autofill(string docuNumb, [FromQuery] string createId = "2948")
+        {
+            if (string.IsNullOrWhiteSpace(docuNumb))
+                return BadRequest("docuNumb is required.");
+            if (string.IsNullOrWhiteSpace(createId))
+                return BadRequest("createId is required.");
+
+            // master
+            const string masterSql = @"
+SELECT TOP 1
+    a.docuNumb, a.dsrParam, a.docuDate, a.cusRtlFl, a.cusRtlCd,
+    a.dsrRem01, a.dsrRem02, a.dsrRem03, a.dsrRem04,
+    a.dsrRem05, a.dsrRem06, a.dsrRem07, a.dsrRem08,
+    a.latitute, a.lgtitute, a.areaCode, a.deptCode, a.statFlag, a.createId
+FROM dptDSRActvt a WITH (NOLOCK)
+WHERE a.docuNumb = @DocuNumb AND a.createId = @CreateId";
+            var mParams = new Dictionary<string, object>
+            {
+                ["@DocuNumb"] = docuNumb,
+                ["@CreateId"] = createId
+            };
+            var mRows = _db.WebSessBean(masterSql, mParams) as List<Dictionary<string, object>>;
+            if (mRows == null || mRows.Count == 0)
+                return NotFound($"No DSR found for docuNumb '{docuNumb}' and createId '{createId}'.");
+
+            var m = mRows[0];
+
+            // details (split normal vs market-mapping mrktData='01')
+            const string detailSql = @"
+SELECT docuSrNo, repoCatg, catgPack,
+       ISNULL(prodQnty,0) AS prodQnty,
+       ISNULL(projQnty,0) AS projQnty,
+       ISNULL(actnRemk,'') AS actnRemk,
+       targetDt,
+       ISNULL(mrktData,'') AS mrktData
+FROM dptDSRActvtDtl WITH (NOLOCK)
+WHERE docuNumb = @DocuNumb
+ORDER BY docuSrNo";
+            var dRows = _db.WebSessBean(detailSql, new Dictionary<string, object> { ["@DocuNumb"] = docuNumb })
+                        as List<Dictionary<string, object>> ?? new List<Dictionary<string, object>>();
+
+            var details = new List<DsrDetailDto>();
+            var market = new List<DsrDetailDto>();
+            foreach (var r in dRows)
+            {
+                var dto = new DsrDetailDto
+                {
+                    RepoCatg = TryGet(r, "repoCatg"),
+                    CatgPack = TryGet(r, "catgPack"),
+                    ProdQnty = TryGetDec(r, "prodQnty"),
+                    ProjQnty = TryGetDec(r, "projQnty"),
+                    ActnRemk = TryGet(r, "actnRemk"),
+                    TargetDt = TryGetDt(r, "targetDt")
+                };
+                var mrkt = TryGet(r, "mrktData");
+                if (string.Equals(mrkt, "01", StringComparison.OrdinalIgnoreCase))
+                    market.Add(dto);
+                else
+                    details.Add(dto);
+            }
+
+            var dsrParam = TryGet(m, "dsrParam");
+            var activity = ParamToActivity.TryGetValue(dsrParam, out var nm) ? nm : dsrParam;
+
+            var dtoOut = new DsrEntryDto
+            {
+                ProcessType = "U",
+                DocuNumb = docuNumb,
+                CreateId = TryGet(m, "createId"),
+                DsrParam = dsrParam,
+                ActivityType = activity,
+                SubmissionDate = DateTime.Now, // for UI; DB has createDt already
+                ReportDate = TryGetDt(m, "docuDate") ?? DateTime.Today,
+                AreaCode = TryGet(m, "areaCode"),
+                deptCode = TryGet(m, "deptCode"),
+                statflag = TryGet(m, "statFlag"),
+                Purchaser = TryGet(m, "cusRtlFl"),
+                PurchaserCode = TryGet(m, "cusRtlCd"),
+                dsrRem01 = TryGet(m, "dsrRem01"),
+                dsrRem02 = TryGet(m, "dsrRem02"),
+                dsrRem03 = TryGet(m, "dsrRem03"),
+                dsrRem04 = TryGet(m, "dsrRem04"),
+                dsrRem05 = TryGet(m, "dsrRem05"),
+                dsrRem06 = TryGet(m, "dsrRem06"),
+                dsrRem07 = TryGet(m, "dsrRem07"),
+                dsrRem08 = TryGet(m, "dsrRem08"),
+                latitude = TryGet(m, "latitute"),
+                longitude = TryGet(m, "lgtitute"),
+                Details = details,
+                MarketDetails = market
+            };
+
+            return Ok(dtoOut);
+        }
+
+        /// <summary>
+        /// PUT api/DsrTry/autofill/{docuNumb}
+        /// Updates the DSR (master + replaces all details). Ownership check by CreateId.
+        /// </summary>
+        [HttpPut("autofill/{docuNumb}")]
+        [ProducesResponseType(StatusCodes.Status204NoContent)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+        public IActionResult AutofillUpdate(string docuNumb, [FromBody] DsrEntryDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(docuNumb))
+                return BadRequest("docuNumb is required.");
+            if (dto == null)
+                return BadRequest("Body is required.");
+            if (string.IsNullOrWhiteSpace(dto.CreateId))
+                return BadRequest("CreateId is required.");
+
+            // ensure the row exists and belongs to CreateId
+            const string existsSql = "SELECT 1 FROM dptDSRActvt WITH (NOLOCK) WHERE docuNumb=@DocuNumb AND createId=@CreateId";
+            var exists = _db.WebSessBean(existsSql, new Dictionary<string, object>
+            {
+                ["@DocuNumb"] = docuNumb,
+                ["@CreateId"] = dto.CreateId
+            }) as List<Dictionary<string, object>>;
+            if (exists == null || exists.Count == 0)
+                return NotFound($"You do not own docuNumb '{docuNumb}', or it does not exist.");
+
+            // master update
+            const string updateMasterSql = @"
+UPDATE dptDSRActvt
+   SET dsrParam = @dsrParam,
+       docuDate = @reportDate,
+       cusRtlFl = @cusRtlFl,
+       cusRtlCd = @cusRtlCd,
+       dsrRem01 = @r1,
+       dsrRem02 = @r2,
+       dsrRem03 = @r3,
+       dsrRem04 = @r4,
+       dsrRem05 = @r5,
+       dsrRem06 = @r6,
+       dsrRem07 = @r7,
+       dsrRem08 = @r8,
+       latitute = @latitude,
+       lgtitute = @longitude,
+       areaCode = @areaCode,
+       updateId = @updateId,
+       updateDt = GETDATE()
+ WHERE docuNumb = @docuNumb";
+            var um = new Dictionary<string, object>
+            {
+                ["@docuNumb"] = docuNumb,
+                ["@dsrParam"] = string.IsNullOrWhiteSpace(dto.DsrParam) ? "" : dto.DsrParam,
+                ["@reportDate"] = dto.ReportDate,
+                ["@cusRtlFl"] = dto.Purchaser ?? "",
+                ["@cusRtlCd"] = dto.PurchaserCode ?? "",
+                ["@r1"] = dto.dsrRem01 ?? "",
+                ["@r2"] = dto.dsrRem02 ?? "",
+                ["@r3"] = dto.dsrRem03 ?? "",
+                ["@r4"] = dto.dsrRem04 ?? "",
+                ["@r5"] = dto.dsrRem05 ?? "",
+                ["@r6"] = dto.dsrRem06 ?? "",
+                ["@r7"] = dto.dsrRem07 ?? "",
+                ["@r8"] = dto.dsrRem08 ?? "",
+                ["@latitude"] = dto.latitude ?? "",
+                ["@longitude"] = dto.longitude ?? "",
+                ["@areaCode"] = dto.AreaCode ?? "",
+                ["@updateId"] = dto.CreateId
+            };
+
+            // details DML
+            const string deleteDetailsSql = "DELETE FROM dptDSRActvtDtl WHERE docuNumb=@docuNumb";
+            const string insertDetailSql = @"
+INSERT INTO dptDSRActvtDtl
+  (docuNumb, docuSrNo, repoCatg, catgPack,
+   prodQnty, projQnty, actnRemk, targetDt,
+   mrktData, statFlag, createId, createDt)
+VALUES
+  (@docuNumb, @srNo, @repoCatg, @catgPack,
+   @prodQnty, @projQnty, @actnRemk, @targetDt,
+   @mrktData, 'N', @createId, GETDATE())";
+
+            try
+            {
+                _db.WebSessBean(updateMasterSql, um);
+
+                // blow away all existing rows and reinsert (simple & mirrors JSP)
+                _db.WebSessBean(deleteDetailsSql, new Dictionary<string, object> { ["@docuNumb"] = docuNumb });
+
+                int sr = 1;
+                // normal details
+                if (dto.Details != null)
+                {
+                    foreach (var d in dto.Details)
+                    {
+                        if (d == null) continue;
+                        if (string.IsNullOrWhiteSpace(d.RepoCatg) && d.ProdQnty == 0 && d.ProjQnty == 0) continue;
+
+                        var pd = new Dictionary<string, object>
+                        {
+                            ["@docuNumb"] = docuNumb,
+                            ["@srNo"] = sr++,
+                            ["@repoCatg"] = d.RepoCatg ?? "",
+                            ["@catgPack"] = d.CatgPack ?? "",
+                            ["@prodQnty"] = d.ProdQnty,
+                            ["@projQnty"] = d.ProjQnty,
+                            ["@actnRemk"] = d.ActnRemk ?? "",
+                            ["@targetDt"] = d.TargetDt?.ToString("yyyy-MM-dd") ?? (object)DBNull.Value,
+                            ["@mrktData"] = DBNull.Value,
+                            ["@createId"] = dto.CreateId
+                        };
+                        _db.WebSessBean(insertDetailSql, pd);
+                    }
+                }
+                // market mapping rows (mrktData='01')
+                if (dto.MarketDetails != null)
+                {
+                    foreach (var d in dto.MarketDetails)
+                    {
+                        if (d == null) continue;
+                        if (string.IsNullOrWhiteSpace(d.RepoCatg) && d.ProdQnty == 0 && d.ProjQnty == 0) continue;
+
+                        var pm = new Dictionary<string, object>
+                        {
+                            ["@docuNumb"] = docuNumb,
+                            ["@srNo"] = sr++,
+                            ["@repoCatg"] = d.RepoCatg ?? "",
+                            ["@catgPack"] = d.CatgPack ?? "",
+                            ["@prodQnty"] = d.ProdQnty,
+                            ["@projQnty"] = d.ProjQnty,
+                            ["@actnRemk"] = d.ActnRemk ?? "",
+                            ["@targetDt"] = d.TargetDt?.ToString("yyyy-MM-dd") ?? (object)DBNull.Value,
+                            ["@mrktData"] = "01",
+                            ["@createId"] = dto.CreateId
+                        };
+                        _db.WebSessBean(insertDetailSql, pm);
+                    }
+                }
+
+                return NoContent();
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error updating '{docuNumb}': {ex.Message}");
+            }
+        }
+    }
 }
