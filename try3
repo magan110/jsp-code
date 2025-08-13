@@ -1,484 +1,182 @@
-<%@ include file="/Envr/JSP/SecurityCom.jsp"%>
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+using System.Text.Json.Serialization;
 
-<%
-/*
-http://10.4.64.20/BirlaWhite/Trans/GenExcp.jsp
-http://10.4.64.20/BirlaWhite/Trans/GenExcpAppr.jsp
-select * from wcmParametr where paramTyp = 70 and paramCod = 'G'
-*/
-String  usrCdExc = "",
-		procType = "N", // N for New and A for Approval 
-		formName = "GenExcp",
-		dataDtCn = "",
-		usrNmExc = "",
-		excpRemk = "",
-		excpDat1 = sysDateOnly,
-		excpDat2 = WebSessBean.addDays(excpDat1, 3),
-		sttDocDt = "",
-		sapLgnGr = (log.sapLgnIdGet().length() < 6 ? "" : log.sapLgnIdGet().substring(0, 6)),
-		endDocDt = "",
-		pendWith = "",
-		emplCode = "",
-		emplName = "",
-		excpTySt = "", // Paramtyp 70
-		statFlSt = "", 
-		sql = "";
-
-endDocDt = WebSessBean.addDays(sysDateOnly, -4);
-sttDocDt = "01" + endDocDt.substring(2);
-
-boolean recFound = false;
-
-int rsetIndx = 0;
-
-if(XssFilter.parSmGet("procType") != null)
-	procType = XssFilter.parSmGet("procType");
-
-if(XssFilter.parSmGet("emplCode") != null)
-	emplCode = XssFilter.parSmGet("emplCode");
-
-if(XssFilter.parSmGet("formName") != null)
-	formName = XssFilter.parSmGet("formName");
-
-if(procType.equals("A")) 
+namespace sparshWebService.Controllers
 {
-	formName = "GenExcpAppr";
+    /// <summary>
+    /// REST translation of legacy TokenRecd.jsp (token scanning & submission workflow).
+    /// Endpoints: random key, TDS rate, token validation, bulk submit.
+    /// Stored procedure names (MK_02004, MK_02014) are placeholders mirroring legacy codes; adjust to real database objects.
+    /// </summary>
+    [ApiController]
+    [Route("api/[controller]")]
+    public class TokenScanController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public TokenScanController(DatabaseHelper db)
+        {
+            _db = db;
+        }
+
+        [HttpGet("random-key")] 
+        public IActionResult GetRandomKey()
+        {
+            try
+            {
+                const string sql = "SELECT RIGHT(NEWID(),16) AS RandomKey"; // SQL Server
+                var rows = _db.WebSessBean(sql, new());
+                var key = rows.FirstOrDefault()? ["RandomKey"]?.ToString() ?? string.Empty;
+                return Ok(new { success = true, randomKey = key });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet("tds-rate/{custCode}")]
+        public IActionResult GetTdsRate(string custCode)
+        {
+            if (string.IsNullOrWhiteSpace(custCode)) return BadRequest("custCode required");
+            try
+            {
+                const string sql = @"SELECT dbo.dpfTokTdsRt(itxPanNo, kycVerFl) AS TokTdsRt, appRtlty FROM wcvAllCustm WITH (NOLOCK) WHERE appRtlcd = @cust";
+                var rows = _db.WebSessBean(sql, new() { ["@cust"] = custCode });
+                var row = rows.FirstOrDefault();
+                if (row == null) return NotFound(new { success = false, message = "Customer not found" });
+                double.TryParse(row["TokTdsRt"].ToString(), out var rate);
+                return Ok(new { success = true, custCode, tdsRate = rate, retailerType = row["appRtlty"]?.ToString() });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpPost("validate-token")]
+        public IActionResult ValidateToken([FromBody] TokenValidateRequest req)
+        {
+            if (!ModelState.IsValid) return ValidationProblem(ModelState);
+            try
+            {
+                const string sql = "EXEC MK_02004 @TokenNum, @AreaCode, @CustCode, @RandKey"; // Placeholder
+                var rows = _db.WebSessBean(sql, new()
+                {
+                    ["@TokenNum"] = req.TokenNumber,
+                    ["@AreaCode"] = req.AreaCode,
+                    ["@CustCode"] = req.CustCode,
+                    ["@RandKey"] = req.RandomKey ?? string.Empty
+                });
+                if (rows.Count == 0)
+                    return NotFound(new { success = false, message = "Token not found or invalid" });
+
+                var r = rows.First();
+                var result = new TokenValidationResult
+                {
+                    TokenId = r.GetValueOrDefault("tokenIdn")?.ToString(),
+                    Status = r.GetValueOrDefault("isActive")?.ToString(),
+                    ValidUntil = r.GetValueOrDefault("validDat")?.ToString(),
+                    ScannedBy = r.GetValueOrDefault("scanndBy")?.ToString(),
+                    TokenValue = ParseDouble(r.GetValueOrDefault("tokenVal")),
+                    HandlingRate = ParseDouble(r.GetValueOrDefault("handRate")),
+                    DiscountRate = ParseDouble(r.GetValueOrDefault("scnrDdRt")),
+                    EndValue = ParseDouble(r.GetValueOrDefault("tokEndVl")),
+                    DisplayValue = ParseDouble(r.GetValueOrDefault("tokDspVl")),
+                    TokenType = r.GetValueOrDefault("bcTknTyp")?.ToString(),
+                    ExpiredFlag = r.GetValueOrDefault("exprFlag")?.ToString(),
+                    PinMasked = string.IsNullOrEmpty(r.GetValueOrDefault("numCvvNo")?.ToString()) ? null : "***",
+                    Raw = r
+                };
+                result.AmountPayable = (result.DisplayValue ?? 0) + (result.HandlingRate ?? 0);
+                return Ok(new { success = true, token = result });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpPost("submit")] 
+        public IActionResult SubmitTokens([FromBody] TokenSubmitRequest req)
+        {
+            if (!ModelState.IsValid) return ValidationProblem(ModelState);
+            if (req.Tokens == null || req.Tokens.Count == 0)
+                return BadRequest("At least one token required");
+            try
+            {
+                var tokenList = string.Join(',', req.Tokens.Distinct());
+                const string sql = "EXEC MK_02014 @TokenList, @DocNumber, @AreaCode, @CustCode, @LoginId, @RandomKey, @UserType"; // Placeholder
+                var rows = _db.WebSessBean(sql, new()
+                {
+                    ["@TokenList"] = tokenList,
+                    ["@DocNumber"] = req.DocNumber,
+                    ["@AreaCode"] = req.AreaCode,
+                    ["@CustCode"] = req.CustCode,
+                    ["@LoginId"] = req.LoginId ?? req.CustCode,
+                    ["@RandomKey"] = req.RandomKey ?? string.Empty,
+                    ["@UserType"] = req.UserType ?? string.Empty
+                });
+                double total = 0; int valid = 0, invalid = 0, expired = 0, already = 0;
+                foreach (var r in rows)
+                {
+                    var status = r.GetValueOrDefault("isActive")?.ToString();
+                    if (status == "Y") { valid++; total += (ParseDouble(r.GetValueOrDefault("tokDspVl")) ?? 0) + (ParseDouble(r.GetValueOrDefault("handRate")) ?? 0); }
+                    else if (status == "E") expired++;
+                    else if (status == "Z") already++;
+                    else invalid++;
+                }
+                return Ok(new { success = true, tokensSubmitted = req.Tokens.Count, valid, invalid, expired, already, totalAmount = total, docNumber = req.DocNumber, dbRows = rows });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        private static double? ParseDouble(object? v) => v == null ? null : (double.TryParse(v.ToString(), out var d) ? d : null);
+    }
+
+    public class TokenValidateRequest
+    {
+        [JsonPropertyName("tokenNumber")] public string TokenNumber { get; set; } = string.Empty;
+        [JsonPropertyName("areaCode")] public string AreaCode { get; set; } = string.Empty;
+        [JsonPropertyName("custCode")] public string CustCode { get; set; } = string.Empty;
+        [JsonPropertyName("randomKey")] public string? RandomKey { get; set; }
+    }
+
+    public class TokenSubmitRequest
+    {
+        [JsonPropertyName("tokens")] public List<string> Tokens { get; set; } = new();
+        [JsonPropertyName("areaCode")] public string AreaCode { get; set; } = string.Empty;
+        [JsonPropertyName("custCode")] public string CustCode { get; set; } = string.Empty;
+        [JsonPropertyName("docNumber")] public string DocNumber { get; set; } = string.Empty;
+        [JsonPropertyName("loginId")] public string? LoginId { get; set; }
+        [JsonPropertyName("userType")] public string? UserType { get; set; }
+        [JsonPropertyName("randomKey")] public string? RandomKey { get; set; }
+    }
+
+    public class TokenValidationResult
+    {
+        public string? TokenId { get; set; }
+        public string? Status { get; set; }
+        public string? ValidUntil { get; set; }
+        public string? ScannedBy { get; set; }
+        public double? TokenValue { get; set; }
+        public double? HandlingRate { get; set; }
+        public double? DiscountRate { get; set; }
+        public double? EndValue { get; set; }
+        public double? DisplayValue { get; set; }
+        public double? AmountPayable { get; set; }
+        public string? TokenType { get; set; }
+        public string? ExpiredFlag { get; set; }
+        public string? PinMasked { get; set; }
+        public Dictionary<string, object> Raw { get; set; } = new();
+    }
 }
 
-
-excpTySt = WebSessBean.getSqlToOptionStr(WebSessBean.getParamSql("wc", "excpType") + " and paramCod in ('D')", "D");
-
-statFlSt = WebSessBean.getSqlToOptionStr("select 'A', 'Approve' union select 'R', 'Reject'", "");
-
-if(loginIdM.equals("2954") || loginIdM.equals(log.getZoneHead()))
+internal static class DictExtensions
 {
-	pendWith = log.getFuncHdMk();
+    public static object? GetValueOrDefault(this Dictionary<string, object> dict, string key) => dict.TryGetValue(key, out var v) ? v : null;
 }
-else if(sapLgnGr.equals("BWZHKY") || sapLgnGr.equals("BWSHRT") || sapLgnGr.equals("BWZHCS") || sapLgnGr.equals("BWZCUB")) 
-{
-	pendWith = log.getZoneHead();
-}
-else if(sapLgnGr.equals("BWMORL")) 
-{
-//	pendWith = log.rurlHeadGet(); //ruralHead
-	sql = " select rurlStHd from bkmStateLgc with (nolock) where stLgcCod in (select stLgcCod from bkmAreaMast with (nolock) where areaCode  = '" + log.getArCode() + "') ";
-	rset = WebSessBean.selectRecord(sql);
-
-	if(rset.next())
-	{
-		pendWith = rset.getString(1);
-	}
-}
-else if(log.deptCodeGet().equals("KKR162")) 
-{
-	pendWith = "2440"; //VAP Team
-}
-else
-{
-	pendWith = log.getStatHead();
-}
-
-if(log.getUserType().equals("S") || log.getUserType().equals("P"))
-{
-	sql = "select retlArHd from bkmAreaMast where areaCode = '" + log.getArCode() + "' ";
-	rset = WebSessBean.selectRecord(sql);
-
-	if(rset.next())
-	{
-		pendWith = rset.getString(1);
-	}
-
-}
-
-	out.println("Pendwith : "+pendWith);
-//	out.println("pendWith : " + pendWith + UserBean.getDepCode());
-
-%>
-<!-- Header Starts -->
-<jsp:include page="/Envr/JSP/HeaderCom.jsp" flush="true">
-	<jsp:param name="mobFrend" value="B"/>
-	<jsp:param name="pagTypRp" value="N"/>
-</jsp:include>
-
-<!-- Header Ends -->
-
-
-<script type="text/javascript" language="JavaScript">
-function handleBackLoc()
-{
-	deleteAllRows("prjTable", 1);
-	addrow1();
-}
-
-function areaCdCh(varNumRw)
-{
-	eval("document.<%=formName%>.usrCdExc" + varNumRw).value = "";
-	return true;
-}
-
-function excpTypeChange(varNumRw)
-{
-	var excpType = eval("document.<%=formName%>.excpType" + varNumRw).value;
-	eval("document.<%=formName%>.usrCdExc" + varNumRw).value = ""; 
-
-	return true;
-}
-
-function addrow1()
-{
-	addrow('', '', '', "<%=excpDat1%>", '<%=excpDat2%>', ''); 
-}
-
-function addrow(usrCdExc, dataDtCn, usrNmExc, excpDat1, excpDat2, excpRemk)
-{
-	var numrows = getNumRows();
-	var newRow = insertRowBw(document.all.prjTable);
-
-	var name = "abc1";
-	m = insertCellBw(newRow);
-	m.innerHTML = "<input type='checkbox' name='" + name + "' value='" + numrows + "' disabled tabindex=-1>";
-	m.className = "darkData";
-
-	name = "excpType" + numrows;
-	m = insertCellBw(newRow); 
-	m.innerHTML = "<div id='info" + numrows + "Div' align='left'></div><select name='" + name + "' class='form-control' onchange='return excpTypeChange(" + numrows + ")'><%=excpTySt%></select>";
-	m.className = "darkData";
-
-	name = "usrCdExc" + numrows;
-	m = insertCellBw(newRow); 
-	//m.innerHTML = "<select name='" + name + "'><%=WebSessBean.getReportingEmplDesc("", true)%></select>";
-	m.innerHTML = usrNmExc;
-	m.innerHTML += "<input type='hidden' name='" + name + "' value='" + usrCdExc + "'>";
-	m.innerHTML += (dataDtCn != "" ? "<BR>Report Counts Entered " + dataDtCn + " Days": "");
-	m.className = "darkData";
-
-	name = "excpDat1" + numrows;
-	m = insertCellBw(newRow);
-	m.innerHTML = "<input type='text' name='" + name + "' size='10' value='" + excpDat1 + "' class='form-control' maxlength='10'  onChange='return isDate(this, true, \"<=today\")' onfocus='setAccessKey(this, \"calRD" + numrows + "\")' onClick=\"showCal('<%=formName%>', '" + name + "')\">";
-	m.className = "darkData";
-
-
-	name = "excpDat2" + numrows;
-	m.innerHTML += "<input type='hidden' name='" + name + "' value=''>";
-
-/*	
-	m = insertCellBw(newRow);
-	m.innerHTML = "<input type='text' name='" + name + "' size='10' value='" + excpDat2 + "' maxlength='10'  onChange='return isDate(this, true, \">=today\")' onfocus='setAccessKey(this, \"calRD" + numrows + "\")'><input type='button' name='calRD" + numrows + "' class='calendarBtnApp' onClick=\"showCal('<%=formName%>', '" + name + "')\">";
-	m.className = "darkData";
-*/
-
-
-	name = "excpRemk" + numrows;
-	m = insertCellBw(newRow);
-	m.innerHTML = "<input type='text' name='" + name + "' size='50' class='form-control'  value='" + excpRemk + "' onchange=\"return textValidApp(this, 'Remarks', true)\" maxlength=50>";
-
-	name = "statFlag" + numrows;
-
-	if(document.<%=formName%>.procType.value == "A") 
-	{
-		m.innerHTML += "<BR>Status <select name='" + name + "'><%=statFlSt%></select>";
-		readonly("excpDat1" + numrows, "D");
-		readonly("excpRemk" + numrows, "D");
-	}
-	else
-	{
-		m.innerHTML += "<input type='hidden' name='" + name + "' value='N'>";
-	}
-		
-	m.className = "darkData";
-	m.innerHTML += "<input type='hidden' name='srNumber' value=" + numrows + ">";
-
-	//eval("document.<%=formName%>.usrCdExc" + numrows).value = usrCdExc;
-}
-
-function deleter()
-{
-	deleterCv("<%=formName%>", "abc1", "prjTable", 1);
-}
-
-function submitValid()
-{
-	var rowLen = document.<%=formName%>.srNumber.length;
-	var abcLen = document.<%=formName%>.srNumber.length;
-	if(rowLen == null)
-	{
-		rowLen = 1;
-	}
-	var fldIndex = "";
-	var arryIndx = 0;
-	var fieldObj = "", excpRemk=0, usrCdExc;
-	var usrCdExcArr = new Array();	
-
-
-	for(ck=0; ck<rowLen; ck++)
-	{
-		if(abcLen == null)
-			fldIndex = document.<%=formName%>.srNumber.value;
-		else
-			fldIndex = document.<%=formName%>.srNumber[ck].value;
-
-		fieldObj = eval("document.<%=formName%>.excpType" + fldIndex);
-		if (!textValidApp(fieldObj, "Type", false)) 
-		{
-			fieldObj.focus();
-			return false;
-		}
-		
-
-		if (!textValidApp(eval("document.<%=formName%>.usrCdExc" + fldIndex), "Employee Code", false)) 
-			return false;
-
-		usrCdExc = eval("document.<%=formName%>.usrCdExc" + fldIndex).value;
-		
-		/* Duplicate Checking not required
-		if(isInArray(usrCdExcArr, eval("document.<%=formName%>.usrCdExc" + fldIndex).value))
-		{
-			alert("Duplicate Code");
-			eval("document.<%=formName%>.usrCdExc" + fldIndex).focus();
-			return false;
-		}
-		*/
-		
-		if(usrCdExc != "")
-			usrCdExcArr[arryIndx] = eval("document.<%=formName%>.usrCdExc" + fldIndex).value;
-
-		arryIndx++;
-
-		fieldObj = eval("document.<%=formName%>.excpDat1" + fldIndex);
-		if (!isDate(fieldObj, true, "<=today")) 
-			return false;
-
-		/*fieldObj = eval("document.<%=formName%>.excpDat2" + fldIndex);
-		if (!isDate(fieldObj, false, ">=today")) 
-			return false;*/
-		
-		fieldObj = eval("document.<%=formName%>.excpRemk" + fldIndex);
-		if (!textValidApp(fieldObj, "remarks", true)) 
-			return false;
-
-		if (!textValidApp(eval("document.<%=formName%>.statFlag" + fldIndex), "Status", false)) 
-			return false;
-	}
-
-	if (!subValidCom("<%=formName%>"))
-		return false;	
-
-	if(confirm("Want to submit details"))
-	{
-		document.<%=formName%>.method = "POST";
-		document.<%=formName%>.action = "<%=formName%>S.jsp"; 
-		document.<%=formName%>.submit();
-		return true;	
-	}
-	else
-	{
-		return false;
-	}
-}  
-
-function refreshed()
-{
-	document.<%=formName%>.method="POST";
-	document.<%=formName%>.action="<%=formName%>.jsp";
-	document.<%=formName%>.submit();
-}
-
-</script>
-
-<form  name="<%=formName%>" onload="handleBackLoc()">
-<input type="hidden" name="formName" value="<%=formName%>">
-<div class="container-fluid">
-	<div class="alert alert-primary" role="alert">
-		<blockquote>
-			<ul>
-				<li>Please Note Exception is valid for Late DSR Entry earlier than 3 days
-				<li>DSR Entry is must after Exception Approval for Attendance Entry
-				<li>Exception Validity is also 3 days after date of Exception Approval
-			</ul>
-		</blockquote>
-	</div>
-<input type="hidden" name="procType" value="<%=procType%>">
-<input type="hidden" name="pendWith" value="<%=pendWith%>">
-<%
-if(procType.equals("A"))
-{
-%>
-<div class="form-row">
-	<div class="form-group col-md-3">
-		<label class="control-label float-sm-left"  for="emplCode">Employee Code :</label>
-	</div>
-	<div class="form-group col-md-3">
-		<input type="text" name="emplCode" class="form-control" id="emplCode" value="<%=emplCode%>" onChange="return refreshed()">
-	</div>
-</div>
-<%
-}
-else
-{
-	if(!pendWith.equals(""))
-	{
-		sql = "select emplName from wcvLoginMas with (nolock) where loginIdM = '" + pendWith + "' ";
-		rset = WebSessBean.selectRecord(sql);
-		if(rset.next())
-		{
-			emplName = rset.getString(1);
-		}
-%>
-	<div class="form-row">
-		<div class="alert alert-primary" role="alert">
-			<blockquote>
-				<ul>
-					<li><label class="control-label float-sm-left"  for="emplCode" ><font size="3" color="red"><strong>Dear User : DSR Exception approval is position based not supervisor based and Your Approval Aurthrority is : <%=emplName%></strong></font></label></li>
-				</ul>
-			</blockquote>
-		</div>
-	</div>
-<%
-	}
-}
-%>
-<div class="row">
-<div class="table-responsive">  
-<table  id="prjTable" class="table table-sm table-hover table-bordered dataTable">
-<thead>
-<tr>
-	<th id="th">del</th>
-	<th id="th">Exception Type</th>
-	<th id="th">Employee</th>
-	<th id="th">Exception Date for DSR</th>
-<!-- 	<td class='headerBw' width="10%">Exception End Date</td> -->
-	<th id="th">Remarks</th>
-</tr>
-</thead>
-<tbody>
-<%
-	try
-	{
-		/*	sql = "select createId, count(distinct docuDate) as dataDtCn "
-			+ "from dptDSRActvt with (nolock) "
-			+ "where docuDate between '" + WebSessBean.dmyTOymd(sttDocDt) + "' and '" + WebSessBean.dmyTOymd(endDocDt) + "' "
-			+ "and   statFlag not in ('C', 'R') "
-			+ "and   createId in (" + WebSessBean.getReportingEmplString() + ") " 
-			+ "and   createId not in (select usrCdExc from dptGenExcpn with (nolock) where statFlag not in ('C', 'R') and excpDat2 > convert(varchar(10), getdate(), 111)) " 
-			+ "group by createId "
-			+ "having count(distinct docuDate) < " + endDocDt.substring(0, 2);*/
-
-		if(procType.equals("N"))
-		{
-			sql = "select loginIdM, '' as dataDtCn, emplName, '' as excpDat1, '' as excpDat2, '' as excpRemk "
-				+ "from prmEmployee with (nolock) "
-				+ "where loginIdM  = '" + loginIdM + "' "; 
-				//+ "and   createId not in (select usrCdExc from dptGenExcpn with (nolock) where statFlag not in ('C', 'R') and excpDat2 <= convert(varchar(10), getdate(), 111)) ";
-		}
-		else if(procType.equals("A"))
-		{
-			sql = "select a.createId, '' as dataDtCn, b.emplName + b.loginIdM , convert(char(10), a.excpDat1, 103), '' as excpDat2, a.excpRemk "
-				+ "from dptGenExcpn a with (nolock), prmEmployee b with (nolock) "
-				+ "where a.pendWith  = '" + loginIdM + "' " 
-				+ "and   a.createId  = b.loginIdM " 
-				+ "and   a.statFlag  = 'N' ";
-			
-			if(!emplCode.equals(""))
-				sql += "and  b.loginIdM = '" + emplCode + "'";
-		}
-
-		rset = WebSessBean.selectRecord(sql);
-
-		while(rset.next())
-		{
-			rsetIndx = 0;
-			usrCdExc = rset.getString(++rsetIndx);
-			dataDtCn = rset.getString(++rsetIndx);
-			usrNmExc = rset.getString(++rsetIndx);
-			excpDat1 = rset.getString(++rsetIndx);
-			excpDat2 = rset.getString(++rsetIndx);
-			excpRemk = rset.getString(++rsetIndx);
-			recFound = true;
-%>
-			<script type="text/javascript" language="javascript">
-				addrow('<%=usrCdExc%>', '<%=dataDtCn%>', '<%=usrNmExc%>', '<%=excpDat1%>', '<%=excpDat2%>', '<%=excpRemk%>');
-			</script>
-
-<%
-		} 
-	}
-	catch(Exception e)
-	{
-		throw new Exception("Error displaying in " + pageAddress + e.toString() + " Hello "+ sapLgnGr);  
-	}
-	rset = WebSessBean.closeRset(rset);
-
-%>
-</tbody>
-</table>
-</div>
-</div>
-		<div align="center">
-<!-- 		<input type="button" name="btnAdd" value="Add" class='coloredBtn' onClick="addrow1()">
-			<input type="button" name="btnDel" value="Delete" class='coloredBtn' onClick="deleter()"> -->
-			<input type="button" name="select" value="Submit" class='btn btn-primary' onClick="return submitValid()">
-		</div>
-<%
-if(!recFound)
-{
-%>
-<script language="javascript">
-	//addrow1();
-</script>
-<%
-}
-%>
-<div class="row">
-<div class="table-responsive">  
-	<table  id="dispTabl" class="table table-sm table-hover table-bordered dataTable js-basic-example">
-		<thead>
-			<tr>
-				<th id="th">Employee</th>
-				<th id="th">Exception Date for DSR</th>
-				<th id="th">Remarks</th>
-				<th id="th">Status</th>
-				<th id="th">Create Date</th>
-			</tr>
-		</thead>
-		<tbody>
-<%
-		sql = "select top 31 dbo.wcfLoginVal('N', usrCdExc) as employeeName, CONVERT(varchar(11), excpDat1, 113) as excpDate, excpRemk, "
-			+" case when statFlag = 'A' then 'Approved by ' when statFlag = 'N' then 'Pending For Approval with ' else 'rejected  by ' end + dbo.wcfLoginVal('N', pendWith) as Status, "
-			+" CONVERT(varchar(11), createDt, 113) as CreateDate "
-			+" from dptGenExcpn with (nolock) ";
-			
-		if(procType.equals("N"))
-		{
-			sql += "where createId = '" + loginIdM + "'";
-		}
-		else if(procType.equals("A"))
-		{
-			sql += "where pendWith = '" + loginIdM + "'";
-		}
-			sql += "order by excpDat1 desc ";
-		
-		rset = WebSessBean.selectRecord(sql);
-		while(rset.next())
-		{
-%>
-			<tr>
-				<td><%=rset.getString(1)%></td>
-				<td><%=rset.getString(2)%></td>
-				<td><%=rset.getString(3)%></td>
-				<td><%=rset.getString(4)%></td>
-				<td><%=rset.getString(5)%></td>
-			</tr>			
-<%
-		}
-
-	rset = WebSessBean.closeRset(rset);
-%>
-	</tbody>
-</table>
-</div>
-</div>
-
-</div>
-<!-- Form footer Starts --->
-<jsp:include page="/Envr/JSP/FooterCom.jsp" flush="true"/>
-<!-- Form footer Ends --->
