@@ -1,525 +1,539 @@
-<%@ include file="/Envr/JSP/SecurityCom.jsp"%>
-<%@ include file="/Envr/Login/LYPEnvrSet.jsp"%>
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+using System.ComponentModel.DataAnnotations;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 
-<%
-CallableStatement cstmt = null;
-ResultSet rset = null;
-
-boolean dbSubmit = false,
-		sysOutFl = true;
-
-if (sysOutFl)
+namespace sparshWebService.Controllers
 {
-	LypSessBean.setSqlToDsp(true);
-//	WebSessBean.setSqlToDsp(true);
+    [Route("api/[controller]")]
+    [ApiController]
+    public class TokenScanController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public TokenScanController(DatabaseHelper db)
+        {
+            _db = db;
+        }
+
+        // Health
+        [HttpGet("health")]
+        public IActionResult Health() => Ok(new { status = "OK", controller = nameof(TokenScanController), time = DateTime.UtcNow });
+
+        // Generate a random number similar to: select right(newid(), 16)
+        [HttpGet("random")]
+        public IActionResult Random()
+        {
+            const string sql = "SELECT RIGHT(CONVERT(varchar(36), NEWID()), 16) AS rand";
+            var rows = _db.WebSessBean(sql, new Dictionary<string, object>());
+            var rand = rows.FirstOrDefault()? ["rand"]?.ToString();
+            return Ok(new { rand = rand ?? Guid.NewGuid().ToString("N").Substring(0, 16) });
+        }
+
+        // Validate token details (JSP used MK_02004)
+        [HttpPost("validate")]
+        public IActionResult ValidateToken([FromBody] ValidateTokenRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.TokenNum))
+                return BadRequest("TokenNum is required");
+
+            var rand = string.IsNullOrWhiteSpace(request.Rand) ? Guid.NewGuid().ToString("N").Substring(0, 16) : request.Rand;
+
+            // EXEC MK_02004 @__01=@TokenNum, @__02=@AreaCode, @__03=@CustCode, @__04=@Rand
+            const string sql = "EXEC MK_02004 @__01, @__02, @__03, @__04";
+            var parameters = new Dictionary<string, object>
+            {
+                ["@__01"] = request.TokenNum,
+                ["@__02"] = request.AreaCode ?? string.Empty,
+                ["@__03"] = request.CustCode ?? string.Empty,
+                ["@__04"] = rand
+            };
+
+            var rows = _db.WebSessBean(sql, parameters);
+            if (rows.Count == 0)
+                return NotFound(new { message = "No Record Found or validation failed" });
+
+            return Ok(new { rand, data = rows });
+        }
+
+        // Submit scanned tokens (JSP used MK_02014)
+        [HttpPost("submit")]
+        public IActionResult SubmitTokens([FromBody] SubmitTokensRequest request)
+        {
+            if (request == null)
+                return BadRequest("Request body is required");
+            if (request.TokenNumbers == null || request.TokenNumbers.Count == 0)
+                return BadRequest("At least one token number is required");
+            if (string.IsNullOrWhiteSpace(request.DocuNumb))
+                return BadRequest("DocuNumb is required");
+
+            var tokenCsv = string.Join(',', request.TokenNumbers);
+            var rand = string.IsNullOrWhiteSpace(request.Rand) ? Guid.NewGuid().ToString("N").Substring(0, 16) : request.Rand;
+
+            // EXEC MK_02014 @__01, @__02, @__03, @__04, @__05, @__06, @__07, @__08, @__09
+            const string sql = "EXEC MK_02014 @__01, @__02, @__03, @__04, @__05, @__06, @__07, @__08, @__09";
+            var parameters = new Dictionary<string, object>
+            {
+                ["@__01"] = "jav01",
+                ["@__02"] = tokenCsv,
+                ["@__03"] = request.DocuNumb,
+                ["@__04"] = request.AreaCode ?? string.Empty,
+                ["@__05"] = request.CustCode ?? string.Empty,
+                ["@__06"] = request.LoginId ?? string.Empty,
+                ["@__07"] = request.Extra ?? string.Empty,
+                ["@__08"] = rand,
+                ["@__09"] = request.UserType ?? string.Empty
+            };
+
+            var rows = _db.WebSessBean(sql, parameters);
+            return Ok(new { rand, submitted = request.TokenNumbers.Count, data = rows });
+        }
+
+        // Loyalty token validate (JSP used MK_02012)
+        [HttpPost("loyalty-validate")]
+        public IActionResult LoyaltyValidate([FromBody] LoyaltyValidateRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.TokenNum) || string.IsNullOrWhiteSpace(request.TokenIdn))
+                return BadRequest("TokenNum and TokenIdn are required");
+
+            const string sql = "EXEC MK_02012 @__01, @__02, @__03";
+            var parameters = new Dictionary<string, object>
+            {
+                ["@__01"] = request.TokenNum,
+                ["@__02"] = request.TokenIdn,
+                ["@__03"] = request.LoginId ?? string.Empty
+            };
+
+            var rows = _db.WebSessBean(sql, parameters);
+            if (rows.Count == 0)
+                return NotFound(new { message = "No Record Found or validation failed" });
+
+            return Ok(rows);
+        }
+
+        // Insert into lytToknHsSp (history log as per JSP snippet)
+        [HttpPost("history")] 
+        public IActionResult InsertHistory([FromBody] TokenHistoryRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.TokenNum) || string.IsNullOrWhiteSpace(request.TokenIdn))
+                return BadRequest("TokenNum and TokenIdn are required");
+
+            // Using WebSessBean to execute an INSERT (consistent with existing pattern)
+            const string sql = @"INSERT INTO lytToknHsSp(tokenNum, codeMsId, cdStatus, statFlag, createId, createDt)
+                                 SELECT @tokenNum, @tokenIdn, @tokenVld, 'N', @loginId, GETDATE()";
+            var parameters = new Dictionary<string, object>
+            {
+                ["@tokenNum"] = request.TokenNum,
+                ["@tokenIdn"] = request.TokenIdn,
+                ["@tokenVld"] = request.TokenVld ?? string.Empty,
+                ["@loginId"] = request.LoginId ?? string.Empty
+            };
+
+            // Execute and respond (no result set expected)
+            _db.WebSessBean(sql, parameters);
+            return Ok(new { success = true });
+        }
+
+        // Process batch token scanning (ported from JSP flow)
+        [HttpPost("process")]
+        public IActionResult ProcessBatch([FromBody] TokenScanProcessRequest request)
+        {
+            if (request == null)
+                return BadRequest("Request body is required");
+            if (request.TokenNumbers == null || request.TokenNumbers.Count == 0)
+                return BadRequest("TokenNumbers are required");
+            if (string.IsNullOrWhiteSpace(request.CustCode))
+                return BadRequest("CustCode is required");
+
+            var areaCode = request.AreaCode ?? string.Empty;
+            var loginIdM = request.LoginId ?? string.Empty;
+            var userType = request.UserType ?? string.Empty;
+
+            try
+            {
+                // 1) Set dateformat
+                _db.WebSessBean("SET DATEFORMAT YMD", new Dictionary<string, object>());
+
+                // 2) Generate document number for docType 'TKN'
+                const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
+                var genParams = new Dictionary<string, object>
+                {
+                    ["@DocType"] = "TKN",
+                    ["@AreaCode"] = areaCode
+                };
+                var genResult = _db.WebSessBean(genSql, genParams) as List<Dictionary<string, object>>;
+                var docuNumb = genResult?.FirstOrDefault()? ["docuNumb"]?.ToString();
+                if (string.IsNullOrWhiteSpace(docuNumb))
+                    return StatusCode(500, "Failed to generate document number for TKN.");
+
+                // If rand was used earlier, link testing table
+                if (!string.IsNullOrWhiteSpace(request.RandNumb))
+                {
+                    const string upRand = @"UPDATE dptTknTestg SET docuNumb = @docuNumb WHERE uniqueId = @rand AND createDt > GETDATE()-1";
+                    _db.WebSessBean(upRand, new Dictionary<string, object>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@rand"] = request.RandNumb
+                    });
+                }
+
+                // Accumulators and state
+                string tralhist = string.Empty;
+                string toknHsty = string.Empty;
+                string statFlag = "A";
+                string cdnDocTy = "CRN";
+                string bcTknTyp = string.Empty;
+                string dbActSts = string.Empty;
+                string exprFlag = string.Empty;
+                int prodCode = 0;
+                int prodCodeHd = 0;
+                int rightEnt = 0, wrongEnt = 0, alrdyScn = 0;
+                double tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
+                double basTknAm = 0, handAmnt = 0, scnDedAm = 0, payblAmt = 0, tdsTotAm = 0;
+
+                var inflName = string.IsNullOrWhiteSpace(request.InflName) ? "Anuhit" : request.InflName;
+                var inflCode = string.IsNullOrWhiteSpace(request.InflCode) ? "INF00000" : request.InflCode;
+                var mobileNo = string.IsNullOrWhiteSpace(request.MobileNo) ? "9798000000" : request.MobileNo;
+
+                // helpers to read values from row
+                static string GetStr(Dictionary<string, object> r, params string[] keys)
+                {
+                    foreach (var k in keys)
+                        if (r.TryGetValue(k, out var v) && v != null) return v.ToString() ?? string.Empty;
+                    return string.Empty;
+                }
+                static double GetDbl(Dictionary<string, object> r, params string[] keys)
+                {
+                    foreach (var k in keys)
+                        if (r.TryGetValue(k, out var v) && v != null && double.TryParse(v.ToString(), out var d)) return d;
+                    return 0d;
+                }
+                static int GetInt(Dictionary<string, object> r, params string[] keys)
+                {
+                    foreach (var k in keys)
+                        if (r.TryGetValue(k, out var v) && v != null && int.TryParse(v.ToString(), out var d)) return d;
+                    return 0;
+                }
+
+                foreach (var token in request.TokenNumbers)
+                {
+                    var tokenNum = (token ?? string.Empty).Trim();
+                    if (string.IsNullOrWhiteSpace(tokenNum))
+                        continue;
+
+                    tralhist += " <br> Token No : " + tokenNum;
+                    toknHsty += "," + tokenNum;
+
+                    // Insert into testing log table (as JSP)
+                    const string insTest = @"INSERT INTO dpmTknTestg (docuNumb, tokenNum, mobileNo, inflName, inflCode, createId, createDt)
+                                             VALUES (@docuNumb, @tokenNum, @mobileNo, @inflName, @inflCode, @createId, GETDATE())";
+                    _db.WebSessBean(insTest, new Dictionary<string, object>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@tokenNum"] = tokenNum,
+                        ["@mobileNo"] = mobileNo,
+                        ["@inflName"] = inflName,
+                        ["@inflCode"] = inflCode,
+                        ["@createId"] = loginIdM
+                    });
+
+                    // Call token proc to get values
+                    var procRows = _db.WebSessBean("EXEC bwlive.dbo.dppToknProc @p1, @p2, @p3",
+                        new Dictionary<string, object>
+                        {
+                            ["@p1"] = "jav01",
+                            ["@p2"] = tokenNum,
+                            ["@p3"] = 0
+                        });
+                    bcTknTyp = string.Empty; tokenVal = handRate = scnrDdRt = tokEndVl = 0; prodCode = 0; dbActSts = string.Empty; exprFlag = string.Empty;
+                    if (procRows.Count > 0)
+                    {
+                        var r = procRows[0];
+                        bcTknTyp = GetStr(r, "bcTknTyp", "BC_TKN_TYP", "bcTknSav");
+                        tokenVal = GetDbl(r, "tokenVal", "TOKEN_VAL");
+                        handRate = GetDbl(r, "handRate", "HAND_RATE");
+                        scnrDdRt = GetDbl(r, "scnrDdRt", "SCNR_DD_RT");
+                        tokEndVl = GetDbl(r, "tokEndVl", "TOK_END_VL");
+                        prodCode = GetInt(r, "prodCode", "PROD_CODE");
+                        dbActSts = GetStr(r, "dbActSts", "DB_ACT_STS");
+                        exprFlag = GetStr(r, "exprFlag", "EXPR_FLAG");
+                    }
+
+                    if (!string.Equals(exprFlag, "Y", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Multi-scan allowance check
+                        const string multiSel = @"SELECT b.isActive AS isActive, b.scnMlCnt AS scnMlCnt, b.scnMlAlw AS scnMlAlw, ISNULL(b.updateId,'') AS updateId
+                                                   FROM dpmToknMlSc b WITH (NOLOCK)
+                                                   WHERE b.tokenNum = @tokenNum AND b.isActive='Y' AND b.scnMlCnt < b.scnMlAlw";
+                        var msRows = _db.WebSessBean(multiSel, new Dictionary<string, object> { ["@tokenNum"] = tokenNum });
+                        string scnMlStt = string.Empty; int scnMlCnt = 0, scnMlAlw = 0; string updIdMlt = string.Empty;
+                        if (msRows.Count > 0)
+                        {
+                            var m = msRows[0];
+                            scnMlStt = m.GetValueOrDefault("isActive")?.ToString() ?? string.Empty;
+                            scnMlCnt = Convert.ToInt32(m.GetValueOrDefault("scnMlCnt") ?? 0);
+                            scnMlAlw = Convert.ToInt32(m.GetValueOrDefault("scnMlAlw") ?? 0);
+                            updIdMlt = (m.GetValueOrDefault("updateId")?.ToString() ?? string.Empty).Trim();
+                            if (updIdMlt == loginIdM && scnMlStt == "Y") { scnMlStt = string.Empty; scnMlCnt = 0; }
+                        }
+
+                        // Update master token status; capture rowcount
+                        var needActive = (msRows.Count > 0 && Convert.ToInt32(msRows[0].GetValueOrDefault("scnMlCnt") ?? 0) > 0) ? "Z" : "Y";
+                        const string upSql = @"UPDATE dpmTokenNos
+                                      SET isActive = 'Z', updateId = @loginId, updateDt = GETDATE()
+                                      WHERE tokenNum = @tokenNum
+                                      AND CASE WHEN GETDATE() > dbo.dpfTknValDt(@bcTknTyp, @areaCode)
+                                               THEN CAST(GETDATE() - printgDt AS SMALLINT) ELSE 1 END
+                                          <= validDay + dbo.dpfTknValDy(@bcTknTyp, @areaCode)
+                                      AND isActive = @needActive;
+                                      SELECT @@ROWCOUNT AS cnt";
+                        var upRows = _db.WebSessBean(upSql, new Dictionary<string, object>
+                        {
+                            ["@loginId"] = loginIdM,
+                            ["@tokenNum"] = tokenNum,
+                            ["@bcTknTyp"] = bcTknTyp,
+                            ["@areaCode"] = areaCode,
+                            ["@needActive"] = needActive
+                        });
+                        var updatCnt = 0;
+                        if (upRows.Count > 0 && upRows[0].ContainsKey("cnt"))
+                            updatCnt = Convert.ToInt32(upRows[0]["cnt"] ?? 0);
+
+                        if (updatCnt > 0 || !string.IsNullOrEmpty(scnMlStt))
+                        {
+                            if (!string.IsNullOrEmpty(scnMlStt))
+                            {
+                                scnMlCnt++;
+                                scnMlStt = (scnMlCnt == scnMlAlw) ? "Z" : "Y";
+                                const string msUpd = @"UPDATE dpmToknMlSc
+                                                        SET isActive = @st, scnMlCnt = @cnt, updateId = @uid, updateDt = GETDATE()
+                                                        WHERE tokenNum = @tokenNum AND isActive = 'Y'";
+                                _db.WebSessBean(msUpd, new Dictionary<string, object>
+                                {
+                                    ["@st"] = scnMlStt,
+                                    ["@cnt"] = scnMlCnt,
+                                    ["@uid"] = loginIdM,
+                                    ["@tokenNum"] = tokenNum
+                                });
+                            }
+
+                            if (prodCode > 0)
+                            {
+                                basTknAm += tokenVal;
+                                payblAmt += tokEndVl;
+                                handAmnt += handRate;
+                                scnDedAm += scnrDdRt;
+                                rightEnt++;
+                            }
+                        }
+                        else
+                        {
+                            // check already scanned or wrong token
+                            const string chkTok = @"SELECT tokenNum FROM dpmTokenNos WITH (NOLOCK) WHERE tokenNum = @t AND isActive IN ('Z','X','Y')
+                                                    UNION ALL
+                                                    SELECT tokenNum FROM dpaTokenNos WITH (NOLOCK) WHERE tokenNum = @t AND isActive IN ('Z','X','Y')";
+                            var chk = _db.WebSessBean(chkTok, new Dictionary<string, object> { ["@t"] = tokenNum });
+                            if (chk.Count == 0) wrongEnt++; else alrdyScn++;
+                        }
+                    }
+
+                    // Insert detail row regardless, mirroring JSP
+                    const string insDtl = @"INSERT INTO dptTokenRecDtl
+                        (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp, tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag, createId, createDt)
+                        VALUES (@docuNumb, @tokenNum, @tokenVld, @exprFlag, @toknStat, @bcTknTyp, @tokenVal, @handRate, @tokEndVl, @prodCode, @inflCode, @statFlag, @createId, GETDATE())";
+                    _db.WebSessBean(insDtl, new Dictionary<string, object>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@tokenNum"] = tokenNum,
+                        ["@tokenVld"] = tokenVal > 0 ? "Y" : "N",
+                        ["@exprFlag"] = exprFlag ?? string.Empty,
+                        ["@toknStat"] = dbActSts ?? string.Empty,
+                        ["@bcTknTyp"] = bcTknTyp ?? string.Empty,
+                        ["@tokenVal"] = tokenVal,
+                        ["@handRate"] = handRate,
+                        ["@tokEndVl"] = tokEndVl,
+                        ["@prodCode"] = prodCode,
+                        ["@inflCode"] = inflCode,
+                        ["@statFlag"] = statFlag,
+                        ["@createId"] = loginIdM
+                    });
+
+                    prodCodeHd = prodCode;
+                }
+
+                // Header insert and update
+                const string insHdr = @"INSERT INTO cdtTokenRec (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode, recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt)
+                                        VALUES (@docuNumb, EOMONTH(GETDATE()), 'BC', @cdnDocTy, @custCode, 0, 0, 0, 0, 0, 0, @statFlag, @createId, GETDATE())";
+                _db.WebSessBean(insHdr, new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb,
+                    ["@cdnDocTy"] = cdnDocTy,
+                    ["@custCode"] = request.CustCode,
+                    ["@statFlag"] = statFlag,
+                    ["@createId"] = loginIdM
+                });
+
+                const string updHdr = @"UPDATE cdtTokenRec
+                                          SET recptQty = @rightEnt,
+                                              basTknAm = @basTknAm,
+                                              handAmnt = @handAmnt,
+                                              payblAmt = @payblAmt,
+                                              scnDedAm = @scnDedAm,
+                                              prodCode = @prodCode,
+                                              updateId = @updateId,
+                                              updateDt = GETDATE()
+                                          WHERE docuNumb = @docuNumb";
+                _db.WebSessBean(updHdr, new Dictionary<string, object>
+                {
+                    ["@rightEnt"] = rightEnt,
+                    ["@basTknAm"] = basTknAm,
+                    ["@handAmnt"] = handAmnt,
+                    ["@payblAmt"] = payblAmt,
+                    ["@scnDedAm"] = scnDedAm,
+                    ["@prodCode"] = prodCodeHd,
+                    ["@updateId"] = loginIdM,
+                    ["@docuNumb"] = docuNumb
+                });
+
+                // Mode of disbursement
+                var mdOfDisb = userType == "R" ? "01" : "04";
+
+                if (payblAmt > 0)
+                {
+                    var discQnty = rightEnt;
+                    var discRate = tokEndVl; // last token's end value
+                    const string insPay = @"INSERT INTO cdtCusToPay
+                        (docuNumb, custCode, custAcCd, cdnDocTy, invDocNo, invnSrNo, prodCode, strtDate, endgDate, discQnty, discRate, dtlSbTot, deducAmt, tdsTotAm, cnDnTyCd, naration, mdOfDisb, statFlag, createId, createDt, cheqNumb, cheqDate, refDocNo)
+                        VALUES (@docuNumb, @custCode, @custAcCd, @cdnDocTy, @invDocNo, @invnSrNo, @prodCode, EOMONTH(GETDATE()), EOMONTH(GETDATE()), @discQnty, @discRate, @dtlSbTot, @deducAmt, @tdsTotAm, '11', @naration, @mdOfDisb, @statFlag, @createId, GETDATE(), NULL, NULL, NULL)";
+                    _db.WebSessBean(insPay, new Dictionary<string, object>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@custCode"] = request.CustCode,
+                        ["@custAcCd"] = "01",
+                        ["@cdnDocTy"] = cdnDocTy,
+                        ["@invDocNo"] = string.Empty,
+                        ["@invnSrNo"] = string.Empty,
+                        ["@prodCode"] = prodCodeHd,
+                        ["@discQnty"] = discQnty,
+                        ["@discRate"] = discRate,
+                        ["@dtlSbTot"] = payblAmt + scnDedAm,
+                        ["@deducAmt"] = scnDedAm,
+                        ["@tdsTotAm"] = tdsTotAm,
+                        ["@naration"] = $"Paper Token Receipt Entry for {rightEnt} Qty",
+                        ["@mdOfDisb"] = mdOfDisb,
+                        ["@statFlag"] = statFlag,
+                        ["@createId"] = loginIdM
+                    });
+                }
+
+                // Update document number sequence (commit doc number)
+                const string updDoc = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
+                _db.WebSessBean(updDoc, genParams);
+
+                // Optional scanner deduction detail when applicable
+                if (scnDedAm > 0)
+                {
+                    const string insScn = @"INSERT INTO dptToknScnrDtl (docuNumb, docuDate, userCode, docuNarr, vouDrAmt, vouCrAmt, statFlag, createId, createDt)
+                                            VALUES (@docuNumb, GETDATE(), @userCode, @docuNarr, 0, @vouCrAmt, 'N', @createId, GETDATE())";
+                    _db.WebSessBean(insScn, new Dictionary<string, object>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@userCode"] = request.CustCode,
+                        ["@docuNarr"] = $"Dedc. against Scanner Issued, amount left 0",
+                        ["@vouCrAmt"] = scnDedAm,
+                        ["@createId"] = loginIdM
+                    });
+                }
+
+                // Block user if too many wrong entries
+                if (wrongEnt > 10 && !string.IsNullOrWhiteSpace(loginIdM))
+                {
+                    const string blk = @"UPDATE wcmUserCred SET blckedDt = GETDATE(), updateId = @loginId, updateDt = GETDATE() WHERE loginIdM = @loginId";
+                    _db.WebSessBean(blk, new Dictionary<string, object> { ["@loginId"] = loginIdM });
+                }
+
+                var msg = $"@br@Your Request has been Processed! @br@ @br@ Your Batch No is : {docuNumb} @br@ Token Value is {basTknAm} @br@ Right Entries  : {rightEnt} @br@ Wrong Entries : {alrdyScn} @br@ Payble Amt {payblAmt}";
+                if (!string.Equals(userType, "R", StringComparison.OrdinalIgnoreCase))
+                    msg += ", @br@Credit Note will be generated at the end of the day.";
+
+                return Ok(new
+                {
+                    success = true,
+                    docuNumb,
+                    rightEnt,
+                    wrongEnt,
+                    alreadyScanned = alrdyScn,
+                    basTknAm,
+                    handAmnt,
+                    scnDedAm,
+                    payblAmt,
+                    message = msg,
+                    tokens = request.TokenNumbers
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+    }
+
+    public class ValidateTokenRequest
+    {
+        [Required]
+        public string TokenNum { get; set; } = string.Empty;
+        public string? AreaCode { get; set; }
+        public string? CustCode { get; set; }
+        public string? Rand { get; set; }
+    }
+
+    public class SubmitTokensRequest
+    {
+        [Required]
+        public List<string> TokenNumbers { get; set; } = new();
+        [Required]
+        public string DocuNumb { get; set; } = string.Empty;
+        public string? AreaCode { get; set; }
+        public string? CustCode { get; set; }
+        public string? LoginId { get; set; }
+        public string? UserType { get; set; }
+        public string? Extra { get; set; }
+        public string? Rand { get; set; }
+    }
+
+    public class LoyaltyValidateRequest
+    {
+        [Required]
+        public string TokenNum { get; set; } = string.Empty;
+        [Required]
+        public string TokenIdn { get; set; } = string.Empty;
+        public string? LoginId { get; set; }
+    }
+
+    public class TokenHistoryRequest
+    {
+        [Required]
+        public string TokenNum { get; set; } = string.Empty;
+        [Required]
+        public string TokenIdn { get; set; } = string.Empty;
+        public string? TokenVld { get; set; }
+        public string? LoginId { get; set; } 
+    }
+
+    public class TokenScanProcessRequest
+    {
+        [Required]
+        public string CustCode { get; set; } = string.Empty;
+        public string? AreaCode { get; set; }
+        public string? LoginId { get; set; }
+        public string? UserType { get; set; }
+        [Required]
+        public List<string> TokenNumbers { get; set; } = new();
+        public string? RandNumb { get; set; }
+        public string? MobileNo { get; set; }
+        public string? InflName { get; set; }
+        public string? InflCode { get; set; }
+    }
 }
-
-if (sysOutFl) // System.out.println("In Token Scanning 1");
-
-String  sql = "",
-		custCode = XssFilter.parSmGet("custCode"),
-		tokenNum = "",
-		areaCode = log.getArCode(),
-		inflCode = "INF00000",
-		inflName = "Anuhit",
-		mobileNo = "9798000000",
-		naration = "",
-		cheqNumb = "",
-		dbTknNum = "",
-		tokenNuH = "",
-		randNumb = "",
-		cheqDate = "",
-		cnDnTyCd = "",
-		refDocNo = "",
-		exprFlag = "",
-		locMsgDs = "",
-		tokenNumStr = "",
-		inflCodeStr = "",
-		srNumber[] = XssFilter.parArGet("srNumber"),
-		dpTKNIns = (String) session.getAttribute("dpTKNIns");
-
-int 	trnIndex = 0;
-		String trnTrail = "";
-
-		String  msg = "",
-				procType = "",
-				docuType = "TKN",
-				cdnDocTy = "CRN",
-				tokenVld = "",
-				tokenIdn = "",
-				wrongStr = "",
-				rightStr = "",
-				custAcCd = "01",
-				deducStr = "",
-				docuNumb = "",
-				bcTknTyp = "",
-				dbActSts = "",
-				invDocNo = "",
-				invnSrNo = "",
-				bcTknSav = "",
-				mdOfDisb = "",
-				scnMlStt = "",
-				updIdAct = "",
-				updIdMlt = "",
-				updateId = "",
-				tralhist = "",
-				toknHsty = "",
-				statFlag = "A",
-				prodCodeArr[] = {"","","","","","","",""}, 
-				docuDate = WebSessBean.mnthEnDtGet(docuType);
-		int 	wrongEnt = 0,
-				rightEnt = 0,
-				rightCnt = 0,
-				scnMlCnt = 0,
-				scnMlAlw = 0,
-				sysOutId = 0,
-				alrdyScn = 0,
-				prodCode = 0,
-				prdCount = 0,
-				prodCodeHd = 0,
-				wrongCnt = 0;
-
-		double  payblAmt = 0,
-				basTknAm = 0,
-				handAmnt = 0,
-				tokenVal = 0,
-				scnDedAm = 0,
-				scnrDdLf = 0,
-				handRate = 0,
-				scnrDdRt = 0,
-				scDdAmCl = 0,
-				discQnty = 0,
-				discRate = 0,
-				tdsTotAm = 0,
-				tokEndVl = 0;
-
-		boolean prdFound = false,
-				webLogin = false;
-
-
-if(XssFilter.parSmGet("areaCode") != null)
-	areaCode = XssFilter.parSmGet("areaCode");
-
-if(XssFilter.parSmGet("randNumb") != null)
-	randNumb = XssFilter.parSmGet("randNumb");
-
- //// System.out.println("In Token Scanning 1 " + custCode);
-if (sysOutFl) 
-	// System.out.println("In Token Scanning 2 " + custCode);
-try
-{
-	if (sysOutFl) // System.out.println("In Token Scanning 3 " + loginIdM + " dpTKNIns : " + dpTKNIns);
-
-	if(dpTKNIns == null || (dpTKNIns != null && dpTKNIns.equals("Y")))
-	{
-		dbSubmit = true;
-		throw new Exception("Duplicate Entry, please open fresh page from menu and try again " + loginIdM);
-	}
-
-	if (sysOutFl) // System.out.println("In Token Scanning 4 " + loginIdM + " " + dbSubmit);
-
-	session.setAttribute("dpTKNIns", "Y");
-	sql = "set dateformat YMD";
-	LypSessBean.updateRecord(sql);
-	
-	areaCode = log.getArCode();
-	userType = log.getUserType();
-
-
-	LypSessBean.setAutoCommit(false);
-//	WebSessBean.setAutoCommit(false);
-
-	if (sysOutFl) // System.out.println("In Token Scanning 5 " + loginIdM + " " + dbSubmit);
-	docuNumb = WebSessBean.getDocumentNo(docuType, areaCode);
-//	WebSessBean.setAutoCommit(false);
-	
-	if(!randNumb.equals(""))
-	{
-		sql = "update dptTknTestg set docuNumb = '" + docuNumb + "' where uniqueId = '" + randNumb + "' and createDt > getdate()-1 ";
-		LypSessBean.updateRecord(sql);
-	}
-	if (sysOutFl) // System.out.println("In Token Scanning 6 " + loginIdM + " " + dbSubmit);
-	for(int i=0; i<srNumber.length; i++)
-	{
-		if(XssFilter.parSmGet("tokenNum" + srNumber[i]) != null)
-		{
-			tokenNum = XssFilter.parSmGet("tokenNum" + srNumber[i]).trim();
-			
-			if(!tokenNuH.equals("") && tokenNuH.equals(tokenNum))	// Added By Rajendra For Cross Duplicate Validation
-			{
-				tokenNum = ""; 
-			}
-			tokenNuH = tokenNum;
-		}
-		else 
-			tokenNum = "";
-		
-		if (sysOutFl)// System.out.println( "inflCode" + inflCode );
-
-		if(!tokenNum.equals(""))
-		{
-			tralhist += " <br> Token No : " + tokenNum;
-			toknHsty += "," + tokenNum;
-			sql = " insert into dpmTknTestg (docuNumb, tokenNum,mobileNo,inflName,inflCode,createId,createDt) values("  
-				+ " '" + docuNumb + "',"
-				+ " '" + tokenNum + "',"
-				+ " '" + mobileNo + "',"
-				+ " '" + inflName + "',"
-				+ " '" + inflCode + "',"
-				+ " '" + loginIdM + "',"
-				+ " getdate())";
-	//		// System.out.println(sql);
-			LypSessBean.updateRecord(sql);
-
-			bcTknTyp = "";
-			bcTknSav = "";
-			updateId = "";
-			prodCode = 0;
-			tokenVal = 0;
-			handRate = 0;
-			scnrDdRt = 0;
-			tokEndVl = 0;
-		//	// System.out.println("3");
-			
-			sql = "exec bwlive.dbo.dppToknProc 'jav01', '" + tokenNum + "', 0";
-			rset = LypSessBean.selectRecord(sql);
-			if(rset.next())
-			{
-				bcTknTyp = rset.getString(1);
-				tokenVal = rset.getDouble(2);
-				handRate = rset.getDouble(3);
-				scnrDdRt = rset.getDouble(4);
-				tokEndVl = rset.getDouble(5);
-				prodCode = rset.getInt(6);
-				updateId = rset.getString(7);
-				dbActSts = rset.getString(8);
-				exprFlag = rset.getString(9);
-
-				bcTknSav = bcTknTyp;
-				if (sysOutFl)// System.out.println((++sysOutId) + " In Rset . bcTknTyp : " + bcTknTyp + ". tokenVal : " + tokenVal + ". prodCode : " + prodCode + ". updateId : " + updateId);
-			}
-			trnTrail += "\n" + (++trnIndex) + ". Token Valid Flag Java " + tokenVld;
-			 /** Changes Done by RajendrA 19 Dec 2022 **/
-			
-			
-			tralhist += " <br> bcTknTyp No : " + bcTknTyp;
-
-			scnMlStt = "";
-			scnMlCnt = 0;
-
-		   if(!exprFlag.equals("Y"))
-		   {
-				sql = "select b.isActive, b.scnMlCnt, b.scnMlAlw, isNull(b.updateId, '') from dpmToknMlSc b with (nolock) where b.tokenNum = '" + tokenNum + "' and b.isActive='Y' and b.scnMlCnt < b.scnMlAlw";
-				rset = LypSessBean.selectRecord(sql);
-			//	// System.out.println(sql);
-				if(rset.next())
-				{
-					scnMlStt = rset.getString(1);
-					scnMlCnt = rset.getInt(2);
-					scnMlAlw = rset.getInt(3);
-					updIdMlt = rset.getString(4).trim();
-
-					if(updateId.equals(loginIdM) && scnMlStt.equals("Y"))
-					{
-						scnMlStt = "";
-						scnMlCnt = 0;
-					}
-				}
-
-				sql = "update dpmTokenNos set isActive = 'Z', updateId = '" + loginIdM + "', updateDt=getdate() where tokenNum = '" + tokenNum + "' and case when getdate() > dbo.dpfTknValDt('" + bcTknSav + "','" + areaCode + "') then cast(getdate() - printgDt as smallint) else 1 end <= validDay + dbo.dpfTknValDy('" + bcTknSav + "','" + areaCode + "') "; 
-
-				if(scnMlCnt == 0)
-					sql += "and isActive = 'Y'";
-				else
-					sql += "and isActive = 'Z'";
-
-				int updatCnt = LypSessBean.updateRecord(sql);
-				trnTrail += "\n" + (++trnIndex) + ". Token Master updated " + updatCnt + " " + sql;
-			//	// System.out.println(sql);
-				if(updatCnt > 0 || !scnMlStt.equals(""))
-				{
-					/** Changes Done by RajendrA 19 Dec 2022 **/
-					if(!scnMlStt.equals(""))
-					{
-						scnMlCnt++;
-						if(scnMlCnt == scnMlAlw)
-							scnMlStt = "Z";
-						else
-							scnMlStt = "Y";
-
-						sql = "update dpmToknMlSc set isActive = '" + scnMlStt + "', scnMlCnt = '" + scnMlCnt + "', updateId = '" + loginIdM + "', updateDt = getdate() where tokenNum = '" + tokenNum + "' and isActive='Y'"; 
-						updatCnt = LypSessBean.updateRecord(sql);
-					//	// System.out.println("11");
-						if(updatCnt <= 0)
-						{
-							trnTrail += "\n" + (++trnIndex) + ". dpmToknMlSc not updated " + updatCnt + " " + sql;
-							throw new Exception("Please Contact to IT Birlawhite, Token Status not updated for Token No " + tokenNum);
-						}
-					}
-					
-					if(prodCode > 0)
-					{
-						trnTrail += "\n" + (++trnIndex) + ". Token Master selected " + sql;
-
-						basTknAm += tokenVal;
-						payblAmt += tokEndVl;
-						handAmnt += handRate;
-						scDdAmCl += scnrDdRt;
-						tokenVld = "Y";
-						rightEnt++;
-					}
-					else
-					{
-						throw new Exception("Please Contact to IT Birlawhite, Token Rate not updated for Token No " + tokenNum);
-					}
-				}
-				else
-				{
-					// Added By Rajendra / Navin for Remove block of already scan token
-
-					sql = " select tokenNum from dpmTokenNos with (nolock) where tokenNum = '" + tokenNum + "' and isActive in ('Z','X','Y') union all select tokenNum from dpaTokenNos with (nolock) where tokenNum = '" + tokenNum + "' and isActive in ('Z','X','Y') ";
-					rset = LypSessBean.selectRecord(sql);
-				//	// System.out.println("12");
-					if(rset.next())
-					{
-						dbTknNum = rset.getString(1);
-					}
-					
-					if(dbTknNum.equals(""))
-					{
-						wrongEnt++;		
-						dbTknNum = "";
-					}
-					else
-					{
-						alrdyScn++;
-					}
-					wrongStr += ", " + tokenNum;
-					tokenVld = "N";
-				}
-		   }
-		   else
-		   {
-			   tokenVld = "N";
-			 //  tokenVal = 0;
-			 //  handRate = 0;
-			 //  tokEndVl = 0;
-		   }
-			tralhist += " <br> insert into dptTokenRecDtl before ";
-			
-			sql = "insert into dptTokenRecDtl (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp, tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag, createId, createDt) values ("
-				+ "'" +	docuNumb + "', "
-				+ "'" + tokenNum + "', "
-				+ "'" + tokenVld + "', "
-				+ "'" + exprFlag + "', "
-				+ "'" + dbActSts + "', "
-				+ "'" + bcTknTyp + "', "
-				+ "'" + tokenVal + "', "
-				+ "'" + handRate + "', "
-				+ "'" + tokEndVl + "', "
-				+ "'" + prodCode + "', "
-				+ "'" + inflCode + "', "
-				+ "'" + statFlag + "', "
-				+ "'" + loginIdM + "', "
-				+ "getdate())";
-
-			LypSessBean.updateRecord(sql);
-			tralhist += " <br> inserted into dptTokenRecDtl ";
-		//	// System.out.println(sql);
-			trnTrail += "\n" + (++trnIndex) + ". Detail Inserted " + sql;
-		}
-		payblAmt -= scnDedAm;
-		prodCodeHd = prodCode;
-	}
-
-	sql = "insert into cdtTokenRec (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode, recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt) values("
-		+ "'" +	docuNumb + "', "
-		+ "'" +	LypSessBean.dmyTOymd(docuDate) + "', "
-		+ "'BC', "
-		+ "'" + cdnDocTy + "', "
-		+ "'" + custCode + "', "
-		+ "0, 0, 0, 0, "
-		+ "0, 0, "
-		+ "'" + statFlag + "', "
-		+ "'" + loginIdM + "', "
-		+ "getdate())";
-	LypSessBean.updateRecord(sql);
-//	// System.out.println(sql);
-
-	sql = "update cdtTokenRec set recptQty = " + rightEnt + ", basTknAm = " + basTknAm + ", handAmnt = " + handAmnt + ", payblAmt = " + payblAmt + ", scnDedAm = " + scnDedAm + ", prodCode = " + prodCodeHd + ", updateId = '" + loginIdM + "', updateDt = getdate()   where docuNumb = '" + docuNumb + "'";
-	int j = LypSessBean.updateRecord(sql);
-
-	if (j < 1)
-	{
-		throw new Exception("No Record found in Header, Contact IT Dept, Birla White");
-			//trnTrail += "\n" + (++trnIndex) + ". Header Updated after Detail Insertion " + loginIdM + " " + sql;
-	}
-
-	if(userType.equals("R"))
-		mdOfDisb = "01";
-	else
-		mdOfDisb = "04";
-			
-	if(payblAmt > 0)
-	{
-		discQnty = rightEnt;
-		discRate = tokEndVl;
-		cnDnTyCd = "11";
-		naration = "Paper Token Receipt Entry for " + rightEnt + " Qty";
-		mdOfDisb = mdOfDisb;
-		
-		if(bcTknTyp.equals("E1"))
-		{
-			refDocNo = "NA";
-		}
-		
-		sql = "insert into cdtCusToPay (docuNumb, custCode, custAcCd, cdnDocTy, invDocNo, invnSrNo, prodCode, strtDate, endgDate, discQnty, discRate, dtlSbTot, deducAmt, tdsTotAm, cnDnTyCd, naration, mdOfDisb, statFlag, createId, createDt, cheqNumb, cheqDate, refDocNo) values ("
-			+ "'" + docuNumb + "', "
-			+ "'" + custCode + "', "
-			+ "'" + custAcCd + "', "
-			+ "'" + cdnDocTy + "', "
-			+ "'" + invDocNo + "', "
-			+ "'" + invnSrNo + "', "
-			+ "'" + prodCode + "', "
-			+ "'" + LypSessBean.dmyTOymd(docuDate) + "', "
-			+ "'" + LypSessBean.dmyTOymd(docuDate) + "', "
-			+ "'" + discQnty + "', "
-			+ "'" + discRate + "', "
-			+ "'" + (payblAmt + scnDedAm) + "', "
-			+ "'" + scnDedAm + "', "
-			+ "'" + tdsTotAm + "', "
-			+ "'" + cnDnTyCd + "', "
-			+ "'" + naration + "', "
-			+ "'" + mdOfDisb + "', "
-			+ "'" + statFlag + "', "
-			+ "'" + loginIdM + "', ";
-
-		sql += "getdate(), ";
-
-		if (cheqNumb.equals(""))
-			sql += "null, ";
-		else
-			sql += "'" + cheqNumb + "', ";
-
-		if (cheqDate.equals(""))
-			sql += "null, ";
-		else
-			sql += "'" + cheqDate + "', ";
-
-		if (refDocNo.equals(""))
-			sql += "null, ";
-		else
-			sql += "'" + refDocNo + "', ";
-
-	//	sql = sql.substring(0, sql.length() - 2) + ")";
-	//	WebSessBean.updateRecord(sql);
-	//	// System.out.println(sql);
-	}
-	
-	/*
-	sql = "select isNull(sum(case when b.tokenVld = 'Y' then 1 else 0 end), 0) as rightCnt, isNull(sum(case when b.tokenVld <> 'Y' then 1 else 0 end), 0) as wrongCnt from cdtTokenRec a with (nolock), dptTokenRecDtl b with (nolock) where a.docuNumb = b.docuNumb and a.docuNumb = '" + docuNumb + "' and b.statFlag not in ('C', 'R')";
-	rset = WebSessBean.selectRecord(sql);
-	if(rset.next())
-	{
-		rightCnt = rset.getInt(1);
-		wrongCnt = rset.getInt(2);
-	}
-			
-	trnTrail += "\n" + (++trnIndex) + ". rightEnt " + rightEnt + ". rightCnt " + rightCnt + ". wrongEnt " + wrongEnt + ". wrongCnt " + wrongCnt;
-	*/		
-	WebSessBean.setDocumentNo(docuType, areaCode);
-
-	if(scnDedAm > 0) // for Retailer and customer both
-	{
-		sql = "insert into dptToknScnrDtl (docuNumb, docuDate, userCode, docuNarr, vouDrAmt, vouCrAmt, statFlag, createId, createDt) values ("
-		+ "'" +	docuNumb + "', " 
-		//+ "'" + dmyTOymd(docuDate) + "', "
-		+ "'" + custCode + "', "
-		+ "'Dedc. against Scanner Issued, amount left " + scnrDdLf + "', "
-		+ " 0, "
-		+ " " + scnDedAm + ", "
-		+ " 'N', "
-		+ "'" + loginIdM + "', "
-		+ "getdate())";
-		LypSessBean.updateRecord(sql);
-	//	// System.out.println(sql);
-		deducStr = ",Amount deducted for scanner " + scnDedAm + ", remaining amount " + scnrDdLf;
-	}
-
-	trnTrail += "\n" + (++trnIndex) + ". Header Updated after Detail Insertion " + sql;
-
-	if(wrongEnt > 10)
-	{
-		sql = "update wcmUserCred set blckedDt = getdate(), updateId = '" + loginIdM + "', updateDt = getdate() where loginIdM ='" + loginIdM + "'";
-		LypSessBean.updateRecord(sql);
-	}
-		
-	if(wrongStr.trim().equals(""))
-		wrongStr = "None";
-
-
-	msg += "@br@ Your Batch No is : " + docuNumb + " @br@ Token Value is " + basTknAm + " @br@ Right Entries  : " + rightEnt + " @br@ Wrong Entries : " + alrdyScn + deducStr + " @br@ Payble Amt " + payblAmt; 
-
-	if (sysOutFl) // System.out.println("msg" + msg);
-	msg = "@br@Your Request has been Processed! @br@" + msg;
-	
-
-	if(!userType.equals("R")) 	
-	{
-		msg += ", @br@Credit Note will be generated at the end of the day.";
-	}
-	// // System.out.println(trnTrail);
-	
-	tralhist += " <br> End ";
-
-//	if(rightCnt != rightEnt)
-//	{
-//		 sql = "insert into cotMailSend (sentFlag, emailTos, emailCcs, emailBcc, emailSub, emailBdy, bodyFrmt, createDt)"
-//			 + " select 'N', 'rajendra.sikhwal@adityabirla.com', '', '', 'Token Scanning of : " + loginIdM + ". Document No //: " + docuNumb + "', '" + tralhist + " <br> " + toknHsty + "', 'HTML', getdate() ";
-//		
-//	 //// System.out.println(sql);
-//		WebSessBean.updateRecord(sql);
-//	}
-
-//	if(rightCnt != rightEnt)
-//	{
-//		WebSessBean.rollbackConn();
-//		LypSessBean.rollbackConn();
-//		throw new Exception("Due to some technical issue, Data not Saved. Please re-scan and check. Birla White");
-//	//	trnTrail += "\n" + (++trnIndex) + ". Header Updated after Detail Insertion " + loginIdM + " " + sql;
-//	}
-//	// System.out.println("Transaction End " + docuNumb);
-//	WebSessBean.setDocumentNo(docuType, areaCode);
-
-	// WebSessBean.rollbackConn();
-	// LypSessBean.rollbackConn();
-
-
-//	WebSessBean.commitConn();
-	LypSessBean.commitConn();
-//	WebSessBean.commitConn();
-	
-	locMsgDs += "\n" + (++trnIndex) + ". commited with message " + msg;
-	trnIndex = 0;
-	response.sendRedirect("TknScanDtl.jsp?savPagFl=Y&erMsgRtn=" + msg + "");
-	//response.sendRedirect(errorPage + "?message=" + msg);
-}
-catch (Exception e)
-{
-	//if (!dbSubmit) // Commented 03-Feb-20 To review for Header Fields not updated in cdtTokenRec 
-	WebSessBean.rollbackConn();
-	LypSessBean.rollbackConn();
-	session.setAttribute("dpTKNIns", "N");
-	locMsgDs += "\n" + (++trnIndex) + ". Rollback with Error " + e.toString();
-	throw new Exception("Error in updating details in " + pageAddress + e.toString());
-}
-finally
-{
-//	WebSessBean.rollbackConn();
-//	LypSessBean.rollbackConn();
-
-//	if(trnIndex > 0)
-//		JSPMail.setAll("sqladmn@adityabirla.com", "vaibhav.jain@adityabirla.com", "", "Bar Code Token Scanning of : " + loginIdM, LypSessBean.trnTrailGet() +  locMsgDs, "", "");
-	UtilBean.sessMgmtRst();
-}
-%>
