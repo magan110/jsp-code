@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Data;
 using System.Data.SqlClient;
+using System.Net.Http;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
@@ -26,7 +28,7 @@ namespace sparshWebService.Controllers
         }
 
         // --------------------------------------------------------------------
-        // NEW: DOCUMENT NUMBER GENERATOR (JSP-like)
+        // DOCUMENT NUMBER GENERATOR (JSP-like)
         // GET /api/tokenscan/doc-number?areaCode=EXB&docuType=TKN
         // --------------------------------------------------------------------
         [HttpGet("doc-number")]
@@ -84,7 +86,7 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // (a) SP: bwlive.dbo.dppToknProc 'jav01', @tokenNum, 0 (if present)
+                // (a) SP (if present)
                 try
                 {
                     await using var sp = new SqlCommand("bwlive.dbo.dppToknProc", con)
@@ -96,7 +98,6 @@ namespace sparshWebService.Controllers
                     await using var r = await sp.ExecuteReaderAsync(ct);
                     if (await r.ReadAsync(ct))
                     {
-                        // 0..8 = bcTknTyp, tokenVal, handRate, scnrDdRt, tokEndVl, prodCode, updateId, dbActSts, exprFlag
                         info.BcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
                         info.TokenVal = SafeDecimal(r, 1);
                         info.HandRate = SafeDecimal(r, 2);
@@ -113,7 +114,7 @@ namespace sparshWebService.Controllers
                     _log.LogWarning(ex, "dppToknProc not found; proceeding without SP.");
                 }
 
-                // (b) Master row (supports LY_dpmTokenNos / dpmTokenNos / dpaTokenNos)
+                // (b) Master row
                 var master = await FetchMasterRowAsync(con, req.TokenNum, ct);
                 if (!master.Found)
                     return Ok(new { found = false, message = "No record found for token." });
@@ -235,7 +236,7 @@ END";
         }
 
         // --------------------------------------------------------------------
-        // 3) SUBMIT (≈ MK_02014). No DB transactions/rollbacks.
+        // 3) SUBMIT (≈ MK_02014) — uses /doc-number endpoint; no local generation
         // --------------------------------------------------------------------
         [HttpPost("submit")]
         public async Task<ActionResult<SubmitTokensResponse>> SubmitAsync(
@@ -245,29 +246,47 @@ END";
             if (req.TokenNums is null || req.TokenNums.Count == 0)
                 return BadRequest(new { message = "No tokens to submit." });
 
+            // Resolve a doc number ONLY via the doc-number endpoint when not provided
+            string docuNumb = (req.DocuNumb ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(docuNumb))
+            {
+                try
+                {
+                    var scheme = Request.Scheme;
+                    var host = Request.Host.Value; // includes port
+                    var url = $"{scheme}://{host}/api/tokenscan/doc-number?areaCode={Uri.EscapeDataString(req.AreaCode)}&docuType=TKN";
+
+                    using var http = new HttpClient();
+                    using var resp = await http.GetAsync(url, ct);
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        _log.LogWarning("doc-number endpoint returned {Status} for {Url}", resp.StatusCode, url);
+                        return Problem(statusCode: 503, title: "doc-number not available", detail: $"HTTP {(int)resp.StatusCode}: {resp.ReasonPhrase}");
+                    }
+
+                    var json = await resp.Content.ReadAsStringAsync();
+                    var docResp = JsonSerializer.Deserialize<DocNumberResponse>(json, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (docResp == null || string.IsNullOrWhiteSpace(docResp.DocuNumb))
+                    {
+                        _log.LogWarning("doc-number endpoint returned empty payload.");
+                        return Problem(statusCode: 500, title: "doc-number returned empty");
+                    }
+
+                    docuNumb = docResp.DocuNumb.Trim();
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to obtain doc-number from endpoint");
+                    return Problem("doc-number not available, cannot submit.");
+                }
+            }
+
             await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
             await con.OpenAsync(ct);
-
-            // Resolve a doc number (JSP-like) if caller didn't send one
-            string docuNumb = req.DocuNumb ?? "";
-            try
-            {
-                var maxLen = await GetVarcharMaxLenAsync(con, "cdtTokenRec", "docuNumb", ct);
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                {
-                    var gen = await GenerateDocumentNumberCoreAsync(con, req.AreaCode, "TKN", maxLen, ct);
-                    docuNumb = gen.docNo;
-                }
-                else
-                {
-                    docuNumb = Truncate(docuNumb.Trim(), maxLen);
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Unable to resolve docuNumb. Will fallback.");
-                docuNumb = MakeSafeDocNo(req.AreaCode, 40);
-            }
 
             // Create/ensure header first (like JSP does)
             try
@@ -287,7 +306,6 @@ VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
             }
             catch (SqlException ex) when (ex.Number == 2627 /* duplicate */ || ex.Number == 2601)
             {
-                // header already exists (idempotent submit resume)
                 _log.LogInformation("Header {Doc} already exists; will update totals.", docuNumb);
             }
             catch (Exception ex)
@@ -363,7 +381,7 @@ VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
                     scnDedAm += scnrDdRt;
                     prodCodeForHdr = prodCode;
 
-                    // 3b) Mark master scanned (no transaction; best-effort)
+                    // 3b) Mark master scanned (best-effort)
                     try
                     {
                         await using var up = new SqlCommand(@"
@@ -395,7 +413,7 @@ END", con);
                         up2.Parameters.AddWithValue("@token", token);
                         await up2.ExecuteNonQueryAsync(ct);
                     }
-                    catch { /* ignore – table may not exist */ }
+                    catch { /* ignore */ }
                 }
 
                 // 3d) Detail insert (always write what we evaluated)
@@ -576,13 +594,12 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
             return new TokenMasterRow { Found = false };
         }
 
-        // ===== Document number helpers (shared by endpoint & submit) =====
+        // ===== Document number helpers (used only by /doc-number) =====
         private static string Truncate(string s, int maxLen)
             => (maxLen > 0 && s.Length > maxLen) ? s.Substring(0, maxLen) : s;
 
         private static string MakeSafeDocNo(string areaCode, int maxLen)
         {
-            // Example: TKN-EXB-250818-153045-7F3C (UTC)
             var stamp = DateTime.UtcNow.ToString("yyMMdd-HHmmss");
             var rndHex = Random.Shared.Next(0x1000, 0xFFFF).ToString("X");
             var s = $"TKN-{areaCode}-{stamp}-{rndHex}";
@@ -620,7 +637,6 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
         private static async Task<string?> TryGetDocNoFromProcAsync(
             SqlConnection con, string docuType, string areaCode, CancellationToken ct)
         {
-            // Assumes: exec dbo.dppGetDocumentNo @docuType, @areaCode, @docuNumb OUTPUT
             try
             {
                 await using var cmd = new SqlCommand("dbo.dppGetDocumentNo", con)
@@ -643,17 +659,14 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
         private static async Task<(string docNo, string source)> GenerateDocumentNumberCoreAsync(
             SqlConnection con, string areaCode, string docuType, int maxLen, CancellationToken ct)
         {
-            // 1) DB function
             var fromFn = await TryGetDocNoFromFunctionAsync(con, docuType, areaCode, ct);
             if (!string.IsNullOrWhiteSpace(fromFn))
                 return (Truncate(fromFn!, maxLen), "function");
 
-            // 2) Stored procedure
             var fromSp = await TryGetDocNoFromProcAsync(con, docuType, areaCode, ct);
             if (!string.IsNullOrWhiteSpace(fromSp))
                 return (Truncate(fromSp!, maxLen), "procedure");
 
-            // 3) Fallback
             return (MakeSafeDocNo(areaCode, maxLen > 0 ? maxLen : 40), "fallback");
         }
 
