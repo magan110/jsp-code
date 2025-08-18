@@ -26,6 +26,43 @@ namespace sparshWebService.Controllers
         }
 
         // --------------------------------------------------------------------
+        // NEW: DOCUMENT NUMBER GENERATOR (JSP-like)
+        // GET /api/tokenscan/doc-number?areaCode=EXB&docuType=TKN
+        // --------------------------------------------------------------------
+        [HttpGet("doc-number")]
+        public async Task<ActionResult<DocNumberResponse>> GetDocumentNumberAsync(
+            [FromQuery, Required, StringLength(10)] string areaCode,
+            [FromQuery, StringLength(10)] string? docuType,
+            CancellationToken ct)
+        {
+            if (!ModelState.IsValid) return ValidationProblem(ModelState);
+
+            docuType = string.IsNullOrWhiteSpace(docuType) ? "TKN" : docuType.Trim();
+
+            await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
+            await con.OpenAsync(ct);
+
+            try
+            {
+                var maxLen = await GetVarcharMaxLenAsync(con, "cdtTokenRec", "docuNumb", ct);
+                var (docNo, source) = await GenerateDocumentNumberCoreAsync(con, areaCode.Trim(), docuType, maxLen, ct);
+
+                return Ok(new DocNumberResponse
+                {
+                    DocuNumb = docNo,
+                    Source = source,
+                    MaxLen = maxLen,
+                    Utc = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "doc-number generation failed for area {Area} type {Type}", areaCode, docuType);
+                return Problem("Could not generate document number.");
+            }
+        }
+
+        // --------------------------------------------------------------------
         // 1) TOKEN INFO  (≈ MK_02004)
         // --------------------------------------------------------------------
         [HttpPost("token-info")]
@@ -211,11 +248,28 @@ END";
             await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
             await con.OpenAsync(ct);
 
-            // Create/ensure header first (like JSP does)
-            var docuNumb = string.IsNullOrWhiteSpace(req.DocuNumb)
-                ? $"TKN-{req.AreaCode}-{DateTime.UtcNow:yyyyMMddHHmmss}-{Random.Shared.Next(1000, 9999)}"
-                : req.DocuNumb;
+            // Resolve a doc number (JSP-like) if caller didn't send one
+            string docuNumb = req.DocuNumb ?? "";
+            try
+            {
+                var maxLen = await GetVarcharMaxLenAsync(con, "cdtTokenRec", "docuNumb", ct);
+                if (string.IsNullOrWhiteSpace(docuNumb))
+                {
+                    var gen = await GenerateDocumentNumberCoreAsync(con, req.AreaCode, "TKN", maxLen, ct);
+                    docuNumb = gen.docNo;
+                }
+                else
+                {
+                    docuNumb = Truncate(docuNumb.Trim(), maxLen);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Unable to resolve docuNumb. Will fallback.");
+                docuNumb = MakeSafeDocNo(req.AreaCode, 40);
+            }
 
+            // Create/ensure header first (like JSP does)
             try
             {
                 await using (var hdr = new SqlCommand(@"
@@ -522,6 +576,87 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
             return new TokenMasterRow { Found = false };
         }
 
+        // ===== Document number helpers (shared by endpoint & submit) =====
+        private static string Truncate(string s, int maxLen)
+            => (maxLen > 0 && s.Length > maxLen) ? s.Substring(0, maxLen) : s;
+
+        private static string MakeSafeDocNo(string areaCode, int maxLen)
+        {
+            // Example: TKN-EXB-250818-153045-7F3C (UTC)
+            var stamp = DateTime.UtcNow.ToString("yyMMdd-HHmmss");
+            var rndHex = Random.Shared.Next(0x1000, 0xFFFF).ToString("X");
+            var s = $"TKN-{areaCode}-{stamp}-{rndHex}";
+            return Truncate(s, maxLen);
+        }
+
+        private static async Task<int> GetVarcharMaxLenAsync(SqlConnection con, string table, string column, CancellationToken ct)
+        {
+            const string q = @"
+        SELECT CHARACTER_MAXIMUM_LENGTH
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=@t AND COLUMN_NAME=@c;";
+            await using var cmd = new SqlCommand(q, con);
+            cmd.Parameters.AddWithValue("@t", table);
+            cmd.Parameters.AddWithValue("@c", column);
+            var o = await cmd.ExecuteScalarAsync(ct);
+            return (o == null || o is DBNull) ? -1 : Convert.ToInt32(o);
+        }
+
+        private static async Task<string?> TryGetDocNoFromFunctionAsync(
+            SqlConnection con, string docuType, string areaCode, CancellationToken ct)
+        {
+            const string sql = @"
+        IF OBJECT_ID(N'dbo.dpfGetDocumentNo', N'FN') IS NOT NULL
+            SELECT docuNo = dbo.dpfGetDocumentNo(@typ, @ar);
+        ELSE
+            SELECT docuNo = NULL;";
+            await using var cmd = new SqlCommand(sql, con);
+            cmd.Parameters.AddWithValue("@typ", docuType);
+            cmd.Parameters.AddWithValue("@ar", areaCode);
+            var o = await cmd.ExecuteScalarAsync(ct);
+            return (o == null || o is DBNull) ? null : Convert.ToString(o);
+        }
+
+        private static async Task<string?> TryGetDocNoFromProcAsync(
+            SqlConnection con, string docuType, string areaCode, CancellationToken ct)
+        {
+            // Assumes: exec dbo.dppGetDocumentNo @docuType, @areaCode, @docuNumb OUTPUT
+            try
+            {
+                await using var cmd = new SqlCommand("dbo.dppGetDocumentNo", con)
+                { CommandType = CommandType.StoredProcedure };
+                cmd.Parameters.AddWithValue("@docuType", docuType);
+                cmd.Parameters.AddWithValue("@areaCode", areaCode);
+                var outP = new SqlParameter("@docuNumb", SqlDbType.NVarChar, 64)
+                { Direction = ParameterDirection.Output };
+                cmd.Parameters.Add(outP);
+
+                await cmd.ExecuteNonQueryAsync(ct);
+                return outP.Value is DBNull ? null : Convert.ToString(outP.Value);
+            }
+            catch (SqlException ex) when (ex.Number == 2812) // missing proc
+            {
+                return null;
+            }
+        }
+
+        private static async Task<(string docNo, string source)> GenerateDocumentNumberCoreAsync(
+            SqlConnection con, string areaCode, string docuType, int maxLen, CancellationToken ct)
+        {
+            // 1) DB function
+            var fromFn = await TryGetDocNoFromFunctionAsync(con, docuType, areaCode, ct);
+            if (!string.IsNullOrWhiteSpace(fromFn))
+                return (Truncate(fromFn!, maxLen), "function");
+
+            // 2) Stored procedure
+            var fromSp = await TryGetDocNoFromProcAsync(con, docuType, areaCode, ct);
+            if (!string.IsNullOrWhiteSpace(fromSp))
+                return (Truncate(fromSp!, maxLen), "procedure");
+
+            // 3) Fallback
+            return (MakeSafeDocNo(areaCode, maxLen > 0 ? maxLen : 40), "fallback");
+        }
+
         // ======================= DTOs / Models =======================
         private sealed class TokenMasterRow
         {
@@ -631,7 +766,7 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
         [Required]
         public List<string> TokenNums { get; set; } = new();
 
-        [StringLength(40)]
+        [StringLength(64)]
         public string? DocuNumb { get; set; }
     }
 
@@ -647,5 +782,13 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
         public decimal ScnDedAm { get; set; }
         public decimal PayblAmt { get; set; }
         public string Message { get; set; } = "";
+    }
+
+    public sealed class DocNumberResponse
+    {
+        public string DocuNumb { get; set; } = "";
+        public string Source { get; set; } = "";  // function | procedure | fallback
+        public int MaxLen { get; set; }
+        public DateTime Utc { get; set; }
     }
 }
