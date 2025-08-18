@@ -19,19 +19,19 @@ namespace sparshWebService.Controllers
         private readonly IConfiguration _cfg;
         private readonly ILogger<TokenScanController> _log;
 
-        // You already have custom AuthenticationMiddleware in the pipeline;
-        // this controller assumes requests are already authenticated there.
         public TokenScanController(IConfiguration cfg, ILogger<TokenScanController> log)
         {
             _cfg = cfg;
             _log = log;
         }
 
-        // --- 0) Mobile app version gate (mirrors JSP's getBuildNumb >= 1.48) ---
+        // Optional: mirrors the mobile check in your JSP (update value as needed)
         [HttpGet("min-app-version")]
         public ActionResult<object> GetMinAppVersion() => Ok(new { android = "1.48" });
 
-        // --- 1) Validate a single token (MK_02004 equivalent) ---
+        // --------------------------------------------------------------------
+        // VALIDATE (slim): ONLY checks token existence and whether CVV is required
+        // --------------------------------------------------------------------
         [HttpPost("validate")]
         public async Task<ActionResult<ValidateTokenResponse>> ValidateAsync(
             [FromBody] ValidateTokenRequest req,
@@ -42,124 +42,62 @@ namespace sparshWebService.Controllers
             await using var con = new SqlConnection(_cfg.GetConnectionString("DefaultConnection"));
             await con.OpenAsync(ct);
 
-            // We follow the JSP logic:
-            //   exec bwlive.dbo.dppToknProc 'jav01', @tokenNum, 0
-            // + Multi-scan allowance (dpmToknMlSc)
-            // + Current isActive/status (dpmTokenNos / dpaTokenNos)
-            // All calls are parameterized.
-            string procMode = "jav01";
+            const string sql = @"
+                ;with U as (
+                    select tokenNum, numCvvNo
+                    from dpmTokenNos with (nolock)
+                    where tokenNum = @token
 
-            var res = new ValidateTokenResponse { TokenNum = req.TokenNum };
+                    union all
+
+                    select tokenNum, numCvvNo
+                    from dpaTokenNos with (nolock)
+                    where tokenNum = @token
+                )
+                select top 1
+                    tokenNum,
+                    isnull(ltrim(rtrim(cast(numCvvNo as nvarchar(16)))),'') as numCvvNo
+                from U";
 
             try
             {
-                // 1) Stored proc: core token info
-                await using (var cmd = new SqlCommand("bwlive.dbo.dppToknProc", con))
-                {
-                    cmd.CommandType = CommandType.StoredProcedure;
-                    cmd.Parameters.AddWithValue("@mode", procMode);
-                    cmd.Parameters.AddWithValue("@tokenNum", req.TokenNum);
-                    cmd.Parameters.AddWithValue("@dummy", 0);
+                await using var cmd = new SqlCommand(sql, con);
+                cmd.Parameters.AddWithValue("@token", req.TokenNum);
 
-                    await using var rdr = await cmd.ExecuteReaderAsync(ct);
-                    if (await rdr.ReadAsync(ct))
+                await using var rdr = await cmd.ExecuteReaderAsync(ct);
+                if (!await rdr.ReadAsync(ct))
+                {
+                    return Ok(new ValidateTokenResponse
                     {
-                        // Order mirrors JSP:
-                        // 0: bcTknTyp, 1: tokenVal, 2: handRate, 3: scnrDdRt, 4: tokEndVl,
-                        // 5: prodCode, 6: updateId, 7: dbActSts, 8: exprFlag
-                        res.BcTknTyp  = rdr.IsDBNull(0) ? ""  : rdr.GetString(0);
-                        res.TokenVal  = rdr.IsDBNull(1) ? 0m : SafeDecimal(rdr, 1);
-                        res.HandRate  = rdr.IsDBNull(2) ? 0m : SafeDecimal(rdr, 2);
-                        res.ScnrDdRt  = rdr.IsDBNull(3) ? 0m : SafeDecimal(rdr, 3);
-                        res.TokEndVl  = rdr.IsDBNull(4) ? 0m : SafeDecimal(rdr, 4);
-                        res.ProdCode  = rdr.IsDBNull(5) ? 0   : rdr.GetInt32(5);
-                        res.UpdIdAct  = rdr.IsDBNull(6) ? ""  : rdr.GetString(6);
-                        res.DbActSts  = rdr.IsDBNull(7) ? ""  : rdr.GetString(7);
-                        res.ExprFlag  = rdr.IsDBNull(8) ? ""  : rdr.GetString(8);
-                    }
-                    else
-                    {
-                        return NotFound(new { message = "No record found for token." });
-                    }
+                        TokenNum = req.TokenNum,
+                        Found = false,
+                        RequiresCvv = false,
+                        CvvLength = null
+                    });
                 }
 
-                // 2) Multi-scan allowance (if any)
-                await using (var cmd = new SqlCommand(@"
-                    select top 1 isActive, scnMlCnt, scnMlAlw, isnull(updateId,'')
-                    from dpmToknMlSc with (nolock)
-                    where tokenNum = @tokenNum and isActive='Y' and scnMlCnt < scnMlAlw
-                    order by updateDt desc;", con))
+                var cvvRaw = rdr.IsDBNull(1) ? "" : rdr.GetString(1);
+                var requires = !string.IsNullOrWhiteSpace(cvvRaw);
+
+                return Ok(new ValidateTokenResponse
                 {
-                    cmd.Parameters.AddWithValue("@tokenNum", req.TokenNum);
-                    await using var rdr = await cmd.ExecuteReaderAsync(ct);
-                    if (await rdr.ReadAsync(ct))
-                    {
-                        res.ScnMlStt = rdr.IsDBNull(0) ? ""  : rdr.GetString(0);
-                        res.ScnMlCnt = rdr.IsDBNull(1) ? 0   : rdr.GetInt32(1);
-                        res.ScnMlAlw = rdr.IsDBNull(2) ? 0   : rdr.GetInt32(2);
-                        res.UpdIdMlt = rdr.IsDBNull(3) ? ""  : rdr.GetString(3);
-                    }
-                }
-
-                // 3) Pull current token master status + validity date
-                await using (var cmd = new SqlCommand(@"
-                    ;with M as (
-                        select tokenNum, isActive, printgDt, validDay, updateId, scanndBy = ''
-                        from dpmTokenNos with (nolock) where tokenNum = @tokenNum
-                        union all
-                        select tokenNum, isActive, printgDt, validDay, updateId, scanndBy = ''
-                        from dpaTokenNos with (nolock) where tokenNum = @tokenNum
-                    )
-                    select top 1
-                        isActive,
-                        -- If you have dpfTknValDy/dpfTknValDt functions, prefer them.
-                        convert(char(11), dateadd(day, isnull(validDay,0), isnull(printgDt, getdate())), 100) as validDat,
-                        isnull(updateId,'') as upd
-                    from M;", con))
-                {
-                    cmd.Parameters.AddWithValue("@tokenNum", req.TokenNum);
-                    await using var rdr = await cmd.ExecuteReaderAsync(ct);
-                    if (await rdr.ReadAsync(ct))
-                    {
-                        res.IsActive = rdr.IsDBNull(0) ? "" : rdr.GetString(0);
-                        res.ValidDat = rdr.IsDBNull(1) ? "" : rdr.GetString(1);
-                        // Map updateId from master as "scanndBy" for parity with JSP display
-                        res.ScanndBy = rdr.IsDBNull(2) ? "" : rdr.GetString(2);
-                    }
-                }
-
-                // 4) Derived display value like JSP (tokDspVl = tokenVal ? or specific rule)
-                res.TokDspVl = res.TokenVal;                 // tune if you have a different display calc
-                res.TokAmPay = res.TokDspVl + res.HandRate;  // what UI shows per-row
-
-                // 5) Optional PIN (3-digit) if your schema stores it
-                // If you keep token-specific CVV/PIN in a table, fetch it here.
-                await using (var cmd = new SqlCommand(@"
-                    select top 1 numCvvNo
-                    from dpmTokenNos with (nolock)
-                    where tokenNum = @tokenNum;", con))
-                {
-                    cmd.Parameters.AddWithValue("@tokenNum", req.TokenNum);
-                    var pin = await cmd.ExecuteScalarAsync(ct);
-                    res.NumCvvNo = pin == null ? "" : Convert.ToString(pin);
-                }
-
-                // Area/type guard (client also checks this, but statically flag on server too)
-                res.AreaAllowed = AreaTypeAllowed(res.BcTknTyp, req.AreaCode);
-
-                // The exact 'isActive' semantics mirror JSP: 'Y'=OK, 'Z'=already, 'E'=expired, 'T'=theft, ''=unchecked
-                res.Success = true;
-                res.Message = "OK";
-                return Ok(res);
+                    TokenNum = req.TokenNum,
+                    Found = true,
+                    RequiresCvv = requires,
+                    CvvLength = requires ? cvvRaw.Length : (int?)null
+                });
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "Error validating token {Token}", req.TokenNum);
+                _log.LogError(ex, "Validate failed for token {Token}", req.TokenNum);
                 return Problem("Unexpected error during validation.");
             }
         }
 
-        // --- 2) Submit a batch (MK_02014 equivalent) ---
+        // --------------------------------------------------------------------
+        // SUBMIT: batch-save tokens (kept practical to match your JSP flow)
+        // You can remove this if you only want the validate endpoint.
+        // --------------------------------------------------------------------
         [HttpPost("submit")]
         public async Task<ActionResult<SubmitTokensResponse>> SubmitAsync(
             [FromBody] SubmitTokensRequest req,
@@ -175,12 +113,12 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // Generate a batch doc no like JSP (replace this with your DB doc no generator if available)
+                // If you already have a DB doc number generator, replace this with that call.
                 var docuNumb = string.IsNullOrWhiteSpace(req.DocuNumb)
                     ? $"TKN-{req.AreaCode}-{DateTime.UtcNow:yyyyMMddHHmmss}-{Random.Shared.Next(1000, 9999)}"
                     : req.DocuNumb;
 
-                // Header placeholder (mirrors cdtTokenRec insert; update later with totals)
+                // Header placeholder (cdtTokenRec)
                 await using (var hdr = new SqlCommand(@"
                     insert into cdtTokenRec (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode,
                                               recptQty, basTknAm, handAmnt, scnDedAm, payblAmt,
@@ -200,7 +138,7 @@ namespace sparshWebService.Controllers
 
                 foreach (var token in req.TokenNums)
                 {
-                    // Reuse the validate proc to compute values in-transaction
+                    // Reuse the same stored proc the JSP used
                     string bcTknTyp = "", dbActSts = "", exprFlag = "";
                     int prodCode = 0;
                     decimal tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
@@ -215,18 +153,20 @@ namespace sparshWebService.Controllers
                         await using var rdr = await cmd.ExecuteReaderAsync(ct);
                         if (await rdr.ReadAsync(ct))
                         {
+                            // 0: bcTknTyp, 1: tokenVal, 2: handRate, 3: scnrDdRt, 4: tokEndVl,
+                            // 5: prodCode, 6: updateId, 7: dbActSts, 8: exprFlag
                             bcTknTyp = rdr.IsDBNull(0) ? "" : rdr.GetString(0);
                             tokenVal = rdr.IsDBNull(1) ? 0m : SafeDecimal(rdr, 1);
                             handRate = rdr.IsDBNull(2) ? 0m : SafeDecimal(rdr, 2);
                             scnrDdRt = rdr.IsDBNull(3) ? 0m : SafeDecimal(rdr, 3);
                             tokEndVl = rdr.IsDBNull(4) ? 0m : SafeDecimal(rdr, 4);
-                            prodCode = rdr.IsDBNull(5) ? 0   : rdr.GetInt32(5);
-                            dbActSts = rdr.IsDBNull(7) ? ""  : rdr.GetString(7);
-                            exprFlag = rdr.IsDBNull(8) ? ""  : rdr.GetString(8);
+                            prodCode = rdr.IsDBNull(5) ? 0 : rdr.GetInt32(5);
+                            dbActSts = rdr.IsDBNull(7) ? "" : rdr.GetString(7);
+                            exprFlag = rdr.IsDBNull(8) ? "" : rdr.GetString(8);
                         }
                     }
 
-                    // Decide status buckets like JSP
+                    // Bucket into statuses (aligning with JSP semantics)
                     string tokenVld;
                     if (exprFlag == "Y")
                     {
@@ -247,10 +187,10 @@ namespace sparshWebService.Controllers
                         handAmnt += handRate;
                         payblAmt += tokEndVl;
                         scnDedAm += scnrDdRt;
-                        prodCodeForHdr = prodCode; // last non-zero
+                        prodCodeForHdr = prodCode;
                     }
 
-                    // Detail row (mirrors dptTokenRecDtl)
+                    // Detail row (dptTokenRecDtl)
                     await using (var det = new SqlCommand(@"
                         insert into dptTokenRecDtl
                           (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp,
@@ -276,7 +216,7 @@ namespace sparshWebService.Controllers
                         await det.ExecuteNonQueryAsync(ct);
                     }
 
-                    // Mark token scanned IF valid (aligns with JSP's guarded update)
+                    // Mark token scanned if valid (master)
                     if (tokenVld == "Y")
                     {
                         await using var up = new SqlCommand(@"
@@ -292,7 +232,7 @@ namespace sparshWebService.Controllers
                     }
                 }
 
-                // Update header totals (cdtTokenRec)
+                // Update header totals
                 await using (var upd = new SqlCommand(@"
                     update cdtTokenRec
                        set recptQty = @qty,
@@ -318,8 +258,6 @@ namespace sparshWebService.Controllers
 
                 await tx.CommitAsync(ct);
 
-                var msg = $"Batch: {docuNumb}. Right: {rightEnt}, Already: {already}, Expired: {expired}, Invalid: {invalid}. Payable: {payblAmt}";
-
                 return Ok(new SubmitTokensResponse
                 {
                     DocuNumb = docuNumb,
@@ -331,7 +269,7 @@ namespace sparshWebService.Controllers
                     HandAmnt = handAmnt,
                     ScnDedAm = scnDedAm,
                     PayblAmt = payblAmt,
-                    Message = msg
+                    Message = $"Batch: {docuNumb}. Right: {rightEnt}, Already: {already}, Expired: {expired}, Invalid: {invalid}. Payable: {payblAmt}"
                 });
             }
             catch (Exception ex)
@@ -342,84 +280,30 @@ namespace sparshWebService.Controllers
             }
         }
 
-        // --- helpers ---
+        // ------------------- helpers -------------------
         private static decimal SafeDecimal(IDataRecord r, int ordinal)
         {
-            // Handles sql money/decimal/double conversion safely
             var v = r.GetValue(ordinal);
             if (v is decimal d) return d;
             if (v is double dd) return Convert.ToDecimal(dd);
             if (v is float ff) return Convert.ToDecimal(ff);
             return Convert.ToDecimal(v);
         }
-
-        private static bool AreaTypeAllowed(string bcTknTyp, string areaCode)
-        {
-            if (string.IsNullOrWhiteSpace(bcTknTyp) || string.IsNullOrWhiteSpace(areaCode)) return true;
-            var a = areaCode.ToUpperInvariant();
-            var t = bcTknTyp.ToUpperInvariant();
-
-            // JSP rules:
-            // - B1 (domestic?) not allowed in EXE/EXN/EXR
-            // - E1 (export) only allowed in EXB/EXC/EXG
-            if (t == "B1" && (a == "EXE" || a == "EXN" || a == "EXR")) return false;
-            if (t == "E1" && !(a == "EXB" || a == "EXC" || a == "EXG")) return false;
-            return true;
-        }
     }
 
-    // --- DTOs -----
+    // -------------------- DTOs -----------------------
     public sealed class ValidateTokenRequest
     {
         [Required, StringLength(20)]
         public string TokenNum { get; set; } = default!;
-
-        [Required, StringLength(10)]
-        public string AreaCode { get; set; } = default!;
-
-        [Required, StringLength(12)]
-        public string CustCode { get; set; } = default!;
-
-        // carried through from JSP for audit/dup-protection
-        [StringLength(32)]
-        public string? SessionId { get; set; }
-
-        [StringLength(16)]
-        public string? LoginId { get; set; }
     }
 
     public sealed class ValidateTokenResponse
     {
-        public bool Success { get; set; }
-        public string Message { get; set; } = "";
-
         public string TokenNum { get; set; } = "";
-        public string TokenIdn { get; set; } = "";     // optional (if you store it)
-        public string IsActive { get; set; } = "";     // Y/Z/E/T/...
-        public string ValidDat { get; set; } = "";     // e.g., "12 Jan 2026"
-        public string ScanndBy { get; set; } = "";
-
-        public decimal TokenVal { get; set; }
-        public decimal HandRate { get; set; }
-        public decimal ScnrDdRt { get; set; }
-        public decimal TokEndVl { get; set; }
-        public decimal TokDspVl { get; set; }          // display value
-        public decimal TokAmPay { get; set; }          // TokDspVl + HandRate
-
-        public string BcTknTyp { get; set; } = "";     // B1/E1/...
-        public string DbActSts { get; set; } = "";
-        public string ExprFlag { get; set; } = "";     // Y/N expired
-
-        public string NumCvvNo { get; set; } = "";     // 3-digit pin (if any)
-        public string UpdIdAct { get; set; } = "";     // from master
-        public string UpdIdMlt { get; set; } = "";     // multiscan update id
-
-        public string ScnMlStt { get; set; } = "";     // multi-scan status
-        public int ScnMlCnt { get; set; }
-        public int ScnMlAlw { get; set; }
-
-        public int ProdCode { get; set; }
-        public bool AreaAllowed { get; set; }
+        public bool Found { get; set; }
+        public bool RequiresCvv { get; set; }
+        public int? CvvLength { get; set; }
     }
 
     public sealed class SubmitTokensRequest
@@ -434,19 +318,19 @@ namespace sparshWebService.Controllers
         public string LoginId { get; set; } = default!;
 
         [StringLength(1)]
-        public string? UserType { get; set; }          // C/R/I etc (if needed for TDS etc)
+        public string? UserType { get; set; }  // optional (C/R/I) if you need TDS later
 
         [Required]
         public List<string> TokenNums { get; set; } = new();
 
         [StringLength(32)]
-        public string? RandNumb { get; set; }          // session ticket from JSP
+        public string? RandNumb { get; set; }  // optional session ticket
 
         [StringLength(40)]
-        public string? DocuNumb { get; set; }          // optional inbound doc number
+        public string? DocuNumb { get; set; }  // optional inbound doc number
 
         [StringLength(16)]
-        public string? InflCode { get; set; }          // if you attach influencer
+        public string? InflCode { get; set; }  // optional influencer
     }
 
     public sealed class SubmitTokensResponse
