@@ -26,9 +26,7 @@ namespace sparshWebService.Controllers
         }
 
         // --------------------------------------------------------------------
-        // 1) TOKEN INFO (MK_02004 equivalent)
-        //    - Input: tokenNum, areaCode, custCode, loginId (for parity)
-        //    - Output: token details (validity, values, type, multi-scan flags, requires CVV)
+        // 1) TOKEN INFO  (≈ MK_02004)
         // --------------------------------------------------------------------
         [HttpPost("token-info")]
         public async Task<ActionResult<TokenInfoResponse>> GetTokenInfoAsync(
@@ -41,16 +39,23 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // 1) Stored proc providing financial & type info (as used by JSP)
-                var sp = new SqlCommand("bwlive.dbo.dppToknProc", con) { CommandType = CommandType.StoredProcedure };
-                sp.Parameters.AddWithValue("@mode", "jav01");
-                sp.Parameters.AddWithValue("@tokenNum", req.TokenNum);
-                sp.Parameters.AddWithValue("@dummy", 0);
-
-                var info = new TokenInfoResponse { TokenNum = req.TokenNum, AreaCode = req.AreaCode };
-
-                await using (var r = await sp.ExecuteReaderAsync(ct))
+                var info = new TokenInfoResponse
                 {
+                    TokenNum = req.TokenNum,
+                    AreaCode = req.AreaCode,
+                    CustCode = req.CustCode,
+                    LoginId  = req.LoginId
+                };
+
+                // ---- (a) call the same SP your JSP uses ----
+                await using (var sp = new SqlCommand("bwlive.dbo.dppToknProc", con))
+                {
+                    sp.CommandType = CommandType.StoredProcedure;
+                    sp.Parameters.AddWithValue("@mode", "jav01");
+                    sp.Parameters.AddWithValue("@tokenNum", req.TokenNum);
+                    sp.Parameters.AddWithValue("@dummy", 0);
+
+                    await using var r = await sp.ExecuteReaderAsync(ct);
                     if (await r.ReadAsync(ct))
                     {
                         // 0: bcTknTyp, 1: tokenVal, 2: handRate, 3: scnrDdRt, 4: tokEndVl,
@@ -71,15 +76,27 @@ namespace sparshWebService.Controllers
                     }
                 }
 
-                // 2) Multi-scan allowance (if configured)
-                const string sqlMult =
-                    @"select top 1 isActive, scnMlCnt, scnMlAlw, isnull(updateId,'')
-                      from dbo.dpmToknMlSc with (nolock)
-                      where tokenNum = @tokenNum and isActive='Y' and scnMlCnt < scnMlAlw
-                      order by updateDt desc;";
+                // ---- (b) master row: isActive, valid date, last updater, CVV ----
+                var master = await FetchMasterRowAsync(con, req.TokenNum, ct);
+                info.IsActive = master.IsActive;
+                info.ValidDat = master.ValidDat;    // pretty string (e.g., "Sep 14 2024")
+                info.ScanndBy = master.UpdateId;
+                info.NumCvvNo = master.NumCvvNo ?? "";
+                info.RequiresCvv = !string.IsNullOrWhiteSpace(info.NumCvvNo) && info.NumCvvNo != "0";
+
+                // display value and payable like JSP
+                info.TokDspVl = info.TokenVal; // adjust if your MK_02004 returns a distinct display value
+                info.TokAmPay = info.TokDspVl + info.HandRate;
+
+                // ---- (c) multi-scan allowance (if configured) ----
+                const string sqlMult = @"
+                    select top 1 isActive, scnMlCnt, scnMlAlw, isnull(updateId,'')
+                    from dbo.dpmToknMlSc with (nolock)
+                    where tokenNum = @token and isActive='Y' and scnMlCnt < scnMlAlw
+                    order by updateDt desc;";
                 await using (var cmd = new SqlCommand(sqlMult, con))
                 {
-                    cmd.Parameters.AddWithValue("@tokenNum", req.TokenNum);
+                    cmd.Parameters.AddWithValue("@token", req.TokenNum);
                     await using var r = await cmd.ExecuteReaderAsync(ct);
                     if (await r.ReadAsync(ct))
                     {
@@ -90,17 +107,7 @@ namespace sparshWebService.Controllers
                     }
                 }
 
-                // 3) Token master status + computed valid date + scanndBy + numCvvNo
-                var master = await FetchMasterRowAsync(con, req.TokenNum, ct);
-                info.IsActive = master.IsActive;
-                info.ValidDat = master.ValidDat;
-                info.ScanndBy = master.UpdateId; // JSP shows who updated/scanned last
-                info.NumCvvNo = master.NumCvvNo ?? "";
-                info.RequiresCvv = !string.IsNullOrWhiteSpace(info.NumCvvNo) && info.NumCvvNo != "0";
-                info.TokDspVl = info.TokenVal; // tune if needed (JSP uses tokDspVl returned by MK_02004)
-                info.TokAmPay = info.TokDspVl + info.HandRate;
-
-                // 4) Area/type rule (JSP hard-rule for B1/E1)
+                // ---- (d) area/type hard rules (JSP logic) ----
                 info.AreaAllowed = AreaTypeAllowed(info.BcTknTyp, req.AreaCode);
 
                 info.Success = true;
@@ -115,9 +122,8 @@ namespace sparshWebService.Controllers
         }
 
         // --------------------------------------------------------------------
-        // 2) CVV VALIDATE (client passes attempt index; lock after 3)
-        //    - Input: tokenNum, attempt (1..3), optional cvv
-        //    - Output: Found, RequiresCvv, Valid, Locked, AttemptsLeft
+        // 2) CVV VALIDATE with 3-attempt lock (mirrors JSP row lock after 3 wrong)
+        //    Client sends Attempt=1..3; on 3rd wrong => Locked=true, prompt rescan
         // --------------------------------------------------------------------
         [HttpPost("validate")]
         public async Task<ActionResult<CvvValidateResponse>> ValidateCvvAsync(
@@ -136,8 +142,9 @@ namespace sparshWebService.Controllers
                 {
                     return Ok(new CvvValidateResponse
                     {
-                        TokenNum = req.TokenNum, Found = false, RequiresCvv = false,
-                        Valid = false, Locked = false, AttemptsLeft = 3, Message = "Token not found."
+                        TokenNum = req.TokenNum, Found = false,
+                        RequiresCvv = false, Valid = false,
+                        Locked = false, AttemptsLeft = 3, Message = "Token not found."
                     });
                 }
 
@@ -149,20 +156,21 @@ namespace sparshWebService.Controllers
                     return Ok(new CvvValidateResponse
                     {
                         TokenNum = req.TokenNum, Found = true, RequiresCvv = false,
-                        Valid = true, Locked = false, AttemptsLeft = 3, Message = "Valid: CVV not required."
+                        Valid = true, Locked = false, AttemptsLeft = 3,
+                        Message = "Valid: CVV not required."
                     });
                 }
 
-                // requires CVV
                 var provided = (req.Cvv ?? "").Trim();
                 if (string.IsNullOrEmpty(provided))
                 {
-                    // treat missing CVV just like JSP → prompt to enter
                     return Ok(new CvvValidateResponse
                     {
                         TokenNum = req.TokenNum, Found = true, RequiresCvv = true,
-                        Valid = false, Locked = false, AttemptsLeft = Math.Max(0, 3 - req.Attempt),
-                        CvvLength = stored.Length, Message = "CVV required."
+                        CvvLength = stored.Length,
+                        Valid = false, Locked = false,
+                        AttemptsLeft = Math.Max(0, 3 - req.Attempt),
+                        Message = "CVV required."
                     });
                 }
 
@@ -172,38 +180,40 @@ namespace sparshWebService.Controllers
                     return Ok(new CvvValidateResponse
                     {
                         TokenNum = req.TokenNum, Found = true, RequiresCvv = true,
-                        Valid = true, Locked = false, AttemptsLeft = Math.Max(0, 3 - req.Attempt),
-                        CvvLength = stored.Length, Message = "Valid: CVV matched."
+                        CvvLength = stored.Length,
+                        Valid = true, Locked = false,
+                        AttemptsLeft = Math.Max(0, 3 - req.Attempt),
+                        Message = "Valid: CVV matched."
                     });
                 }
 
-                // Mismatch: lock on 3rd attempt (JSP clears/locks row after 3 wrong attempts)
                 var locked = req.Attempt >= 3;
                 return Ok(new CvvValidateResponse
                 {
                     TokenNum = req.TokenNum, Found = true, RequiresCvv = true,
-                    Valid = false, Locked = locked, AttemptsLeft = locked ? 0 : (3 - req.Attempt),
                     CvvLength = stored.Length,
+                    Valid = false, Locked = locked,
+                    AttemptsLeft = locked ? 0 : (3 - req.Attempt),
                     Message = locked ? "CVV failed 3 times; please rescan." : "Invalid CVV."
                 });
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "validate (cvv) failed for token {Token}", req.TokenNum);
+                _log.LogError(ex, "validate failed for token {Token}", req.TokenNum);
                 return Problem("Unexpected error during validation.");
             }
         }
 
         // --------------------------------------------------------------------
-        // 3) SUBMIT (MK_02014 equivalent)
-        //    Saves a batch; updates master; writes detail+header. Transactional.
+        // 3) SUBMIT  (≈ MK_02014 end-to-end)
+        //    Creates header, writes details, updates master & multi-scan, totals.
         // --------------------------------------------------------------------
         [HttpPost("submit")]
         public async Task<ActionResult<SubmitTokensResponse>> SubmitAsync(
             [FromBody] SubmitTokensRequest req, CancellationToken ct)
         {
             if (!ModelState.IsValid) return ValidationProblem(ModelState);
-            if (req.TokenNums == null || req.TokenNums.Count == 0)
+            if (req.TokenNums is null || req.TokenNums.Count == 0)
                 return BadRequest(new { message = "No tokens to submit." });
 
             await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
@@ -212,21 +222,22 @@ namespace sparshWebService.Controllers
 
             try
             {
+                // Mimic WebSessBean.getDocumentNo -> generate if not provided
                 var docuNumb = string.IsNullOrWhiteSpace(req.DocuNumb)
                     ? $"TKN-{req.AreaCode}-{DateTime.UtcNow:yyyyMMddHHmmss}-{Random.Shared.Next(1000,9999)}"
                     : req.DocuNumb;
 
-                // Header placeholder (cdtTokenRec)
+                // Header stub: cdtTokenRec
                 await using (var hdr = new SqlCommand(@"
                     insert into cdtTokenRec (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode,
                                               recptQty, basTknAm, handAmnt, scnDedAm, payblAmt,
                                               statFlag, createId, createDt)
-                    values (@docuNumb, convert(date, getdate()), 'BC', 'CRN', @custCode, 0,
-                            0, 0, 0, 0, 0, 'A', @loginId, getdate());", con, (SqlTransaction)tx))
+                    values (@docu, convert(date, getdate()), 'BC', 'CRN', @cust, 0,
+                            0, 0, 0, 0, 0, 'A', @login, getdate());", con, (SqlTransaction)tx))
                 {
-                    hdr.Parameters.AddWithValue("@docuNumb", docuNumb);
-                    hdr.Parameters.AddWithValue("@custCode", req.CustCode);
-                    hdr.Parameters.AddWithValue("@loginId", req.LoginId);
+                    hdr.Parameters.AddWithValue("@docu", docuNumb);
+                    hdr.Parameters.AddWithValue("@cust", req.CustCode);
+                    hdr.Parameters.AddWithValue("@login", req.LoginId);
                     await hdr.ExecuteNonQueryAsync(ct);
                 }
 
@@ -236,19 +247,19 @@ namespace sparshWebService.Controllers
 
                 foreach (var token in req.TokenNums)
                 {
-                    // Reuse SP for financial/type/expiry flags
+                    // get valuation/flags from SP (as JSP)
                     string bcTknTyp = "", dbActSts = "", exprFlag = "";
                     int prodCode = 0;
                     decimal tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
 
-                    await using (var cmd = new SqlCommand("bwlive.dbo.dppToknProc", con, (SqlTransaction)tx))
+                    await using (var sp = new SqlCommand("bwlive.dbo.dppToknProc", con, (SqlTransaction)tx))
                     {
-                        cmd.CommandType = CommandType.StoredProcedure;
-                        cmd.Parameters.AddWithValue("@mode", "jav01");
-                        cmd.Parameters.AddWithValue("@tokenNum", token);
-                        cmd.Parameters.AddWithValue("@dummy", 0);
+                        sp.CommandType = CommandType.StoredProcedure;
+                        sp.Parameters.AddWithValue("@mode", "jav01");
+                        sp.Parameters.AddWithValue("@tokenNum", token);
+                        sp.Parameters.AddWithValue("@dummy", 0);
 
-                        await using var r = await cmd.ExecuteReaderAsync(ct);
+                        await using var r = await sp.ExecuteReaderAsync(ct);
                         if (await r.ReadAsync(ct))
                         {
                             bcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
@@ -262,6 +273,7 @@ namespace sparshWebService.Controllers
                         }
                     }
 
+                    // bucket status like JSP
                     string tokenVld;
                     if (exprFlag == "Y")
                     {
@@ -285,60 +297,64 @@ namespace sparshWebService.Controllers
                         prodCodeForHdr = prodCode;
                     }
 
-                    // Detail row (dptTokenRecDtl)
+                    // detail row: dptTokenRecDtl
                     await using (var det = new SqlCommand(@"
                         insert into dptTokenRecDtl
                           (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp,
                            tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag,
                            createId, createDt)
                         values
-                          (@docuNumb, @tokenNum, @tokenVld, @exprFlag, @dbActSts, @bcTknTyp,
-                           @tokenVal, @handRate, @tokEndVl, @prodCode, @inflCode, 'A',
-                           @loginId, getdate());", con, (SqlTransaction)tx))
+                          (@docu, @token, @vld, @expr, @stat, @typ,
+                           @tval, @hr, @endv, @prod, @infl, 'A',
+                           @login, getdate());", con, (SqlTransaction)tx))
                     {
-                        det.Parameters.AddWithValue("@docuNumb", docuNumb);
-                        det.Parameters.AddWithValue("@tokenNum", token);
-                        det.Parameters.AddWithValue("@tokenVld", tokenVld);
-                        det.Parameters.AddWithValue("@exprFlag", exprFlag);
-                        det.Parameters.AddWithValue("@dbActSts", dbActSts);
-                        det.Parameters.AddWithValue("@bcTknTyp", bcTknTyp);
-                        det.Parameters.AddWithValue("@tokenVal", tokenVal);
-                        det.Parameters.AddWithValue("@handRate", handRate);
-                        det.Parameters.AddWithValue("@tokEndVl", tokEndVl);
-                        det.Parameters.AddWithValue("@prodCode", prodCode);
-                        det.Parameters.AddWithValue("@inflCode", req.InflCode ?? "INF00000");
-                        det.Parameters.AddWithValue("@loginId", req.LoginId);
+                        det.Parameters.AddWithValue("@docu", docuNumb);
+                        det.Parameters.AddWithValue("@token", token);
+                        det.Parameters.AddWithValue("@vld", tokenVld);
+                        det.Parameters.AddWithValue("@expr", exprFlag);
+                        det.Parameters.AddWithValue("@stat", dbActSts);
+                        det.Parameters.AddWithValue("@typ", bcTknTyp);
+                        det.Parameters.AddWithValue("@tval", tokenVal);
+                        det.Parameters.AddWithValue("@hr", handRate);
+                        det.Parameters.AddWithValue("@endv", tokEndVl);
+                        det.Parameters.AddWithValue("@prod", prodCode);
+                        det.Parameters.AddWithValue("@infl", req.InflCode ?? "INF00000");
+                        det.Parameters.AddWithValue("@login", req.LoginId);
                         await det.ExecuteNonQueryAsync(ct);
                     }
 
-                    // Mark master scanned if valid (mirrors JSP behavior)
+                    // mark master scanned for valid tokens (JSP sets isActive='Z')
                     if (tokenVld == "Y")
                     {
                         await using var up = new SqlCommand(@"
                             update dbo.dpmTokenNos
                                set isActive = 'Z',
-                                   updateId = @loginId,
+                                   updateId = @login,
                                    updateDt = getdate()
-                             where tokenNum = @tokenNum
+                             where tokenNum = @token
                                and isActive in ('Y','Z');", con, (SqlTransaction)tx);
-                        up.Parameters.AddWithValue("@loginId", req.LoginId);
-                        up.Parameters.AddWithValue("@tokenNum", token);
+                        up.Parameters.AddWithValue("@login", req.LoginId);
+                        up.Parameters.AddWithValue("@token", token);
                         await up.ExecuteNonQueryAsync(ct);
 
-                        // Optional: update multi-scan counter if applicable
-                        await using var up2 = new SqlCommand(@"
-                            update dbo.dpmToknMlSc
-                               set scnMlCnt = scnMlCnt + 1,
-                                   isActive = case when scnMlCnt + 1 >= scnMlAlw then 'Z' else 'Y' end,
-                                   updateId = @loginId, updateDt = getdate()
-                             where tokenNum = @token and isActive='Y' and scnMlCnt < scnMlAlw;", con, (SqlTransaction)tx);
-                        up2.Parameters.AddWithValue("@loginId", req.LoginId);
-                        up2.Parameters.AddWithValue("@token", token);
-                        await up2.ExecuteNonQueryAsync(ct);
+                        // multi-scan counter update (if configured)
+                        try
+                        {
+                            await using var up2 = new SqlCommand(@"
+                                update dbo.dpmToknMlSc
+                                   set scnMlCnt = scnMlCnt + 1,
+                                       isActive = case when scnMlCnt + 1 >= scnMlAlw then 'Z' else 'Y' end,
+                                       updateId = @login, updateDt = getdate()
+                                 where tokenNum = @token and isActive='Y' and scnMlCnt < scnMlAlw;", con, (SqlTransaction)tx);
+                            up2.Parameters.AddWithValue("@login", req.LoginId);
+                            up2.Parameters.AddWithValue("@token", token);
+                            await up2.ExecuteNonQueryAsync(ct);
+                        }
+                        catch { /* table may not exist in some envs */ }
                     }
                 }
 
-                // Update header totals
+                // header totals
                 await using (var upd = new SqlCommand(@"
                     update cdtTokenRec
                        set recptQty = @qty,
@@ -347,9 +363,9 @@ namespace sparshWebService.Controllers
                            scnDedAm = @scn,
                            payblAmt = @pay,
                            prodCode = @prod,
-                           updateId = @loginId,
+                           updateId = @login,
                            updateDt = getdate()
-                     where docuNumb = @docuNumb;", con, (SqlTransaction)tx))
+                     where docuNumb = @docu;", con, (SqlTransaction)tx))
                 {
                     upd.Parameters.AddWithValue("@qty", rightEnt);
                     upd.Parameters.AddWithValue("@bas", basTknAm);
@@ -357,9 +373,31 @@ namespace sparshWebService.Controllers
                     upd.Parameters.AddWithValue("@scn", scnDedAm);
                     upd.Parameters.AddWithValue("@pay", payblAmt);
                     upd.Parameters.AddWithValue("@prod", prodCodeForHdr);
-                    upd.Parameters.AddWithValue("@loginId", req.LoginId);
-                    upd.Parameters.AddWithValue("@docuNumb", docuNumb);
+                    upd.Parameters.AddWithValue("@login", req.LoginId);
+                    upd.Parameters.AddWithValue("@docu", docuNumb);
                     await upd.ExecuteNonQueryAsync(ct);
+                }
+
+                // optional: scanner deduction ledger (only if any deduction applied)
+                if (scnDedAm > 0)
+                {
+                    try
+                    {
+                        await using var ins = new SqlCommand(@"
+                            insert into dptToknScnrDtl
+                              (docuNumb, docuDate, userCode, docuNarr, vouDrAmt, vouCrAmt,
+                               statFlag, createId, createDt)
+                            values
+                              (@docu, convert(date,getdate()), @cust,
+                               'Dedc. against Scanner Issued', 0, @cr,
+                               'N', @login, getdate());", con, (SqlTransaction)tx);
+                        ins.Parameters.AddWithValue("@docu", docuNumb);
+                        ins.Parameters.AddWithValue("@cust", req.CustCode);
+                        ins.Parameters.AddWithValue("@cr", scnDedAm);
+                        ins.Parameters.AddWithValue("@login", req.LoginId);
+                        await ins.ExecuteNonQueryAsync(ct);
+                    }
+                    catch { /* table may not exist everywhere */ }
                 }
 
                 await tx.CommitAsync(ct);
@@ -406,6 +444,8 @@ namespace sparshWebService.Controllers
             if (string.IsNullOrWhiteSpace(bcTknTyp) || string.IsNullOrWhiteSpace(areaCode)) return true;
             var t = bcTknTyp.ToUpperInvariant();
             var a = areaCode.ToUpperInvariant();
+            // JSP hard rules:
+            // B1 disallowed in EXE/EXN/EXR; E1 allowed only in EXB/EXC/EXG
             if (t == "B1" && (a == "EXE" || a == "EXN" || a == "EXR")) return false;
             if (t == "E1" && !(a == "EXB" || a == "EXC" || a == "EXG")) return false;
             return true;
@@ -413,7 +453,7 @@ namespace sparshWebService.Controllers
 
         private static async Task<TokenMasterRow> FetchMasterRowAsync(SqlConnection con, string tokenNum, CancellationToken ct)
         {
-            // Prefer dbo.LY_dpmTokenNos; then dbo.dpmTokenNos; then dbo.dpaTokenNos
+            // Prefer dbo.LY_dpmTokenNos (your “LY_” alias), else dpmTokenNos, else dpaTokenNos
             const string sql = @"
                 SET NOCOUNT ON;
 
@@ -459,9 +499,7 @@ namespace sparshWebService.Controllers
                     return;
                 end
 
-                -- No source tables present -> return nothing
                 select top 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '';";
-
             await using var cmd = new SqlCommand(sql, con) { CommandTimeout = 30 };
             cmd.Parameters.AddWithValue("@token", tokenNum);
 
@@ -470,7 +508,7 @@ namespace sparshWebService.Controllers
             {
                 return new TokenMasterRow
                 {
-                    Found = true,
+                    Found    = true,
                     IsActive = r.IsDBNull(1) ? "" : r.GetString(1),
                     ValidDat = r.IsDBNull(2) ? "" : r.GetString(2),
                     UpdateId = r.IsDBNull(3) ? "" : r.GetString(3),
@@ -479,9 +517,19 @@ namespace sparshWebService.Controllers
             }
             return new TokenMasterRow { Found = false };
         }
+
+        // ======================= DTOs / Models =======================
+        private sealed class TokenMasterRow
+        {
+            public bool   Found { get; set; }
+            public string IsActive { get; set; } = "";
+            public string ValidDat { get; set; } = "";
+            public string UpdateId { get; set; } = "";
+            public string? NumCvvNo { get; set; }
+        }
     }
 
-    // ======================= DTOs =======================
+    // ---------------- Requests / Responses ----------------
 
     public sealed class TokenInfoRequest
     {
@@ -500,39 +548,42 @@ namespace sparshWebService.Controllers
 
     public sealed class TokenInfoResponse
     {
-        public bool Success { get; set; }
+        public bool   Success { get; set; }
         public string Message { get; set; } = "";
 
         public string TokenNum { get; set; } = "";
         public string AreaCode { get; set; } = "";
+        public string CustCode { get; set; } = "";
+        public string LoginId  { get; set; } = "";
 
-        public string IsActive { get; set; } = "";  // Y/Z/E/T/...
-        public string ValidDat { get; set; } = "";  // e.g., "14 Sep 2024"
+        // master/SP data
+        public string IsActive { get; set; } = "";  // Y/Z/E/T...
+        public string ValidDat { get; set; } = "";
         public string ScanndBy { get; set; } = "";
 
         public decimal TokenVal { get; set; }
         public decimal HandRate { get; set; }
         public decimal ScnrDdRt { get; set; }
         public decimal TokEndVl { get; set; }
-        public decimal TokDspVl { get; set; }  // display value (align with JSP)
-        public decimal TokAmPay { get; set; }  // TokDspVl + HandRate
+        public decimal TokDspVl { get; set; }
+        public decimal TokAmPay { get; set; }
 
-        public string BcTknTyp { get; set; } = ""; // B1/E1/...
+        public string BcTknTyp { get; set; } = "";
         public string DbActSts { get; set; } = "";
-        public string ExprFlag { get; set; } = ""; // Y/N expired
+        public string ExprFlag { get; set; } = "";
 
-        public string NumCvvNo { get; set; } = ""; // NOT for display on UI; for logic only
-        public bool RequiresCvv { get; set; }
+        public string NumCvvNo { get; set; } = ""; // keep hidden client-side; for logic
+        public bool   RequiresCvv { get; set; }
 
-        public string UpdIdAct { get; set; } = ""; // from SP
-        public string UpdIdMlt { get; set; } = ""; // from multi-scan
-
+        // multi-scan flags
+        public string UpdIdAct { get; set; } = "";
+        public string UpdIdMlt { get; set; } = "";
         public string ScnMlStt { get; set; } = "";
-        public int ScnMlCnt { get; set; }
-        public int ScnMlAlw { get; set; }
+        public int    ScnMlCnt { get; set; }
+        public int    ScnMlAlw { get; set; }
 
-        public int ProdCode { get; set; }
-        public bool AreaAllowed { get; set; }
+        public int    ProdCode { get; set; }
+        public bool   AreaAllowed { get; set; }
     }
 
     public sealed class CvvValidateRequest
@@ -543,7 +594,7 @@ namespace sparshWebService.Controllers
         [StringLength(16)]
         public string? Cvv { get; set; }
 
-        // Client keeps count just like JSP's pinInvdlC (1, 2, 3)
+        // mirrors JSP's pinInvdlC (1..3)
         [Range(1, 3)]
         public int Attempt { get; set; } = 1;
     }
@@ -551,12 +602,12 @@ namespace sparshWebService.Controllers
     public sealed class CvvValidateResponse
     {
         public string TokenNum { get; set; } = "";
-        public bool Found { get; set; }
-        public bool RequiresCvv { get; set; }
-        public int? CvvLength { get; set; } // 3 typically
-        public bool Valid { get; set; }
-        public bool Locked { get; set; }     // true after 3rd wrong attempt (mirrors JSP row lock)
-        public int AttemptsLeft { get; set; } // 0..2
+        public bool   Found { get; set; }
+        public bool   RequiresCvv { get; set; }
+        public int?   CvvLength { get; set; }
+        public bool   Valid { get; set; }
+        public bool   Locked { get; set; }     // 3rd wrong -> true
+        public int    AttemptsLeft { get; set; } // 0..2
         public string Message { get; set; } = "";
     }
 
@@ -572,37 +623,26 @@ namespace sparshWebService.Controllers
         public string LoginId { get; set; } = default!;
 
         [StringLength(16)]
-        public string? InflCode { get; set; } // optional influencer
+        public string? InflCode { get; set; }
 
         [Required]
         public List<string> TokenNums { get; set; } = new();
 
         [StringLength(40)]
-        public string? DocuNumb { get; set; } // optional inbound doc number
+        public string? DocuNumb { get; set; }
     }
 
     public sealed class SubmitTokensResponse
     {
-        public string DocuNumb { get; set; } = "";
-        public int Right { get; set; }
-        public int Already { get; set; }
-        public int Expired { get; set; }
-        public int Invalid { get; set; }
-
+        public string  DocuNumb { get; set; } = "";
+        public int     Right { get; set; }
+        public int     Already { get; set; }
+        public int     Expired { get; set; }
+        public int     Invalid { get; set; }
         public decimal BasTknAm { get; set; }
         public decimal HandAmnt { get; set; }
         public decimal ScnDedAm { get; set; }
         public decimal PayblAmt { get; set; }
-
-        public string Message { get; set; } = "";
-    }
-
-    internal sealed class TokenMasterRow
-    {
-        public bool   Found { get; set; }
-        public string IsActive { get; set; } = "";
-        public string ValidDat { get; set; } = "";
-        public string UpdateId { get; set; } = "";
-        public string? NumCvvNo { get; set; }
+        public string  Message { get; set; } = "";
     }
 }
