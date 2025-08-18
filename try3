@@ -98,7 +98,6 @@ namespace sparshWebService.Controllers
                     await using var r = await sp.ExecuteReaderAsync(ct);
                     if (await r.ReadAsync(ct))
                     {
-                        // 0..8 = bcTknTyp, tokenVal, handRate, scnrDdRt, tokEndVl, prodCode, updateId, dbActSts, exprFlag
                         info.BcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
                         info.TokenVal = SafeDecimal(r, 1);
                         info.HandRate = SafeDecimal(r, 2);
@@ -115,7 +114,7 @@ namespace sparshWebService.Controllers
                     _log.LogWarning(ex, "dppToknProc not found; proceeding without SP.");
                 }
 
-                // (b) Master row (supports LY_dpmTokenNos / dpmTokenNos / dpaTokenNos)
+                // (b) Master row
                 var master = await FetchMasterRowAsync(con, req.TokenNum, ct);
                 if (!master.Found)
                     return Ok(new { found = false, message = "No record found for token." });
@@ -317,7 +316,7 @@ END";
             try
             {
                 await using (var hdr = new SqlCommand(@"
-INSERT INTO dbo.cdtTokenRec
+INSERT INTO cdtTokenRec
       (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode,
        recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt)
 VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
@@ -343,11 +342,15 @@ VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
             int prodCodeForHdr = 0;
             decimal basTknAm = 0, handAmnt = 0, payblAmt = 0, scnDedAm = 0;
 
-            foreach (var token in req.TokenNums)
+            foreach (var rawToken in req.TokenNums)
             {
+                var token = (rawToken ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(token)) continue;
+
                 // Defaults
-                 var token = (rawToken ?? string.Empty).Trim();
-    if (string.IsNullOrEmpty(token)) continue;
+                string bcTknTyp = "", dbActSts = "", exprFlag = "";
+                int prodCode = 0;
+                decimal tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
 
                 // 3a) Price/flags via SP (if available)
                 try
@@ -405,16 +408,18 @@ VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
                     scnDedAm += scnrDdRt;
                     prodCodeForHdr = prodCode;
 
-                    // 3b) Mark master scanned (best-effort; try all known master tables)
+                    // 3b) Mark master scanned (robust)
                     try
                     {
-                        var updRes = await UpdateMasterRowAsync(con, token, req.LoginId, ct);
-                        if (updRes.affected == 0)
+                        var (affected, table, current) = await UpdateMasterRowAsync(con, token, req.LoginId, ct);
+                        if (affected == 0)
                         {
-                            if (updRes.table != null && updRes.currentStatus != null)
-                                _log.LogWarning("No update for token {Tkn} in {Tbl}; current isActive={St}.", token, updRes.table, updRes.currentStatus);
-                            else
-                                _log.LogWarning("No master row found for token {Tkn} in any master table.", token);
+                            _log.LogWarning("No master row updated for token {Tkn}. Table={Table} CurrStatus={Curr}",
+                                token, table ?? "(none)", current ?? "(unknown)");
+                        }
+                        else
+                        {
+                            _log.LogInformation("Master updated for {Tkn} in {Table} rows={Rows}", token, table, affected);
                         }
                     }
                     catch (Exception ex)
@@ -445,7 +450,7 @@ END", con);
                 try
                 {
                     await using var det = new SqlCommand(@"
-INSERT INTO dbo.dptTokenRecDtl
+INSERT INTO dptTokenRecDtl
   (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp,
    tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag,
    createId, createDt)
@@ -477,7 +482,7 @@ VALUES
             try
             {
                 await using var upd = new SqlCommand(@"
-UPDATE dbo.cdtTokenRec
+UPDATE cdtTokenRec
    SET recptQty = @qty,
        basTknAm = @bas,
        handAmnt = @hand,
@@ -510,7 +515,7 @@ UPDATE dbo.cdtTokenRec
                     await using var ins = new SqlCommand(@"
 IF OBJECT_ID(N'dbo.dptToknScnrDtl', N'U') IS NOT NULL
 BEGIN
-  INSERT INTO dbo.dptToknScnrDtl
+  INSERT INTO dptToknScnrDtl
     (docuNumb, docuDate, userCode, docuNarr, vouDrAmt, vouCrAmt,
      statFlag, createId, createDt)
   VALUES
@@ -619,26 +624,25 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
             return new TokenMasterRow { Found = false };
         }
 
-        // Try all master tables; return how many rows were updated, which table we tried, and current status if found but not updated
+        // ---- Robust updater for LY_dpmTokenNos / dpmTokenNos / dpaTokenNos ----
         private static async Task<(int affected, string? table, string? currentStatus)> UpdateMasterRowAsync(
-    SqlConnection con, string token, string login, CancellationToken ct)
-{
-    // Try in this order
-    var tables = new[] { "dbo.LY_dpmTokenNos", "dbo.dpmTokenNos", "dbo.dpaTokenNos" };
-    var tokenTrim = token.Trim();
-
-    foreach (var tbl in tables)
-    {
-        // Table exists?
-        var existsSql = $"IF OBJECT_ID(N'{tbl}', N'U') IS NULL SELECT 0 ELSE SELECT 1;";
-        await using (var existsCmd = new SqlCommand(existsSql, con))
+            SqlConnection con, string token, string login, CancellationToken ct)
         {
-            var exists = Convert.ToInt32(await existsCmd.ExecuteScalarAsync(ct)) == 1;
-            if (!exists) continue;
-        }
+            var tables = new[] { "dbo.LY_dpmTokenNos", "dbo.dpmTokenNos", "dbo.dpaTokenNos" };
+            var tokenTrim = token.Trim();
 
-        // 1) Preferred update path: only when isActive Y/Z
-        var updSql1 = $@"
+            foreach (var tbl in tables)
+            {
+                // table exists?
+                var existsSql = $"IF OBJECT_ID(N'{tbl}', N'U') IS NULL SELECT 0 ELSE SELECT 1;";
+                await using (var existsCmd = new SqlCommand(existsSql, con))
+                {
+                    var exists = Convert.ToInt32(await existsCmd.ExecuteScalarAsync(ct)) == 1;
+                    if (!exists) continue;
+                }
+
+                // preferred path: only when isActive Y/Z
+                var updSql1 = $@"
 UPDATE T WITH (ROWLOCK)
    SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
   FROM {tbl} AS T
@@ -646,35 +650,35 @@ UPDATE T WITH (ROWLOCK)
    AND T.isActive IN ('Y','Z');
 
 SELECT @@ROWCOUNT;";
-        int affected1;
-        await using (var upd1 = new SqlCommand(updSql1, con))
-        {
-            upd1.Parameters.AddWithValue("@login", login);
-            upd1.Parameters.AddWithValue("@token", token);
-            upd1.Parameters.AddWithValue("@tokenTrim", tokenTrim);
-            var o = await upd1.ExecuteScalarAsync(ct);
-            affected1 = (o == null || o is DBNull) ? 0 : Convert.ToInt32(o);
-        }
-        if (affected1 > 0) return (affected1, tbl, null);
+                int affected1;
+                await using (var upd1 = new SqlCommand(updSql1, con))
+                {
+                    upd1.Parameters.AddWithValue("@login", login);
+                    upd1.Parameters.AddWithValue("@token", token);
+                    upd1.Parameters.AddWithValue("@tokenTrim", tokenTrim);
+                    var o = await upd1.ExecuteScalarAsync(ct);
+                    affected1 = (o == null || o is DBNull) ? 0 : Convert.ToInt32(o);
+                }
+                if (affected1 > 0) return (affected1, tbl, null);
 
-        // 2) If nothing changed, find current status for diagnostics
-        string? curr = null;
-        var checkSql = $@"
+                // diagnose current status
+                string? curr = null;
+                var checkSql = $@"
 SELECT TOP 1 isActive
   FROM {tbl} WITH (NOLOCK)
  WHERE (tokenNum = @token OR LTRIM(RTRIM(tokenNum)) = @tokenTrim);";
-        await using (var chk = new SqlCommand(checkSql, con))
-        {
-            chk.Parameters.AddWithValue("@token", token);
-            chk.Parameters.AddWithValue("@tokenTrim", tokenTrim);
-            var v = await chk.ExecuteScalarAsync(ct);
-            if (v != null && v != DBNull.Value) curr = Convert.ToString(v);
-        }
+                await using (var chk = new SqlCommand(checkSql, con))
+                {
+                    chk.Parameters.AddWithValue("@token", token);
+                    chk.Parameters.AddWithValue("@tokenTrim", tokenTrim);
+                    var v = await chk.ExecuteScalarAsync(ct);
+                    if (v != null && v != DBNull.Value) curr = Convert.ToString(v);
+                }
 
-        // 3) Fallback: if row exists and not already 'Z', force it to 'Z'
-        if (curr != null && !string.Equals(curr, "Z", StringComparison.OrdinalIgnoreCase))
-        {
-            var updSql2 = $@"
+                // fallback: if exists and not already Z, force to Z
+                if (curr != null && !string.Equals(curr, "Z", StringComparison.OrdinalIgnoreCase))
+                {
+                    var updSql2 = $@"
 UPDATE T WITH (ROWLOCK)
    SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
   FROM {tbl} AS T
@@ -682,25 +686,23 @@ UPDATE T WITH (ROWLOCK)
    AND (T.isActive <> 'Z' OR T.isActive IS NULL);
 
 SELECT @@ROWCOUNT;";
-            await using (var upd2 = new SqlCommand(updSql2, con))
-            {
-                upd2.Parameters.AddWithValue("@login", login);
-                upd2.Parameters.AddWithValue("@token", token);
-                upd2.Parameters.AddWithValue("@tokenTrim", tokenTrim);
-                var o2 = await upd2.ExecuteScalarAsync(ct);
-                var affected2 = (o2 == null || o2 is DBNull) ? 0 : Convert.ToInt32(o2);
-                if (affected2 > 0) return (affected2, tbl, curr);
+                    await using (var upd2 = new SqlCommand(updSql2, con))
+                    {
+                        upd2.Parameters.AddWithValue("@login", login);
+                        upd2.Parameters.AddWithValue("@token", token);
+                        upd2.Parameters.AddWithValue("@tokenTrim", tokenTrim);
+                        var o2 = await upd2.ExecuteScalarAsync(ct);
+                        var affected2 = (o2 == null || o2 is DBNull) ? 0 : Convert.ToInt32(o2);
+                        if (affected2 > 0) return (affected2, tbl, curr);
+                    }
+                }
+
+                // if we found a row but nothing changed (already Z), return diagnostics
+                if (curr != null) return (0, tbl, curr);
             }
+
+            return (0, null, null);
         }
-
-        // If we got here, the row either doesn’t exist in this table
-        // or it already was 'Z'. Try next table.
-        if (curr != null) return (0, tbl, curr);
-    }
-
-    return (0, null, null);
-}
-
 
         // ===== Document number helpers (used only by /doc-number) =====
         private static string Truncate(string s, int maxLen)
