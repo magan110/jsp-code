@@ -98,6 +98,7 @@ namespace sparshWebService.Controllers
                     await using var r = await sp.ExecuteReaderAsync(ct);
                     if (await r.ReadAsync(ct))
                     {
+                        // 0..8 = bcTknTyp, tokenVal, handRate, scnrDdRt, tokEndVl, prodCode, updateId, dbActSts, exprFlag
                         info.BcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
                         info.TokenVal = SafeDecimal(r, 1);
                         info.HandRate = SafeDecimal(r, 2);
@@ -114,7 +115,7 @@ namespace sparshWebService.Controllers
                     _log.LogWarning(ex, "dppToknProc not found; proceeding without SP.");
                 }
 
-                // (b) Master row
+                // (b) Master row (supports LY_dpmTokenNos / dpmTokenNos / dpaTokenNos)
                 var master = await FetchMasterRowAsync(con, req.TokenNum, ct);
                 if (!master.Found)
                     return Ok(new { found = false, message = "No record found for token." });
@@ -316,7 +317,7 @@ END";
             try
             {
                 await using (var hdr = new SqlCommand(@"
-INSERT INTO cdtTokenRec
+INSERT INTO dbo.cdtTokenRec
       (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode,
        recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt)
 VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
@@ -405,59 +406,47 @@ VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
                     scnDedAm += scnrDdRt;
                     prodCodeForHdr = prodCode;
 
-                    // 3b) Mark master scanned (best-effort)
+                    // 3b) Mark master scanned (best-effort; try all known master tables)
                     try
-{
-    const string updSql = @"
-DECLARE @rc int = 0;
+                    {
+                        var updRes = await UpdateMasterRowAsync(con, token, req.LoginId, ct);
+                        if (updRes.affected == 0)
+                        {
+                            if (updRes.table != null && updRes.currentStatus != null)
+                                _log.LogWarning("No update for token {Tkn} in {Tbl}; current isActive={St}.", token, updRes.table, updRes.currentStatus);
+                            else
+                                _log.LogWarning("No master row found for token {Tkn} in any master table.", token);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "Master update failed for token {Tkn}", token);
+                    }
 
-IF OBJECT_ID(N'dbo.LY_dpmTokenNos', N'U') IS NOT NULL
+                    // 3c) Multi-scan counter (if table exists)
+                    try
+                    {
+                        await using var up2 = new SqlCommand(@"
+IF OBJECT_ID(N'dbo.dpmToknMlSc', N'U') IS NOT NULL
 BEGIN
-  UPDATE dbo.LY_dpmTokenNos
-     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
-   WHERE tokenNum = @token AND isActive IN ('Y','Z');
-  SET @rc = @@ROWCOUNT;
-END
-
-IF (@rc = 0 AND OBJECT_ID(N'dbo.dpmTokenNos', N'U') IS NOT NULL)
-BEGIN
-  UPDATE dbo.dpmTokenNos
-     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
-   WHERE tokenNum = @token AND isActive IN ('Y','Z');
-  SET @rc = @@ROWCOUNT;
-END
-
-IF (@rc = 0 AND OBJECT_ID(N'dbo.dpaTokenNos', N'U') IS NOT NULL)
-BEGIN
-  UPDATE dbo.dpaTokenNos
-     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
-   WHERE tokenNum = @token AND isActive IN ('Y','Z');
-  SET @rc = @@ROWCOUNT;
-END
-
-SELECT @rc;
-";
-
-    await using var up = new SqlCommand(updSql, con);
-    up.Parameters.AddWithValue("@login", req.LoginId);
-    up.Parameters.AddWithValue("@token", token);
-
-    var o = await up.ExecuteScalarAsync(ct);
-    var affected = (o == null || o is DBNull) ? 0 : Convert.ToInt32(o);
-
-    if (affected == 0)
-        _log.LogWarning("No master row updated for token {Tkn}. Check table/source or status.", token);
-}
-catch (Exception ex)
-{
-    _log.LogWarning(ex, "Master update failed for token {Tkn}", token);
-}
+  UPDATE dbo.dpmToknMlSc
+     SET scnMlCnt = scnMlCnt + 1,
+         isActive = CASE WHEN scnMlCnt + 1 >= scnMlAlw THEN 'Z' ELSE 'Y' END,
+         updateId = @login, updateDt = GETDATE()
+   WHERE tokenNum = @token AND isActive='Y' AND scnMlCnt < scnMlAlw;
+END", con);
+                        up2.Parameters.AddWithValue("@login", req.LoginId);
+                        up2.Parameters.AddWithValue("@token", token);
+                        await up2.ExecuteNonQueryAsync(ct);
+                    }
+                    catch { /* ignore */ }
+                }
 
                 // 3d) Detail insert (always write what we evaluated)
                 try
                 {
                     await using var det = new SqlCommand(@"
-INSERT INTO dptTokenRecDtl
+INSERT INTO dbo.dptTokenRecDtl
   (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp,
    tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag,
    createId, createDt)
@@ -489,7 +478,7 @@ VALUES
             try
             {
                 await using var upd = new SqlCommand(@"
-UPDATE cdtTokenRec
+UPDATE dbo.cdtTokenRec
    SET recptQty = @qty,
        basTknAm = @bas,
        handAmnt = @hand,
@@ -522,7 +511,7 @@ UPDATE cdtTokenRec
                     await using var ins = new SqlCommand(@"
 IF OBJECT_ID(N'dbo.dptToknScnrDtl', N'U') IS NOT NULL
 BEGIN
-  INSERT INTO dptToknScnrDtl
+  INSERT INTO dbo.dptToknScnrDtl
     (docuNumb, docuDate, userCode, docuNarr, vouDrAmt, vouCrAmt,
      statFlag, createId, createDt)
   VALUES
@@ -629,6 +618,51 @@ SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '
                 };
             }
             return new TokenMasterRow { Found = false };
+        }
+
+        // Try all master tables; return how many rows were updated, which table we tried, and current status if found but not updated
+        private static async Task<(int affected, string? table, string? currentStatus)> UpdateMasterRowAsync(
+            SqlConnection con, string token, string login, CancellationToken ct)
+        {
+            var tables = new[] { "dbo.LY_dpmTokenNos", "dbo.dpmTokenNos", "dbo.dpaTokenNos" };
+
+            foreach (var tbl in tables)
+            {
+                // Does the table exist?
+                var existsSql = $"IF OBJECT_ID(N'{tbl}', N'U') IS NULL SELECT 0 ELSE SELECT 1;";
+                await using (var existsCmd = new SqlCommand(existsSql, con))
+                {
+                    var exists = Convert.ToInt32(await existsCmd.ExecuteScalarAsync(ct)) == 1;
+                    if (!exists) continue;
+                }
+
+                // Attempt the update (only when isActive in Y/Z)
+                var updSql = $@"
+UPDATE {tbl}
+   SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
+ WHERE tokenNum = @token AND isActive IN ('Y','Z');
+SELECT @@ROWCOUNT;";
+                await using (var updCmd = new SqlCommand(updSql, con))
+                {
+                    updCmd.Parameters.AddWithValue("@login", login);
+                    updCmd.Parameters.AddWithValue("@token", token);
+                    var affectedObj = await updCmd.ExecuteScalarAsync(ct);
+                    var affected = (affectedObj == null || affectedObj is DBNull) ? 0 : Convert.ToInt32(affectedObj);
+                    if (affected > 0) return (affected, tbl, null);
+                }
+
+                // Not updated; check if row exists and see current status for logging
+                var chkSql = $"SELECT TOP 1 isActive FROM {tbl} WITH (NOLOCK) WHERE tokenNum=@token;";
+                await using (var chkCmd = new SqlCommand(chkSql, con))
+                {
+                    chkCmd.Parameters.AddWithValue("@token", token);
+                    var statusObj = await chkCmd.ExecuteScalarAsync(ct);
+                    if (statusObj != null && statusObj != DBNull.Value)
+                        return (0, tbl, Convert.ToString(statusObj));
+                }
+            }
+
+            return (0, null, null);
         }
 
         // ===== Document number helpers (used only by /doc-number) =====
