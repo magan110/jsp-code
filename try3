@@ -407,38 +407,51 @@ VALUES (@docu, CONVERT(date, GETDATE()), 'BC', 'CRN', @cust, 0,
 
                     // 3b) Mark master scanned (best-effort)
                     try
-                    {
-                        await using var up = new SqlCommand(@"
-UPDATE LY_dpmTokenNos
-   SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
- WHERE tokenNum = @token AND isActive IN ('Y','Z');", con);
-                        up.Parameters.AddWithValue("@login", req.LoginId);
-                        up.Parameters.AddWithValue("@token", token);
-                        await up.ExecuteNonQueryAsync(ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.LogWarning(ex, "Master update failed for token {Tkn}", token);
-                    }
+{
+    const string updSql = @"
+DECLARE @rc int = 0;
 
-                    // 3c) Multi-scan counter (if table exists)
-                    try
-                    {
-                        await using var up2 = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dpmToknMlSc', N'U') IS NOT NULL
+IF OBJECT_ID(N'dbo.LY_dpmTokenNos', N'U') IS NOT NULL
 BEGIN
-  UPDATE dbo.dpmToknMlSc
-     SET scnMlCnt = scnMlCnt + 1,
-         isActive = CASE WHEN scnMlCnt + 1 >= scnMlAlw THEN 'Z' ELSE 'Y' END,
-         updateId = @login, updateDt = GETDATE()
-   WHERE tokenNum = @token AND isActive='Y' AND scnMlCnt < scnMlAlw;
-END", con);
-                        up2.Parameters.AddWithValue("@login", req.LoginId);
-                        up2.Parameters.AddWithValue("@token", token);
-                        await up2.ExecuteNonQueryAsync(ct);
-                    }
-                    catch { /* ignore */ }
-                }
+  UPDATE dbo.LY_dpmTokenNos
+     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
+   WHERE tokenNum = @token AND isActive IN ('Y','Z');
+  SET @rc = @@ROWCOUNT;
+END
+
+IF (@rc = 0 AND OBJECT_ID(N'dbo.dpmTokenNos', N'U') IS NOT NULL)
+BEGIN
+  UPDATE dbo.dpmTokenNos
+     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
+   WHERE tokenNum = @token AND isActive IN ('Y','Z');
+  SET @rc = @@ROWCOUNT;
+END
+
+IF (@rc = 0 AND OBJECT_ID(N'dbo.dpaTokenNos', N'U') IS NOT NULL)
+BEGIN
+  UPDATE dbo.dpaTokenNos
+     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
+   WHERE tokenNum = @token AND isActive IN ('Y','Z');
+  SET @rc = @@ROWCOUNT;
+END
+
+SELECT @rc;
+";
+
+    await using var up = new SqlCommand(updSql, con);
+    up.Parameters.AddWithValue("@login", req.LoginId);
+    up.Parameters.AddWithValue("@token", token);
+
+    var o = await up.ExecuteScalarAsync(ct);
+    var affected = (o == null || o is DBNull) ? 0 : Convert.ToInt32(o);
+
+    if (affected == 0)
+        _log.LogWarning("No master row updated for token {Tkn}. Check table/source or status.", token);
+}
+catch (Exception ex)
+{
+    _log.LogWarning(ex, "Master update failed for token {Tkn}", token);
+}
 
                 // 3d) Detail insert (always write what we evaluated)
                 try
