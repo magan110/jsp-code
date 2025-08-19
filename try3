@@ -1,864 +1,843 @@
-// Controllers/TokenRecdController.cs
-//
-// A line-by-line port of the JSP flow into an ASP.NET Core controller.
-// It implements three endpoints that map to the JSP’s behavior:
-//
-// 1)  POST /api/tokenrecd/init
-//     -> Initializes page/session state (randNumb, admin flags, TDS/appRtlTy)
-//
-// 2)  POST /api/tokenrecd/token-info        (JSP: MK_02004)
-//     -> Returns all 17 fields the JSP expects after scanning a token
-//
-// 3)  POST /api/tokenrecd/submit            (JSP: MK_02014)
-//     -> Saves the full batch (detail rows, header, LY_dpmTokenNos update block)
-//
-// Notes:
-// - The “isActive=Y → Z” update block uses the EXACT code you provided, against
-//   dbo.LY_dpmTokenNos. If that table doesn’t exist, we fall back to dbo.dpmTokenNos
-//   with the same semantics.
-// - Document numbering uses dbo.wcpDocNoGen, analogous to WebSessBean.getDocumentNo.
-// - Calls bwlive.dbo.dppToknProc ('jav01', @token, 0) to get token-type/values.
-// - Multi-scan table dpmToknMlSc is optional; the code guards for its absence.
-// - All SQL is parameterized. Connection string key: "bwlive".
-// - Replace or adjust table/proc names only if your schema differs.
-//
-
-using System;
-using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Data;
-using System.Data.SqlClient;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
+using Microsoft.Data.SqlClient;
 
-namespace Sparsh.Api.Controllers
+namespace Bw.Api.Controllers;
+
+/// <summary>
+/// Token Receipt flow, ported from /BirlaWhite/Trans/Token/TokenRecd.jsp
+/// </summary>
+[ApiController]
+[Route("api/[controller]")]
+public sealed class TokenRecdController : ControllerBase
 {
-    [ApiController]
-    [Route("api/[controller]")]
-    public class TokenRecdController : ControllerBase
+    private readonly IConfiguration _cfg;
+    private readonly ILogger<TokenRecdController> _log;
+
+    public TokenRecdController(IConfiguration cfg, ILogger<TokenRecdController> log)
     {
-        private readonly IConfiguration _cfg;
-        private readonly ILogger<TokenRecdController> _log;
+        _cfg = cfg;
+        _log = log;
+    }
 
-        public TokenRecdController(IConfiguration cfg, ILogger<TokenRecdController> log)
+    // =========================================================================
+    // 0) CONFIG: centralize schema object names used in SQL
+    // =========================================================================
+    private const string DbName             = "bwlive";          // change if needed
+    private const string SpTokenProc        = $"{DbName}.dbo.dppToknProc";
+    private const string TblTokenNos        = "dbo.dpmTokenNos"; // printed tokens
+    private const string TblTokenNosAlt     = "dbo.dpaTokenNos"; // historical/alt bucket
+    private const string TblMultiScan       = "dbo.dpmToknMlSc"; // per-token multi-scan
+    private const string TblTestLog         = "dbo.dpmTknTestg";
+    private const string TblDetail          = "dbo.dptTokenRecDtl";
+    private const string TblHeader          = "dbo.cdtTokenRec";
+    private const string TblToPay           = "dbo.cdtCusToPay";
+    private const string TblUsers           = "dbo.wcvAllCustm";
+
+    // =========================================================================
+    // 1) PAGE INIT (TDS rate + rand id)
+    // =========================================================================
+    [HttpGet("init")]
+    public async Task<ActionResult<PageInitResponse>> InitAsync(
+        [FromQuery, Required] string loginId, CancellationToken ct)
+    {
+        try
         {
-            _cfg = cfg;
-            _log = log;
-        }
-
-        // =========================================================================
-        // 1) INIT  (JSP top block: randNumb, admin role, TDS rate/appRtlTy for C/R/I)
-        // =========================================================================
-        [HttpPost("init")]
-        public async Task<ActionResult<InitResponse>> InitAsync([FromBody] InitRequest req, CancellationToken ct)
-        {
-            if (!ModelState.IsValid) return ValidationProblem(ModelState);
-
-            var resp = new InitResponse
+            var resp = new PageInitResponse
             {
-                FormName = "TokenRecd",
-                RandNumb = Guid.NewGuid().ToString("N")[^16..], // right(newid(), 16)
-                AreaCode = req.AreaCode ?? "",
-                Admin = req.IsAdmin,
-                ReadButtonText = req.IsAdmin ? "TxtFileUpld" : "",
-                ReadButtonDisabled = !req.IsAdmin
+                RandId = await NewRandomIdAsync(ct)
             };
 
-            // TDS + appRtlTy for user types C/R/I (from JSP)
-            if (!string.IsNullOrWhiteSpace(req.LoginId) &&
-                (string.Equals(req.UserType, "C", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(req.UserType, "R", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(req.UserType, "I", StringComparison.OrdinalIgnoreCase)))
-            {
-                try
-                {
-                    await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
-                    await con.OpenAsync(ct);
-
-                    const string q = @"
-SELECT dbo.dpfTokTdsRt(itxPanNo, kycVerFl) AS tokTdsRt,
-       appRtlty
-  FROM wcvAllCustm WITH (NOLOCK)
- WHERE appRtlcd = @login;";
-                    await using var cmd = new SqlCommand(q, con);
-                    cmd.Parameters.AddWithValue("@login", req.LoginId);
-                    await using var r = await cmd.ExecuteReaderAsync(ct);
-                    if (await r.ReadAsync(ct))
-                    {
-                        resp.TokTdsRt = SafeDecimal(r, 0);
-                        resp.AppRtlTy = r.IsDBNull(1) ? "" : r.GetString(1);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "init: TDS/appRtlTy lookup failed for {Login}", req.LoginId);
-                }
-            }
-
-            // Place-holder text
-            resp.Placeholder = req.MobilApp ? "Click here to scan Code" : "Click here Token Code";
-
-            // Session-guard equivalent (dpTKNIns=N at page entry)
-            resp.DpTknIns = "N";
-
-            return Ok(resp);
-        }
-
-        // =========================================================================
-        // 2) TOKEN-INFO (JSP: MK_02004) → returns 17-tuple used by the page
-        // =========================================================================
-        [HttpPost("token-info")]
-        public async Task<ActionResult<TokenInfoFlatResponse>> TokenInfoAsync(
-            [FromBody] TokenInfoFlatRequest req, CancellationToken ct)
-        {
-            if (!ModelState.IsValid) return ValidationProblem(ModelState);
-
-            // Fields per JSP order:
-            // 0 tokenIdn, 1 isActive, 2 validDat, 3 scanndBy, 4 tokenVal, 5 handRate,
-            // 6 scnrDdRt, 7 tokEndVl, 8 scnMlStt, 9 scnMlCnt, 10 scnMlAlw,
-            // 11 updIdAct, 12 updIdMlt, 13 tokDspVl, 14 bcTknTyp, 15 exprFlag, 16 numCvvNo
-
-            var f = new string[17] { "", "", "", "", "0", "0", "0", "0", "", "0", "0", "", "", "0", "", "N", "" };
-
-            try
-            {
-                await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
-                await con.OpenAsync(ct);
-
-                // 2a) Stored-proc dppToknProc ('jav01', token, 0)
-                string bcTknTyp = "", dbActSts = "", exprFlag = "N", updIdAct = "";
-                int prodCode = 0;
-                decimal tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0, tokDspVl = 0;
-
-                try
-                {
-                    await using var sp = new SqlCommand("bwlive.dbo.dppToknProc", con)
-                    {
-                        CommandType = CommandType.StoredProcedure
-                    };
-                    sp.Parameters.AddWithValue("@mode", "jav01");
-                    sp.Parameters.AddWithValue("@tokenNum", req.TokenNum?.Trim() ?? "");
-                    sp.Parameters.AddWithValue("@dummy", 0);
-
-                    await using var r = await sp.ExecuteReaderAsync(ct);
-                    if (await r.ReadAsync(ct))
-                    {
-                        bcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
-                        tokenVal  = SafeDecimal(r, 1);
-                        handRate  = SafeDecimal(r, 2);
-                        scnrDdRt  = SafeDecimal(r, 3);
-                        tokEndVl  = SafeDecimal(r, 4);
-                        prodCode  = r.IsDBNull(5) ? 0 : r.GetInt32(5);
-                        updIdAct  = r.IsDBNull(6) ? "" : r.GetString(6);
-                        dbActSts  = r.IsDBNull(7) ? "" : r.GetString(7);
-                        exprFlag  = r.IsDBNull(8) ? "N" : r.GetString(8);
-                    }
-                }
-                catch (SqlException ex) when (ex.Number == 2812)
-                {
-                    _log.LogWarning("dppToknProc missing; continuing without SP for token {Token}", req.TokenNum);
-                }
-
-                // 2b) Master row (LY_dpmTokenNos/dpmTokenNos/dpaTokenNos)
-                var master = await FetchMasterRowAsync(con, req.TokenNum!, ct);
-                if (!master.Found)
-                    return Ok(new TokenInfoFlatResponse { Success = false, Message = "No Record Found" });
-
-                var isActive = master.IsActive ?? "";
-                var validDat = master.ValidDat ?? "";
-                var scanndBy = master.UpdateId ?? "";
-                var numCvvNo = master.NumCvvNo ?? "";
-                var requiresCvv = !string.IsNullOrWhiteSpace(numCvvNo) && numCvvNo != "0";
-
-                // 2c) Multi-scan eligibility
-                string scnMlStt = ""; int scnMlCnt = 0, scnMlAlw = 0; string updIdMlt = "";
-                const string sqlMult = @"
-IF OBJECT_ID(N'dbo.dpmToknMlSc', N'U') IS NOT NULL
-BEGIN
-  SELECT TOP 1 isActive, scnMlCnt, scnMlAlw, ISNULL(updateId,'')
-  FROM dbo.dpmToknMlSc WITH (NOLOCK)
-  WHERE tokenNum = @token AND isActive='Y' AND scnMlCnt < scnMlAlw
-  ORDER BY updateDt DESC;
-END
-ELSE
-BEGIN
-  SELECT TOP 0 isActive='', scnMlCnt=0, scnMlAlw=0, updateId='';
-END";
-                await using (var cmd = new SqlCommand(sqlMult, con))
-                {
-                    cmd.Parameters.AddWithValue("@token", req.TokenNum!);
-                    await using var r = await cmd.ExecuteReaderAsync(ct);
-                    if (await r.ReadAsync(ct))
-                    {
-                        scnMlStt = r.IsDBNull(0) ? "" : r.GetString(0);
-                        scnMlCnt = r.IsDBNull(1) ? 0 : r.GetInt32(1);
-                        scnMlAlw = r.IsDBNull(2) ? 0 : r.GetInt32(2);
-                        updIdMlt = r.IsDBNull(3) ? "" : r.GetString(3);
-                    }
-                }
-
-                // Derived display values used by JSP
-                tokDspVl = tokenVal; // JSP uses tokDspVl, default == tokenVal
-                var tokenIdn = req.TokenNum; // the display idn shown back
-                // Area/type validity check is done on client; we just return data.
-
-                // Pack into JSP order
-                f[0]  = tokenIdn ?? "";
-                f[1]  = isActive;
-                f[2]  = validDat;
-                f[3]  = scanndBy;
-                f[4]  = tokenVal.ToString("0.##");
-                f[5]  = handRate.ToString("0.##");
-                f[6]  = scnrDdRt.ToString("0.##");
-                f[7]  = tokEndVl.ToString("0.##");
-                f[8]  = scnMlStt;
-                f[9]  = scnMlCnt.ToString();
-                f[10] = scnMlAlw.ToString();
-                f[11] = updIdAct;
-                f[12] = updIdMlt;
-                f[13] = tokDspVl.ToString("0.##");
-                f[14] = bcTknTyp;
-                f[15] = string.IsNullOrWhiteSpace(exprFlag) ? "N" : exprFlag;
-                f[16] = numCvvNo;
-
-                return Ok(new TokenInfoFlatResponse
-                {
-                    Success = true,
-                    Message = "OK",
-                    Fields = f
-                });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "token-info failed for {Token}", req.TokenNum);
-                return Problem("Unexpected error");
-            }
-        }
-
-        // =========================================================================
-        // 3) SUBMIT (JSP: MK_02014)
-        // =========================================================================
-        [HttpPost("submit")]
-        public async Task<ActionResult<SubmitResponse>> SubmitAsync([FromBody] SubmitRequest req, CancellationToken ct)
-        {
-            if (!ModelState.IsValid) return ValidationProblem(ModelState);
-
-            if (string.IsNullOrWhiteSpace(req.TokenNmL))
-                return BadRequest(new { message = "No tokens provided." });
-
-            var tokens = SplitTokens(req.TokenNmL);
-            if (tokens.Count == 0)
-                return BadRequest(new { message = "No tokens provided." });
-
-            await using var con = new SqlConnection(_cfg.GetConnectionString("bwlive"));
+            await using var con = new SqlConnection(_cfg.GetConnectionString(DbName));
             await con.OpenAsync(ct);
 
-            // ===== Duplicate-entry guard (dpTKNIns equivalent via uniqueId/randNumb) =====
-            // JSP: if dpTKNIns == "Y" → throw Duplicate; here we log randNumb into dptTknTestg
-            // and will reject if the same randNumb+docuNumb appears twice in one day.
-            if (!string.IsNullOrWhiteSpace(req.RandNumb))
+            // JSP: select dbo.dpfTokTdsRt(itxPanNo, kycVerFl), appRtlty from wcvAllCustm where appRtlcd=loginId
+            const string sql = $@"
+SELECT TOP 1
+       CAST(dbo.dpfTokTdsRt(itxPanNo, kycVerFl) AS decimal(9,4)) AS TokTdsRt,
+       appRtlty
+  FROM {TblUsers} WITH (NOLOCK)
+ WHERE appRtlcd = @L";
+
+            await using var cmd = new SqlCommand(sql, con);
+            cmd.Parameters.AddWithValue("@L", loginId);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
             {
-                try
+                resp.TdsRate = r.IsDBNull(0) ? 0m : r.GetDecimal(0);
+                resp.AppRetailType = r.IsDBNull(1) ? "" : r.GetString(1);
+            }
+            return Ok(resp);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "init failed for {Login}", loginId);
+            return Problem("Unexpected error.");
+        }
+    }
+
+    // =========================================================================
+    // 2) VALIDATE (no DB updates) – mirrors JSP preview pane
+    // =========================================================================
+    [HttpPost("validate")]
+    public async Task<ActionResult<ValidateTokenResponse>> ValidateAsync(
+        [FromBody] ValidateTokenRequest req, CancellationToken ct)
+    {
+        if (!ModelState.IsValid) return ValidationProblem(ModelState);
+
+        try
+        {
+            await using var con = new SqlConnection(_cfg.GetConnectionString(DbName));
+            await con.OpenAsync(ct);
+
+            // 2.1 commercials/type via SP (dppToknProc 'jav01', token)
+            var sp = await GetTokenCommercialsAsync(con, req.TokenNum!, ct);
+
+            // 2.2 fetch master (current status / PIN / valid date / last updater)
+            var master = await FetchMasterRowAsync(con, req.TokenNum!, ct);
+            if (!master.Found)
+            {
+                return Ok(new ValidateTokenResponse
                 {
-                    await using var chk = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dptTknTestg', N'U') IS NOT NULL
-BEGIN
-  IF EXISTS (SELECT 1 FROM dbo.dptTknTestg WITH (NOLOCK)
-             WHERE uniqueId = @u AND createDt > DATEADD(day,-1,GETDATE()))
-    SELECT 1;
-  ELSE
-    SELECT 0;
-END
-ELSE SELECT 0;", con);
-                    chk.Parameters.AddWithValue("@u", req.RandNumb);
-                    var v = await chk.ExecuteScalarAsync(ct);
-                    var exists = v != null && v != DBNull.Value && Convert.ToInt32(v) == 1;
-                    if (exists)
-                        return Conflict(new { message = "Duplicate Entry, please open fresh page and try again." });
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "submit: dptTknTestg precheck failed");
-                }
+                    Status = "NotFound",
+                    Message = "No Record Found",
+                    TokenNum = req.TokenNum!
+                });
             }
 
-            // ===== Doc number (WebSessBean.getDocumentNo) =====
-            var docuNumb = string.IsNullOrWhiteSpace(req.DocuNumb)
-                ? await GenerateDocNoViaWcpAsync(con, "TKN", req.AreaCode ?? "", ct) ?? ""
-                : req.DocuNumb!.Trim();
+            // 2.3 multi-scan window (if table exists)
+            var ms = await FetchMultiScanAsync(con, req.TokenNum!, ct);
 
-            if (string.IsNullOrWhiteSpace(docuNumb))
-                return StatusCode(500, "Failed to generate document number.");
-
-            // Track the doc against uniqueId (randNumb) like JSP
-            if (!string.IsNullOrWhiteSpace(req.RandNumb))
+            // 2.4 area rules
+            if (!IsAreaValid(sp.BcTknTyp, req.AreaCode ?? ""))
             {
-                try
+                return Ok(new ValidateTokenResponse
                 {
-                    await using var up = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dptTknTestg', N'U') IS NOT NULL
-BEGIN
-  UPDATE dbo.dptTknTestg
-     SET docuNumb = @doc
-   WHERE uniqueId = @u AND createDt > DATEADD(day,-1,GETDATE());
-END", con);
-                    up.Parameters.AddWithValue("@doc", docuNumb);
-                    up.Parameters.AddWithValue("@u", req.RandNumb!);
-                    await up.ExecuteNonQueryAsync(ct);
+                    Status = "AreaMismatch",
+                    Message = "This token type is invalid for this area.",
+                    TokenNum = req.TokenNum!,
+                    TokenIdn = req.TokenNum!,
+                    IsActive = master.IsActive ?? "",
+                    BcTknTyp = sp.BcTknTyp
+                });
+            }
+
+            // 2.5 PIN rules
+            var pinRequired = !string.IsNullOrWhiteSpace(master.NumCvvNo) && master.NumCvvNo != "0";
+            if (pinRequired && string.IsNullOrWhiteSpace(req.Pin))
+            {
+                return Ok(new ValidateTokenResponse
+                {
+                    Status = "PinRequired",
+                    Message = "PIN is required for this token.",
+                    TokenNum = req.TokenNum!,
+                    RequiresPin = true,
+                    PinOk = false
+                });
+            }
+            if (pinRequired && !string.Equals(req.Pin, master.NumCvvNo, StringComparison.Ordinal))
+            {
+                return Ok(new ValidateTokenResponse
+                {
+                    Status = "PinMismatch",
+                    Message = "Invalid PIN.",
+                    TokenNum = req.TokenNum!,
+                    RequiresPin = true,
+                    PinOk = false
+                });
+            }
+
+            // 2.6 final classification
+            var isActive = master.IsActive ?? "";
+            var amountToPay = (sp.ExprFlag == "N" && isActive == "Y" && sp.ProdCode > 0)
+                            ? sp.DisplayValue + sp.HandlingRate : 0m;
+
+            string status, message;
+            if (isActive == "T")
+            {
+                status = "Theft"; message = "Token is reported as theft. Contact company officer.";
+            }
+            else if (sp.ExprFlag == "Y")
+            {
+                status = "Expired"; message = $"Validity expired {master.ValidDt}.";
+            }
+            else if (isActive == "Z" || string.Equals(sp.UpdateId, req.LoginId, StringComparison.OrdinalIgnoreCase))
+            {
+                status = "AlreadyScanned";
+                message = $"Already scanned earlier by {master.UpdateId ?? sp.UpdateId}.";
+            }
+            else if (isActive == "Y" && sp.ProdCode > 0)
+            {
+                status = "Valid";
+                message = $"Valid upto {master.ValidDt}. Value {sp.DisplayValue:0.##}, Handling {sp.HandlingRate:0.##}.";
+            }
+            else if (string.IsNullOrWhiteSpace(isActive))
+            {
+                status = "Unchecked";
+                message = "Status not checked; can be validated after submit.";
+            }
+            else
+            {
+                status = "Invalid";
+                message = "Not OK.";
+            }
+
+            return Ok(new ValidateTokenResponse
+            {
+                Status = status,
+                Message = message,
+
+                TokenNum = req.TokenNum!,
+                TokenIdn = req.TokenNum!,
+                IsActive = isActive,
+                ValidUntil = master.ValidDt ?? "",
+                ScannedBy = master.UpdateId ?? "",
+
+                BcTknTyp = sp.BcTknTyp,
+                ProductCode = sp.ProdCode,
+
+                TokenValue = sp.TokenValue,
+                HandlingRate = sp.HandlingRate,
+                ScannerDeductionRate = sp.ScannerDeductionRate,
+                EndValue = sp.TokenEndValue,
+                DisplayValue = sp.DisplayValue,
+                AmountToPay = amountToPay,
+
+                RequiresPin = pinRequired,
+                PinOk = !pinRequired || string.Equals(req.Pin, master.NumCvvNo, StringComparison.Ordinal),
+
+                MultiScan = ms
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "validate failed for token {T}", req.TokenNum);
+            return Problem("Unexpected error.");
+        }
+    }
+
+    // =========================================================================
+    // 3) SUBMIT (writes header + details; updates master w/ ROWLOCK)
+    // =========================================================================
+    [HttpPost("submit")]
+    public async Task<ActionResult<SubmitTokensResponse>> SubmitAsync(
+        [FromBody] SubmitTokensRequest req, CancellationToken ct)
+    {
+        if (!ModelState.IsValid) return ValidationProblem(ModelState);
+        if (req.Tokens == null || req.Tokens.Count == 0)
+            return BadRequest("No tokens supplied.");
+
+        await using var con = new SqlConnection(_cfg.GetConnectionString(DbName));
+        await con.OpenAsync(ct);
+        await using var tx = await con.BeginTransactionAsync(ct);
+
+        try
+        {
+            var docNum = string.IsNullOrWhiteSpace(req.DocuNumb)
+                ? await GenerateDocNumberAsync(con, tx, ct)
+                : req.DocuNumb!;
+
+            // calculate TDS rate for the purchaser (same as init)
+            var (tdsRate, appRtlTy) = await GetTdsAndRetailTypeAsync(con, tx, req.CustCode!, ct);
+
+            // seed test log if you keep parity with JSP (optional)
+            if (!string.IsNullOrWhiteSpace(req.RandId))
+            {
+                const string up = $@"UPDATE {TblTestLog}
+                                        SET docuNumb = @D
+                                      WHERE uniqueId = @U AND createDt > DATEADD(day,-1,GETDATE())";
+                await ExecAsync(con, tx, up, new()
+                {
+                    ["@D"] = docNum,
+                    ["@U"] = req.RandId!
+                }, ct);
+            }
+
+            // Header (pre) – placeholder insert (then updated after details)
+            const string insHdr = $@"
+INSERT INTO {TblHeader}
+(docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode, recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt)
+VALUES (@D, CONVERT(date, GETDATE()), 'BC', 'CRN', @C, 0, 0, 0, 0, 0, 0, 'A', @L, GETDATE());";
+            await ExecAsync(con, tx, insHdr, new() { ["@D"] = docNum, ["@C"] = req.CustCode!, ["@L"] = req.LoginId! }, ct);
+
+            // Loop tokens
+            var detail = new List<SubmitItemResult>();
+            int rightEnt = 0, expiredCnt = 0, alreadyCnt = 0, invalidCnt = 0;
+            int prodCodeHd = 0;
+            decimal basTknAm = 0, handAmnt = 0, payblAmt = 0, scnDedAm = 0, lastEndVal = 0;
+
+            foreach (var t in req.Tokens)
+            {
+                var token = (t?.TokenNum ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(token))
+                    continue;
+
+                // 3.1 commercials
+                var sp = await GetTokenCommercialsAsync(con, token, ct, tx);
+                var master = await FetchMasterRowAsync(con, token, ct, tx);
+                var ms = await FetchMultiScanAsync(con, token, ct, tx);
+
+                // 3.2 Area + PIN checks
+                if (!IsAreaValid(sp.BcTknTyp, req.AreaCode!))
+                {
+                    detail.Add(new SubmitItemResult { TokenNum = token, Status = "AreaMismatch", Message = "This token type is invalid for this area." });
+                    invalidCnt++;
+                    continue;
                 }
-                catch { /* non-fatal */ }
-            }
-
-            // ===== Header insert (cdtTokenRec) =====
-            try
-            {
-                await using var hdr = new SqlCommand(@"
-IF NOT EXISTS (SELECT 1 FROM cdtTokenRec WHERE docuNumb=@docu)
-BEGIN
-  INSERT INTO cdtTokenRec
-    (docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode,
-     recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt)
-  VALUES
-    (@docu, CONVERT(date,GETDATE()), 'BC', 'CRN', @cust, 0,
-     0, 0, 0, 0, 0, 'A', @login, GETDATE());
-END", con);
-                hdr.Parameters.AddWithValue("@docu", docuNumb);
-                hdr.Parameters.AddWithValue("@cust", req.CustCode ?? "");
-                hdr.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                await hdr.ExecuteNonQueryAsync(ct);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Header insert failed for {Doc}", docuNumb);
-                return Problem("Could not prepare header.");
-            }
-
-            // ===== Per-token loop (mirrors JSP) =====
-            int rightEnt = 0, alrdyScn = 0, expired = 0, invalid = 0;
-            int prodCodeHdr = 0;
-            decimal basTknAm = 0, handAmnt = 0, payblAmt = 0, scnDedAm = 0;
-
-            // For the EXACT LY_dpmTokenNos update block counters (your code)
-            int lyUpdated = 0, lyAlreadyZ = 0, lyNotY = 0, lyNotFound = 0;
-            var lyResults = new List<SimpleItemResult>();
-
-            foreach (var token in tokens)
-            {
-                // For tracing / test logging like dpmTknTestg in JSP
-                try
+                var pinRequired = !string.IsNullOrWhiteSpace(master.NumCvvNo) && master.NumCvvNo != "0";
+                if (pinRequired)
                 {
-                    await using var insT = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dpmTknTestg', N'U') IS NOT NULL
-BEGIN
-  INSERT INTO dbo.dpmTknTestg (docuNumb, tokenNum, mobileNo, inflName, inflCode, createId, createDt)
-  VALUES (@docu, @tkn, @mob, @inflNm, @inflCd, @login, GETDATE());
-END", con);
-                    insT.Parameters.AddWithValue("@docu", docuNumb);
-                    insT.Parameters.AddWithValue("@tkn", token);
-                    insT.Parameters.AddWithValue("@mob", req.MobileNo ?? "9798000000");
-                    insT.Parameters.AddWithValue("@inflNm", req.InflName ?? "Anuhit");
-                    insT.Parameters.AddWithValue("@inflCd", req.InflCode ?? "INF00000");
-                    insT.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                    await insT.ExecuteNonQueryAsync(ct);
-                }
-                catch { /* non-fatal */ }
-
-                // Values from SP
-                string bcTknTyp = "", dbActSts = "", exprFlag = "N";
-                int prodCode = 0;
-                decimal tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
-
-                try
-                {
-                    await using var sp = new SqlCommand("bwlive.dbo.dppToknProc", con)
+                    if (string.IsNullOrWhiteSpace(t.Pin))
                     {
-                        CommandType = CommandType.StoredProcedure
-                    };
-                    sp.Parameters.AddWithValue("@mode", "jav01");
-                    sp.Parameters.AddWithValue("@tokenNum", token);
-                    sp.Parameters.AddWithValue("@dummy", 0);
-
-                    await using var r = await sp.ExecuteReaderAsync(ct);
-                    if (await r.ReadAsync(ct))
+                        detail.Add(new SubmitItemResult { TokenNum = token, Status = "PinRequired", Message = "PIN is required." });
+                        invalidCnt++;
+                        continue;
+                    }
+                    if (!string.Equals(t.Pin, master.NumCvvNo, StringComparison.Ordinal))
                     {
-                        bcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
-                        tokenVal  = SafeDecimal(r, 1);
-                        handRate  = SafeDecimal(r, 2);
-                        scnrDdRt  = SafeDecimal(r, 3);
-                        tokEndVl  = SafeDecimal(r, 4);
-                        prodCode  = r.IsDBNull(5) ? 0 : r.GetInt32(5);
-                        dbActSts  = r.IsDBNull(7) ? "" : r.GetString(7);
-                        exprFlag  = r.IsDBNull(8) ? "N" : r.GetString(8);
+                        detail.Add(new SubmitItemResult { TokenNum = token, Status = "PinMismatch", Message = "Invalid PIN." });
+                        invalidCnt++;
+                        continue;
                     }
                 }
-                catch (SqlException ex) when (ex.Number == 2812)
+
+                // 3.3 Expiry classification from SP
+                if (sp.ExprFlag == "Y")
                 {
-                    _log.LogWarning("Missing dppToknProc; token {T} may not have rates", token);
+                    await InsertDetailAsync(con, tx, docNum, token, "N", "Y", sp, req.LoginId!, ct);
+                    detail.Add(new SubmitItemResult { TokenNum = token, Status = "Expired" });
+                    expiredCnt++;
+                    continue;
                 }
 
-                // Multi-scan allowance read and then update after success (optional table)
-                string scnMlStt = ""; int scnMlCnt = 0, scnMlAlw = 0;
-                try
-                {
-                    await using var sel = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dpmToknMlSc', N'U') IS NOT NULL
-BEGIN
-  SELECT TOP 1 isActive, scnMlCnt, scnMlAlw
-    FROM dbo.dpmToknMlSc WITH (NOLOCK)
-   WHERE tokenNum=@tkn AND isActive='Y' AND scnMlCnt < scnMlAlw
-   ORDER BY updateDt DESC;
-END", con);
-                    sel.Parameters.AddWithValue("@tkn", token);
-                    await using var r = await sel.ExecuteReaderAsync(ct);
-                    if (await r.ReadAsync(ct))
-                    {
-                        scnMlStt = r.IsDBNull(0) ? "" : r.GetString(0);
-                        scnMlCnt = r.IsDBNull(1) ? 0 : r.GetInt32(1);
-                        scnMlAlw = r.IsDBNull(2) ? 0 : r.GetInt32(2);
-                    }
-                }
-                catch { /* ignore */ }
+                // 3.4 Try to UPDATE master with ROWLOCK: isActive Y → Z (your required block)
+                var updateOutcome = await UpdateMasterRowAsync(con, tx, token, req.LoginId!, ct);
 
-                // =========================
-                // EXACT "isActive block" you asked us to use (on LY_dpmTokenNos)
-                // =========================
-                try
+                // If no update but Multi-scan row grants allowance, adjust that table (exactly like JSP)
+                if (updateOutcome.Status == "NotY" && ms.Allowed > ms.Count && string.Equals(ms.IsActive, "Y", StringComparison.OrdinalIgnoreCase))
                 {
-                    int rows;
-                    const string updateSql = @"
+                    // increment multi-scan counters
+                    var nextCnt = ms.Count + 1;
+                    var nextStt = nextCnt >= ms.Allowed ? "Z" : "Y";
+                    const string updMs = $@"
+UPDATE {TblMultiScan}
+   SET isActive = @S, scnMlCnt = @N, updateId = @L, updateDt = GETDATE()
+ WHERE tokenNum = @T AND isActive = 'Y';";
+                    await ExecAsync(con, tx, updMs, new() { ["@S"] = nextStt, ["@N"] = nextCnt, ["@L"] = req.LoginId!, ["@T"] = token }, ct);
+
+                    updateOutcome = updateOutcome with { Status = "Updated", CurrentIsActive = "Z" }; // allow
+                }
+
+                // 3.5 Classify after master update / existence check
+                if (updateOutcome.Status == "Updated" && sp.ProdCode > 0)
+                {
+                    // success path → add to totals
+                    basTknAm  += sp.TokenValue;
+                    handAmnt  += sp.HandlingRate;
+                    payblAmt  += sp.TokenEndValue;
+                    lastEndVal = sp.TokenEndValue;
+                    rightEnt++;
+                    prodCodeHd = sp.ProdCode;
+
+                    await InsertDetailAsync(con, tx, docNum, token, "Y", sp.ExprFlag, sp, req.LoginId!, ct);
+                    detail.Add(new SubmitItemResult { TokenNum = token, Status = "OK", CurrentIsActive = "Z" });
+                }
+                else if (updateOutcome.Status == "AlreadyZ")
+                {
+                    await InsertDetailAsync(con, tx, docNum, token, "N", sp.ExprFlag, sp, req.LoginId!, ct, toknStat: "Z");
+                    detail.Add(new SubmitItemResult { TokenNum = token, Status = "AlreadyScanned", CurrentIsActive = "Z" });
+                    alreadyCnt++;
+                }
+                else if (updateOutcome.Status == "NotFound")
+                {
+                    await InsertDetailAsync(con, tx, docNum, token, "N", sp.ExprFlag, sp, req.LoginId!, ct);
+                    detail.Add(new SubmitItemResult { TokenNum = token, Status = "NotFound" });
+                    invalidCnt++;
+                }
+                else // NotY OR generic invalid
+                {
+                    await InsertDetailAsync(con, tx, docNum, token, "N", sp.ExprFlag, sp, req.LoginId!, ct, toknStat: updateOutcome.CurrentIsActive);
+                    detail.Add(new SubmitItemResult { TokenNum = token, Status = "Invalid", CurrentIsActive = updateOutcome.CurrentIsActive });
+                    invalidCnt++;
+                }
+            }
+
+            // 3.6 header final totals
+            const string updHdr = $@"
+UPDATE {TblHeader}
+   SET recptQty = @Q,
+       basTknAm = @B,
+       handAmnt = @H,
+       payblAmt = @P,
+       scnDedAm = @S,
+       prodCode = @PC,
+       updateId = @L,
+       updateDt = GETDATE()
+ WHERE docuNumb = @D;";
+            await ExecAsync(con, tx, updHdr, new()
+            {
+                ["@Q"] = rightEnt,
+                ["@B"] = basTknAm,
+                ["@H"] = handAmnt,
+                ["@P"] = payblAmt,
+                ["@S"] = scnDedAm,
+                ["@PC"] = prodCodeHd,
+                ["@L"] = req.LoginId!,
+                ["@D"] = docNum
+            }, ct);
+
+            // 3.7 credit note / to-pay row (when there is payable)
+            if (payblAmt > 0)
+            {
+                const string insPay = $@"
+INSERT INTO {TblToPay}
+(docuNumb, custCode, custAcCd, cdnDocTy, invDocNo, invnSrNo, prodCode, strtDate, endgDate,
+ discQnty, discRate, dtlSbTot, deducAmt, tdsTotAm, cnDnTyCd, naration, mdOfDisb, statFlag, createId, createDt,
+ cheqNumb, cheqDate, refDocNo)
+VALUES
+(@D, @C, '01', 'CRN', NULL, NULL, @PC, CONVERT(date, GETDATE()), CONVERT(date, GETDATE()),
+ @Q, @R, @TotInclDed, @Ded, @Tds, '11', @Nar, @Md, 'A', @L, GETDATE(), NULL, NULL, @RefNo);";
+                // JSP: discRate = tokEndVl (last), discQnty = rightEnt; naration shows qty
+                var nar = $"Paper Token Receipt Entry for {rightEnt} Qty";
+                var tds = (basTknAm + handAmnt) * (tdsRate / 100m);
+                var totInclDed = payblAmt + scnDedAm;
+                var refNo = (sp: lastEndVal, type: req.AreaCode).Equals(default) ? (object)DBNull.Value : "NA";
+                var mode = string.Equals(req.UserType, "R", StringComparison.OrdinalIgnoreCase) ? "01" : "04";
+
+                await ExecAsync(con, tx, insPay, new()
+                {
+                    ["@D"] = docNum,
+                    ["@C"] = req.CustCode!,
+                    ["@PC"] = prodCodeHd,
+                    ["@Q"] = rightEnt,
+                    ["@R"] = lastEndVal,
+                    ["@TotInclDed"] = totInclDed,
+                    ["@Ded"] = scnDedAm,
+                    ["@Tds"] = tds,
+                    ["@Nar"] = nar,
+                    ["@Md"] = mode,
+                    ["@L"] = req.LoginId!,
+                    ["@RefNo"] = (object)DBNull.Value // set "NA" if you need export behavior
+                }, ct);
+            }
+
+            await tx.CommitAsync(ct);
+
+            var msg = $"Your Request has been Processed!\n" +
+                      $"Batch No: {docNum}\n" +
+                      $"Token Value: {(basTknAm + handAmnt):0.##}\n" +
+                      $"Right Entries: {rightEnt}\n" +
+                      $"Already Scanned: {alreadyCnt}\n" +
+                      $"Expired: {expiredCnt}\n" +
+                      $"Invalid: {invalidCnt}\n" +
+                      $"Payable Amt: {payblAmt:0.##}";
+
+            return Ok(new SubmitTokensResponse
+            {
+                DocuNumb = docNum,
+                RightCount = rightEnt,
+                AlreadyScanned = alreadyCnt,
+                Expired = expiredCnt,
+                Invalid = invalidCnt,
+                BaseAmount = basTknAm,
+                HandlingAmount = handAmnt,
+                PayableAmount = payblAmt,
+                TdsRate = tdsRate,
+                AppRetailType = appRtlTy,
+                Message = msg,
+                Details = detail
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "submit failed for {Login}", req.LoginId);
+            try { await tx.RollbackAsync(ct); } catch { /* ignore */ }
+            return Problem("Failed to submit tokens.");
+        }
+    }
+
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+    private static decimal SafeDecimal(IDataRecord r, int i) =>
+        r.IsDBNull(i) ? 0m : Convert.ToDecimal(r.GetValue(i));
+
+    private static bool IsAreaValid(string? bcTknTyp, string areaCode)
+    {
+        if (string.IsNullOrWhiteSpace(areaCode)) return true;
+        var exRetail = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "EXE", "EXN", "EXR" };
+        var exportA  = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "EXB", "EXC", "EXG" };
+
+        if (string.Equals(bcTknTyp, "B1", StringComparison.OrdinalIgnoreCase))
+            return exRetail.Contains(areaCode);
+        if (exRetail.Contains(areaCode) && !string.Equals(bcTknTyp, "B1", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (string.Equals(bcTknTyp, "E1", StringComparison.OrdinalIgnoreCase))
+            return exportA.Contains(areaCode);
+        if (exportA.Contains(areaCode) && !string.Equals(bcTknTyp, "E1", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return true;
+    }
+
+    private async Task<string> NewRandomIdAsync(CancellationToken ct)
+    {
+        await using var con = new SqlConnection(_cfg.GetConnectionString(DbName));
+        await con.OpenAsync(ct);
+        const string sql = "SELECT RIGHT(NEWID(),16);";
+        await using var cmd = new SqlCommand(sql, con);
+        var o = await cmd.ExecuteScalarAsync(ct);
+        return Convert.ToString(o) ?? Guid.NewGuid().ToString("N")[..16];
+    }
+
+    private static async Task ExecAsync(SqlConnection con, SqlTransaction? tx, string sql, Dictionary<string, object?> p, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand(sql, con, tx);
+        foreach (var kv in p) cmd.Parameters.AddWithValue(kv.Key, kv.Value ?? DBNull.Value);
+        _ = await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private async Task<(decimal TdsRate, string AppRtType)> GetTdsAndRetailTypeAsync(SqlConnection con, SqlTransaction tx, string custCode, CancellationToken ct)
+    {
+        const string sql = $@"
+SELECT TOP 1 CAST(dbo.dpfTokTdsRt(itxPanNo, kycVerFl) AS decimal(9,4)) AS TokTdsRt,
+             appRtlty
+  FROM {TblUsers} WITH (NOLOCK)
+ WHERE appRtlcd = @C;";
+        await using var cmd = new SqlCommand(sql, con, tx);
+        cmd.Parameters.AddWithValue("@C", custCode);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (await r.ReadAsync(ct))
+        {
+            return (r.IsDBNull(0) ? 0m : r.GetDecimal(0), r.IsDBNull(1) ? "" : r.GetString(1));
+        }
+        return (0m, "");
+    }
+
+    private async Task<string> GenerateDocNumberAsync(SqlConnection con, SqlTransaction tx, CancellationToken ct)
+    {
+        // Simple doc number: TKNyyyymmdd-XXXXXX (retry until unique)
+        for (var i = 0; i < 5; i++)
+        {
+            var candidate = $"TKN{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid():N}".Substring(0, 18);
+            const string exists = $@"SELECT 1 FROM {TblHeader} WITH (NOLOCK) WHERE docuNumb=@D";
+            await using var cmd = new SqlCommand(exists, con, tx);
+            cmd.Parameters.AddWithValue("@D", candidate);
+            var o = await cmd.ExecuteScalarAsync(ct);
+            if (o == null) return candidate;
+        }
+        return $"TKN{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid():N}".Substring(0, 18);
+    }
+
+    private async Task<TokenCommercials> GetTokenCommercialsAsync(SqlConnection con, string token, CancellationToken ct, SqlTransaction? tx = null)
+    {
+        var res = new TokenCommercials();
+        try
+        {
+            await using var sp = new SqlCommand(SpTokenProc, con, tx) { CommandType = CommandType.StoredProcedure };
+            sp.Parameters.AddWithValue("@mode", "jav01");
+            sp.Parameters.AddWithValue("@tokenNum", token);
+            sp.Parameters.AddWithValue("@dummy", 0);
+
+            await using var r = await sp.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                res.BcTknTyp = r.IsDBNull(0) ? "" : r.GetString(0);
+                res.TokenValue = SafeDecimal(r, 1);
+                res.HandlingRate = SafeDecimal(r, 2);
+                res.ScannerDeductionRate = SafeDecimal(r, 3);
+                res.TokenEndValue = SafeDecimal(r, 4);
+                res.ProdCode = r.IsDBNull(5) ? 0 : r.GetInt32(5);
+                res.UpdateId = r.IsDBNull(6) ? "" : r.GetString(6);
+                res.DbActSts = r.IsDBNull(7) ? "" : r.GetString(7);
+                res.ExprFlag = r.IsDBNull(8) ? "N" : r.GetString(8);
+                res.DisplayValue = res.TokenValue; // JSP shows tokDspVl = token value (adjust if different)
+            }
+        }
+        catch (SqlException ex) when (ex.Number == 2812) // SP not found
+        {
+            _log.LogWarning("SP {Sp} missing; token={T}", SpTokenProc, token);
+        }
+        return res;
+    }
+
+    private async Task<MasterRow> FetchMasterRowAsync(SqlConnection con, string token, CancellationToken ct, SqlTransaction? tx = null)
+    {
+        // Pull from main table if present; else from alt table
+        var sql = $@"
+SELECT TOP 1
+       ISNULL(isActive,''), updateId, 
+       -- valid date is not directly stored; keep empty unless you have a column:
+       CONVERT(varchar(10), NULL), 
+       ISNULL(NULLIF(LTRIM(RTRIM(numCvvNo)),''),'') as numCvvNo
+  FROM {TblTokenNos} WITH (NOLOCK)
+ WHERE (tokenNum=@t OR LTRIM(RTRIM(tokenNum))=@t)
+ UNION ALL
+SELECT TOP 1
+       ISNULL(isActive,''), updateId,
+       CONVERT(varchar(10), NULL),
+       ISNULL(NULLIF(LTRIM(RTRIM(numCvvNo)),''),'')
+  FROM {TblTokenNosAlt} WITH (NOLOCK)
+ WHERE (tokenNum=@t OR LTRIM(RTRIM(tokenNum))=@t);";
+
+        await using var cmd = new SqlCommand(sql, con, tx);
+        cmd.Parameters.AddWithValue("@t", token);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (await r.ReadAsync(ct))
+        {
+            return new MasterRow
+            {
+                Found = true,
+                IsActive = r.IsDBNull(0) ? "" : r.GetString(0),
+                UpdateId = r.IsDBNull(1) ? "" : r.GetString(1),
+                ValidDt = r.IsDBNull(2) ? "" : r.GetString(2),
+                NumCvvNo = r.IsDBNull(3) ? "" : r.GetString(3)
+            };
+        }
+        return MasterRow.NotFound;
+    }
+
+    private async Task<MultiScanInfo> FetchMultiScanAsync(SqlConnection con, string token, CancellationToken ct, SqlTransaction? tx = null)
+    {
+        var existsSql = @"SELECT OBJECT_ID(@obj, 'U');";
+        await using (var ex = new SqlCommand(existsSql, con, tx))
+        {
+            ex.Parameters.AddWithValue("@obj", TblMultiScan);
+            var id = await ex.ExecuteScalarAsync(ct);
+            if (id == null || id == DBNull.Value) return new MultiScanInfo(); // table not present
+        }
+
+        var sql = $@"
+SELECT TOP 1 isActive, scnMlCnt, scnMlAlw
+  FROM {TblMultiScan} WITH (NOLOCK)
+ WHERE tokenNum=@t AND isActive='Y' AND scnMlCnt < scnMlAlw
+ ORDER BY updateDt DESC;";
+        await using var cmd = new SqlCommand(sql, con, tx);
+        cmd.Parameters.AddWithValue("@t", token);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (await r.ReadAsync(ct))
+        {
+            return new MultiScanInfo
+            {
+                IsActive = r.IsDBNull(0) ? "" : r.GetString(0),
+                Count = r.IsDBNull(1) ? 0 : r.GetInt32(1),
+                Allowed = r.IsDBNull(2) ? 0 : r.GetInt32(2)
+            };
+        }
+        return new MultiScanInfo();
+    }
+
+    /// <summary>
+    /// Your required ROWLOCK update block for dpmTokenNos, with existence probing.
+    /// </summary>
+    private async Task<UpdateOutcome> UpdateMasterRowAsync(SqlConnection con, SqlTransaction tx, string token, string loginId, CancellationToken ct)
+    {
+        // Try to flip Y → Z atomically
+        const string updateSql = @"
 UPDATE T WITH (ROWLOCK)
    SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
   FROM dbo.LY_dpmTokenNos AS T
  WHERE (T.tokenNum = @token OR LTRIM(RTRIM(T.tokenNum)) = @tokenTrim)
    AND ISNULL(T.isActive,'') = 'Y';
 SELECT @@ROWCOUNT;";
-                    await using (var cmd = new SqlCommand(updateSql, con))
-                    {
-                        cmd.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                        cmd.Parameters.AddWithValue("@token", token);
-                        cmd.Parameters.AddWithValue("@tokenTrim", token);
-                        var o = await cmd.ExecuteScalarAsync(ct);
-                        rows = (o == null || o is DBNull) ? 0 : Convert.ToInt32(o);
-                    }
+        int rows;
+        await using (var cmd = new SqlCommand(updateSql, con, tx))
+        {
+            cmd.Parameters.AddWithValue("@login", loginId ?? "");
+            cmd.Parameters.AddWithValue("@token", token);
+            cmd.Parameters.AddWithValue("@tokenTrim", token);
+            var o = await cmd.ExecuteScalarAsync(ct);
+            rows = (o == null || o is DBNull) ? 0 : Convert.ToInt32(o);
+        }
+        if (rows > 0)
+            return new UpdateOutcome("Updated", "Z");
 
-                    if (rows > 0)
-                    {
-                        lyUpdated += rows;
-                        lyResults.Add(new SimpleItemResult { TokenNum = token, Status = "Updated", CurrentIsActive = "Z" });
-                    }
-                    else
-                    {
-                        // If no rows updated, check LY_dpmTokenNos status
-                        string? curr = null;
-                        const string checkSql = @"
+        // probe current status in LY_dpmTokenNos, then fallback to dpm/dpa as in JSP
+        const string checkSql = @"
 SELECT TOP 1 ISNULL(isActive,'')
   FROM dbo.LY_dpmTokenNos WITH (NOLOCK)
- WHERE (tokenNum = @token OR LTRIM(RTRIM(tokenNum)) = @tokenTrim);";
-                        await using (var chk = new SqlCommand(checkSql, con))
-                        {
-                            chk.Parameters.AddWithValue("@token", token);
-                            chk.Parameters.AddWithValue("@tokenTrim", token);
-                            var v = await chk.ExecuteScalarAsync(ct);
-                            if (v != null && v != DBNull.Value) curr = Convert.ToString(v);
-                        }
-
-                        if (curr == null)
-                        {
-                            // if LY_* not found, try legacy dpmTokenNos with same semantics
-                            int rows2;
-                            const string upd2 = @"
-IF OBJECT_ID(N'dbo.dpmTokenNos', N'U') IS NOT NULL
-BEGIN
-  UPDATE T WITH (ROWLOCK)
-     SET isActive = 'Z', updateId = @login, updateDt = GETDATE()
-    FROM dbo.dpmTokenNos AS T
-   WHERE (T.tokenNum = @token OR LTRIM(RTRIM(T.tokenNum)) = @tokenTrim)
-     AND ISNULL(T.isActive,'') = 'Y';
-  SELECT @@ROWCOUNT;
-END
-ELSE SELECT 0;";
-                            await using (var cmd2 = new SqlCommand(upd2, con))
-                            {
-                                cmd2.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                                cmd2.Parameters.AddWithValue("@token", token);
-                                cmd2.Parameters.AddWithValue("@tokenTrim", token);
-                                var o2 = await cmd2.ExecuteScalarAsync(ct);
-                                rows2 = (o2 == null || o2 is DBNull) ? 0 : Convert.ToInt32(o2);
-                            }
-
-                            if (rows2 > 0)
-                            {
-                                lyUpdated += rows2;
-                                lyResults.Add(new SimpleItemResult { TokenNum = token, Status = "Updated", CurrentIsActive = "Z" });
-                            }
-                            else
-                            {
-                                // Truly NotFound (neither table had it)
-                                lyNotFound++;
-                                lyResults.Add(new SimpleItemResult { TokenNum = token, Status = "NotFound" });
-                            }
-                        }
-                        else if (string.Equals(curr, "Z", StringComparison.OrdinalIgnoreCase))
-                        {
-                            lyAlreadyZ++;
-                            lyResults.Add(new SimpleItemResult { TokenNum = token, Status = "AlreadyZ", CurrentIsActive = "Z" });
-                        }
-                        else
-                        {
-                            lyNotY++;
-                            lyResults.Add(new SimpleItemResult { TokenNum = token, Status = "NotY", CurrentIsActive = curr });
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "LY_dpmTokenNos update block failed for token {Token}", token);
-                }
-                // ========================= END of EXACT block =========================
-
-                // “Business” outcome classification (mirrors JSP buckets)
-                string tokenVld;
-                if (string.Equals(exprFlag, "Y", StringComparison.OrdinalIgnoreCase))
-                {
-                    tokenVld = "E";
-                    expired++;
-                }
-                else if (string.Equals(dbActSts, "Z", StringComparison.OrdinalIgnoreCase))
-                {
-                    tokenVld = "Z";
-                    alrdyScn++;
-                }
-                else if (prodCode <= 0)
-                {
-                    tokenVld = "N";
-                    invalid++;
-                }
-                else
-                {
-                    tokenVld = "Y";
-                    rightEnt++;
-                    basTknAm += tokenVal;
-                    handAmnt += handRate;
-                    payblAmt += tokEndVl;
-                    scnDedAm += scnrDdRt;
-                    prodCodeHdr = prodCode;
-                }
-
-                // Multi-scan consume (optional)
-                try
-                {
-                    await using var upd = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dpmToknMlSc', N'U') IS NOT NULL
-BEGIN
-  UPDATE dbo.dpmToknMlSc
-     SET scnMlCnt = scnMlCnt + 1,
-         isActive = CASE WHEN scnMlCnt + 1 >= scnMlAlw THEN 'Z' ELSE 'Y' END,
-         updateId = @login, updateDt = GETDATE()
-   WHERE tokenNum = @tkn AND isActive='Y' AND scnMlCnt < scnMlAlw;
-END", con);
-                    upd.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                    upd.Parameters.AddWithValue("@tkn", token);
-                    await upd.ExecuteNonQueryAsync(ct);
-                }
-                catch { /* ignore */ }
-
-                // Detail insert
-                try
-                {
-                    await using var det = new SqlCommand(@"
-INSERT INTO dptTokenRecDtl
-  (docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp,
-   tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag, createId, createDt)
-VALUES
-  (@docu, @token, @vld, @expr, @stat, @typ,
-   @tval, @hr, @endv, @prod, @infl, 'A', @login, GETDATE());", con);
-                    det.Parameters.AddWithValue("@docu", docuNumb);
-                    det.Parameters.AddWithValue("@token", token);
-                    det.Parameters.AddWithValue("@vld", tokenVld);
-                    det.Parameters.AddWithValue("@expr", exprFlag);
-                    det.Parameters.AddWithValue("@stat", dbActSts ?? "");
-                    det.Parameters.AddWithValue("@typ", bcTknTyp ?? "");
-                    det.Parameters.AddWithValue("@tval", tokenVal);
-                    det.Parameters.AddWithValue("@hr", handRate);
-                    det.Parameters.AddWithValue("@endv", tokEndVl);
-                    det.Parameters.AddWithValue("@prod", prodCode);
-                    det.Parameters.AddWithValue("@infl", req.InflCode ?? "INF00000");
-                    det.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                    await det.ExecuteNonQueryAsync(ct);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "Detail insert failed for token {T}", token);
-                }
-            }
-
-            // ===== Update header totals =====
-            try
-            {
-                await using var upd = new SqlCommand(@"
-UPDATE cdtTokenRec
-   SET recptQty = @qty,
-       basTknAm = @bas,
-       handAmnt = @hand,
-       scnDedAm = @scn,
-       payblAmt = @pay,
-       prodCode = @prod,
-       updateId = @login,
-       updateDt = GETDATE()
- WHERE docuNumb = @docu;", con);
-                upd.Parameters.AddWithValue("@qty", rightEnt);
-                upd.Parameters.AddWithValue("@bas", basTknAm);
-                upd.Parameters.AddWithValue("@hand", handAmnt);
-                upd.Parameters.AddWithValue("@scn", scnDedAm);
-                upd.Parameters.AddWithValue("@pay", payblAmt);
-                upd.Parameters.AddWithValue("@prod", prodCodeHdr);
-                upd.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                upd.Parameters.AddWithValue("@docu", docuNumb);
-                await upd.ExecuteNonQueryAsync(ct);
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Header totals update failed for {Doc}", docuNumb);
-            }
-
-            // ===== Scanner deduction ledger (optional, JSP behavior) =====
-            if (scnDedAm > 0)
-            {
-                try
-                {
-                    await using var ins = new SqlCommand(@"
-IF OBJECT_ID(N'dbo.dptToknScnrDtl', N'U') IS NOT NULL
-BEGIN
-  INSERT INTO dptToknScnrDtl
-    (docuNumb, docuDate, userCode, docuNarr, vouDrAmt, vouCrAmt, statFlag, createId, createDt)
-  VALUES
-    (@docu, CONVERT(date,GETDATE()), @cust,
-     'Dedc. against Scanner Issued', 0, @cr, 'N', @login, GETDATE());
-END", con);
-                    ins.Parameters.AddWithValue("@docu", docuNumb);
-                    ins.Parameters.AddWithValue("@cust", req.CustCode ?? "");
-                    ins.Parameters.AddWithValue("@cr", scnDedAm);
-                    ins.Parameters.AddWithValue("@login", req.LoginId ?? "");
-                    await ins.ExecuteNonQueryAsync(ct);
-                }
-                catch { /* ignore */ }
-            }
-
-            // ===== Response (the JSP shows a modal with these) =====
-            var msg = $"Your Batch No is : {docuNumb} | Token Value : {basTknAm:0.##} | " +
-                      $"Right Entries : {rightEnt} | Already Scanned : {alrdyScn} | Payable : {payblAmt:0.##}";
-
-            return Ok(new SubmitResponse
-            {
-                DocuNumb   = docuNumb,
-                Right      = rightEnt,
-                Already    = alrdyScn,
-                Expired    = expired,
-                Invalid    = invalid,
-                BasTknAm   = basTknAm,
-                HandAmnt   = handAmnt,
-                ScnDedAm   = scnDedAm,
-                PayblAmt   = payblAmt,
-                LyUpdated  = lyUpdated,
-                LyAlreadyZ = lyAlreadyZ,
-                LyNotY     = lyNotY,
-                LyNotFound = lyNotFound,
-                LyResults  = lyResults,
-                Message    = msg
-            });
-        }
-
-        // ======================= Helpers =======================
-
-        private static List<string> SplitTokens(string csv)
+ WHERE (tokenNum=@token OR LTRIM(RTRIM(tokenNum))=@tokenTrim);";
+        string? curr = null;
+        await using (var chk = new SqlCommand(checkSql, con, tx))
         {
-            var list = new List<string>();
-            foreach (var s in (csv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
-            {
-                var t = s.Trim();
-                if (t.Length > 0) list.Add(t);
-            }
-            return list;
+            chk.Parameters.AddWithValue("@token", token);
+            chk.Parameters.AddWithValue("@tokenTrim", token);
+            var v = await chk.ExecuteScalarAsync(ct);
+            if (v != null && v != DBNull.Value) curr = Convert.ToString(v);
         }
-
-        private static decimal SafeDecimal(IDataRecord r, int ordinal)
+        if (curr == null)
         {
-            if (r.IsDBNull(ordinal)) return 0m;
-            var v = r.GetValue(ordinal);
-            return v switch
-            {
-                decimal d => d,
-                double dd => Convert.ToDecimal(dd),
-                float ff => Convert.ToDecimal(ff),
-                _ => Convert.ToDecimal(v)
-            };
+            // fall back to original tables union (JSP path)
+            var uf = await FetchMasterRowAsync(con, token, ct, tx);
+            if (!uf.Found) return new UpdateOutcome("NotFound", "");
+            curr = uf.IsActive ?? "";
         }
 
-        private static async Task<TokenMasterRow> FetchMasterRowAsync(SqlConnection con, string tokenNum, CancellationToken ct)
-        {
-            const string sql = @"
-SET NOCOUNT ON;
-DECLARE @src int = 0;
-IF OBJECT_ID(N'dbo.LY_dpmTokenNos', N'U') IS NOT NULL SET @src = 1;
-ELSE IF OBJECT_ID(N'dbo.dpmTokenNos',  N'U') IS NOT NULL SET @src = 2;
-ELSE IF OBJECT_ID(N'dbo.dpaTokenNos',  N'U') IS NOT NULL SET @src = 3;
+        if (string.Equals(curr, "Z", StringComparison.OrdinalIgnoreCase))
+            return new UpdateOutcome("AlreadyZ", "Z");
+        if (!string.Equals(curr, "Y", StringComparison.OrdinalIgnoreCase))
+            return new UpdateOutcome("NotY", curr ?? "");
 
-IF (@src = 1)
-BEGIN
-  SELECT TOP 1 tokenNum, isActive,
-    CONVERT(char(11), DATEADD(day, ISNULL(validDay,0), ISNULL(printgDt, GETDATE())), 100) AS validDat,
-    ISNULL(updateId,'') AS upd,
-    ISNULL(LTRIM(RTRIM(CAST(numCvvNo AS nvarchar(16)))),'') AS numCvvNo
-  FROM dbo.LY_dpmTokenNos WITH (NOLOCK) WHERE tokenNum = @token; RETURN;
-END
-IF (@src = 2)
-BEGIN
-  SELECT TOP 1 tokenNum, isActive,
-    CONVERT(char(11), DATEADD(day, ISNULL(validDay,0), ISNULL(printgDt, GETDATE())), 100) AS validDat,
-    ISNULL(updateId,'') AS upd,
-    ISNULL(LTRIM(RTRIM(CAST(numCvvNo AS nvarchar(16)))),'') AS numCvvNo
-  FROM dbo.dpmTokenNos WITH (NOLOCK) WHERE tokenNum = @token; RETURN;
-END
-IF (@src = 3)
-BEGIN
-  SELECT TOP 1 tokenNum, isActive,
-    CONVERT(char(11), DATEADD(day, ISNULL(validDay,0), ISNULL(printgDt, GETDATE())), 100) AS validDat,
-    ISNULL(updateId,'') AS upd,
-    ISNULL(LTRIM(RTRIM(CAST(numCvvNo AS nvarchar(16)))),'') AS numCvvNo
-  FROM dbo.dpaTokenNos WITH (NOLOCK) WHERE tokenNum = @token; RETURN;
-END
-
-SELECT TOP 0 tokenNum = '', isActive = '', validDat = '', upd = '', numCvvNo = '';";
-            await using var cmd = new SqlCommand(sql, con) { CommandTimeout = 30 };
-            cmd.Parameters.AddWithValue("@token", tokenNum);
-
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            if (await r.ReadAsync(ct))
-            {
-                return new TokenMasterRow
-                {
-                    Found = true,
-                    IsActive = r.IsDBNull(1) ? "" : r.GetString(1),
-                    ValidDat = r.IsDBNull(2) ? "" : r.GetString(2),
-                    UpdateId = r.IsDBNull(3) ? "" : r.GetString(3),
-                    NumCvvNo = r.IsDBNull(4) ? "" : r.GetString(4)
-                };
-            }
-            return new TokenMasterRow { Found = false };
-        }
-
-        private static async Task<string?> GenerateDocNoViaWcpAsync(SqlConnection con, string docType, string areaCode, CancellationToken ct)
-        {
-            const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
-            await using var cmd = new SqlCommand(genSql, con);
-            cmd.Parameters.AddWithValue("@DocType", docType ?? "TKN");
-            cmd.Parameters.AddWithValue("@AreaCode", areaCode ?? "");
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            if (await r.ReadAsync(ct))
-            {
-                try { return Convert.ToString(r["docuNumb"])?.Trim(); }
-                catch { return r.IsDBNull(0) ? null : Convert.ToString(r.GetValue(0))?.Trim(); }
-            }
-            return null;
-        }
-
-        // ======================= DTOs =======================
-        private sealed class TokenMasterRow
-        {
-            public bool   Found   { get; set; }
-            public string IsActive { get; set; } = "";
-            public string ValidDat { get; set; } = "";
-            public string UpdateId { get; set; } = "";
-            public string? NumCvvNo { get; set; }
-        }
+        // curr == Y but the LY update could not grab – treat as NotY to keep logic simple
+        return new UpdateOutcome("NotY", curr);
     }
 
-    // ======================= Request/Response Models =======================
-
-    public sealed class InitRequest
+    private static async Task InsertDetailAsync(SqlConnection con, SqlTransaction tx,
+        string docNum, string token, string tokenVld, string exprFlag, TokenCommercials sp,
+        string loginId, CancellationToken ct, string? toknStat = null)
     {
-        [Required, StringLength(16)] public string LoginId  { get; set; } = default!;
-        [Required, StringLength(1)]  public string UserType { get; set; } = default!; // C/R/I/...
-        [StringLength(8)]            public string? AreaCode { get; set; }
-        public bool IsAdmin { get; set; }
-        public bool MobilApp { get; set; }
+        var sql = $@"
+INSERT INTO {TblDetail}
+(docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp, tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag, createId, createDt)
+VALUES (@D, @T, @V, @E, @S, @B, @TV, @HR, @EV, @PC, @INF, 'A', @L, GETDATE());";
+
+        await using var cmd = new SqlCommand(sql, con, tx);
+        cmd.Parameters.AddWithValue("@D", docNum);
+        cmd.Parameters.AddWithValue("@T", token);
+        cmd.Parameters.AddWithValue("@V", tokenVld);
+        cmd.Parameters.AddWithValue("@E", string.IsNullOrWhiteSpace(exprFlag) ? "N" : exprFlag);
+        cmd.Parameters.AddWithValue("@S", (object?)toknStat ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@B", sp.BcTknTyp ?? "");
+        cmd.Parameters.AddWithValue("@TV", sp.TokenValue);
+        cmd.Parameters.AddWithValue("@HR", sp.HandlingRate);
+        cmd.Parameters.AddWithValue("@EV", sp.TokenEndValue);
+        cmd.Parameters.AddWithValue("@PC", sp.ProdCode);
+        cmd.Parameters.AddWithValue("@INF", "INF00000"); // matches JSP default
+        cmd.Parameters.AddWithValue("@L", loginId);
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    public sealed class InitResponse
+    // =========================================================================
+    // DTOs
+    // =========================================================================
+    public sealed class PageInitResponse
     {
-        public string FormName { get; set; } = "TokenRecd";
-        public string RandNumb { get; set; } = "";
-        public string AreaCode { get; set; } = "";
-        public bool   Admin { get; set; }
-        public string ReadButtonText { get; set; } = "";
-        public bool   ReadButtonDisabled { get; set; }
-        public decimal TokTdsRt { get; set; } // dbo.dpfTokTdsRt(...)
-        public string  AppRtlTy { get; set; } = "";
-        public string  Placeholder { get; set; } = "";
-        public string  DpTknIns { get; set; } = "N";
+        public string RandId { get; set; } = "";
+        public decimal TdsRate { get; set; }
+        public string AppRetailType { get; set; } = "";
     }
 
-    public sealed class TokenInfoFlatRequest
+    public sealed class ValidateTokenRequest
     {
         [Required, StringLength(20)] public string TokenNum  { get; set; } = default!;
         [Required, StringLength(8)]  public string AreaCode  { get; set; } = default!;
         [Required, StringLength(12)] public string CustCode  { get; set; } = default!;
         [Required, StringLength(16)] public string LoginId   { get; set; } = default!;
-        [StringLength(16)]           public string? RandNumb { get; set; }
+        [StringLength(6)]            public string? Pin      { get; set; } // CVV/PIN if any
     }
 
-    public sealed class TokenInfoFlatResponse
+    public sealed class ValidateTokenResponse
     {
-        public bool   Success { get; set; }
+        public string Status  { get; set; } = "";
         public string Message { get; set; } = "";
-        // Exactly 17 fields in the JSP order (see comment above).
-        public string[] Fields { get; set; } = Array.Empty<string>();
+
+        public string TokenNum   { get; set; } = "";
+        public string TokenIdn   { get; set; } = "";
+        public string IsActive   { get; set; } = "";
+        public string ValidUntil { get; set; } = "";
+        public string ScannedBy  { get; set; } = "";
+
+        public string BcTknTyp { get; set; } = "";
+        public int    ProductCode { get; set; }
+
+        public decimal TokenValue           { get; set; }
+        public decimal HandlingRate         { get; set; }
+        public decimal ScannerDeductionRate { get; set; }
+        public decimal EndValue             { get; set; }
+        public decimal DisplayValue         { get; set; }
+        public decimal AmountToPay          { get; set; }
+
+        public bool RequiresPin { get; set; }
+        public bool PinOk       { get; set; }
+
+        public MultiScanInfo MultiScan { get; set; } = new();
     }
 
-    public sealed class SubmitRequest
+    public sealed class SubmitTokensRequest
     {
-        // From JSP finlSubmitAjx():
-        // @__02 tokenNmL (comma-separated), @__03 docuNumb, @__04 areaCode,
-        // @__05 custCode, @__06 loginId, @__08 randNumb, @__09 userType
-        [Required]                   public string TokenNmL  { get; set; } = default!;
-        [StringLength(64)]           public string? DocuNumb { get; set; }
-        [Required, StringLength(8)]  public string AreaCode  { get; set; } = default!;
-        [Required, StringLength(12)] public string CustCode  { get; set; } = default!;
-        [Required, StringLength(16)] public string LoginId   { get; set; } = default!;
-        [StringLength(16)]           public string? RandNumb { get; set; }
-        [StringLength(1)]            public string? UserType { get; set; } // C/R/I/Retailer...
-        [StringLength(16)]           public string? InflCode { get; set; } = "INF00000";
-        [StringLength(40)]           public string? InflName { get; set; } = "Anuhit";
-        [StringLength(12)]           public string? MobileNo { get; set; } = "9798000000";
+        [Required, StringLength(8)]  public string AreaCode { get; set; } = default!;
+        [Required, StringLength(12)] public string CustCode { get; set; } = default!;
+        [Required, StringLength(16)] public string LoginId  { get; set; } = default!;
+        [Required, StringLength(1)]  public string UserType { get; set; } = "C"; // C/R/I etc
+
+        public string? RandId    { get; set; }  // from init
+        public string? DocuNumb  { get; set; }  // optional override
+
+        [Required] public List<SubmitTokenItem> Tokens { get; set; } = new();
     }
 
-    public sealed class SimpleItemResult
+    public sealed class SubmitTokenItem
     {
-        public string TokenNum { get; set; } = "";
-        public string Status   { get; set; } = ""; // Updated / AlreadyZ / NotY / NotFound
-        public string? CurrentIsActive { get; set; }
+        [Required, StringLength(20)] public string TokenNum { get; set; } = default!;
+        [StringLength(6)] public string? Pin { get; set; }
     }
 
-    public sealed class SubmitResponse
+    public sealed class SubmitTokensResponse
     {
         public string DocuNumb { get; set; } = "";
-        public int Right { get; set; }
-        public int Already { get; set; }
+
+        public int RightCount { get; set; }
+        public int AlreadyScanned { get; set; }
         public int Expired { get; set; }
         public int Invalid { get; set; }
-        public decimal BasTknAm { get; set; }
-        public decimal HandAmnt { get; set; }
-        public decimal ScnDedAm { get; set; }
-        public decimal PayblAmt { get; set; }
-        // Visibility for the EXACT LY_dpmTokenNos block:
-        public int LyUpdated { get; set; }
-        public int LyAlreadyZ { get; set; }
-        public int LyNotY { get; set; }
-        public int LyNotFound { get; set; }
-        public List<SimpleItemResult> LyResults { get; set; } = new();
+
+        public decimal BaseAmount { get; set; }
+        public decimal HandlingAmount { get; set; }
+        public decimal PayableAmount { get; set; }
+        public decimal TdsRate { get; set; }
+        public string AppRetailType { get; set; } = "";
+
         public string Message { get; set; } = "";
+        public List<SubmitItemResult> Details { get; set; } = new();
+    }
+
+    public sealed record SubmitItemResult
+    {
+        public string TokenNum { get; init; } = "";
+        public string Status   { get; init; } = ""; // OK / AlreadyScanned / Expired / Invalid / NotFound / AreaMismatch / PinRequired / PinMismatch
+        public string? Message { get; init; }
+        public string? CurrentIsActive { get; init; }
+    }
+
+    public sealed class MultiScanInfo
+    {
+        public string IsActive { get; set; } = ""; // '' | Y | Z
+        public int    Count    { get; set; }
+        public int    Allowed  { get; set; }
+    }
+
+    private readonly struct UpdateOutcome
+    {
+        public UpdateOutcome(string status, string? curr) { Status = status; CurrentIsActive = curr ?? ""; }
+        public string Status { get; }
+        public string CurrentIsActive { get; }
+        public void Deconstruct(out string status, out string curr) { status = Status; curr = CurrentIsActive; }
+    }
+
+    private sealed class TokenCommercials
+    {
+        public string BcTknTyp { get; set; } = "";
+        public decimal TokenValue { get; set; }
+        public decimal HandlingRate { get; set; }
+        public decimal ScannerDeductionRate { get; set; }
+        public decimal TokenEndValue { get; set; }
+        public decimal DisplayValue { get; set; }
+        public int ProdCode { get; set; }
+        public string UpdateId { get; set; } = "";
+        public string DbActSts { get; set; } = "";
+        public string ExprFlag { get; set; } = "N";
+    }
+
+    private sealed class MasterRow
+    {
+        public bool   Found    { get; set; }
+        public string? IsActive { get; set; }
+        public string? UpdateId { get; set; }
+        public string? ValidDt  { get; set; }
+        public string? NumCvvNo { get; set; }
+
+        public static MasterRow NotFound => new() { Found = false };
     }
 }
