@@ -1,5 +1,359 @@
-✅ Quick Fix 1 — Force HF to avoid Xet bridge
+pip install truststore
 
-This keeps downloads on the regular Hugging Face CDN (which usually validates fine).
 
-Add these lines at the very top of your script (before any HF/transformers import):
+
+pip install "huggingface_hub[hf_xet]"
+
+
+
+# on a machine with access
+pip install huggingface_hub
+huggingface-cli download t5-small --local-dir "C:\models\t5-small"
+
+
+
+# text2sql_train_and_run_with_progress.py
+# ---------------------------------------------------------
+# Train your OWN Text->SQL model automatically from your DB schema,
+# then run natural-language questions directly against your database.
+# Training happens only if the model does not exist.
+# Shows progress in console.
+# ---------------------------------------------------------
+
+# ==== Network & TLS hardening for corporate environments (MUST be at very top) ====
+import os
+
+# Prefer Windows system trust store (includes your corporate root CAs).
+# pip install truststore
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    # If truststore isn't available, we continue; you can still use a custom PEM below.
+    pass
+
+# Avoid the Hugging Face Xet bridge endpoint (cas-bridge.xethub.hf.co)
+# which is often blocked by SSL-inspecting proxies.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+# Silence symlink warnings on Windows (harmless).
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+# If you must use a custom corporate CA bundle, uncomment and point these:
+# os.environ["REQUESTS_CA_BUNDLE"] = r"C:\certs\corp_bundle.pem"
+# os.environ["SSL_CERT_FILE"] = r"C:\certs\corp_bundle.pem"
+
+# ================================================================================
+import re
+import ssl
+import random
+import time
+from typing import List, Tuple, Any, Optional
+from tqdm import tqdm
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+from datasets import Dataset, DatasetDict
+from transformers import (
+    T5Tokenizer, T5ForConditionalGeneration,
+    Trainer, TrainingArguments, DataCollatorForSeq2Seq
+)
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+CONNECTION_STRING = (
+    "mssql+pyodbc://birlawhite:M%40nsv1530@10.4.64.15/bwlive"
+    "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
+)
+
+# Where to save/read the fine-tuned model
+OUTPUT_DIR = r"./text2sql_local_model"
+
+# Base model source:
+# - If BASE_MODEL_PATH is set to a local folder, the script never tries internet.
+# - Otherwise it will download "t5-small" using the TLS-safe settings above.
+BASE_MODEL_NAME = "t5-small"
+BASE_MODEL_PATH: Optional[str] = None  # e.g., r"C:\models\t5-small" for fully offline use
+
+# Training size knobs (keep conservative while iterating; scale up later)
+PAIRS_PER_TABLE = 50     # was 300; keep lighter at first
+NUM_EPOCHS = 1           # iterate quickly; bump after pipeline is stable
+TRAIN_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 8
+LEARNING_RATE = 2e-4
+MAX_INPUT_LEN = 128
+MAX_TARGET_LEN = 128
+ALLOW_ONLY_SELECT = True
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def make_engine() -> Engine:
+    return create_engine(CONNECTION_STRING, pool_pre_ping=True)
+
+def fetch_schema(engine: Engine) -> pd.DataFrame:
+    q = text("""
+        SELECT TABLE_SCHEMA as schema_name,
+               TABLE_NAME as table_name,
+               COLUMN_NAME as column_name,
+               DATA_TYPE as data_type,
+               IS_NULLABLE as is_nullable
+        FROM INFORMATION_SCHEMA.COLUMNS
+        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+    """)
+    return pd.read_sql(q, engine)
+
+def list_tables(schema_df: pd.DataFrame) -> List[Tuple[str, str]]:
+    tables = schema_df[['schema_name','table_name']].drop_duplicates()
+    return list(tables.itertuples(index=False, name=None))
+
+def columns_for_table(schema_df: pd.DataFrame, schema_name: str, table_name: str) -> pd.DataFrame:
+    return schema_df[(schema_df['schema_name']==schema_name) & (schema_df['table_name']==table_name)]
+
+def sql_qualified(schema_name: str, table_name: str) -> str:
+    return f"[{schema_name}].[{table_name}]"
+
+def sample_values(engine: Engine, schema_name: str, table_name: str, col_name: str, limit: int = 5) -> List[Any]:
+    try:
+        q = text(f"SELECT DISTINCT TOP {limit} [{col_name}] AS v FROM {sql_qualified(schema_name, table_name)} WHERE [{col_name}] IS NOT NULL")
+        df = pd.read_sql(q, engine)
+        return df["v"].dropna().tolist()
+    except Exception:
+        return []
+
+def is_numeric_type(dtype: str) -> bool:
+    return dtype.lower() in {"int", "bigint", "smallint", "tinyint", "float", "real", "decimal", "numeric", "money", "smallmoney"}
+
+def is_date_type(dtype: str) -> bool:
+    return any(k in dtype.lower() for k in ["date", "time", "datetime", "smalldatetime", "datetime2", "datetimeoffset"])
+
+def build_schema_text(schema_df: pd.DataFrame) -> str:
+    parts = []
+    for (s, t), g in schema_df.groupby(["schema_name", "table_name"]):
+        cols = ", ".join([f"{r['column_name']}:{r['data_type']}" for _, r in g.iterrows()])
+        parts.append(f"{s}.{t}({cols})")
+    return " | ".join(parts)
+
+# -----------------------------
+# Synthetic training pairs
+# -----------------------------
+def question_sql_pairs_for_table(
+    engine: Engine, schema_df: pd.DataFrame,
+    schema_name: str, table_name: str, per_table: int
+) -> List[Tuple[str, str]]:
+
+    col_df = columns_for_table(schema_df, schema_name, table_name)
+    if col_df.empty:
+        return []
+
+    pairs: List[Tuple[str, str]] = []
+    qname = sql_qualified(schema_name, table_name)
+
+    # Basic pairs
+    pairs.append((f"show top 5 rows from {table_name}", f"SELECT TOP 5 * FROM {qname};"))
+    pairs.append((f"how many rows are in {table_name}", f"SELECT COUNT(*) AS row_count FROM {qname};"))
+
+    all_cols = col_df["column_name"].tolist()
+    random.shuffle(all_cols)
+    few_cols = all_cols[:min(3, len(all_cols))]
+    if few_cols:
+        pairs.append((f"show {', '.join(few_cols)} from {table_name}", f"SELECT TOP 10 {', '.join(f'[{c}]' for c in few_cols)} FROM {qname};"))
+
+    non_numeric_cols = col_df[~col_df["data_type"].apply(is_numeric_type)]
+    # sample up to 2 non-numeric columns for equality filter examples
+    try:
+        nnc = non_numeric_cols.sample(n=min(2, len(non_numeric_cols)), replace=False) if len(non_numeric_cols) else pd.DataFrame()
+    except ValueError:
+        nnc = non_numeric_cols  # fallback (shouldn’t really happen)
+
+    for _, r in nnc.iterrows():
+        col = r["column_name"]
+        vals = sample_values(engine, schema_name, table_name, col, limit=5)
+        if vals:
+            v = random.choice(vals)
+            if is_date_type(r["data_type"]) or isinstance(v, str):
+                v2 = str(v).replace("'", "''")
+                pairs.append((f"show rows from {table_name} where {col} is {v}", f"SELECT TOP 10 * FROM {qname} WHERE [{col}] = '{v2}';"))
+            else:
+                pairs.append((f"show rows from {table_name} where {col} is {v}", f"SELECT TOP 10 * FROM {qname} WHERE [{col}] = {v};"))
+
+    num_cols = col_df[col_df["data_type"].apply(is_numeric_type)]["column_name"].tolist()
+    if num_cols:
+        c = random.choice(num_cols)
+        pairs.append((f"what is the average of {c} in {table_name}", f"SELECT AVG([{c}]) AS avg_{c} FROM {qname};"))
+        pairs.append((f"sum of {c} by top 10 rows in {table_name}", f"SELECT SUM([{c}]) AS sum_{c} FROM {qname};"))
+
+    base = pairs[:]
+    while len(pairs) < per_table and base:
+        instr, sqlq = random.choice(base)
+        n = random.choice([5, 10, 20, 50])
+        sqlq2 = re.sub(r"TOP\s+\d+", f"TOP {n}", sqlq, flags=re.IGNORECASE)
+        instr2 = re.sub(r"top\s+\d+", f"top {n}", instr, flags=re.IGNORECASE)
+        pairs.append((instr2, sqlq2))
+
+    return pairs[:per_table]
+
+def build_dataset(engine: Engine, schema_df: pd.DataFrame, per_table: int) -> DatasetDict:
+    pairs: List[Tuple[str, str]] = []
+    all_tables = list_tables(schema_df)
+    print(f"Found {len(all_tables)} tables. Generating synthetic training pairs ...")
+    for s, t in tqdm(all_tables, desc="Tables processed"):
+        t_pairs = question_sql_pairs_for_table(engine, schema_df, s, t, per_table)
+        pairs.extend(t_pairs)
+
+    random.shuffle(pairs)
+    n = len(pairs)
+    n_train = int(n * 0.85)
+    n_val = int(n * 0.10)
+    train_pairs = pairs[:n_train]
+    val_pairs = pairs[n_train:n_train+n_val]
+    test_pairs = pairs[n_train+n_val:]
+
+    def to_ds(items):
+        return Dataset.from_dict({
+            "question": [q for q, _ in items],
+            "sql": [s for _, s in items]
+        })
+
+    return DatasetDict({
+        "train": to_ds(train_pairs),
+        "validation": to_ds(val_pairs),
+        "test": to_ds(test_pairs)
+    })
+
+# -----------------------------
+# Tokenization & Training
+# -----------------------------
+def get_tokenizer_and_model():
+    """
+    Loads base model either from local path (BASE_MODEL_PATH) or from HF hub (BASE_MODEL_NAME).
+    The TLS/SSL settings at top should handle corp proxies. If your environment is fully offline,
+    set BASE_MODEL_PATH to a local folder (huggingface-cli download t5-small --local-dir <path>).
+    """
+    model_id = BASE_MODEL_PATH if BASE_MODEL_PATH else BASE_MODEL_NAME
+    print(f"Loading base model from: {model_id}")
+    tokenizer = T5Tokenizer.from_pretrained(
+        model_id,
+        local_files_only=bool(BASE_MODEL_PATH)
+    )
+    model = T5ForConditionalGeneration.from_pretrained(
+        model_id,
+        local_files_only=bool(BASE_MODEL_PATH)
+    )
+    return tokenizer, model
+
+def preprocess_function(examples, tokenizer):
+    prefix = "translate English to SQL: "
+    inputs = [prefix + q for q in examples["question"]]
+    model_inputs = tokenizer(inputs, max_length=MAX_INPUT_LEN, truncation=True, padding="max_length")
+    # Newer tokenizers don’t need as_target_tokenizer; using the current API:
+    labels = tokenizer(examples["sql"], max_length=MAX_TARGET_LEN, truncation=True, padding="max_length")
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+def train_model(tokenizer, model, dataset: DatasetDict):
+    tokenized = dataset.map(lambda batch: preprocess_function(batch, tokenizer), batched=True, remove_columns=dataset["train"].column_names)
+    collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+    args = TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_strategy="steps",
+        logging_steps=50,
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=TRAIN_BATCH_SIZE,
+        per_device_eval_batch_size=EVAL_BATCH_SIZE,
+        num_train_epochs=NUM_EPOCHS,
+        weight_decay=0.01,
+        report_to=[],
+    )
+    trainer = Trainer(model=model, args=args, train_dataset=tokenized["train"], eval_dataset=tokenized["validation"], data_collator=collator, tokenizer=tokenizer)
+    trainer.train()
+    trainer.save_model(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"\nModel saved to: {OUTPUT_DIR}")
+
+# -----------------------------
+# Inference
+# -----------------------------
+def load_finetuned():
+    tok = T5Tokenizer.from_pretrained(OUTPUT_DIR, local_files_only=True)
+    mdl = T5ForConditionalGeneration.from_pretrained(OUTPUT_DIR, local_files_only=True)
+    return tok, mdl
+
+def nl_to_sql(question: str, tokenizer, model) -> str:
+    prefix = "translate English to SQL: "
+    inputs = tokenizer(prefix + question, return_tensors="pt", padding=True, truncation=True, max_length=MAX_INPUT_LEN)
+    outputs = model.generate(**inputs, max_length=MAX_TARGET_LEN)
+    sql_query = tokenizer.decode(outputs[0], skip_special_tokens=True).strip().rstrip(";") + ";"
+    if ALLOW_ONLY_SELECT and not re.match(r"(?is)^\s*SELECT\b", sql_query):
+        raise ValueError(f"Refusing to execute non-SELECT SQL: {sql_query}")
+    return sql_query
+
+def run_sql(engine: Engine, sql_query: str) -> pd.DataFrame:
+    if ALLOW_ONLY_SELECT and not re.match(r"(?is)^\s*SELECT\b", sql_query):
+        raise ValueError("Only SELECT queries are allowed.")
+    return pd.read_sql(text(sql_query), engine)
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    random.seed(42)
+    engine = make_engine()
+    print("Reading schema ...")
+    schema_df = fetch_schema(engine)
+    if schema_df.empty:
+        raise RuntimeError("No schema read from DB.")
+
+    schema_text = build_schema_text(schema_df)
+    print("Schema summary (truncated):", schema_text[:300])
+
+    # Train only if model folder does not exist
+    if not os.path.exists(OUTPUT_DIR):
+        print("Building dataset and training model ...")
+        dataset = build_dataset(engine, schema_df, per_table=PAIRS_PER_TABLE)
+        print(f"Training pairs: train={len(dataset['train'])}, val={len(dataset['validation'])}, test={len(dataset['test'])}")
+        tokenizer, model = get_tokenizer_and_model()
+        train_model(tokenizer, model, dataset)
+    else:
+        print("Using existing trained model.")
+        tokenizer, model = load_finetuned()
+
+    # Demo questions
+    questions = [
+        "show top 5 rows from dptDsrActvt",
+        "how many rows are in dptDsrActvt",
+        "show date, activity from dptDsrActvt",
+    ]
+    for q in questions:
+        print("\nQ:", q)
+        try:
+            sqlq = nl_to_sql(q, tokenizer, model)
+            print("SQL:", sqlq)
+            df = run_sql(engine, sqlq)
+            print(df.head(10))
+        except Exception as e:
+            print("Error:", e)
+
+    # Interactive loop
+    try:
+        while True:
+            q = input("\nAsk (or 'exit'): ").strip()
+            if q.lower() in {"exit", "quit"}:
+                break
+            try:
+                sqlq = nl_to_sql(q, tokenizer, model)
+                print("SQL:", sqlq)
+                df = run_sql(engine, sqlq)
+                print(df.head(20))
+            except Exception as e:
+                print("Error:", e)
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
