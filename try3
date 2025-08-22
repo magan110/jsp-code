@@ -1,680 +1,305 @@
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Data.SqlClient;
 
-namespace BirlaWhite.Api.Controllers
+namespace sparshWebService.Controllers
 {
+    [Route("api/[controller]")]
     [ApiController]
-    [Route("api/token-scanning")]
-    public class TokenScanningController : ControllerBase
+    public class GrcLeadController : ControllerBase
     {
-        private readonly IConfiguration _config;
-        public TokenScanningController(IConfiguration config) => _config = config;
+        private readonly DatabaseHelper _db;
+        public GrcLeadController(DatabaseHelper db) { _db = db; }
 
-        private SqlConnection GetConn() => new SqlConnection(_config.GetConnectionString("bwlive")); // <-- set this
-
-        // ---------- Models ----------
-        public record InitRequest(string LoginIdM);
-        public record InitResponse(string AreaCode, bool CustLoggedIn, double TokTdsRate, string AppRetailerType, string BatchKey, string Placeholder);
-        public record ValidateTokenRequest(string TokenNum, string AreaCode, string CustCode, string LoginIdM, string BatchKey);
-        public record ValidateTokenResponse(
-            string TokenIdn,
-            string IsActive,      // Y/Z/E/T/empty
-            string ValidUpto,     // display date
-            string ScanndBy,
-            double TokenVal,
-            double HandRate,
-            double ScnrDdRate,
-            double TokEndVal,
-            string ScnMlStt,
-            int    ScnMlCnt,
-            int    ScnMlAlw,
-            string UpdIdAct,
-            string UpdIdMlt,
-            double TokDspVal,     // display value
-            string BcTknTyp,      // B1/E1/...
-            string ExprFlag,      // Y/N
-            string NumCvvNo,      // optional pin
-            bool   AreaAllowed,
-            string Message
-        );
-
-        public record SubmitTokenItem(string TokenNum, string? NumCvvNo);
-        public record SubmitRequest(
-            string AreaCode,
-            string CustCode,
-            string LoginIdM,
-            string UserType,      // "C","R","I", etc.
-            string BatchKey,
-            List<SubmitTokenItem> Tokens
-        );
-
-        public record SubmitResponse(
-            string DocuNumb,
-            int TotalScanned,
-            int ValidCount,
-            int ExpiredCount,
-            int AlreadyScannedCount,
-            int InvalidCount,
-            double TotAmount,   // sum(tokDspVal + handRate)
-            double TdsAmount,
-            double NetPayable,
-            string Message
-        );
-
-        // ---------- Helpers ----------
-        private static bool AreaMatchesTokenType(string bcTknTyp, string areaCode)
+        // GET api/GrcLead/meta -> dynamic option lists (queried via SQL)
+        [HttpGet("meta")]
+        public IActionResult GetMeta()
         {
-            if (string.IsNullOrWhiteSpace(bcTknTyp)) return true;
-            areaCode = (areaCode ?? "").Trim().ToUpperInvariant();
+            // Queries mirror the JSP unions but are executed on DB side to avoid hardcoded arrays here
+            const string uomSql = @"select 'F2' Code, 'Feet Squre' Name
+union all select 'FT','Feet'
+union all select 'M2','Meter Squre'
+union all select 'NO','Numbers'
+union all select 'RF','Running Ft'";
 
-            // JSP rules:
-            // B1 not allowed in EXE/EXN/EXR; others allowed. If not B1, those EX* areas are not allowed.
-            var exportDomesticBlock = new HashSet<string> { "EXE", "EXN", "EXR" };
-            if (bcTknTyp == "B1")
-            {
-                if (exportDomesticBlock.Contains(areaCode)) return false;
-            }
-            else
-            {
-                if (exportDomesticBlock.Contains(areaCode)) return true; // allowed if it's not B1 for these checks? (JSP: condition was symmetric)
-            }
+            const string delSql = @"select '01-03 month' Code, '01-03 month' Name
+union all select '04-06 month','04-06 month'
+union all select '07-12 month','07-12 month'
+union all select 'over 12 month','over 12 month'";
 
-            // Export tokens E1 are only valid in EXB/EXC/EXG; other areas invalid
-            var exportAreas = new HashSet<string> { "EXB", "EXC", "EXG" };
-            if (bcTknTyp == "E1")
-            {
-                return exportAreas.Contains(areaCode);
-            }
-            else
-            {
-                // If area is an export-only area but token not export type -> invalid
-                if (exportAreas.Contains(areaCode)) return false;
-            }
+            const string prjSql = @"select 'residence / bunglow' Code, 'residence / bunglow' Name
+union all select 'religious','religious'
+union all select 'hotel','hotel'
+union all select 'hospital','hospital'
+union all select 'Govt. Project','Govt. Project'
+union all select 'Commercial Project','Commercial Project'
+union all select 'high rise','high rise'
+union all select 'land scaping','land scaping'
+union all select 'educational institute','educational institute'
+union all select 'Others','Others'";
 
-            return true;
+            const string cntSql = @"select 'Owner' Code, 'Owner' Name
+union all select 'builder','builder'
+union all select 'contractor','contractor'
+union all select 'architect','architect'
+union all select 'construction company','construction company'";
+
+            const string siteTypeSql = @"select 'O' Code, 'Onsite' Name
+union all select 'F','Offsite'";
+
+            const string procTypeSql = @"select 'A' Code, 'Add' Name
+union all select 'U','Update'";
+
+            var units = _db.WebSessBean(uomSql, new Dictionary<string, object>());
+            var delivery = _db.WebSessBean(delSql, new Dictionary<string, object>());
+            var projectKinds = _db.WebSessBean(prjSql, new Dictionary<string, object>());
+            var contactTypes = _db.WebSessBean(cntSql, new Dictionary<string, object>());
+            var siteTypes = _db.WebSessBean(siteTypeSql, new Dictionary<string, object>());
+            var procTypes = _db.WebSessBean(procTypeSql, new Dictionary<string, object>());
+
+            return Ok(new
+            {
+                unitsOfMeasure = units,
+                deliveryPeriods = delivery,
+                projectKinds,
+                contactPersonTypes = contactTypes,
+                siteTypes,
+                procTypes
+            });
+        }
+        
+        // GET api/GrcLead/docs?createdBy=S5558 -> list of doc numbers for the user (matches JSP when procType=U)
+        [HttpGet("docs")]
+        public IActionResult GetDocs([FromQuery] string createdBy)
+        {
+            if (string.IsNullOrWhiteSpace(createdBy)) return BadRequest("createdBy is required");
+            const string sql = @"SELECT a.docuNumb FROM bwlive.dbo.dptGrcLeadGn a WITH (NOLOCK) WHERE a.createId = @createdBy ORDER BY a.docuNumb DESC";
+            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@createdBy"] = createdBy });
+            return Ok(res);
         }
 
-        private static double CalcTds(double totAmPay, double tdsRatePct) => Math.Round(totAmPay * (tdsRatePct / 100.0), 2);
-
-        private static string NewBatchKey() => Guid.NewGuid().ToString("N")[^16..]; // mimic RIGHT(NEWID(),16)
-
-        // ========== 1) INIT ==========
-        [HttpPost("init")]
-        public async Task<ActionResult<InitResponse>> Init(InitRequest req)
+        // GET api/GrcLead/areas -> dynamic areas from retailer data
+        [HttpGet("areas")]
+        public IActionResult GetAreas()
         {
-            // In JSP: area from log.getArCode(), tds via dpfTokTdsRt, retailer type via appRtlty
-            // Here we accept LoginIdM and fetch both.
-            using var con = GetConn();
-            await con.OpenAsync();
-
-            string areaCode = await GetAreaForUser(con, req.LoginIdM) ?? "NA";
-            (double tdsRate, string appRtlTy) = await GetTdsAndRetailType(con, req.LoginIdM);
-
-            // Placeholder text change like JSP (mobile vs desktop) — here always generic
-            string plc = "Click here Token Code";
-
-            var resp = new InitResponse(
-                AreaCode: areaCode,
-                CustLoggedIn: true,         // you can set this based on your auth/userType if needed
-                TokTdsRate: tdsRate,
-                AppRetailerType: appRtlTy ?? "",
-                BatchKey: NewBatchKey(),
-                Placeholder: plc
-            );
-            return Ok(resp);
+            const string sql = @"SELECT DISTINCT areaCode AS Code, areaCode AS Name FROM bwlive.dbo.rtmRetailer WITH (NOLOCK) WHERE areaCode IS NOT NULL ORDER BY areaCode";
+            var res = _db.WebSessBean(sql, new Dictionary<string, object>());
+            return Ok(res);
         }
 
-        private static async Task<string?> GetAreaForUser(SqlConnection con, string loginIdM)
+        // GET api/GrcLead/districts?areaCode=... -> dynamic districts inferred from existing leads (can be pointed to a master later)
+        [HttpGet("districts")]
+        public IActionResult GetDistricts([FromQuery] string areaCode)
         {
-            // Replace with your actual user area lookup if you don’t have it in token context
-            const string sql = @"select top 1 areaCode from wcvAllCustm with(nolock) where appRtlcd = @loginIdM";
-            using var cmd = new SqlCommand(sql, con);
-            cmd.Parameters.AddWithValue("@loginIdM", loginIdM);
-            var o = await cmd.ExecuteScalarAsync();
-            return o as string;
+            if (string.IsNullOrWhiteSpace(areaCode)) return BadRequest("areaCode is required");
+            const string sql = @"SELECT DISTINCT district AS Name, district AS Code
+                                   FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK)
+                                  WHERE areaCode = @areaCode AND ISNULL(district,'') <> ''
+                               ORDER BY district";
+            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@areaCode"] = areaCode });
+            return Ok(res);
         }
 
-        private static async Task<(double tdsRate, string appRtlTy)> GetTdsAndRetailType(SqlConnection con, string loginIdM)
+        // GET api/GrcLead/pincodes?district=... -> dynamic pincode list inferred from existing leads
+        [HttpGet("pincodes")]
+        public IActionResult GetPincodes([FromQuery] string district)
         {
-            // Mirrors: select dbo.dpfTokTdsRt(itxPanNo, kycVerFl), appRtlty from wcvAllCustm where appRtlcd = @loginIdM
-            const string sql = @"
-select cast(dbo.dpfTokTdsRt(itxPanNo, kycVerFl) as float) as TdsRate, appRtlty
-from wcvAllCustm with(nolock)
-where appRtlcd = @loginIdM";
-            using var cmd = new SqlCommand(sql, con);
-            cmd.Parameters.AddWithValue("@loginIdM", loginIdM);
-            using var r = await cmd.ExecuteReaderAsync();
-            if (await r.ReadAsync())
+            if (string.IsNullOrWhiteSpace(district)) return BadRequest("district is required");
+            const string sql = @"SELECT DISTINCT sitePinC AS Code, sitePinC AS Name
+                                   FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK)
+                                  WHERE district = @district AND ISNULL(sitePinC,'') <> ''
+                               ORDER BY sitePinC";
+            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@district"] = district });
+            return Ok(res);
+        }
+
+        // GET api/GrcLead/{docuNumb} -> fetch a lead (subset of fields shown in JSP)
+        [HttpGet("{docuNumb}")]
+        public IActionResult GetLead(string docuNumb, [FromQuery] string siteType = "F")
+        {
+            if (string.IsNullOrWhiteSpace(docuNumb)) return BadRequest("docuNumb is required");
+
+            string sql = siteType == "O"
+                ? @"SELECT docuNumb, CONVERT(varchar(10), leadDate, 111) AS leadDate, leadQnty, leadMsrs, siteName, mobileNo, siteAddr, siteRmrk, stMobNum, cntPrsnt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, stateNam, cityName, delvrPrd, prjctKnd, attchMnt
+                      FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK) WHERE docuNumb = @docuNumb"
+                : @"SELECT docuNumb, CONVERT(varchar(10), leadDate, 111) AS leadDate, leadQnty, leadMsrs, siteName, mobileNo, siteAddr, siteRmrk, stMobNum, cntPrsnt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, areaCode, sitePinC, delvrPrd, prjctKnd, attchMnt
+                      FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK) WHERE docuNumb = @docuNumb";
+
+            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@docuNumb"] = docuNumb });
+            if (res.Count == 0) return NotFound("Lead not found");
+            return Ok(res[0]);
+        }
+
+        // GET api/GrcLead/attachments?drawRand=... -> returns base64 images like JSP image listing
+        [HttpGet("attachments")]
+        public IActionResult GetAttachments([FromQuery] string drawRand)
+        {
+            if (string.IsNullOrWhiteSpace(drawRand)) return BadRequest("drawRand is required");
+            // In JSP, images are fetched from imageData.dbo.cotDocAttch where docuNumb = drawRand
+            const string sql = @"SELECT attachFl FROM imageData.dbo.cotDocAttch WITH (NOLOCK) WHERE docuNumb = @drawRand";
+            var res = _db.ImgSessBean(sql, new Dictionary<string, object> { ["@drawRand"] = drawRand });
+            // DatabaseHelper returns raw objects; assume varbinary data comes as byte[] or base64-able string
+            var images = new List<string>();
+            foreach (var row in res)
             {
-                double tds = r.IsDBNull(0) ? 0d : r.GetDouble(0);
-                string ty = r.IsDBNull(1) ? "" : r.GetString(1);
-                return (tds, ty);
-            }
-            return (0d, "");
-        }
-
-        // ========== 2) VALIDATE (AJAX) ==========
-        [HttpPost("validate")]
-        public async Task<ActionResult<ValidateTokenResponse>> ValidateToken(ValidateTokenRequest req)
-        {
-            if (string.IsNullOrWhiteSpace(req.TokenNum))
-                return BadRequest("TokenNum is required.");
-
-            using var con = GetConn();
-            await con.OpenAsync();
-
-            // This block mirrors: dppToknProc + (multi-scan state) + optional numCvvNo + compose response
-            // Stored proc 'dppToknProc' signature (from JSP use): exec bwlive.dbo.dppToknProc 'jav01', @tokenNum, 0
-            // Returns: bcTknTyp, tokenVal, handRate, scnrDdRt, tokEndVl, prodCode, updateId, dbActSts, exprFlag
-            string bcTknTyp = "";
-            double tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
-            int prodCode = 0;
-            string updIdAct = "", dbActSts = "", exprFlag = "";
-
-            using (var cmd = new SqlCommand("bwlive.dbo.dppToknProc", con))
-            {
-                cmd.CommandType = CommandType.StoredProcedure;
-                cmd.Parameters.AddWithValue("@p1", "jav01");
-                cmd.Parameters.AddWithValue("@p2", req.TokenNum);
-                cmd.Parameters.AddWithValue("@p3", 0);
-                using var rd = await cmd.ExecuteReaderAsync();
-                if (await rd.ReadAsync())
+                if (row.TryGetValue("attachFl", out var blob) && blob != null)
                 {
-                    bcTknTyp = rd.IsDBNull(0) ? "" : rd.GetString(0);
-                    tokenVal = SafeD(rd, 1);
-                    handRate = SafeD(rd, 2);
-                    scnrDdRt = SafeD(rd, 3);
-                    tokEndVl = SafeD(rd, 4);
-                    prodCode = rd.IsDBNull(5) ? 0 : rd.GetInt32(5);
-                    updIdAct = rd.IsDBNull(6) ? "" : rd.GetString(6);
-                    dbActSts = rd.IsDBNull(7) ? "" : rd.GetString(7);
-                    exprFlag = rd.IsDBNull(8) ? "" : rd.GetString(8);
+                    if (blob is byte[] b) images.Add(Convert.ToBase64String(b));
+                    else
+                    {
+                        var s = blob.ToString();
+                        if (!string.IsNullOrEmpty(s)) images.Add(s);
+                    }
                 }
             }
-
-            // Multi-scan status (dpmToknMlSc)
-            string scnMlStt = "";
-            int scnMlCnt = 0, scnMlAlw = 0;
-            string updIdMlt = "";
-
-            // Only if not expired
-            if (!string.Equals(exprFlag, "Y", StringComparison.OrdinalIgnoreCase))
-            {
-                const string sqlMl = @"select b.isActive, b.scnMlCnt, b.scnMlAlw, isNull(b.updateId,'')
-                                       from dpmToknMlSc b with(nolock)
-                                       where b.tokenNum = @token and b.isActive = 'Y' and b.scnMlCnt < b.scnMlAlw";
-                using var cmdMl = new SqlCommand(sqlMl, con);
-                cmdMl.Parameters.AddWithValue("@token", req.TokenNum);
-                using var rd = await cmdMl.ExecuteReaderAsync();
-                if (await rd.ReadAsync())
-                {
-                    scnMlStt = rd.IsDBNull(0) ? "" : rd.GetString(0);
-                    scnMlCnt = rd.IsDBNull(1) ? 0 : rd.GetInt32(1);
-                    scnMlAlw = rd.IsDBNull(2) ? 0 : rd.GetInt32(2);
-                    updIdMlt = rd.IsDBNull(3) ? "" : rd.GetString(3);
-                }
-            }
-
-            // Token master state (isActive etc.) and pin if any
-            string tokenIdn = "";
-            string isActive = ""; // Y/Z/E/T/...
-            string validUpto = "";
-            string scanndBy = "";
-            string numCvvNo = "";
-            double tokDspVal = tokEndVl; // JSP uses tokDspVl + handRate => we keep tokEndVl separate and add client-side as they did
-
-            // NOTE: these fields come from your MK_02004 in JSP. Here’s a practical way to fetch them:
-            const string sqlMaster = @"
-select 
-  cast(tokenIdn as varchar(20)) as tokenIdn,
-  isActive,
-  upper(convert(char(11), dateadd(dd, validDay, printgDt), 100)) as validDat,
-  isNull(updateId,'') as scanndBy,
-  isNull(numCvvNo,'') as numCvvNo
-from dpmTokenNos with(nolock)
-where tokenNum = @token";
-            using (var cmd = new SqlCommand(sqlMaster, con))
-            {
-                cmd.Parameters.AddWithValue("@token", req.TokenNum);
-                using var rd = await cmd.ExecuteReaderAsync();
-                if (await rd.ReadAsync())
-                {
-                    tokenIdn = rd.IsDBNull(0) ? "" : rd.GetString(0);
-                    isActive = rd.IsDBNull(1) ? "" : rd.GetString(1);
-                    validUpto = rd.IsDBNull(2) ? "" : rd.GetString(2);
-                    scanndBy = rd.IsDBNull(3) ? "" : rd.GetString(3);
-                    numCvvNo = rd.IsDBNull(4) ? "" : rd.GetString(4);
-                }
-            }
-
-            // Area rule check (like JSP areaCheckLoc)
-            bool areaOk = AreaMatchesTokenType(bcTknTyp, req.AreaCode);
-
-            string msg = isActive switch
-            {
-                "Y" when !string.Equals(exprFlag, "Y", StringComparison.OrdinalIgnoreCase)
-                    => $"{tokenIdn} valid upto {validUpto}, Value To Pay {tokDspVal}, Handling {handRate} OK",
-                "Z" => $"{tokenIdn} Already scanned earlier {scanndBy}",
-                "E" => $"{tokenIdn} Validity Expired {validUpto}, NOT Ok",
-                "T" => $"{tokenIdn} NOT OK and it is in theft category",
-                _   => $"{tokenIdn} NOT Checked, can be validated after submit"
-            };
-
-            if (!areaOk)
-            {
-                msg = "This token type is invalid for this area";
-            }
-
-            var resp = new ValidateTokenResponse(
-                TokenIdn: tokenIdn,
-                IsActive: isActive,
-                ValidUpto: validUpto,
-                ScanndBy: scanndBy,
-                TokenVal: tokenVal,
-                HandRate: handRate,
-                ScnrDdRate: scnrDdRt,
-                TokEndVal: tokEndVl,
-                ScnMlStt: scnMlStt,
-                ScnMlCnt: scnMlCnt,
-                ScnMlAlw: scnMlAlw,
-                UpdIdAct: updIdAct,
-                UpdIdMlt: updIdMlt,
-                TokDspVal: tokDspVal,
-                BcTknTyp: bcTknTyp,
-                ExprFlag: exprFlag,
-                NumCvvNo: numCvvNo,
-                AreaAllowed: areaOk,
-                Message: msg
-            );
-
-            return Ok(resp);
+            return Ok(new { count = images.Count, images });
         }
 
-        private static double SafeD(SqlDataReader rd, int ordinal) => rd.IsDBNull(ordinal) ? 0d : Convert.ToDouble(rd.GetValue(ordinal));
-
-        // ========== 3) SUBMIT (Transactional Save) ==========
-        [HttpPost("submit")]
-        public async Task<ActionResult<SubmitResponse>> Submit(SubmitRequest req)
+        // GET api/GrcLead/pincode-info?pincode=... -> infer district/areaCode for a pincode (used by pinCodeNoGet in JSP)
+        [HttpGet("pincode-info")]
+        public IActionResult GetPincodeInfo([FromQuery] string pincode)
         {
-            if (req.Tokens is null || req.Tokens.Count == 0)
-                return BadRequest("No tokens provided.");
+            if (string.IsNullOrWhiteSpace(pincode)) return BadRequest("pincode is required");
+            const string sql = @"SELECT TOP 1 district, areaCode, stateNam, cityName
+                                   FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK)
+                                  WHERE sitePinC = @pincode AND (ISNULL(district,'')<>'' OR ISNULL(areaCode,'')<>'')
+                               ORDER BY leadDate DESC";
+            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@pincode"] = pincode });
+            if (res.Count == 0) return NotFound("No mapping found for pincode");
+            return Ok(res[0]);
+        }
 
-            using var con = GetConn();
-            await con.OpenAsync();
-            using var tx = await con.BeginTransactionAsync();
+        // POST api/GrcLead/save -> Add or Update (ProcType: A/U). Uses INSERT/UPDATE + trailing SELECT to keep within select API.
+        [HttpPost("save")]
+        public IActionResult SaveLead([FromBody] GrcLeadRequest req)
+        {
+            if (req == null) return BadRequest("Body is required");
+            if (string.IsNullOrWhiteSpace(req.ProcType)) return BadRequest("ProcType is required");
+            // Match JSP validations: Date, Qty, Site Name, Mobile No, Address are mandatory
+            if (string.IsNullOrWhiteSpace(req.SiteName) || string.IsNullOrWhiteSpace(req.MobileNo) || string.IsNullOrWhiteSpace(req.SiteAddr))
+                return BadRequest("SiteName, MobileNo and SiteAddr are required");
+            if (string.IsNullOrWhiteSpace(req.LeadQnty))
+                return BadRequest("LeadQnty is required");
+            if (string.IsNullOrWhiteSpace(req.LeadDate))
+                return BadRequest("LeadDate is required");
+
+            var partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
+            var endpoint = "/api/GrcLead/save";
 
             try
             {
-                // Set dateformat YMD (as JSP)
-                using (var fmt = new SqlCommand("set dateformat YMD", con, (SqlTransaction)tx))
-                    await fmt.ExecuteNonQueryAsync();
-
-                // Optional idempotency: ensure this BatchKey not used (create a small table to track if you want)
-                // await EnsureIdempotencyAsync(con, (SqlTransaction)tx, req.BatchKey);
-
-                // Get area/user tds & retailer type
-                (double tdsRate, string appRtlTy) = await GetTdsAndRetailTypeTx(con, (SqlTransaction)tx, req.LoginIdM);
-
-                // Get new document number (mirror WebSessBean.getDocumentNo)
-                string docuNumb = await GetDocumentNoAsync(con, (SqlTransaction)tx, "TKN", req.AreaCode);
-
-                // (Optional) mark temp link: update dptTknTestg with docuNumb for this BatchKey if you use that table with uniqueId
-                // await BindRandNumbToDocAsync(con, (SqlTransaction)tx, req.BatchKey, docuNumb);
-
-                int rightEnt = 0, wrongEnt = 0, alreadyScn = 0, expiredCnt = 0, invalidCnt = 0;
-                double basTknAm = 0, handAmnt = 0, payblAmt = 0, scnDedAm = 0; // scnDedAm if you apply scanner deductions later
-                int prodCodeHd = 0;
-
-                // Header stub (insert then update, like JSP)
-                await InsertHeaderStubAsync(con, (SqlTransaction)tx, docuNumb, DateTime.UtcNow, req.CustCode, "CRN");
-
-                // Loop tokens
-                foreach (var item in req.Tokens)
+                // Normalize date
+                DateTime? leadDate = null;
+                if (!string.IsNullOrWhiteSpace(req.LeadDate))
                 {
-                    var tokenNum = (item.TokenNum ?? "").Trim();
-                    if (string.IsNullOrWhiteSpace(tokenNum)) continue;
-
-                    // Audit/test insert (dpmTknTestg)
-                    await InsertTestgAsync(con, (SqlTransaction)tx, docuNumb, tokenNum, "9798000000", "Anuhit", "INF00000", req.LoginIdM);
-
-                    // Get token economics (dppToknProc)
-                    string bcTknTyp = "";
-                    double tokenVal = 0, handRate = 0, scnrDdRt = 0, tokEndVl = 0;
-                    int prodCode = 0;
-                    string updateId = "", dbActSts = "", exprFlag = "";
-
-                    using (var cmd = new SqlCommand("bwlive.dbo.dppToknProc", con, (SqlTransaction)tx))
-                    {
-                        cmd.CommandType = CommandType.StoredProcedure;
-                        cmd.Parameters.AddWithValue("@p1", "jav01");
-                        cmd.Parameters.AddWithValue("@p2", tokenNum);
-                        cmd.Parameters.AddWithValue("@p3", 0);
-                        using var rd = await cmd.ExecuteReaderAsync();
-                        if (await rd.ReadAsync())
-                        {
-                            bcTknTyp = rd.IsDBNull(0) ? "" : rd.GetString(0);
-                            tokenVal = SafeD(rd, 1);
-                            handRate = SafeD(rd, 2);
-                            scnrDdRt = SafeD(rd, 3);
-                            tokEndVl = SafeD(rd, 4);
-                            prodCode = rd.IsDBNull(5) ? 0 : rd.GetInt32(5);
-                            updateId = rd.IsDBNull(6) ? "" : rd.GetString(6);
-                            dbActSts = rd.IsDBNull(7) ? "" : rd.GetString(7);
-                            exprFlag = rd.IsDBNull(8) ? "" : rd.GetString(8);
-                        }
-                    }
-
-                    // multi-scan (read allowed state)
-                    string scnMlStt = "";
-                    int scnMlCnt = 0, scnMlAlw = 0;
-                    string updIdMlt = "";
-
-                    if (!string.Equals(exprFlag, "Y", StringComparison.OrdinalIgnoreCase))
-                    {
-                        const string sqlMl = @"select b.isActive, b.scnMlCnt, b.scnMlAlw, isNull(b.updateId,'')
-                                               from dpmToknMlSc b with(nolock)
-                                               where b.tokenNum = @token and b.isActive = 'Y' and b.scnMlCnt < b.scnMlAlw";
-                        using var cmdMl = new SqlCommand(sqlMl, con, (SqlTransaction)tx);
-                        cmdMl.Parameters.AddWithValue("@token", tokenNum);
-                        using var rd = await cmdMl.ExecuteReaderAsync();
-                        if (await rd.ReadAsync())
-                        {
-                            scnMlStt = rd.IsDBNull(0) ? "" : rd.GetString(0);
-                            scnMlCnt = rd.IsDBNull(1) ? 0 : rd.GetInt32(1);
-                            scnMlAlw = rd.IsDBNull(2) ? 0 : rd.GetInt32(2);
-                            updIdMlt = rd.IsDBNull(3) ? "" : rd.GetString(3);
-                        }
-                    }
-
-                    // Try to mark token used in dpmTokenNos (isActive = 'Z') respecting validity window (same where as JSP)
-                    int updatedRows;
-                    {
-                        var sqlUp = @"
-update dpmTokenNos
-   set isActive = 'Z',
-       updateId = @loginIdM,
-       updateDt = getdate()
- where tokenNum = @token
-   and case when getdate() > dbo.dpfTknValDt(@bcTknTyp, @areaCode) 
-            then cast(getdate() - printgDt as smallint) else 1 end 
-       <= validDay + dbo.dpfTknValDy(@bcTknTyp, @areaCode)
-   and isActive = @isActiveNeeded";
-
-                        // if multi-scan active, allow 'Z' → 'Z' update path
-                        var isActiveNeeded = (scnMlCnt == 0) ? "Y" : "Z";
-                        using var cmdUp = new SqlCommand(sqlUp, con, (SqlTransaction)tx);
-                        cmdUp.Parameters.AddWithValue("@loginIdM", req.LoginIdM);
-                        cmdUp.Parameters.AddWithValue("@token", tokenNum);
-                        cmdUp.Parameters.AddWithValue("@bcTknTyp", (object?)bcTknTyp ?? (object)DBNull.Value);
-                        cmdUp.Parameters.AddWithValue("@areaCode", req.AreaCode);
-                        cmdUp.Parameters.AddWithValue("@isActiveNeeded", isActiveNeeded);
-                        updatedRows = await cmdUp.ExecuteNonQueryAsync();
-                    }
-
-                    // If multi-scan row exists, increment its counter
-                    if (!string.IsNullOrEmpty(scnMlStt))
-                    {
-                        scnMlCnt++;
-                        scnMlStt = (scnMlCnt == scnMlAlw) ? "Z" : "Y";
-
-                        const string upMl = @"update dpmToknMlSc
-                                              set isActive = @stt, scnMlCnt = @cnt, updateId = @uid, updateDt = getdate()
-                                              where tokenNum = @token and isActive='Y'";
-                        using var cmd = new SqlCommand(upMl, con, (SqlTransaction)tx);
-                        cmd.Parameters.AddWithValue("@stt", scnMlStt);
-                        cmd.Parameters.AddWithValue("@cnt", scnMlCnt);
-                        cmd.Parameters.AddWithValue("@uid", req.LoginIdM);
-                        cmd.Parameters.AddWithValue("@token", tokenNum);
-                        var af = await cmd.ExecuteNonQueryAsync();
-                        if (af <= 0)
-                            throw new InvalidOperationException($"dpmToknMlSc not updated for token {tokenNum}");
-                    }
-
-                    string tokenVld;
-                    if (string.Equals(exprFlag, "Y", StringComparison.OrdinalIgnoreCase))
-                    {
-                        tokenVld = "N";
-                        expiredCnt++;
-                    }
-                    else if (updatedRows > 0 || !string.IsNullOrEmpty(scnMlStt))
-                    {
-                        if (prodCode <= 0) throw new InvalidOperationException($"Rate/Product not configured for token {tokenNum}");
-
-                        // Valid
-                        tokenVld = "Y";
-                        rightEnt++;
-                        basTknAm += tokenVal;
-                        handAmnt += handRate;
-                        payblAmt += tokEndVl;
-                        prodCodeHd = prodCode;
-                    }
-                    else
-                    {
-                        // Check if present as already scanned/blocked
-                        const string chk = @"
-select tokenNum
-from dpmTokenNos with(nolock) where tokenNum=@t and isActive in ('Z','X','Y')
-union all
-select tokenNum
-from dpaTokenNos with(nolock) where tokenNum=@t and isActive in ('Z','X','Y')";
-                        using var cmd = new SqlCommand(chk, con, (SqlTransaction)tx);
-                        cmd.Parameters.AddWithValue("@t", tokenNum);
-                        var o = await cmd.ExecuteScalarAsync();
-                        if (o == null)
-                        {
-                            tokenVld = "N";
-                            wrongEnt++;
-                            invalidCnt++;
-                        }
-                        else
-                        {
-                            tokenVld = "Z";
-                            alreadyScn++;
-                        }
-                    }
-
-                    // Detail insert (dptTokenRecDtl)
-                    const string insDtl = @"
-insert into dptTokenRecDtl
-(docuNumb, tokenNum, tokenVld, exprFlag, toknStat, bcTknTyp, tokenVal, handRate, tokEndVl, prodCode, inflCode, statFlag, createId, createDt)
-values
-(@doc, @tok, @vld, @exp, @dbSts, @typ, @tVal, @hRate, @tEnd, @pCode, @infl, 'A', @uid, getdate())";
-                    using (var iCmd = new SqlCommand(insDtl, con, (SqlTransaction)tx))
-                    {
-                        iCmd.Parameters.AddWithValue("@doc", docuNumb);
-                        iCmd.Parameters.AddWithValue("@tok", tokenNum);
-                        iCmd.Parameters.AddWithValue("@vld", tokenVld);
-                        iCmd.Parameters.AddWithValue("@exp", exprFlag ?? (object)DBNull.Value);
-                        iCmd.Parameters.AddWithValue("@dbSts", dbActSts ?? (object)DBNull.Value);
-                        iCmd.Parameters.AddWithValue("@typ", bcTknTyp ?? (object)DBNull.Value);
-                        iCmd.Parameters.AddWithValue("@tVal", tokenVal);
-                        iCmd.Parameters.AddWithValue("@hRate", handRate);
-                        iCmd.Parameters.AddWithValue("@tEnd", tokEndVl);
-                        iCmd.Parameters.AddWithValue("@pCode", prodCode);
-                        iCmd.Parameters.AddWithValue("@infl", "INF00000");
-                        iCmd.Parameters.AddWithValue("@uid", req.LoginIdM);
-                        await iCmd.ExecuteNonQueryAsync();
-                    }
+                    if (DateTime.TryParse(req.LeadDate, out var d)) leadDate = d;
                 }
 
-                // Update header totals
-                await UpdateHeaderTotalsAsync(con, (SqlTransaction)tx, docuNumb, rightEnt, basTknAm, handAmnt, payblAmt, scnDedAm, prodCodeHd, req.LoginIdM);
-
-                // Compute TDS + Net
-                double totAmPay = payblAmt + handAmnt;      // JSP shows tokDspVl + handRate, while payblAmt is tokEndVl sum. If your tokEndVl already includes display logic, adjust here.
-                double tds = CalcTds(totAmPay, tdsRate);
-                double net = Math.Round(totAmPay - tds, 2);
-
-                // If payable > 0, prepare CN line (cdtCusToPay) — mirrors JSP (you may enrich as per your accounting rules)
-                if (payblAmt > 0)
+                // For Add, generate docuNumb similar to JSP (RIGHT(NEWID(),8))
+                if (req.ProcType.Equals("A", StringComparison.OrdinalIgnoreCase))
                 {
-                    string mdOfDisb = (string.Equals(req.UserType, "R", StringComparison.OrdinalIgnoreCase)) ? "01" : "04";
-                    string cnDnTyCd = "11";
-                    string naration = $"Paper Token Receipt Entry for {rightEnt} Qty";
-                    string refDocNo = (/* export? */ false) ? "NA" : (string?)null;
+                    const string genSql = "SELECT RIGHT(CONVERT(VARCHAR(36), NEWID()), 8) AS docuNumb";
+                    var gen = _db.WebSessBean(genSql, new Dictionary<string, object>());
+                    var dn = gen.Count > 0 ? gen[0]["docuNumb"]?.ToString() : null;
+                    req.DocuNumb = !string.IsNullOrWhiteSpace(dn) ? dn : Guid.NewGuid().ToString("N").Substring(24, 8);
+                }
+                if (string.IsNullOrWhiteSpace(req.DocuNumb)) return BadRequest("DocuNumb is required for update");
 
-                    await InsertCusToPayAsync(con, (SqlTransaction)tx, docuNumb, req.CustCode, "01", "CRN",
-                                              "", "", prodCodeHd, DateTime.UtcNow, DateTime.UtcNow, rightEnt, payblAmt,
-                                              scnDedAm, tds, cnDnTyCd, naration, mdOfDisb, req.LoginIdM, null, null, refDocNo);
+                // Common params
+                var p = new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = req.DocuNumb,
+                    ["@leadDate"] = (object?)leadDate ?? DBNull.Value,
+                    ["@leadQnty"] = req.LeadQnty ?? (object)DBNull.Value,
+                    ["@leadMsrs"] = req.LeadMsrs ?? (object)DBNull.Value,
+                    ["@siteName"] = req.SiteName,
+                    ["@mobileNo"] = req.MobileNo,
+                    ["@siteAddr"] = req.SiteAddr,
+                    ["@siteRmrk"] = req.SiteRmrk ?? (object)DBNull.Value,
+                    ["@stMobNum"] = req.StMobNum ?? (object)DBNull.Value,
+                    ["@cntPrsnt"] = req.CntPrsnt ?? (object)DBNull.Value,
+                    ["@adhrNumb"] = req.AdhrNumb ?? (object)DBNull.Value,
+                    ["@archtNam"] = req.ArchtNam ?? (object)DBNull.Value,
+                    ["@itxPanNo"] = req.ItxPanNo ?? (object)DBNull.Value,
+                    ["@gstnNumb"] = req.GstnNumb ?? (object)DBNull.Value,
+                    ["@emailAdd"] = req.EmailAdd ?? (object)DBNull.Value,
+                    ["@district"] = req.District ?? (object)DBNull.Value,
+                    ["@areaCode"] = req.AreaCode ?? (object)DBNull.Value,
+                    ["@sitePinC"] = req.SitePinC ?? (object)DBNull.Value,
+                    ["@stateNam"] = req.StateNam ?? (object)DBNull.Value,
+                    ["@cityName"] = req.CityName ?? (object)DBNull.Value,
+                    ["@delvrPrd"] = req.DelvrPrd ?? (object)DBNull.Value,
+                    ["@prjctKnd"] = req.PrjctKnd ?? (object)DBNull.Value,
+                    ["@attchMnt"] = req.DrawRand ?? (object)DBNull.Value,
+                    ["@createId"] = req.CreatedBy ?? (object)DBNull.Value
+                };
+
+                string sql;
+                if (req.ProcType.Equals("A", StringComparison.OrdinalIgnoreCase))
+                {
+              // Insert - include both F and O fields, unknown columns get NULL
+                    sql = @"
+INSERT INTO bwlive.dbo.dptGrcLeadGn
+  (docuNumb, leadDate, leadQnty, leadMsrs, siteName, mobileNo, siteAddr, siteRmrk, stMobNum, cntPrsnt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd,
+   district, areaCode, sitePinC, stateNam, cityName, delvrPrd, prjctKnd, attchMnt, createId)
+VALUES (@docuNumb, @leadDate, @leadQnty, @leadMsrs, @siteName, @mobileNo, @siteAddr, @siteRmrk, @stMobNum, @cntPrsnt, @adhrNumb, @archtNam, @itxPanNo, @gstnNumb, @emailAdd,
+      @district, @areaCode, @sitePinC, @stateNam, @cityName, @delvrPrd, @prjctKnd, @attchMnt, @createId);
+SELECT 'OK' AS Status, @docuNumb AS docuNumb;";
+                }
+                else
+                {
+                    // Update by docuNumb
+                    sql = @"
+UPDATE bwlive.dbo.dptGrcLeadGn SET
+  leadDate=@leadDate, leadQnty=@leadQnty, leadMsrs=@leadMsrs, siteName=@siteName, mobileNo=@mobileNo, siteAddr=@siteAddr, siteRmrk=@siteRmrk,
+  stMobNum=@stMobNum, cntPrsnt=@cntPrsnt,
+  adhrNumb=@adhrNumb, archtNam=@archtNam, itxPanNo=@itxPanNo, gstnNumb=@gstnNumb, emailAdd=@emailAdd,
+  district=@district, areaCode=@areaCode, sitePinC=@sitePinC, stateNam=@stateNam, cityName=@cityName,
+  delvrPrd=@delvrPrd, prjctKnd=@prjctKnd, attchMnt=@attchMnt
+WHERE docuNumb=@docuNumb;
+SELECT 'OK' AS Status, @docuNumb AS docuNumb;";
                 }
 
-                await tx.CommitAsync();
-
-                var resp = new SubmitResponse(
-                    DocuNumb: docuNumb,
-                    TotalScanned: req.Tokens.Count,
-                    ValidCount: rightEnt,
-                    ExpiredCount: expiredCnt,
-                    AlreadyScannedCount: alreadyScn,
-                    InvalidCount: invalidCnt,
-                    TotAmount: Math.Round(totAmPay, 2),
-                    TdsAmount: tds,
-                    NetPayable: net,
-                    Message: $"Batch {docuNumb} processed. Right={rightEnt}, Wrong={invalidCnt}, AlreadyScanned={alreadyScn}, Expired={expiredCnt}. Payable={payblAmt}"
-                );
-
-                return Ok(resp);
+                var result = _db.WebSessBean(sql, p);
+                _db.InsertIntoLog(partnerId, endpoint, "Saved", 200, req);
+                return Ok(new { message = "Saved", docuNumb = req.DocuNumb, result });
             }
             catch (Exception ex)
             {
-                await tx.RollbackAsync();
-                return Problem($"Failed to save token batch. {ex.Message}");
+                _db.InsertIntoLog(partnerId, endpoint, ex.Message, 500, req);
+                return StatusCode(500, new { message = ex.Message });
             }
         }
+    }
 
-        // ---------- DB helpers for submit ----------
-        private static async Task<(double tdsRate, string appRtlTy)> GetTdsAndRetailTypeTx(SqlConnection con, SqlTransaction tx, string loginIdM)
-        {
-            const string sql = @"
-select cast(dbo.dpfTokTdsRt(itxPanNo, kycVerFl) as float) as TdsRate, appRtlty
-from wcvAllCustm with(nolock)
-where appRtlcd = @loginIdM";
-            using var cmd = new SqlCommand(sql, con, tx);
-            cmd.Parameters.AddWithValue("@loginIdM", loginIdM);
-            using var r = await cmd.ExecuteReaderAsync();
-            if (await r.ReadAsync())
-            {
-                double tds = r.IsDBNull(0) ? 0d : r.GetDouble(0);
-                string ty = r.IsDBNull(1) ? "" : r.GetString(1);
-                return (tds, ty);
-            }
-            return (0d, "");
-        }
-
-        private static async Task<string> GetDocumentNoAsync(SqlConnection con, SqlTransaction tx, string docuType, string areaCode)
-        {
-            // Create this proc in DB akin to WebSessBean.getDocumentNo
-            using var cmd = new SqlCommand("dbo.usp_GetDocumentNo", con, tx) { CommandType = CommandType.StoredProcedure };
-            cmd.Parameters.AddWithValue("@DocuType", docuType);
-            cmd.Parameters.AddWithValue("@AreaCode", areaCode);
-            var outParam = new SqlParameter("@DocuNumb", SqlDbType.VarChar, 30) { Direction = ParameterDirection.Output };
-            cmd.Parameters.Add(outParam);
-            await cmd.ExecuteNonQueryAsync();
-            return (string)(outParam.Value ?? throw new InvalidOperationException("Doc number not generated"));
-        }
-
-        private static async Task InsertHeaderStubAsync(SqlConnection con, SqlTransaction tx, string docuNumb, DateTime docDate, string custCode, string cdnDocTy)
-        {
-            const string sql = @"
-insert into cdtTokenRec
-(docuNumb, docuDate, tokenTyp, cdnDocTy, custCode, prodCode, recptQty, basTknAm, handAmnt, scnDedAm, payblAmt, statFlag, createId, createDt)
-values
-(@doc, @date, 'BC', @cdn, @cust, 0, 0, 0, 0, 0, 0, 'A', @uid, getdate())";
-            using var cmd = new SqlCommand(sql, con, tx);
-            cmd.Parameters.AddWithValue("@doc", docuNumb);
-            cmd.Parameters.AddWithValue("@date", docDate);
-            cmd.Parameters.AddWithValue("@cdn", cdnDocTy);
-            cmd.Parameters.AddWithValue("@cust", custCode);
-            cmd.Parameters.AddWithValue("@uid", "system"); // or req.LoginIdM if available here
-            await cmd.ExecuteNonQueryAsync();
-        }
-
-        private static async Task UpdateHeaderTotalsAsync(SqlConnection con, SqlTransaction tx, string docuNumb, int rightEnt, double basTknAm, double handAmnt, double payblAmt, double scnDedAm, int prodCodeHd, string loginIdM)
-        {
-            const string sql = @"
-update cdtTokenRec
-set recptQty = @qty,
-    basTknAm = @bas,
-    handAmnt = @hand,
-    payblAmt = @pay,
-    scnDedAm = @scn,
-    prodCode = @prod,
-    updateId = @uid,
-    updateDt = getdate()
-where docuNumb = @doc";
-            using var cmd = new SqlCommand(sql, con, tx);
-            cmd.Parameters.AddWithValue("@qty", rightEnt);
-            cmd.Parameters.AddWithValue("@bas", basTknAm);
-            cmd.Parameters.AddWithValue("@hand", handAmnt);
-            cmd.Parameters.AddWithValue("@pay", payblAmt);
-            cmd.Parameters.AddWithValue("@scn", scnDedAm);
-            cmd.Parameters.AddWithValue("@prod", prodCodeHd);
-            cmd.Parameters.AddWithValue("@uid", loginIdM);
-            cmd.Parameters.AddWithValue("@doc", docuNumb);
-            var af = await cmd.ExecuteNonQueryAsync();
-            if (af < 1) throw new InvalidOperationException("Header not found for update.");
-        }
-
-        private static async Task InsertCusToPayAsync(SqlConnection con, SqlTransaction tx,
-            string docuNumb, string custCode, string custAcCd, string cdnDocTy,
-            string invDocNo, string invnSrNo, int prodCode,
-            DateTime startDate, DateTime endDate, int discQnty, double payblAmt,
-            double scnDedAm, double tdsTotAm, string cnDnTyCd, string naration,
-            string mdOfDisb, string loginIdM, string? cheqNumb, DateTime? cheqDate, string? refDocNo)
-        {
-            const string sql = @"
-insert into cdtCusToPay
-(docuNumb, custCode, custAcCd, cdnDocTy, invDocNo, invnSrNo, prodCode, strtDate, endgDate,
- discQnty, discRate, dtlSbTot, deducAmt, tdsTotAm, cnDnTyCd, naration, mdOfDisb, statFlag,
- createId, createDt, cheqNumb, cheqDate, refDocNo)
-values
-(@doc, @cust, @ac, @cdn, @inv, @sr, @prod, @sd, @ed,
- @qty, @rate, @sub, @ded, @tds, @ty, @nar, @md, 'A',
- @uid, getdate(), @chq, @chqdt, @ref)";
-            using var cmd = new SqlCommand(sql, con, tx);
-            cmd.Parameters.AddWithValue("@doc", docuNumb);
-            cmd.Parameters.AddWithValue("@cust", custCode);
-            cmd.Parameters.AddWithValue("@ac", custAcCd);
-            cmd.Parameters.AddWithValue("@cdn", cdnDocTy);
-            cmd.Parameters.AddWithValue("@inv", (object)invDocNo ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@sr", (object)invnSrNo ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@prod", prodCode);
-            cmd.Parameters.AddWithValue("@sd", startDate);
-            cmd.Parameters.AddWithValue("@ed", endDate);
-            cmd.Parameters.AddWithValue("@qty", discQnty);
-            cmd.Parameters.AddWithValue("@rate", payblAmt);     // matches JSP usage where discRate ~ tokEndVl per Qty; adjust if needed
-            cmd.Parameters.AddWithValue("@sub", payblAmt + scnDedAm);
-            cmd.Parameters.AddWithValue("@ded", scnDedAm);
-            cmd.Parameters.AddWithValue("@tds", tdsTotAm);
-            cmd.Parameters.AddWithValue("@ty", cnDnTyCd);
-            cmd.Parameters.AddWithValue("@nar", naration);
-            cmd.Parameters.AddWithValue("@md", mdOfDisb);
-            cmd.Parameters.AddWithValue("@uid", loginIdM);
-            cmd.Parameters.AddWithValue("@chq", (object?)cheqNumb ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@chqdt", (object?)cheqDate ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@ref", (object?)refDocNo ?? DBNull.Value);
-            await cmd.ExecuteNonQueryAsync();
-        }
-
-        private static async Task InsertTestgAsync(SqlConnection con, SqlTransaction tx,
-            string docuNumb, string tokenNum, string mobileNo, string inflName, string inflCode, string loginIdM)
-        {
-            const string sql = @"
-insert into dpmTknTestg (docuNumb, tokenNum, mobileNo, inflName, inflCode, createId, createDt)
-values (@doc, @tok, @mob, @inflN, @inflC, @uid, getdate())";
-            using var cmd = new SqlCommand(sql, con, tx);
-            cmd.Parameters.AddWithValue("@doc", docuNumb);
-            cmd.Parameters.AddWithValue("@tok", tokenNum);
-            cmd.Parameters.AddWithValue("@mob", mobileNo);
-            cmd.Parameters.AddWithValue("@inflN", inflName);
-            cmd.Parameters.AddWithValue("@inflC", inflCode);
-            cmd.Parameters.AddWithValue("@uid", loginIdM);
-            await cmd.ExecuteNonQueryAsync();
-        }
+    public class GrcLeadRequest
+    {
+        public string? ProcType { get; set; } // A/U
+        public string? DocuNumb { get; set; }
+        public string? SiteType { get; set; } // O/F (not persisted directly)
+        public string? LeadDate { get; set; } // string accepted
+        public string? LeadQnty { get; set; }
+        public string? LeadMsrs { get; set; }
+        public string? SiteName { get; set; }
+        public string? MobileNo { get; set; }
+        public string? SiteAddr { get; set; }
+        public string? SiteRmrk { get; set; }
+            public string? StMobNum { get; set; } // contact person mobile
+            public string? CntPrsnt { get; set; } // contact person type
+        public string? AdhrNumb { get; set; }
+        public string? ArchtNam { get; set; }
+        public string? ItxPanNo { get; set; }
+        public string? GstnNumb { get; set; }
+        public string? EmailAdd { get; set; }
+        public string? District { get; set; }
+        public string? AreaCode { get; set; }
+        public string? SitePinC { get; set; }
+        public string? StateNam { get; set; }
+        public string? CityName { get; set; }
+        public string? DelvrPrd { get; set; }
+        public string? PrjctKnd { get; set; }
+        public string? DrawRand { get; set; } // attachment doc number (attchMnt)
+        public string? CreatedBy { get; set; } // createId
     }
 }
