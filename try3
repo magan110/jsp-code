@@ -1,305 +1,508 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace sparshWebService.Controllers
 {
-    [Route("api/[controller]")]
-    [ApiController]
-    public class GrcLeadController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-        public GrcLeadController(DatabaseHelper db) { _db = db; }
+	[Route("api/[controller]")]
+	[ApiController]
+	[Authorize]
+	public class GrcLeadController : ControllerBase
+	{
+		private readonly DatabaseHelper _dbHelper;
 
-        // GET api/GrcLead/meta -> dynamic option lists (queried via SQL)
-        [HttpGet("meta")]
-        public IActionResult GetMeta()
-        {
-            // Queries mirror the JSP unions but are executed on DB side to avoid hardcoded arrays here
-            const string uomSql = @"select 'F2' Code, 'Feet Squre' Name
-union all select 'FT','Feet'
-union all select 'M2','Meter Squre'
-union all select 'NO','Numbers'
-union all select 'RF','Running Ft'";
+		public GrcLeadController(DatabaseHelper dbHelper)
+		{
+			_dbHelper = dbHelper;
+		}
 
-            const string delSql = @"select '01-03 month' Code, '01-03 month' Name
-union all select '04-06 month','04-06 month'
-union all select '07-12 month','07-12 month'
-union all select 'over 12 month','over 12 month'";
+		/// <summary>
+		/// Initializes data for GRC Lead Entry form (doc number + dropdown options), based on the provided procType/docuNumb.
+		/// Mirrors legacy JSP init: generates randNmSt when procType = 'A'; otherwise uses supplied docuNumb.
+		/// </summary>
+		[HttpPost("init")]
+		public IActionResult Initialize([FromBody] GrcLeadInitRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/init";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
 
-            const string prjSql = @"select 'residence / bunglow' Code, 'residence / bunglow' Name
-union all select 'religious','religious'
-union all select 'hotel','hotel'
-union all select 'hospital','hospital'
-union all select 'Govt. Project','Govt. Project'
-union all select 'Commercial Project','Commercial Project'
-union all select 'high rise','high rise'
-union all select 'land scaping','land scaping'
-union all select 'educational institute','educational institute'
-union all select 'Others','Others'";
+			try
+			{
+				if (request == null)
+				{
+					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: Request body is null.", 400, new { });
+					return BadRequest(new { code = 400, message = "Request body is required." });
+				}
 
-            const string cntSql = @"select 'Owner' Code, 'Owner' Name
-union all select 'builder','builder'
-union all select 'contractor','contractor'
-union all select 'architect','architect'
-union all select 'construction company','construction company'";
 
-            const string siteTypeSql = @"select 'O' Code, 'Onsite' Name
-union all select 'F','Offsite'";
+				// Determine randNmSt (like: select right(newId(), 8)) if procType == 'A'
+				string randNmSt;
+				if (string.Equals(request.ProcType, "A", StringComparison.OrdinalIgnoreCase))
+				{
+					var rs = _dbHelper.WebSessBean("select right(newId(), 8) as randNmSt", new Dictionary<string, object>());
+					var first = rs.FirstOrDefault();
+					if (first != null && first.ContainsKey("randNmSt"))
+						randNmSt = first["randNmSt"]?.ToString() ?? Guid.NewGuid().ToString("N").Substring(0, 8);
+					else
+						randNmSt = Guid.NewGuid().ToString("N").Substring(0, 8);
+				}
+				else
+				{
+					randNmSt = request.DocuNumb ?? string.Empty;
+				}
 
-            const string procTypeSql = @"select 'A' Code, 'Add' Name
-union all select 'U','Update'";
+				// Build dropdown options (aliased columns to ensure predictable keys)
+				// Add site types (Onsite/Offsite) and proc types (Add/Update) so Flutter can bind everything from one call
+				var siteTypesSql = @"select 'Onsite' as code, 'Onsite' as name
+									union all select 'Offsite','Offsite'";
 
-            var units = _db.WebSessBean(uomSql, new Dictionary<string, object>());
-            var delivery = _db.WebSessBean(delSql, new Dictionary<string, object>());
-            var projectKinds = _db.WebSessBean(prjSql, new Dictionary<string, object>());
-            var contactTypes = _db.WebSessBean(cntSql, new Dictionary<string, object>());
-            var siteTypes = _db.WebSessBean(siteTypeSql, new Dictionary<string, object>());
-            var procTypes = _db.WebSessBean(procTypeSql, new Dictionary<string, object>());
+				var procTypesSql = @"select 'A' as code, 'Add' as name
+								 union all select 'U','Update'";
 
-            return Ok(new
-            {
-                unitsOfMeasure = units,
-                deliveryPeriods = delivery,
-                projectKinds,
-                contactPersonTypes = contactTypes,
-                siteTypes,
-                procTypes
-            });
-        }
-        
-        // GET api/GrcLead/docs?createdBy=S5558 -> list of doc numbers for the user (matches JSP when procType=U)
-        [HttpGet("docs")]
-        public IActionResult GetDocs([FromQuery] string createdBy)
-        {
-            if (string.IsNullOrWhiteSpace(createdBy)) return BadRequest("createdBy is required");
-            const string sql = @"SELECT a.docuNumb FROM bwlive.dbo.dptGrcLeadGn a WITH (NOLOCK) WHERE a.createId = @createdBy ORDER BY a.docuNumb DESC";
-            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@createdBy"] = createdBy });
-            return Ok(res);
-        }
+				var measuresSql = @"select 'F2' as code, 'Feet Squre' as name
+									union all select 'FT' as code, 'Feet' as name
+									union all select 'M2' as code, 'Meter Squre' as name
+									union all select 'NO' as code, 'Numbers' as name
+									union all select 'RF' as code, 'Running Ft' as name";
 
-        // GET api/GrcLead/areas -> dynamic areas from retailer data
-        [HttpGet("areas")]
-        public IActionResult GetAreas()
-        {
-            const string sql = @"SELECT DISTINCT areaCode AS Code, areaCode AS Name FROM bwlive.dbo.rtmRetailer WITH (NOLOCK) WHERE areaCode IS NOT NULL ORDER BY areaCode";
-            var res = _db.WebSessBean(sql, new Dictionary<string, object>());
-            return Ok(res);
-        }
+				var deliveryPeriodSql = @"select '01-03 month' as code, '01-03 month' as name
+										  union all select '04-06 month','04-06 month'
+										  union all select '07-12 month','07-12 month'
+										  union all select 'over 12 month','over 12 month'";
 
-        // GET api/GrcLead/districts?areaCode=... -> dynamic districts inferred from existing leads (can be pointed to a master later)
-        [HttpGet("districts")]
-        public IActionResult GetDistricts([FromQuery] string areaCode)
-        {
-            if (string.IsNullOrWhiteSpace(areaCode)) return BadRequest("areaCode is required");
-            const string sql = @"SELECT DISTINCT district AS Name, district AS Code
-                                   FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK)
-                                  WHERE areaCode = @areaCode AND ISNULL(district,'') <> ''
-                               ORDER BY district";
-            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@areaCode"] = areaCode });
-            return Ok(res);
-        }
+				var projectKindSql = @"select 'residence / bunglow' as code,'residence / bunglow' as name
+									   union all select 'religious','religious'
+									   union all select 'hotel','hotel'
+									   union all select 'hospital','hospital'
+									   union all select 'Govt. Project','Govt. Project'
+									   union all select 'Commercial Project','Commercial Project'
+									   union all select 'high rise','high rise'
+									   union all select 'land scaping','land scaping'
+									   union all select 'educational institute','educational institute'
+									   union all select 'Others','Others'";
 
-        // GET api/GrcLead/pincodes?district=... -> dynamic pincode list inferred from existing leads
-        [HttpGet("pincodes")]
-        public IActionResult GetPincodes([FromQuery] string district)
-        {
-            if (string.IsNullOrWhiteSpace(district)) return BadRequest("district is required");
-            const string sql = @"SELECT DISTINCT sitePinC AS Code, sitePinC AS Name
-                                   FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK)
-                                  WHERE district = @district AND ISNULL(sitePinC,'') <> ''
-                               ORDER BY sitePinC";
-            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@district"] = district });
-            return Ok(res);
-        }
+				var contactPersonSql = @"select 'Owner' as code,'Owner' as name
+										 union all select 'builder','builder'
+										 union all select 'contractor','contractor'
+										 union all select 'architect','architect'
+										 union all select 'construction company','construction company'";
 
-        // GET api/GrcLead/{docuNumb} -> fetch a lead (subset of fields shown in JSP)
-        [HttpGet("{docuNumb}")]
-        public IActionResult GetLead(string docuNumb, [FromQuery] string siteType = "F")
-        {
-            if (string.IsNullOrWhiteSpace(docuNumb)) return BadRequest("docuNumb is required");
+				var siteTypes = ToOptions(_dbHelper.WebSessBean(siteTypesSql, new Dictionary<string, object>()));
+				var procTypes = ToOptions(_dbHelper.WebSessBean(procTypesSql, new Dictionary<string, object>()));
+				var measures = ToOptions(_dbHelper.WebSessBean(measuresSql, new Dictionary<string, object>()));
+				var deliveryPeriods = ToOptions(_dbHelper.WebSessBean(deliveryPeriodSql, new Dictionary<string, object>()));
+				var projectKinds = ToOptions(_dbHelper.WebSessBean(projectKindSql, new Dictionary<string, object>()));
+				var contactPersons = ToOptions(_dbHelper.WebSessBean(contactPersonSql, new Dictionary<string, object>()));
 
-            string sql = siteType == "O"
-                ? @"SELECT docuNumb, CONVERT(varchar(10), leadDate, 111) AS leadDate, leadQnty, leadMsrs, siteName, mobileNo, siteAddr, siteRmrk, stMobNum, cntPrsnt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, stateNam, cityName, delvrPrd, prjctKnd, attchMnt
-                      FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK) WHERE docuNumb = @docuNumb"
-                : @"SELECT docuNumb, CONVERT(varchar(10), leadDate, 111) AS leadDate, leadQnty, leadMsrs, siteName, mobileNo, siteAddr, siteRmrk, stMobNum, cntPrsnt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, areaCode, sitePinC, delvrPrd, prjctKnd, attchMnt
-                      FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK) WHERE docuNumb = @docuNumb";
+				var response = new
+				{
+					code = 200,
+					message = "Initialized successfully.",
+					data = new
+					{
+						procType = request.ProcType,
+						procTypeLabel = string.Equals(request.ProcType, "A", StringComparison.OrdinalIgnoreCase) ? "Add" : "Update",
+						docuNumb = request.DocuNumb,
+						randNmSt,
+						defaultLeadDate = DateTime.Now.ToString("yyyy-MM-dd"),
+						options = new
+						{
+							siteTypes,
+							procTypes,
+							measures,
+							deliveryPeriods,
+							projectKinds,
+							contactPersons
+						}
+					}
+				};
 
-            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@docuNumb"] = docuNumb });
-            if (res.Count == 0) return NotFound("Lead not found");
-            return Ok(res[0]);
-        }
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Initialized successfully.", 200, request);
+				return Ok(response);
+			}
+			catch (Exception ex)
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
+				return StatusCode(500, new { code = 500, message = "Internal server error.", error = ex.Message });
+			}
+		}
 
-        // GET api/GrcLead/attachments?drawRand=... -> returns base64 images like JSP image listing
-        [HttpGet("attachments")]
-        public IActionResult GetAttachments([FromQuery] string drawRand)
-        {
-            if (string.IsNullOrWhiteSpace(drawRand)) return BadRequest("drawRand is required");
-            // In JSP, images are fetched from imageData.dbo.cotDocAttch where docuNumb = drawRand
-            const string sql = @"SELECT attachFl FROM imageData.dbo.cotDocAttch WITH (NOLOCK) WHERE docuNumb = @drawRand";
-            var res = _db.ImgSessBean(sql, new Dictionary<string, object> { ["@drawRand"] = drawRand });
-            // DatabaseHelper returns raw objects; assume varbinary data comes as byte[] or base64-able string
-            var images = new List<string>();
-            foreach (var row in res)
-            {
-                if (row.TryGetValue("attachFl", out var blob) && blob != null)
-                {
-                    if (blob is byte[] b) images.Add(Convert.ToBase64String(b));
-                    else
-                    {
-                        var s = blob.ToString();
-                        if (!string.IsNullOrEmpty(s)) images.Add(s);
-                    }
-                }
-            }
-            return Ok(new { count = images.Count, images });
-        }
+		/// <summary>
+		/// Returns document numbers for Update mode for a given creator (maps JSP dropdown when procType = 'U').
+		/// </summary>
+		[HttpPost("documents")]
+		public IActionResult GetDocuments([FromBody] GrcLeadDocListRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/documents";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
 
-        // GET api/GrcLead/pincode-info?pincode=... -> infer district/areaCode for a pincode (used by pinCodeNoGet in JSP)
-        [HttpGet("pincode-info")]
-        public IActionResult GetPincodeInfo([FromQuery] string pincode)
-        {
-            if (string.IsNullOrWhiteSpace(pincode)) return BadRequest("pincode is required");
-            const string sql = @"SELECT TOP 1 district, areaCode, stateNam, cityName
-                                   FROM bwlive.dbo.dptGrcLeadGn WITH (NOLOCK)
-                                  WHERE sitePinC = @pincode AND (ISNULL(district,'')<>'' OR ISNULL(areaCode,'')<>'')
-                               ORDER BY leadDate DESC";
-            var res = _db.WebSessBean(sql, new Dictionary<string, object> { ["@pincode"] = pincode });
-            if (res.Count == 0) return NotFound("No mapping found for pincode");
-            return Ok(res[0]);
-        }
+			if (request == null || string.IsNullOrWhiteSpace(request.CreateId))
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: CreateId is required.", 400, (object?)request ?? new { });
+				return BadRequest(new { code = 400, message = "CreateId is required." });
+			}
 
-        // POST api/GrcLead/save -> Add or Update (ProcType: A/U). Uses INSERT/UPDATE + trailing SELECT to keep within select API.
-        [HttpPost("save")]
-        public IActionResult SaveLead([FromBody] GrcLeadRequest req)
-        {
-            if (req == null) return BadRequest("Body is required");
-            if (string.IsNullOrWhiteSpace(req.ProcType)) return BadRequest("ProcType is required");
-            // Match JSP validations: Date, Qty, Site Name, Mobile No, Address are mandatory
-            if (string.IsNullOrWhiteSpace(req.SiteName) || string.IsNullOrWhiteSpace(req.MobileNo) || string.IsNullOrWhiteSpace(req.SiteAddr))
-                return BadRequest("SiteName, MobileNo and SiteAddr are required");
-            if (string.IsNullOrWhiteSpace(req.LeadQnty))
-                return BadRequest("LeadQnty is required");
-            if (string.IsNullOrWhiteSpace(req.LeadDate))
-                return BadRequest("LeadDate is required");
+			try
+			{
+				var sql = @"select a.docuNumb as code, a.docuNumb as name
+							from bwlive.dbo.dptGrcLeadGn a with (nolock)
+							where a.createId = @createId
+							order by a.docuNumb desc";
+				var rows = _dbHelper.WebSessBean(sql, new Dictionary<string, object> { { "@createId", request.CreateId } });
+				var options = ToOptions(rows);
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Documents fetched.", 200, request);
+				return Ok(new { code = 200, data = options });
+			}
+			catch (Exception ex)
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
+				return StatusCode(500, new { code = 500, message = ex.Message });
+			}
+		}
 
-            var partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-            var endpoint = "/api/GrcLead/save";
+		/// <summary>
+		/// Fetch lead details by docuNumb; includes both onsite/offsite fields.
+		/// </summary>
+		[HttpPost("details")]
+		public IActionResult GetLeadDetails([FromBody] GrcLeadDetailsRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/details";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
 
-            try
-            {
-                // Normalize date
-                DateTime? leadDate = null;
-                if (!string.IsNullOrWhiteSpace(req.LeadDate))
-                {
-                    if (DateTime.TryParse(req.LeadDate, out var d)) leadDate = d;
-                }
+			if (request == null || string.IsNullOrWhiteSpace(request.DocuNumb))
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: DocuNumb is required.", 400, (object?)request ?? new { });
+				return BadRequest(new { code = 400, message = "DocuNumb is required." });
+			}
 
-                // For Add, generate docuNumb similar to JSP (RIGHT(NEWID(),8))
-                if (req.ProcType.Equals("A", StringComparison.OrdinalIgnoreCase))
-                {
-                    const string genSql = "SELECT RIGHT(CONVERT(VARCHAR(36), NEWID()), 8) AS docuNumb";
-                    var gen = _db.WebSessBean(genSql, new Dictionary<string, object>());
-                    var dn = gen.Count > 0 ? gen[0]["docuNumb"]?.ToString() : null;
-                    req.DocuNumb = !string.IsNullOrWhiteSpace(dn) ? dn : Guid.NewGuid().ToString("N").Substring(24, 8);
-                }
-                if (string.IsNullOrWhiteSpace(req.DocuNumb)) return BadRequest("DocuNumb is required for update");
+			try
+			{
+				var sql = @"select a.docuNumb,
+								   convert(varchar(10), a.leadDate, 111) as leadDate,
+								   a.leadQnty, a.siteName, a.mobileNo, a.siteAddr, a.siteRmrk,
+								   a.adhrNumb, a.archtNam, a.itxPanNo, a.gstnNumb, a.emailAdd,
+								   a.district, a.areaCode, a.retlPinC, a.stateNam, a.cityName, a.attchMnt
+							from bwlive.dbo.dptGrcLeadGn a with (nolock)
+							where a.docuNumb = @docuNumb";
+				var rows = _dbHelper.WebSessBean(sql, new Dictionary<string, object> { { "@docuNumb", request.DocuNumb } });
+				if (rows == null || rows.Count == 0)
+				{
+					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "NotFound: No lead found.", 404, request);
+					return NotFound(new { code = 404, message = "No lead found for provided DocuNumb." });
+				}
+				var data = rows.First();
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Lead details fetched.", 200, request);
+				return Ok(new { code = 200, data });
+			}
+			catch (Exception ex)
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
+				return StatusCode(500, new { code = 500, message = ex.Message });
+			}
+		}
 
-                // Common params
-                var p = new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = req.DocuNumb,
-                    ["@leadDate"] = (object?)leadDate ?? DBNull.Value,
-                    ["@leadQnty"] = req.LeadQnty ?? (object)DBNull.Value,
-                    ["@leadMsrs"] = req.LeadMsrs ?? (object)DBNull.Value,
-                    ["@siteName"] = req.SiteName,
-                    ["@mobileNo"] = req.MobileNo,
-                    ["@siteAddr"] = req.SiteAddr,
-                    ["@siteRmrk"] = req.SiteRmrk ?? (object)DBNull.Value,
-                    ["@stMobNum"] = req.StMobNum ?? (object)DBNull.Value,
-                    ["@cntPrsnt"] = req.CntPrsnt ?? (object)DBNull.Value,
-                    ["@adhrNumb"] = req.AdhrNumb ?? (object)DBNull.Value,
-                    ["@archtNam"] = req.ArchtNam ?? (object)DBNull.Value,
-                    ["@itxPanNo"] = req.ItxPanNo ?? (object)DBNull.Value,
-                    ["@gstnNumb"] = req.GstnNumb ?? (object)DBNull.Value,
-                    ["@emailAdd"] = req.EmailAdd ?? (object)DBNull.Value,
-                    ["@district"] = req.District ?? (object)DBNull.Value,
-                    ["@areaCode"] = req.AreaCode ?? (object)DBNull.Value,
-                    ["@sitePinC"] = req.SitePinC ?? (object)DBNull.Value,
-                    ["@stateNam"] = req.StateNam ?? (object)DBNull.Value,
-                    ["@cityName"] = req.CityName ?? (object)DBNull.Value,
-                    ["@delvrPrd"] = req.DelvrPrd ?? (object)DBNull.Value,
-                    ["@prjctKnd"] = req.PrjctKnd ?? (object)DBNull.Value,
-                    ["@attchMnt"] = req.DrawRand ?? (object)DBNull.Value,
-                    ["@createId"] = req.CreatedBy ?? (object)DBNull.Value
-                };
+		/// <summary>
+		/// Fetches images for a given drawRand/docuNumb from imageData.cotDocAttch as base64 strings.
+		/// </summary>
+		[HttpPost("images")] 
+		public IActionResult GetImages([FromBody] GrcLeadImagesRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/images";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
 
-                string sql;
-                if (req.ProcType.Equals("A", StringComparison.OrdinalIgnoreCase))
-                {
-              // Insert - include both F and O fields, unknown columns get NULL
-                    sql = @"
-INSERT INTO bwlive.dbo.dptGrcLeadGn
-  (docuNumb, leadDate, leadQnty, leadMsrs, siteName, mobileNo, siteAddr, siteRmrk, stMobNum, cntPrsnt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd,
-   district, areaCode, sitePinC, stateNam, cityName, delvrPrd, prjctKnd, attchMnt, createId)
-VALUES (@docuNumb, @leadDate, @leadQnty, @leadMsrs, @siteName, @mobileNo, @siteAddr, @siteRmrk, @stMobNum, @cntPrsnt, @adhrNumb, @archtNam, @itxPanNo, @gstnNumb, @emailAdd,
-      @district, @areaCode, @sitePinC, @stateNam, @cityName, @delvrPrd, @prjctKnd, @attchMnt, @createId);
-SELECT 'OK' AS Status, @docuNumb AS docuNumb;";
-                }
-                else
-                {
-                    // Update by docuNumb
-                    sql = @"
-UPDATE bwlive.dbo.dptGrcLeadGn SET
-  leadDate=@leadDate, leadQnty=@leadQnty, leadMsrs=@leadMsrs, siteName=@siteName, mobileNo=@mobileNo, siteAddr=@siteAddr, siteRmrk=@siteRmrk,
-  stMobNum=@stMobNum, cntPrsnt=@cntPrsnt,
-  adhrNumb=@adhrNumb, archtNam=@archtNam, itxPanNo=@itxPanNo, gstnNumb=@gstnNumb, emailAdd=@emailAdd,
-  district=@district, areaCode=@areaCode, sitePinC=@sitePinC, stateNam=@stateNam, cityName=@cityName,
-  delvrPrd=@delvrPrd, prjctKnd=@prjctKnd, attchMnt=@attchMnt
-WHERE docuNumb=@docuNumb;
-SELECT 'OK' AS Status, @docuNumb AS docuNumb;";
-                }
+			if (request == null || string.IsNullOrWhiteSpace(request.DocuNumb))
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: DocuNumb is required.", 400, (object?)request ?? new { });
+				return BadRequest(new { code = 400, message = "DocuNumb is required." });
+			}
 
-                var result = _db.WebSessBean(sql, p);
-                _db.InsertIntoLog(partnerId, endpoint, "Saved", 200, req);
-                return Ok(new { message = "Saved", docuNumb = req.DocuNumb, result });
-            }
-            catch (Exception ex)
-            {
-                _db.InsertIntoLog(partnerId, endpoint, ex.Message, 500, req);
-                return StatusCode(500, new { message = ex.Message });
-            }
-        }
-    }
+			try
+			{
+				var sql = @"SELECT attachFl FROM imageData.dbo.cotDocAttch with (nolock)
+							WHERE docuNumb = @docuNumb";
+				var rows = _dbHelper.ImgSessBean(sql, new Dictionary<string, object> { { "@docuNumb", request.DocuNumb } });
+				var images = new List<string>();
+				foreach (var row in rows)
+				{
+					if (row.ContainsKey("attachFl") && row["attachFl"] is byte[] bytes && bytes.Length > 0)
+					{
+						images.Add(Convert.ToBase64String(bytes));
+					}
+					else if (row.ContainsKey("attachFl") && row["attachFl"] != null)
+					{
+						// If another provider/type is returned, handle accordingly here.
+					}
+				}
 
-    public class GrcLeadRequest
-    {
-        public string? ProcType { get; set; } // A/U
-        public string? DocuNumb { get; set; }
-        public string? SiteType { get; set; } // O/F (not persisted directly)
-        public string? LeadDate { get; set; } // string accepted
-        public string? LeadQnty { get; set; }
-        public string? LeadMsrs { get; set; }
-        public string? SiteName { get; set; }
-        public string? MobileNo { get; set; }
-        public string? SiteAddr { get; set; }
-        public string? SiteRmrk { get; set; }
-            public string? StMobNum { get; set; } // contact person mobile
-            public string? CntPrsnt { get; set; } // contact person type
-        public string? AdhrNumb { get; set; }
-        public string? ArchtNam { get; set; }
-        public string? ItxPanNo { get; set; }
-        public string? GstnNumb { get; set; }
-        public string? EmailAdd { get; set; }
-        public string? District { get; set; }
-        public string? AreaCode { get; set; }
-        public string? SitePinC { get; set; }
-        public string? StateNam { get; set; }
-        public string? CityName { get; set; }
-        public string? DelvrPrd { get; set; }
-        public string? PrjctKnd { get; set; }
-        public string? DrawRand { get; set; } // attachment doc number (attchMnt)
-        public string? CreatedBy { get; set; } // createId
-    }
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Images fetched.", 200, request);
+				return Ok(new { code = 200, data = images });
+			}
+			catch (Exception ex)
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
+				return StatusCode(500, new { code = 500, message = ex.Message });
+			}
+		}
+
+		/// <summary>
+		/// Lookup districts for a given areaCode (maps frontend districtOpt).
+		/// </summary>
+		[HttpPost("lookups/districts")]
+		public IActionResult GetDistricts([FromBody] DistrictLookupRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/lookups/districts";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
+
+			if (request == null || string.IsNullOrWhiteSpace(request.AreaCode))
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: AreaCode is required.", 400, (object?)request ?? new { });
+				return BadRequest(new { code = 400, message = "AreaCode is required." });
+			}
+
+			// Waiting for backend SQL/stored procedure details; return 501 for now.
+			_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "NotImplemented: Provide SQL/proc for districts.", 501, request);
+			return StatusCode(501, new { code = 501, message = "District lookup not implemented. Please provide SQL/procedure details." });
+		}
+
+		/// <summary>
+		/// Lookup pincodes for a given district (maps frontend pinCodeNOpt).
+		/// </summary>
+		[HttpPost("lookups/pincodes")]
+		public IActionResult GetPincodes([FromBody] PincodeLookupRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/lookups/pincodes";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
+
+			if (request == null || string.IsNullOrWhiteSpace(request.District))
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: District is required.", 400, (object?)request ?? new { });
+				return BadRequest(new { code = 400, message = "District is required." });
+			}
+
+			// Waiting for backend SQL/stored procedure details; return 501 for now.
+			_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "NotImplemented: Provide SQL/proc for pincodes.", 501, request);
+			return StatusCode(501, new { code = 501, message = "Pincode lookup not implemented. Please provide SQL/procedure details." });
+		}
+
+		private static List<OptionDto> ToOptions(List<Dictionary<string, object>> rows)
+		{
+			return rows.Select(r => new OptionDto
+			{
+				Code = r.ContainsKey("code") ? r["code"]?.ToString() : null,
+				Name = r.ContainsKey("name") ? r["name"]?.ToString() : null
+			}).ToList();
+		}
+
+		/// <summary>
+		/// Saves a GRC lead (insert on ProcType='A', update otherwise). Returns the persisted docuNumb.
+		/// </summary>
+		[HttpPost("save")]
+		public IActionResult Save([FromBody] GrcLeadSaveRequest request)
+		{
+			string apiEndpoint = "/api/GrcLead/save";
+			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
+
+			if (request == null)
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: Request body is null.", 400, new { });
+				return BadRequest(new { code = 400, message = "Request body is required." });
+			}
+
+			try
+			{
+				// Parse date if provided (expecting yyyy/MM/dd or dd/MM/yyyy). Fallback to today if missing.
+				DateTime? leadDate = null;
+				if (!string.IsNullOrWhiteSpace(request.LeadDate))
+				{
+					if (DateTime.TryParse(request.LeadDate, out var dt))
+						leadDate = dt.Date;
+				}
+
+				object Db(object? v) => v ?? DBNull.Value;
+
+				if (string.Equals(request.ProcType, "A", StringComparison.OrdinalIgnoreCase))
+				{
+					// Insert and return generated docuNumb (similar to JSP's newId logic)
+					var insertSql = @"
+						declare @doc nvarchar(20) = right(newid(), 8);
+						insert into bwlive.dbo.dptGrcLeadGn
+						(
+							docuNumb, leadDate, leadQnty, siteName, mobileNo, siteAddr, siteRmrk,
+							adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd,
+							district, areaCode, retlPinC, stateNam, cityName,
+							attchMnt, createId
+						)
+						values
+						(
+							@doc, @leadDate, @leadQnty, @siteName, @mobileNo, @siteAddr, @siteRmrk,
+							@adhrNumb, @archtNam, @itxPanNo, @gstnNumb, @emailAdd,
+							@district, @areaCode, @retlPinC, @stateNam, @cityName,
+							@attchMnt, @createId
+						);
+						select @doc as docuNumb;";
+
+					var parameters = new Dictionary<string, object>
+					{
+						{ "leadDate", Db(leadDate) },
+						{ "leadQnty", Db(request.LeadQnty) },
+						{ "siteName", Db(request.SiteName) },
+						{ "mobileNo", Db(request.MobileNo) },
+						{ "siteAddr", Db(request.SiteAddr) },
+						{ "siteRmrk", Db(request.SiteRmrk) },
+						{ "adhrNumb", Db(request.AdhrNumb) },
+						{ "archtNam", Db(request.ArchtNam) },
+						{ "itxPanNo", Db(request.ItxPanNo) },
+						{ "gstnNumb", Db(request.GstnNumb) },
+						{ "emailAdd", Db(request.EmailAdd) },
+						{ "district", Db(request.District) },
+						{ "areaCode", Db(request.AreaCode) },
+						{ "retlPinC", Db(request.RetlPinC) },
+						{ "stateNam", Db(request.StateNam) },
+						{ "cityName", Db(request.CityName) },
+						{ "attchMnt", Db(request.DrawRand) },
+						{ "createId", Db(request.CreateId) }
+					};
+
+					var rows = _dbHelper.WebSessBean(insertSql, parameters);
+					var newDoc = rows.FirstOrDefault()? ["docuNumb"]?.ToString();
+					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Lead inserted successfully.", 200, request);
+					return Ok(new { code = 200, message = "Inserted", docuNumb = newDoc });
+				}
+				else
+				{
+					if (string.IsNullOrWhiteSpace(request.DocuNumb))
+					{
+						_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: DocuNumb is required for update.", 400, request);
+						return BadRequest(new { code = 400, message = "DocuNumb is required for update." });
+					}
+
+					var updateSql = @"
+						update bwlive.dbo.dptGrcLeadGn set
+							leadDate = @leadDate,
+							leadQnty = @leadQnty,
+							siteName = @siteName,
+							mobileNo = @mobileNo,
+							siteAddr = @siteAddr,
+							siteRmrk = @siteRmrk,
+							adhrNumb = @adhrNumb,
+							archtNam = @archtNam,
+							itxPanNo = @itxPanNo,
+							gstnNumb = @gstnNumb,
+							emailAdd = @emailAdd,
+							district = @district,
+							areaCode = @areaCode,
+							retlPinC = @retlPinC,
+							stateNam = @stateNam,
+							cityName = @cityName,
+							attchMnt = @attchMnt
+						where docuNumb = @docuNumb;
+						select @docuNumb as docuNumb;";
+
+					var parameters = new Dictionary<string, object>
+					{
+						{ "docuNumb", request.DocuNumb },
+						{ "leadDate", Db(leadDate) },
+						{ "leadQnty", Db(request.LeadQnty) },
+						{ "siteName", Db(request.SiteName) },
+						{ "mobileNo", Db(request.MobileNo) },
+						{ "siteAddr", Db(request.SiteAddr) },
+						{ "siteRmrk", Db(request.SiteRmrk) },
+						{ "adhrNumb", Db(request.AdhrNumb) },
+						{ "archtNam", Db(request.ArchtNam) },
+						{ "itxPanNo", Db(request.ItxPanNo) },
+						{ "gstnNumb", Db(request.GstnNumb) },
+						{ "emailAdd", Db(request.EmailAdd) },
+						{ "district", Db(request.District) },
+						{ "areaCode", Db(request.AreaCode) },
+						{ "retlPinC", Db(request.RetlPinC) },
+						{ "stateNam", Db(request.StateNam) },
+						{ "cityName", Db(request.CityName) },
+						{ "attchMnt", Db(request.DrawRand) }
+					};
+
+					var rows = _dbHelper.WebSessBean(updateSql, parameters);
+					var doc = rows.FirstOrDefault()? ["docuNumb"]?.ToString();
+					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Lead updated successfully.", 200, request);
+					return Ok(new { code = 200, message = "Updated", docuNumb = doc });
+				}
+			}
+			catch (Exception ex)
+			{
+				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
+				return StatusCode(500, new { code = 500, message = ex.Message });
+			}
+		}
+	}
+
+	public class GrcLeadInitRequest
+	{
+		public string? ProcType { get; set; } = "A"; // 'A' = Add, else Update uses DocuNumb
+		public string? DocuNumb { get; set; }
+		public string? SiteType { get; set; }
+		// Optional selected values coming from client (if any)
+		public string? LeadMsrs { get; set; }
+		public string? DelvrPrd { get; set; }
+		public string? PrjctKnd { get; set; }
+		public string? CntPrsnt { get; set; }
+	}
+
+	public class OptionDto
+	{
+		public string? Code { get; set; }
+		public string? Name { get; set; }
+	}
+
+	public class DistrictLookupRequest
+	{
+		public string AreaCode { get; set; } = string.Empty;
+		public string? WhereList { get; set; }
+	}
+
+	public class PincodeLookupRequest
+	{
+		public string District { get; set; } = string.Empty;
+	}
+
+	public class GrcLeadDocListRequest
+	{
+		public string CreateId { get; set; } = string.Empty;
+	}
+
+	public class GrcLeadDetailsRequest
+	{
+		public string DocuNumb { get; set; } = string.Empty;
+	}
+
+	public class GrcLeadImagesRequest
+	{
+		public string DocuNumb { get; set; } = string.Empty;
+	}
+
+	public class GrcLeadSaveRequest
+	{
+		public string? ProcType { get; set; } // 'A' for add, otherwise update
+		public string? DocuNumb { get; set; }
+		public string? LeadDate { get; set; }
+		public string? LeadQnty { get; set; }
+		public string? SiteName { get; set; }
+		public string? MobileNo { get; set; }
+		public string? SiteAddr { get; set; }
+		public string? SiteRmrk { get; set; }
+		public string? AdhrNumb { get; set; }
+		public string? ArchtNam { get; set; }
+		public string? ItxPanNo { get; set; }
+		public string? GstnNumb { get; set; }
+		public string? EmailAdd { get; set; }
+		public string? District { get; set; }
+		public string? AreaCode { get; set; }
+		public string? RetlPinC { get; set; }
+		public string? StateNam { get; set; }
+		public string? CityName { get; set; }
+		public string? DrawRand { get; set; } // used as attchMnt docuNumb for images linkage
+		public string? CreateId { get; set; } // creator login id, used when inserting
+	}
 }
+
