@@ -1,278 +1,319 @@
-import re
+# ask_gemini.py
+# Natural-language Q&A over a local Parquet export (db_export_bwlive / do_export_bwlive)
+# Requires: pip install google-generativeai duckdb pandas pyarrow
+
 import os
+import re
 import sys
 import json
-import urllib.parse
-from collections import defaultdict
-from typing import List, Dict, Tuple
+import argparse
+from typing import Dict, List, Tuple
 
+import duckdb
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text
-from rapidfuzz import fuzz, process
 
-# ─── DB CONFIG (use your values) ─────────────────────────────────────────────
-SERVER   = "10.4.64.15"
-DATABASE = "bwlive"
-USER     = "birlawhite"
-PASSWORD = "M@nsv1530"
-ODBC_DRIVER = "ODBC Driver 17 for SQL Server"  # or "ODBC Driver 18 for SQL Server"
-# ─────────────────────────────────────────────────────────────────────────────
+# --- Gemini SDK ---
+try:
+    import google.generativeai as genai
+except Exception:
+    print("Missing dependency: google-generativeai. Install with:\n  pip install google-generativeai")
+    sys.exit(1)
 
-# Optional: where a pre-dumped schema.json exists (from your previous script).
-# If not present, we’ll read INFORMATION_SCHEMA live.
-SCHEMA_JSON = os.path.join(f"db_schema_{DATABASE}", "schema.json")
+# ---------------- CONFIG (overridable via CLI/env) ----------------
+EXPORT_CANDIDATES = ["db_export_bwlive", "do_export_bwlive"]  # we’ll accept either name
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 
-# Search limits to keep things fast/safe
-MAX_TABLES_TO_QUERY = 25
-ROWS_PER_QUERY = 10
+MAX_TABLES_TO_TRY = int(os.environ.get("AG_MAX_TABLES", "200"))
+PROBE_ROWS = int(os.environ.get("AG_PROBE_ROWS", "250"))
+ROWS_PER_TABLE_TO_CONTEXT = int(os.environ.get("AG_ROWS_PER_TABLE", "6"))
+MAX_CONTEXT_CHARS = int(os.environ.get("AG_MAX_CONTEXT_CHARS", "12000"))
+# ------------------------------------------------------------------
 
-# Heuristic dictionaries (add as you like)
-SYNONYMS = {
-    "phone": ["phone", "mobile", "mob", "contact", "tel", "telephone", "cell", "phno", "ph", "contactno", "mobile_no", "mobileNo"],
-    "email": ["email", "mail", "e-mail", "emailid", "email_id"],
-    "name":  ["name", "fullname", "first", "last", "employee", "empname", "contactname", "person", "custname", "customername", "vendorname", "retailer", "party"],
-    "id":    ["id", "empid", "employeeid", "poornata_id", "customerid", "vendorid", "code", "custcode", "retlcode"],
-    "address": ["address", "addr", "street", "location"],
-    "dept":  ["department", "dept"],
-    "manager": ["manager", "reporting", "rpt_to", "report_to", "reportsto"],
-}
 
-# Column type hints (if schema.json contains types, we use them)
-TEXT_TYPES_HINT = ("char", "text", "nchar", "varchar", "nvarchar")
+# --------------- Path + catalog helpers ---------------
+def locate_export_root(cli_arg: str | None = None) -> str:
+    """
+    Find the export root (folder that contains 'parquet/' and optionally catalog.json).
+    Priority: CLI arg → env vars → next to script → parent of script → CWD.
+    """
+    if cli_arg and os.path.isdir(cli_arg):
+        return os.path.abspath(cli_arg)
 
-# ─── Utilities ───────────────────────────────────────────────────────────────
+    for env in ("EXPORT_ROOT", "BWLIVE_EXPORT", "DB_EXPORT_ROOT"):
+        p = os.environ.get(env)
+        if p and os.path.isdir(p):
+            return os.path.abspath(p)
 
-def make_engine():
-    params = urllib.parse.quote_plus(
-        f"Driver={{{ODBC_DRIVER}}};"
-        f"Server={SERVER};"
-        f"Database={DATABASE};"
-        f"UID={USER};"
-        f"PWD={PASSWORD};"
-        f"TrustServerCertificate=Yes;"
-        f"Encrypt=no;"
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    # next to the script
+    candidates += [os.path.join(here, name) for name in EXPORT_CANDIDATES]
+    # parent of the script
+    candidates += [os.path.join(here, "..", name) for name in EXPORT_CANDIDATES]
+    # current working dir
+    candidates += [os.path.join(os.getcwd(), name) for name in EXPORT_CANDIDATES]
+
+    for p in candidates:
+        if os.path.isdir(p):
+            return os.path.abspath(p)
+
+    raise SystemExit(
+        "Export folder not found.\n"
+        f"Provide it with -e/--export, set EXPORT_ROOT, or create one of: {', '.join(EXPORT_CANDIDATES)} "
+        "next to this script (containing a 'parquet' subfolder)."
     )
-    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
-def load_schema(engine) -> List[Dict]:
+def cat_path(root: str) -> str:
+    return os.path.join(root, "catalog.json")
+
+def ensure_catalog(root: str) -> Dict:
     """
-    Returns list of dicts: {schema, table, column, type, nullable, default}
-    Prefer local schema.json if present; else use INFORMATION_SCHEMA.
+    Load catalog.json or build it by scanning export_root/parquet/<schema>/*.parquet
     """
-    if os.path.exists(SCHEMA_JSON):
-        with open(SCHEMA_JSON, "r", encoding="utf-8") as f:
+    cpath = cat_path(root)
+    if os.path.isfile(cpath):
+        with open(cpath, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    # Fallback: query INFORMATION_SCHEMA live
-    q = text("""
-        SELECT
-            TABLE_SCHEMA AS [schema],
-            TABLE_NAME   AS [table],
-            COLUMN_NAME  AS [column],
-            DATA_TYPE    AS [type]
-        FROM INFORMATION_SCHEMA.COLUMNS
-        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-    """)
-    with engine.connect() as conn:
-        df = pd.read_sql(q, conn)
-    df["nullable"] = True
-    df["default"] = ""
-    return df.to_dict(orient="records")
+    parquet_dir = os.path.join(root, "parquet")
+    if not os.path.isdir(parquet_dir):
+        raise SystemExit(f"Parquet directory not found: {parquet_dir}")
 
-def tokenize(q: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9_]+", q.lower())
+    db_name = os.path.basename(root).replace("db_export_", "")
+    cat = {"database": db_name, "export_root": os.path.abspath(root), "tables": {}}
 
-def best_match_columns(schema_rows: List[Dict], label_list: List[str]) -> Dict[str, List[Tuple[str, str, str, int]]]:
-    """
-    For each synonym label group, find columns whose names fuzzy-match any synonym.
-    Returns: label -> list of (schema, table, column, score)
-    """
-    results = defaultdict(list)
-    for row in schema_rows:
-        col = row["column"].lower()
-        stc = f"{row['schema']}.{row['table']}.{row['column']}".lower()
-        for label in label_list:
-            synonyms = SYNONYMS.get(label, [])
-            # direct hit first
-            for syn in synonyms:
-                score = fuzz.partial_ratio(col, syn.lower())
-                if score >= 75:
-                    results[label].append((row["schema"], row["table"], row["column"], score))
-                    break
-    # Dedup per label keeping highest score per column
-    dedupd = {}
-    for label, items in results.items():
-        keyd = {}
-        for s, t, c, sc in items:
-            key = (s, t, c)
-            if key not in keyd or sc > keyd[key]:
-                keyd[key] = sc
-        dedupd[label] = sorted([(s, t, c, sc) for (s, t, c), sc in keyd.items()],
-                               key=lambda x: x[3], reverse=True)
-    return dedupd
+    for schema in sorted(os.listdir(parquet_dir)):
+        sp = os.path.join(parquet_dir, schema)
+        if not os.path.isdir(sp):
+            continue
+        for fn in sorted(os.listdir(sp)):
+            if fn.lower().endswith(".parquet"):
+                table = fn[:-8]
+                key = f"{schema}.{table}"
+                cat["tables"][key] = {
+                    "schema": schema,
+                    "table": table,
+                    "parquet": os.path.join(sp, fn),
+                }
 
-def extract_entity(nlq: str) -> str:
-    """
-    Simple heuristic: words after ' of ' or quoted text become the entity.
-    e.g., "Phone number of rajendra shikwal" -> "rajendra shikwal"
-    """
-    m = re.search(r"\bof\s+(.+)$", nlq.strip(), flags=re.IGNORECASE)
+    with open(cpath, "w", encoding="utf-8") as f:
+        json.dump(cat, f, indent=2)
+    return cat
+
+def list_tables(cat: Dict) -> List[str]:
+    return sorted([f"{v['schema']}.{v['table']}" for v in cat["tables"].values()], key=str.lower)
+
+def _norm_path(p: str) -> str:
+    return p.replace("\\", "/")
+
+def _sql_escape_like(s: str) -> str:
+    return (s or "").replace("'", "''")
+# ------------------------------------------------------
+
+
+# --------------- Table probing + retrieval ---------------
+def _detect_string_cols(con: duckdb.DuckDBPyConnection, parquet_path: str) -> List[str]:
+    try:
+        df = con.execute(
+            f"SELECT * FROM parquet('{_sql_escape_like(_norm_path(parquet_path))}') LIMIT {PROBE_ROWS}"
+        ).fetchdf()
+    except Exception:
+        return []
+    return [c for c in df.columns if str(df[c].dtype) in ("object", "string", "category")]
+
+def _search_tokens(
+    con: duckdb.DuckDBPyConnection,
+    parquet_path: str,
+    tokens: List[str],
+    strcols: List[str],
+) -> pd.DataFrame:
+    if not strcols or not tokens:
+        return pd.DataFrame()
+    # AND across tokens; for each token, OR across columns
+    parts = []
+    for t in tokens:
+        t_esc = _sql_escape_like(t)
+        ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in strcols]
+        parts.append("(" + " OR ".join(ors) + ")")
+    where = " AND ".join(parts)
+    q = (
+        f"SELECT * FROM parquet('{_sql_escape_like(_norm_path(parquet_path))}') "
+        f"WHERE {where} LIMIT {ROWS_PER_TABLE_TO_CONTEXT}"
+    )
+    try:
+        return con.execute(q).fetchdf()
+    except Exception:
+        return pd.DataFrame()
+# --------------------------------------------------------
+
+
+# --------------- Query parsing helpers ---------------
+def _extract_tokens(q: str) -> List[str]:
+    # if quoted text exists, prefer those tokens
+    m = re.search(r"[\"“”‘’']([^\"“”‘’']+)[\"“”‘’']", q)
     if m:
-        ent = m.group(1).strip().strip("?")
-        return ent.strip("'\" ")
-    # quoted
-    m2 = re.search(r"[\"']([^\"']+)[\"']", nlq)
-    if m2:
-        return m2.group(1).strip()
-    # fallback: take last 2-4 tokens that look like a name
-    toks = tokenize(nlq)
-    common = set(sum(SYNONYMS.values(), []))
-    candidates = [t for t in toks if t not in common and not t.isdigit()]
-    return " ".join(candidates[-3:]) if candidates else nlq
+        raw = re.findall(r"[A-Za-z0-9@+._/-]+", m.group(1))
+        return [t for t in raw if t]
 
-def guess_intent(nlq: str) -> Dict:
-    """
-    Classify which attribute user wants (phone/email/address/etc.)
-    """
-    L = nlq.lower()
-    for label, words in SYNONYMS.items():
-        for w in words:
-            if re.search(rf"\b{re.escape(w)}\b", L):
-                return {"want": label}
-    # default: name lookup
-    return {"want": "name"}
+    raw = re.findall(r"[A-Za-z0-9@+._/-]+", q)
+    stop = {
+        "what", "is", "are", "the", "a", "an", "of", "for", "about",
+        "list", "show", "name", "names", "tables", "table", "please"
+    }
+    toks = [t for t in raw if (t.lower() not in stop) and (any(c.isdigit() for c in t) or len(t) >= 3)]
+    return toks or (raw[-1:] if raw else [])
 
-def build_candidates(schema_rows: List[Dict], want_label: str) -> List[Dict]:
-    """
-    Choose tables that have BOTH:
-      - a column matching the 'want' (e.g., phone)
-      - and a 'name-like' column to search by entity
-    """
-    by_table = defaultdict(lambda: {"want_cols": [], "name_cols": [], "text_cols": []})
-    for r in schema_rows:
-        s, t, c, typ = r["schema"], r["table"], r["column"], str(r["type"]).lower()
-        key = (s, t)
-        if any(k in c.lower() for k in SYNONYMS.get(want_label, [])):
-            by_table[key]["want_cols"].append(c)
-        if any(k in c.lower() for k in SYNONYMS["name"]):
-            by_table[key]["name_cols"].append(c)
-        if any(tt in typ for tt in TEXT_TYPES_HINT):
-            by_table[key]["text_cols"].append(c)
+def meta_list_tables(q: str) -> bool:
+    L = q.lower().strip()
+    return (
+        (("list" in L or "show" in L or "name" in L) and "table" in L)
+        or L in {"tables", "list tables", "show tables", "name of all tables"}
+    )
 
-    cands = []
-    for (s, t), v in by_table.items():
-        if v["want_cols"] and (v["name_cols"] or v["text_cols"]):
-            cands.append({"schema": s, "table": t, **v})
-    return cands
+def meta_topn(q: str):
+    m = re.search(r"\btop\s+(\d+)\s+([A-Za-z0-9_.-]+)", q, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None
 
-def make_like_param(x: str) -> str:
-    return f"%{x}%"
+def best_table(catalog: Dict, frag: str) -> Tuple[str, Dict, int]:
+    frag = frag.lower()
+    best_key, best_meta, best_score = None, None, -1
+    for key, meta in catalog["tables"].items():
+        cands = [key.lower(), meta["table"].lower(), f"{meta['schema'].lower()}.{meta['table'].lower()}"]
+        score = max(int(frag in c) * 100 + len(os.path.commonprefix([frag, c])) for c in cands)
+        if score > best_score:
+            best_key, best_meta, best_score = key, meta, score
+    return best_key, best_meta, best_score
+# -----------------------------------------------------
 
-def try_query(engine, schema: str, table: str, want_cols: List[str], name_cols: List[str], entity: str) -> pd.DataFrame:
-    """
-    Build a safe parameterized query using LIKE on name-like columns.
-    Returns up to ROWS_PER_QUERY rows.
-    """
-    full = f"[{schema}].[{table}]"
-    want_sel = ", ".join(f"[{wc}]" for wc in want_cols[:3])  # cap to keep narrow
-    if not want_sel:
-        want_sel = "*"
 
-    # if name columns exist, search there; else fallback to all text columns
-    where_parts = []
-    params = {}
-    if name_cols:
-        for i, col in enumerate(name_cols[:4]):
-            where_parts.append(f"[{col}] LIKE :p{i}")
-            params[f"p{i}"] = make_like_param(entity)
-    else:
-        # shouldn't happen if we filtered cands, but guard anyway
-        where_parts.append("1=1")
+# --------------- Context builder for Gemini ---------------
+def build_context(cat: Dict, question: str) -> str:
+    con = duckdb.connect(database=":memory:")
+    tokens = _extract_tokens(question)
+    chunks: List[str] = []
+    total_len = 0
 
-    sql = text(f"""
-        SELECT TOP {ROWS_PER_QUERY}
-            {want_sel},
-            {", ".join(f"[{c}]" for c in name_cols[:3])}
-        FROM {full}
-        WHERE {" OR ".join(where_parts)}
-    """)
-    with engine.connect() as conn:
+    for key, meta in list(cat["tables"].items())[:MAX_TABLES_TO_TRY]:
+        p = meta["parquet"]
+        strcols = _detect_string_cols(con, p)
+        if not strcols:
+            continue
+        hits = _search_tokens(con, p, tokens, strcols)
+        if hits.empty:
+            continue
+
+        block = f"TABLE {meta['schema']}.{meta['table']} (columns: {', '.join(hits.columns.tolist())}):\n"
+        block += hits.to_string(index=False)
+        block += "\n\n"
+        if total_len + len(block) > MAX_CONTEXT_CHARS:
+            break
+        chunks.append(block)
+        total_len += len(block)
+
+    con.close()
+
+    if not chunks:
+        # fall back to schema-only view to let Gemini at least guide the user
+        names = list_tables(cat)
+        return "TABLES AVAILABLE:\n" + ", ".join(names) + "\n"
+    return "".join(chunks)
+# ---------------------------------------------------------
+
+
+# --------------- Gemini call ---------------
+def gemini_answer(question: str, context: str, model_name: str) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise SystemExit("Set GEMINI_API_KEY environment variable first (from Google AI Studio).")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    prompt = (
+        "You are a careful data assistant working over a database export.\n"
+        "Use ONLY the database context below. If the answer is not present, reply exactly: Not found.\n\n"
+        f"User question:\n{question}\n\n"
+        f"Database context (snippets):\n{context}\n\n"
+        "Respond concisely with the value(s) found. If multiple plausible matches exist, "
+        "return the best one or a short comma-separated list. Do not invent columns or values."
+    )
+
+    try:
+        resp = model.generate_content(prompt)
+        text = (resp.text or "").strip()
+    except Exception as e:
+        text = f"Error calling Gemini: {e}"
+    return text
+# ------------------------------------------
+
+
+# --------------- Main answer flow ---------------
+def answer(root: str, q: str, model_name: str):
+    cat = ensure_catalog(root)
+
+    if meta_list_tables(q):
+        print(", ".join(list_tables(cat)))
+        return
+
+    topn = meta_topn(q)
+    if topn:
+        n, frag = topn
+        key, meta, score = best_table(cat, frag)
+        if not meta or score < 10:
+            print("Not found")
+            return
+        con = duckdb.connect(database=":memory:")
+        p = _norm_path(meta["parquet"])
         try:
-            return pd.read_sql(sql, conn, params=params)
+            df = con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
+            print(df.to_string(index=False) if not df.empty else "Not found")
         except Exception:
-            # Some columns may be NVARCHAR(MAX) with non-like-able types; fallback to SELECT * TOP N no WHERE
-            try:
-                q = text(f"SELECT TOP {ROWS_PER_QUERY} {want_sel} FROM {full}")
-                return pd.read_sql(q, conn)
-            except Exception:
-                return pd.DataFrame()
-
-def answer_nlq(nlq: str) -> None:
-    engine = make_engine()
-    schema_rows = load_schema(engine)
-
-    intent = guess_intent(nlq)
-    entity = extract_entity(nlq)
-    want = intent["want"]
-
-    # Rank columns for the "want"
-    want_cols_ranked = best_match_columns(schema_rows, [want])
-
-    # Pick tables that have suitable columns
-    candidates = build_candidates(schema_rows, want)
-
-    # Light ranking: prefer tables where column name match is strong
-    def score_table(cand):
-        s, t = cand["schema"], cand["table"]
-        col_hits = [sc for (cs, ct, cc, sc) in want_cols_ranked.get(want, []) if cs == s and ct == t]
-        return max(col_hits) if col_hits else 0
-
-    candidates.sort(key=score_table, reverse=True)
-    candidates = candidates[:MAX_TABLES_TO_QUERY]
-
-    print(f"\nQuestion: {nlq}")
-    print(f"Detected intent: {want}  |  Entity: '{entity}'")
-    if not candidates:
-        print("No suitable tables found from schema hints.")
+            print("Not found")
+        finally:
+            con.close()
         return
 
-    # Try querying each candidate until we get matches
-    engine.dispose()
-    engine = make_engine()
-    results = []
-    for cand in candidates:
-        df = try_query(engine, cand["schema"], cand["table"], cand["want_cols"], cand["name_cols"], entity)
-        if not df.empty:
-            results.append((cand, df))
+    ctx = build_context(cat, q)
+    ans = gemini_answer(q, ctx, model_name)
+    print(ans if ans else "Not found")
+# ------------------------------------------------
 
-    if not results:
-        print("No matching rows found (tried name-like search).")
-        print("Tip: Try another spelling or add more context (e.g., 'employee phone of ...').")
-        return
 
-    # Present best result first
-    for (cand, df) in results:
-        print(f"\n=== {cand['schema']}.{cand['table']}  (showing up to {len(df)} rows) ===")
-        # Bring likely columns to the front
-        front_cols = cand["want_cols"][:2] + cand["name_cols"][:2]
-        cols = list(dict.fromkeys(front_cols + list(df.columns)))
-        print(df[cols].to_string(index=False))
-
+# --------------- CLI ---------------
 def main():
-    if len(sys.argv) > 1:
-        nlq = " ".join(sys.argv[1:])
-        answer_nlq(nlq)
+    ap = argparse.ArgumentParser(description="Gemini-powered NL Q&A over local Parquet export")
+    ap.add_argument("-e", "--export", help="Path to export root (folder containing 'parquet/')", default=None)
+    ap.add_argument("-m", "--model", help="Gemini model name (default from GEMINI_MODEL env or gemini-1.5-flash)", default=None)
+    ap.add_argument("question", nargs="*", help="Your natural-language question")
+    args = ap.parse_args()
+
+    root = locate_export_root(args.export)
+    model_name = args.model or MODEL_NAME
+
+    if args.question:
+        q = " ".join(args.question).strip()
+        answer(root, q, model_name)
         return
 
-    print("Natural-language DB Q&A. Type a question, or 'quit'.")
+    # Interactive mode
+    print("Gemini DB Q&A over Parquet")
+    print(f"Export root: {root}")
+    print("Examples:")
+    print('  name of all tables')
+    print('  phone number of "rajendra shikwal"')
+    print('  customer code of PZ6115')
+    print('  top 5 adtAnnGifts')
+    print("Type 'exit' to quit.")
     while True:
         try:
             q = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if not q or q.lower() in {"quit", "exit"}:
+        if not q or q.lower() in {"exit", "quit"}:
             break
-        answer_nlq(q)
+        answer(root, q, model_name)
+
 
 if __name__ == "__main__":
     main()
