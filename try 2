@@ -1,270 +1,455 @@
-import os, re, json, requests
-from typing import List, Dict, Tuple
-import pandas as pd
-import pyarrow as pa
-import pyarrow.dataset as ds
-from rapidfuzz import fuzz
-from tqdm import tqdm
+ai_db_agent/
+  requirements.txt
+  build_catalog.py
+  prep_data.py
+  train_tokenizer.py
+  train_nl2sql.py
+  agent.py
+  serve.py
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-DATABASE      = "bwlive"  # matches your folder: db_export_bwlive
-ROOT_OUT      = f"db_export_{DATABASE}"
-CATALOG_JSON  = os.path.join(ROOT_OUT, "catalog.json")
 
-# Ollama settings
-OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL  = os.environ.get("OLLAMA_MODEL", "llama3.1")  # change if you like
-TEMPERATURE   = 0
+torch>=2.2
+transformers>=4.40
+sentencepiece>=0.1.99
+datasets>=2.18
+pandas>=2.0
+pyarrow>=15
+duckdb>=1.0.0
+rapidfuzz>=3.9
+tqdm>=4.66
+fastapi>=0.110
+uvicorn>=0.30
 
-# Retrieval limits
-MAX_TABLES_TO_TRY       = 200
-MAX_STRING_COLS_TO_READ = 50
-ROWS_PER_TABLE_TO_SHOW  = 6        # rows passed to LLM as evidence
-MAX_CONTEXT_CHARS       = 6000     # keep prompt small-ish
-# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------- Catalog helpers ----------
-def ensure_catalog() -> Dict:
-    """Load catalog.json; if missing, build a minimal one by scanning parquet/."""
-    if os.path.exists(CATALOG_JSON):
-        with open(CATALOG_JSON, "r", encoding="utf-8") as f:
-            return json.load(f)
+pip install -r ai_db_agent/requirements.txt
 
-    parquet_dir = os.path.join(ROOT_OUT, "parquet")
-    if not os.path.isdir(parquet_dir):
-        raise SystemExit(f"Parquet folder not found: {parquet_dir}")
 
-    cat = {"database": DATABASE, "export_root": os.path.abspath(ROOT_OUT), "tables": {}}
-    for schema in os.listdir(parquet_dir):
-        sp = os.path.join(parquet_dir, schema)
+# ai_db_agent/build_catalog.py
+import os, json
+import pyarrow.parquet as pq
+
+DB_DIR = "../db_export_bwlive"
+PARQ = os.path.join(DB_DIR, "parquet")
+CAT  = os.path.join(DB_DIR, "catalog.json")
+
+def main():
+    if not os.path.isdir(PARQ):
+        raise SystemExit(f"Parquet folder not found: {PARQ}")
+    cat = {"database": "bwlive", "export_root": os.path.abspath(DB_DIR), "tables": {}}
+    for schema in os.listdir(PARQ):
+        sp = os.path.join(PARQ, schema)
         if not os.path.isdir(sp): continue
         for fn in os.listdir(sp):
-            if fn.lower().endswith(".parquet"):
-                table = fn[:-8]
-                key = f"{schema}.{table}"
-                cat["tables"][key] = {
-                    "schema": schema, "table": table,
-                    "parquet": os.path.join(sp, fn),
-                    "row_count": None,
-                }
-    os.makedirs(ROOT_OUT, exist_ok=True)
-    with open(CATALOG_JSON, "w", encoding="utf-8") as f:
-        json.dump(cat, f, indent=2)
-    return cat
-
-# ---------- NLQ parsing (synonym-free) ----------
-STOPWORDS = {
-    "what","is","are","of","for","about","the","a","an","this","that","these","those",
-    "show","give","get","find","list","name","names","code","codes","number","numbers",
-    "top","first","last","all","and","or","with","without","please","pls","zone"
-}
-def extract_tokens(q: str) -> List[str]:
-    # Prefer quoted chunk as main search
-    m = re.search(r"[\"“”‘’']([^\"“”‘’']+)[\"“”‘’']", q)
-    if m:
-        raw = re.findall(r"[A-Za-z0-9@+._/-]+", m.group(1))
-        return [t for t in raw if t]
-    # Otherwise tokenize whole question
-    raw = re.findall(r"[A-Za-z0-9@+._/-]+", q)
-    toks = []
-    for t in raw:
-        tl = t.lower()
-        if tl in STOPWORDS: continue
-        if any(c.isdigit() for c in t) or len(t) >= 3:
-            toks.append(t)
-    if not toks and raw:
-        toks = [raw[-1]]
-    return toks
-
-def is_list_tables(q: str) -> bool:
-    L = q.lower().strip()
-    return (
-        bool(re.search(r"\b(list|show|name|names)\b", L) and re.search(r"\btables?\b", L))
-        or L in {"tables","list tables","show tables","name of all tables","names of all tables"}
-    )
-
-def parse_top_n(q: str):
-    m = re.search(r"\btop\s+(\d+)\s+([a-zA-Z0-9_.-]+)", q, flags=re.IGNORECASE)
-    if m: return int(m.group(1)), m.group(2)
-    return None
-
-def best_table_match(catalog: Dict, frag: str) -> Tuple[str, Dict, int]:
-    frag = frag.lower()
-    best_key, best_meta, best_score = None, None, -1
-    for key, meta in catalog["tables"].items():
-        cands = [key.lower(), meta["table"].lower(), f"{meta['schema'].lower()}.{meta['table'].lower()}"]
-        sc = max(fuzz.partial_ratio(frag, c) for c in cands)
-        if sc > best_score:
-            best_key, best_meta, best_score = key, meta, sc
-    return best_key, best_meta, best_score
-
-# ---------- Data readers ----------
-def table_string_columns(dataset: ds.Dataset) -> List[str]:
-    cols = []
-    for f in dataset.schema:
-        if pa.types.is_string(f.type) or pa.types.is_large_string(f.type) or pa.types.is_binary(f.type):
-            cols.append(f.name)
-    return cols[:MAX_STRING_COLS_TO_READ]
-
-def search_table_tokens(parquet_path: str, tokens: List[str]) -> pd.DataFrame:
-    dataset = ds.dataset(parquet_path, format="parquet")
-    scols = table_string_columns(dataset)
-    if not scols: return pd.DataFrame()
-    tbl = dataset.to_table(columns=scols)
-    df = tbl.to_pandas()
-    if df.empty: return df
-
-    # AND across tokens (each token must appear in some column)
-    mask = pd.Series(True, index=df.index)
-    for tok in tokens:
-        m = pd.Series(False, index=df.index)
-        for c in scols:
+            if not fn.lower().endswith(".parquet"): continue
+            table = fn[:-8]
+            fpath = os.path.join(sp, fn)
             try:
-                m |= df[c].astype("string").str.contains(tok, case=False, na=False)
+                pf = pq.ParquetFile(fpath)
+                nrows = pf.metadata.num_rows if pf.metadata else None
+                cols  = [pf.schema_arrow.names[i] for i in range(len(pf.schema_arrow.names))]
             except Exception:
-                pass
-        mask &= m
-        if not mask.any(): return pd.DataFrame()
-    return df[mask]
+                nrows, cols = None, []
+            key = f"{schema}.{table}"
+            cat["tables"][key] = {"schema": schema, "table": table, "parquet": fpath, "row_count": nrows, "columns": cols}
+    with open(CAT, "w", encoding="utf-8") as f:
+        json.dump(cat, f, indent=2)
+    print(f"✔ catalog.json → {os.path.abspath(CAT)} | tables: {len(cat['tables'])}")
 
-# ---------- Column ranking (pattern + stats) ----------
-def looks_like_phone(s: pd.Series) -> float:
-    if s.empty: return 0.0
-    pat = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
-    try:
-        x = s.dropna().astype("string").str.fullmatch(pat)
-        return float(x.sum()) / max(1, len(x))
-    except Exception:
-        return 0.0
-
-def looks_like_email(s: pd.Series) -> float:
-    if s.empty: return 0.0
-    pat = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-    try:
-        x = s.dropna().astype("string").str.fullmatch(pat)
-        return float(x.sum()) / max(1, len(x))
-    except Exception:
-        return 0.0
-
-def looks_like_idish(s: pd.Series) -> float:
-    if s.empty: return 0.0
-    try:
-        ss = s.dropna().astype("string").str.strip()
-        ss = ss[~ss.str.contains(r"@", na=False)]
-        ss = ss[ss.str.len() <= 16]
-        code_mask = ss.str.match(r"^[A-Za-z0-9._/-]+$")
-        return float(code_mask.sum()) / max(1, len(s.dropna()))
-    except Exception:
-        return 0.0
-
-def rank_columns(df: pd.DataFrame, question: str) -> List[str]:
-    scores = []
-    head = df.head(min(5000, len(df)))
-    for col in df.columns:
-        s = head[col]
-        is_str = pd.api.types.is_string_dtype(s) or s.dtype == "object"
-        ph = looks_like_phone(s) if is_str else 0.0
-        em = looks_like_email(s) if is_str else 0.0
-        idsc = looks_like_idish(s) if is_str else 0.0
-        nunq = s.nunique(dropna=True); uniq_ratio = float(nunq) / max(1, len(head))
-        sim = fuzz.partial_ratio(col.lower(), question.lower())
-        score = 3.0*max(ph, em) + 1.3*idsc + 0.8*uniq_ratio + 0.02*sim
-        scores.append((col, score))
-    scores.sort(key=lambda x: x[1], reverse=True)
-    top = [c for c, _ in scores[:6]]
-    return top or list(df.columns[:3])
-
-# ---------- Ollama ----------
-def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
-    url = f"{OLLAMA_HOST}/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": TEMPERATURE}}
-    r = requests.post(url, json=payload, timeout=120)
-    r.raise_for_status()
-    txt = r.json().get("response", "").strip()
-    # force one line
-    txt = re.sub(r"\s+", " ", txt).strip()
-    return txt
-
-# ---------- Main answer flow ----------
-def answer(q: str):
-    catalog = ensure_catalog()
-
-    # meta: list tables
-    if is_list_tables(q):
-        names = sorted([f"{v['schema']}.{v['table']}" for v in catalog["tables"].values()], key=str.lower)
-        one_line = ", ".join(names)
-        print(one_line); return
-
-    # meta: top N table
-    topn = parse_top_n(q)
-    if topn:
-        n, frag = topn
-        key, meta, score = best_table_match(catalog, frag)
-        if not meta or score < 40:
-            print("Not found"); return
-        try:
-            df = pd.read_parquet(meta["parquet"]).head(n)
-        except Exception:
-            print("Not found"); return
-        flat = df.to_string(index=False)
-        prompt = (
-            "You are a terse data assistant. In ONE short line, summarize the essence of these rows. "
-            "Do not explain the table; extract the key item the user likely wants. If uncertain, say 'Not found'.\n\n"
-            f"User question: {q}\n\nRows:\n{flat}\n\nOne-line answer:"
-        )
-        ans = ask_ollama(prompt)
-        print(ans); return
-
-    # generic: retrieve → compress → ask ollama
-    tokens = extract_tokens(q)
-    tables = list(catalog["tables"].items())[:MAX_TABLES_TO_TRY]
-
-    contexts = []
-    for _, meta in tqdm(tables, desc="Scanning tables", unit="table", dynamic_ncols=True):
-        p = meta["parquet"]
-        if not os.path.exists(p): continue
-        try:
-            hits = search_table_tokens(p, tokens)
-        except Exception:
-            continue
-        if hits.empty: continue
-
-        cols = rank_columns(hits, q)
-        slim = hits[cols].head(ROWS_PER_TABLE_TO_SHOW)
-        ctx = f"Table {meta['schema']}.{meta['table']}:\n" + slim.to_string(index=False)
-        contexts.append(ctx)
-        joined = "\n\n".join(contexts)
-        if len(joined) >= MAX_CONTEXT_CHARS:
-            break
-
-    if not contexts:
-        print("Not found"); return
-
-    prompt = (
-        "Answer the user's question using ONLY the provided rows. Respond in ONE short line with just the value(s). "
-        "If multiple candidates exist, pick the most plausible. If unknown, reply exactly 'Not found'. "
-        "Avoid extra words, punctuation, or labels.\n\n"
-        f"User question: {q}\n\nContext rows:\n{joined}\n\nOne-line answer:"
-    )
-    ans = ask_ollama(prompt)
-    print(ans)
-
-# ---------- CLI ----------
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        answer(" ".join(sys.argv[1:]))
-    else:
-        print('Ollama DB Q&A (one-line). Examples:')
-        print('  python ask_ollama.py "phone number of \\"rajendra shikwal\\""')
-        print('  python ask_ollama.py "customer code of PZ6115"')
-        print('  python ask_ollama.py "top 5 adtAnnGifts"')
-        print('  python ask_ollama.py "name of all tables"')
-        while True:
-            try:
-                q = input("\n> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not q or q.lower() in {"exit", "quit"}:
-                break
-            answer(q)
+    main()
+
+
+python ai_db_agent/build_catalog.py
+
+
+# ai_db_agent/prep_data.py
+import os, json, re, random
+from pathlib import Path
+import pandas as pd
+import pyarrow.dataset as ds
+
+DB_DIR   = "../db_export_bwlive"
+CAT_PATH = os.path.join(DB_DIR, "catalog.json")
+OUT_DIR  = "data"
+random.seed(7)
+
+MAX_TABLES = 200
+ROWS_PER_TABLE = 800     # sampled for QA synthesis
+TRAIN_SPLIT = 0.9
+
+def looks_like_phone(x:str)->bool:
+    return bool(re.fullmatch(r"\s*\+?\s*(?:\d[\s().-]?){7,15}\s*", x or ""))
+
+def looks_like_email(x:str)->bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", x or ""))
+
+def looks_like_idish(x:str)->bool:
+    if not x: return False
+    if "@" in x: return False
+    x = x.strip()
+    return len(x)<=16 and bool(re.fullmatch(r"[A-Za-z0-9._/-]+", x))
+
+def pick_string_cols(schema):
+    return [f.name for f in schema
+            if str(f.type).lower().startswith("string") or "large_string" in str(f.type).lower() or "binary" in str(f.type).lower()]
+
+def make_q(col_ans, col_key, val_key):
+    # generate a few phrasings (kept generic—no synonym list)
+    templates = [
+        f"{col_ans} of {val_key}",
+        f"what is {col_ans} for {val_key}",
+        f"please return {col_ans} of {val_key}",
+        f"{col_ans} for {val_key}",
+    ]
+    return random.choice(templates)
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    cat = json.load(open(CAT_PATH, "r", encoding="utf-8"))
+    items = list(cat["tables"].items())[:MAX_TABLES]
+
+    pairs = []
+    for key, meta in items:
+        dset = ds.dataset(meta["parquet"], format="parquet")
+        str_cols = pick_string_cols(dset.schema)
+        if not str_cols: continue
+
+        # load a slice
+        tbl = dset.to_table(columns=str_cols)
+        df  = tbl.to_pandas()
+        if df.empty: continue
+        if len(df) > ROWS_PER_TABLE:
+            df = df.sample(ROWS_PER_TABLE, random_state=7)
+
+        # classify columns by pattern density on sample
+        phone_cols = []; email_cols = []; id_cols = []; nameish_cols = []
+        for c in str_cols:
+            s = df[c].astype("string")
+            ph = s.dropna().apply(looks_like_phone).mean()
+            em = s.dropna().apply(looks_like_email).mean()
+            idd= s.dropna().apply(looks_like_idish).mean()
+            # keep plausible "name-ish" columns (varied strings, not id/email/phone)
+            nunq = s.nunique(dropna=True); uniq_ratio = nunq/max(1,len(df))
+            nameish = (uniq_ratio>0.2) and (ph<0.05) and (em<0.05) and (idd<0.2) and (s.str.len().fillna(0).median()<30)
+            if ph>0.4: phone_cols.append(c)
+            if em>0.4: email_cols.append(c)
+            if idd>0.4: id_cols.append(c)
+            if nameish: nameish_cols.append(c)
+
+        # synthetic QAs
+        # 1) ask for phone/email/id given a name-ish or id-ish value
+        for c_ans in phone_cols+email_cols+id_cols:
+            # choose a lookup column (prefer name-ish; else any other string col)
+            c_keys = nameish_cols or [x for x in str_cols if x!=c_ans]
+            if not c_keys: continue
+            c_key = random.choice(c_keys)
+
+            # sample non-null rows with both cols populated
+            sub = df[[c_ans, c_key]].dropna().astype(str)
+            sub = sub[(sub[c_ans].str.len()>0) & (sub[c_key].str.len()>0)]
+            if sub.empty: continue
+            for _, r in sub.head(50).iterrows():
+                val_key = r[c_key]
+                # NL
+                q = make_q(c_ans, c_key, val_key)
+                # SQL over DuckDB parquet() reader
+                # - NOTE: we filter with LIKE to be robust
+                schema, table = meta["schema"], meta["table"]
+                p = meta["parquet"].replace("\\", "/")  # DuckDB on Windows
+                sql = (
+                    f"SELECT \"{c_ans}\" FROM parquet('{p}') "
+                    f"WHERE CAST(\"{c_key}\" AS VARCHAR) ILIKE '%{val_key.replace(\"'\",\"''\")}%' "
+                    f"LIMIT 1;"
+                )
+                pairs.append({"input": q, "target": sql})
+
+        # 2) ask for a row count
+        q = f"count rows in {meta['schema']}.{meta['table']}"
+        p = meta["parquet"].replace("\\", "/")
+        sql = f"SELECT COUNT(*) AS cnt FROM parquet('{p}');"
+        pairs.append({"input": q, "target": sql})
+
+    random.shuffle(pairs)
+    n_train = int(len(pairs)*TRAIN_SPLIT)
+    train = pairs[:n_train]; valid = pairs[n_train:]
+    Path(OUT_DIR, "train.jsonl").write_text("\n".join(json.dumps(x,ensure_ascii=False) for x in train), encoding="utf-8")
+    Path(OUT_DIR, "valid.jsonl").write_text("\n".join(json.dumps(x,ensure_ascii=False) for x in valid), encoding="utf-8")
+    print(f"✔ generated {len(train)} train / {len(valid)} valid pairs at {OUT_DIR}/")
+
+if __name__ == "__main__":
+    main()
+
+
+python ai_db_agent/prep_data.py
+
+
+# ai_db_agent/train_tokenizer.py
+import json, sentencepiece as spm, os
+SRC = "data/train.jsonl"
+TXT = "data/corpus.txt"
+
+def main():
+    # build corpus from both user inputs and target SQL
+    with open(SRC, "r", encoding="utf-8") as f:
+        lines = [json.loads(l) for l in f]
+    with open("data/valid.jsonl","r",encoding="utf-8") as f:
+        lines += [json.loads(l) for l in f]
+    with open(TXT,"w",encoding="utf-8") as out:
+        for r in lines:
+            out.write(r["input"]+"\n")
+            out.write(r["target"]+"\n")
+    spm.SentencePieceTrainer.Train(
+        input=TXT,
+        model_prefix="data/spm",
+        vocab_size=16000,
+        character_coverage=1.0,
+        model_type="bpe",
+        pad_id=0, unk_id=1, bos_id=2, eos_id=3
+    )
+    print("✔ tokenizer -> data/spm.model, data/spm.vocab")
+
+if __name__ == "__main__":
+    main()
+
+
+python ai_db_agent/train_tokenizer.py
+
+
+# ai_db_agent/train_nl2sql.py
+import json, os
+import torch
+from datasets import load_dataset
+from transformers import (
+    PreTrainedTokenizerFast,
+    EncoderDecoderModel, EncoderDecoderConfig,
+    TrainingArguments, Trainer
+)
+
+TOK = "data/spm.model"
+TRAIN = "data/train.jsonl"
+VALID = "data/valid.jsonl"
+OUTDIR = "models/nl2sql_tiny"
+
+MAX_IN = 128
+MAX_OUT= 128
+
+def load_pairs(path):
+    return [json.loads(l) for l in open(path,"r",encoding="utf-8")]
+
+def main():
+    os.makedirs(OUTDIR, exist_ok=True)
+    tok = PreTrainedTokenizerFast(tokenizer_file=TOK, bos_token="<s>", eos_token="</s>", unk_token="<unk>", pad_token="<pad>")
+
+    # small encoder-decoder (both randomly initialized)
+    cfg = EncoderDecoderConfig.from_encoder_decoder_configs(
+        encoder=None, decoder=None
+    )
+    # set tiny dims
+    cfg.encoder = {
+        "model_type":"bert",
+        "hidden_size":256,"num_hidden_layers":4,"num_attention_heads":4,
+        "intermediate_size":1024,"hidden_act":"gelu","vocab_size":len(tok),
+        "max_position_embeddings":256,"type_vocab_size":2,"layer_norm_eps":1e-5
+    }
+    cfg.decoder = {
+        "model_type":"bert",
+        "is_decoder":True,"add_cross_attention":True,
+        "hidden_size":256,"num_hidden_layers":4,"num_attention_heads":4,
+        "intermediate_size":1024,"hidden_act":"gelu","vocab_size":len(tok),
+        "max_position_embeddings":256,"type_vocab_size":2,"layer_norm_eps":1e-5
+    }
+    model = EncoderDecoderModel.from_encoder_decoder_pretrained(
+        None, None, encoder_config=cfg.encoder, decoder_config=cfg.decoder
+    )
+
+    def proc(batch):
+        inputs = tok(batch["input"], truncation=True, padding="max_length", max_length=MAX_IN)
+        labels = tok(batch["target"], truncation=True, padding="max_length", max_length=MAX_OUT)
+        inputs["labels"] = [[(t if t!=tok.pad_token_id else -100) for t in seq] for seq in labels["input_ids"]]
+        return inputs
+
+    ds = {
+        "train": load_dataset("json", data_files=TRAIN, split="train"),
+        "valid": load_dataset("json", data_files=VALID, split="train"),
+    }
+    ds_enc = {
+        "train": ds["train"].map(proc, batched=True, remove_columns=ds["train"].column_names),
+        "valid": ds["valid"].map(proc, batched=True, remove_columns=ds["valid"].column_names),
+    }
+
+    args = TrainingArguments(
+        output_dir=OUTDIR,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        learning_rate=5e-4,
+        num_train_epochs=5,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_steps=50,
+        bf16=torch.cuda.is_available(),
+        fp16=not torch.cuda.is_available(),  # use fp16 on CPU if needed
+        save_total_limit=2,
+        report_to=[]
+    )
+    trainer = Trainer(model=model, args=args, train_dataset=ds_enc["train"], eval_dataset=ds_enc["valid"])
+    trainer.train()
+    model.save_pretrained(OUTDIR)
+    tok.save_pretrained(OUTDIR)
+    print(f"✔ model saved to {OUTDIR}")
+
+if __name__ == "__main__":
+    main()
+
+
+python ai_db_agent/train_nl2sql.py
+
+
+# ai_db_agent/agent.py
+import os, json, re
+import duckdb, pandas as pd
+from transformers import PreTrainedTokenizerFast, EncoderDecoderModel
+
+DB_DIR = "../db_export_bwlive"
+CAT = os.path.join(DB_DIR, "catalog.json")
+MODEL_DIR = "models/nl2sql_tiny"
+
+class DBAgent:
+    def __init__(self):
+        self.cat = json.load(open(CAT,"r",encoding="utf-8"))
+        self.tok = PreTrainedTokenizerFast.from_pretrained(MODEL_DIR)
+        self.model = EncoderDecoderModel.from_pretrained(MODEL_DIR)
+        self.con = duckdb.connect(database=":memory:")
+        self.con.execute("PRAGMA threads=4;")
+
+    def _gen_sql(self, question:str) -> str:
+        ids = self.tok(question, return_tensors="pt", truncation=True, max_length=128)
+        out = self.model.generate(**ids, max_length=128, num_beams=4, do_sample=False)
+        sql = self.tok.decode(out[0], skip_special_tokens=True).strip()
+        return sql
+
+    def _tables(self):
+        return sorted([f"{v['schema']}.{v['table']}" for v in self.cat["tables"].values()], key=str.lower)
+
+    def _best_table(self, frag:str):
+        frag = frag.lower()
+        best = max(self.cat["tables"].items(),
+                   key=lambda kv: (frag in kv[0].lower()) or (frag in kv[1]["table"].lower()))
+        return best
+
+    def ask(self, q:str):
+        L = q.lower().strip()
+        # meta: list tables
+        if ("list" in L or "show" in L or "name of" in L) and "table" in L:
+            return ", ".join(self._tables())
+
+        # meta: top N table
+        m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
+        if m:
+            n, frag = int(m.group(1)), m.group(2)
+            key, meta = self._best_table(frag)
+            df = duckdb.query(f"SELECT * FROM parquet('{meta['parquet'].replace('\\','/')}') LIMIT {n}").to_df()
+            return df.to_string(index=False)
+
+        # main path: NL→SQL
+        sql = self._gen_sql(q)
+        try:
+            # simple guardrails
+            if not re.match(r"^\s*select\s", sql, flags=re.IGNORECASE):
+                raise ValueError("non-SELECT generated")
+            # substitute cataloged parquet paths if a table name appears like schema.table
+            for key, meta in self.cat["tables"].items():
+                sql = re.sub(rf"\b{re.escape(key)}\b", f"parquet('{meta['parquet'].replace('\\','/')}')", sql, flags=re.IGNORECASE)
+            df = self.con.execute(sql).fetchdf()
+            if df.empty:
+                return "Not found"
+            # compact one-line if single cell, else top rows
+            if df.shape == (1,1):
+                v = str(df.iat[0,0])
+                return v if v.strip() else "Not found"
+            return df.head(5).to_string(index=False)
+        except Exception:
+            # fallback: lexical find tokens across string cols (simple, synonym-free)
+            tokens = re.findall(r"[A-Za-z0-9@+._/-]+", q)
+            hits = []
+            for key, meta in list(self.cat["tables"].items())[:200]:
+                try:
+                    cols = duckdb.query(f"SELECT * FROM parquet('{meta['parquet'].replace('\\','/')}') LIMIT 1").columns
+                    strcols = []
+                    # probe types quickly
+                    probe = duckdb.query(f"SELECT * FROM parquet('{meta['parquet'].replace('\\','/')}') LIMIT 200").to_df()
+                    for c in probe.columns:
+                        if str(probe[c].dtype) in ("object","string","category"):
+                            strcols.append(c)
+                    if not strcols: continue
+                    cond = " AND ".join([ " OR ".join([f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t}%'" for c in strcols]) for t in tokens ])
+                    q2 = f"SELECT * FROM parquet('{meta['parquet'].replace('\\','/')}') WHERE {cond} LIMIT 5"
+                    df = duckdb.query(q2).to_df()
+                    if not df.empty:
+                        hits.append((key, df))
+                except Exception:
+                    pass
+            if not hits: return "Not found"
+            # show first hit neatly
+            key, df = hits[0]
+            return f"{key}\n" + df.to_string(index=False)
+
+if __name__ == "__main__":
+    bot = DBAgent()
+    while True:
+        try:
+            s = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not s or s.lower() in {"exit","quit"}: break
+        print(bot.ask(s))
+
+
+python ai_db_agent/agent.py
+# examples:
+# > phone number of "rajendra shikwal"
+# > customer code of PZ6115
+# > name of all tables
+# > top 5 adtAnnGifts
+
+
+# ai_db_agent/serve.py
+from fastapi import FastAPI
+from pydantic import BaseModel
+from agent import DBAgent
+
+app = FastAPI(title="DB Chat (own model)")
+bot = DBAgent()
+
+class ChatIn(BaseModel):
+    question: str
+
+@app.post("/chat")
+def chat(inp: ChatIn):
+    ans = bot.ask(inp.question)
+    # force one-line if you prefer
+    return {"answer": " ".join(str(ans).split())}
+
+@app.get("/health")
+def health():
+    return {"status":"ok"}
+
+# run: uvicorn ai_db_agent.serve:app --reload --port 8000
+
+
+uvicorn ai_db_agent.serve:app --reload --port 8000
+
+
+curl -s -X POST http://127.0.0.1:8000/chat -H "content-type: application/json" -d "{\"question\":\"phone number of 'rajendra'\"}"
+
+
+How it works (end-to-end)
+
+Your data only: training pairs are synthesized from db_export_bwlive/parquet/**.parquet plus column/row patterns.
+
+Tokenizer: trained with SentencePiece on your NL and SQL strings.
+
+Model: small encoder–decoder Transformer initialized from scratch and trained to emit SQL over DuckDB’s parquet('...') reader.
+
+Execution: predictions are run securely in DuckDB; answers returned as single value or compact table.
+
+Fallbacks: if a generated SQL fails, a lexical multi-token search over string columns returns the best matching rows.
