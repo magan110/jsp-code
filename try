@@ -1,319 +1,322 @@
-# ask_gemini.py
-# Natural-language Q&A over a local Parquet export (db_export_bwlive / do_export_bwlive)
-# Requires: pip install google-generativeai duckdb pandas pyarrow
-
-import os
-import re
-import sys
-import json
-import argparse
-from typing import Dict, List, Tuple
-
+import os, json, re, glob
 import duckdb
 import pandas as pd
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 
-# --- Gemini SDK ---
-try:
-    import google.generativeai as genai
-except Exception:
-    print("Missing dependency: google-generativeai. Install with:\n  pip install google-generativeai")
-    sys.exit(1)
+DB_DIR      = "../db_export_bwlive"
+CAT         = os.path.join(DB_DIR, "catalog.json")
+MODEL_BASE  = "models/nl2sql_tiny"
+ENV_MODEL   = os.environ.get("AI_DB_AGENT_MODEL", "")
+ENV_SPM     = os.environ.get("AI_DB_AGENT_SPM", "")
+DEBUG       = os.environ.get("AI_DB_AGENT_DEBUG", "0") == "1"
 
-# ---------------- CONFIG (overridable via CLI/env) ----------------
-EXPORT_CANDIDATES = ["db_export_bwlive", "do_export_bwlive"]  # we’ll accept either name
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+# Words we don't want to search for as entity tokens
+STOPWORDS = {
+    "what","is","are","of","for","about","the","a","an","this","that","these","those",
+    "show","give","get","find","list","name","names","code","codes","number","numbers",
+    "top","first","last","all","and","or","with","without","please","pls","zone",
+}
 
-MAX_TABLES_TO_TRY = int(os.environ.get("AG_MAX_TABLES", "200"))
-PROBE_ROWS = int(os.environ.get("AG_PROBE_ROWS", "250"))
-ROWS_PER_TABLE_TO_CONTEXT = int(os.environ.get("AG_ROWS_PER_TABLE", "6"))
-MAX_CONTEXT_CHARS = int(os.environ.get("AG_MAX_CONTEXT_CHARS", "12000"))
-# ------------------------------------------------------------------
-
-
-# --------------- Path + catalog helpers ---------------
-def locate_export_root(cli_arg: str | None = None) -> str:
-    """
-    Find the export root (folder that contains 'parquet/' and optionally catalog.json).
-    Priority: CLI arg → env vars → next to script → parent of script → CWD.
-    """
-    if cli_arg and os.path.isdir(cli_arg):
-        return os.path.abspath(cli_arg)
-
-    for env in ("EXPORT_ROOT", "BWLIVE_EXPORT", "DB_EXPORT_ROOT"):
-        p = os.environ.get(env)
-        if p and os.path.isdir(p):
-            return os.path.abspath(p)
-
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-    # next to the script
-    candidates += [os.path.join(here, name) for name in EXPORT_CANDIDATES]
-    # parent of the script
-    candidates += [os.path.join(here, "..", name) for name in EXPORT_CANDIDATES]
-    # current working dir
-    candidates += [os.path.join(os.getcwd(), name) for name in EXPORT_CANDIDATES]
-
-    for p in candidates:
-        if os.path.isdir(p):
-            return os.path.abspath(p)
-
-    raise SystemExit(
-        "Export folder not found.\n"
-        f"Provide it with -e/--export, set EXPORT_ROOT, or create one of: {', '.join(EXPORT_CANDIDATES)} "
-        "next to this script (containing a 'parquet' subfolder)."
-    )
-
-def cat_path(root: str) -> str:
-    return os.path.join(root, "catalog.json")
-
-def ensure_catalog(root: str) -> Dict:
-    """
-    Load catalog.json or build it by scanning export_root/parquet/<schema>/*.parquet
-    """
-    cpath = cat_path(root)
-    if os.path.isfile(cpath):
-        with open(cpath, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    parquet_dir = os.path.join(root, "parquet")
-    if not os.path.isdir(parquet_dir):
-        raise SystemExit(f"Parquet directory not found: {parquet_dir}")
-
-    db_name = os.path.basename(root).replace("db_export_", "")
-    cat = {"database": db_name, "export_root": os.path.abspath(root), "tables": {}}
-
-    for schema in sorted(os.listdir(parquet_dir)):
-        sp = os.path.join(parquet_dir, schema)
-        if not os.path.isdir(sp):
-            continue
-        for fn in sorted(os.listdir(sp)):
-            if fn.lower().endswith(".parquet"):
-                table = fn[:-8]
-                key = f"{schema}.{table}"
-                cat["tables"][key] = {
-                    "schema": schema,
-                    "table": table,
-                    "parquet": os.path.join(sp, fn),
-                }
-
-    with open(cpath, "w", encoding="utf-8") as f:
-        json.dump(cat, f, indent=2)
-    return cat
-
-def list_tables(cat: Dict) -> List[str]:
-    return sorted([f"{v['schema']}.{v['table']}" for v in cat["tables"].values()], key=str.lower)
+# Column-name cues
+PHONE_COL_RE = re.compile(r"(mob|phone|phon|tel|contact|cell)", re.I)
+EMAIL_COL_RE = re.compile(r"(email|e\-?mail|mailid|mail_id|mail)", re.I)
 
 def _norm_path(p: str) -> str:
     return p.replace("\\", "/")
 
 def _sql_escape_like(s: str) -> str:
     return (s or "").replace("'", "''")
-# ------------------------------------------------------
 
+def _has_model_files(d: str) -> bool:
+    pats = [
+        "pytorch_model.bin", "model.safetensors",
+        "pytorch_model-*.bin", "model-*.safetensors",
+        "pytorch_model.bin.index.json", "model.safetensors.index.json",
+    ]
+    return any(glob.glob(os.path.join(d, p)) for p in pats)
 
-# --------------- Table probing + retrieval ---------------
-def _detect_string_cols(con: duckdb.DuckDBPyConnection, parquet_path: str) -> List[str]:
-    try:
-        df = con.execute(
-            f"SELECT * FROM parquet('{_sql_escape_like(_norm_path(parquet_path))}') LIMIT {PROBE_ROWS}"
-        ).fetchdf()
-    except Exception:
-        return []
-    return [c for c in df.columns if str(df[c].dtype) in ("object", "string", "category")]
+def _latest_checkpoint(base: str) -> str:
+    if ENV_MODEL:
+        use = os.path.abspath(ENV_MODEL)
+        if not os.path.isdir(use): raise FileNotFoundError(f"AI_DB_AGENT_MODEL not a folder: {use}")
+        if not _has_model_files(use): raise FileNotFoundError(f"No model files in {use}")
+        return use
+    if not os.path.isdir(base): raise FileNotFoundError(f"Model folder not found: {base}")
+    cands = []
+    for name in os.listdir(base):
+        full = os.path.join(base, name)
+        if os.path.isdir(full) and name.startswith("checkpoint-") and _has_model_files(full):
+            try: cands.append((int(name.split("-")[-1]), full))
+            except: pass
+    if cands:
+        cands.sort(key=lambda x: x[0])
+        return cands[-1][1]
+    if _has_model_files(base): return base
+    raise FileNotFoundError(f"No usable model in {base}. Put weights in base or in checkpoint-* subfolders.")
 
-def _search_tokens(
-    con: duckdb.DuckDBPyConnection,
-    parquet_path: str,
-    tokens: List[str],
-    strcols: List[str],
-) -> pd.DataFrame:
-    if not strcols or not tokens:
-        return pd.DataFrame()
-    # AND across tokens; for each token, OR across columns
-    parts = []
-    for t in tokens:
-        t_esc = _sql_escape_like(t)
-        ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in strcols]
-        parts.append("(" + " OR ".join(ors) + ")")
-    where = " AND ".join(parts)
-    q = (
-        f"SELECT * FROM parquet('{_sql_escape_like(_norm_path(parquet_path))}') "
-        f"WHERE {where} LIMIT {ROWS_PER_TABLE_TO_CONTEXT}"
-    )
-    try:
-        return con.execute(q).fetchdf()
-    except Exception:
-        return pd.DataFrame()
-# --------------------------------------------------------
-
-
-# --------------- Query parsing helpers ---------------
-def _extract_tokens(q: str) -> List[str]:
-    # if quoted text exists, prefer those tokens
-    m = re.search(r"[\"“”‘’']([^\"“”‘’']+)[\"“”‘’']", q)
-    if m:
-        raw = re.findall(r"[A-Za-z0-9@+._/-]+", m.group(1))
-        return [t for t in raw if t]
-
-    raw = re.findall(r"[A-Za-z0-9@+._/-]+", q)
-    stop = {
-        "what", "is", "are", "the", "a", "an", "of", "for", "about",
-        "list", "show", "name", "names", "tables", "table", "please"
-    }
-    toks = [t for t in raw if (t.lower() not in stop) and (any(c.isdigit() for c in t) or len(t) >= 3)]
-    return toks or (raw[-1:] if raw else [])
-
-def meta_list_tables(q: str) -> bool:
-    L = q.lower().strip()
-    return (
-        (("list" in L or "show" in L or "name" in L) and "table" in L)
-        or L in {"tables", "list tables", "show tables", "name of all tables"}
+def _find_sp_model(model_dir: str) -> str:
+    if ENV_SPM and os.path.isfile(ENV_SPM):
+        return os.path.abspath(ENV_SPM)
+    for name in ("spiece.model","spm.model","sentencepiece.model","tokenizer.model"):
+        p = os.path.join(model_dir, name)
+        if os.path.isfile(p): return os.path.abspath(p)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("spm.model","spiece.model","sentencepiece.model"):
+        p = os.path.join(here, "data", name)
+        if os.path.isfile(p): return os.path.abspath(p)
+    raise FileNotFoundError(
+        "SentencePiece .model not found. Copy data\\spm.model into the chosen checkpoint as spiece.model, "
+        "or set AI_DB_AGENT_SPM to its full path."
     )
 
-def meta_topn(q: str):
-    m = re.search(r"\btop\s+(\d+)\s+([A-Za-z0-9_.-]+)", q, flags=re.IGNORECASE)
-    if m:
-        return int(m.group(1)), m.group(2)
+def _wanted_field(q: str):
+    L = q.lower()
+    if re.search(r"\b(email|e\-?mail)\b", L): return "email"
+    if re.search(r"\b(mobile|phone|contact|tel|cell)\b", L): return "phone"
     return None
 
-def best_table(catalog: Dict, frag: str) -> Tuple[str, Dict, int]:
-    frag = frag.lower()
-    best_key, best_meta, best_score = None, None, -1
-    for key, meta in catalog["tables"].items():
-        cands = [key.lower(), meta["table"].lower(), f"{meta['schema'].lower()}.{meta['table'].lower()}"]
-        score = max(int(frag in c) * 100 + len(os.path.commonprefix([frag, c])) for c in cands)
-        if score > best_score:
-            best_key, best_meta, best_score = key, meta, score
-    return best_key, best_meta, best_score
-# -----------------------------------------------------
+def _tokens_from_question(q: str):
+    # Prefer quoted phrase
+    m = re.search(r"[\"“”'`](.+?)[\"“”'`]", q)
+    raw = re.findall(r"[A-Za-z0-9@+._/-]+", m.group(1) if m else q)
+    toks = []
+    for t in raw:
+        tl = t.lower()
+        if tl in STOPWORDS: continue
+        # keep numbers and strings >=3 chars
+        if any(c.isdigit() for c in t) or len(t) >= 3:
+            toks.append(t)
+    if not toks and raw:
+        toks = [max(raw, key=len)]
+    return toks[:6]
 
-
-# --------------- Context builder for Gemini ---------------
-def build_context(cat: Dict, question: str) -> str:
-    con = duckdb.connect(database=":memory:")
-    tokens = _extract_tokens(question)
-    chunks: List[str] = []
-    total_len = 0
-
-    for key, meta in list(cat["tables"].items())[:MAX_TABLES_TO_TRY]:
-        p = meta["parquet"]
-        strcols = _detect_string_cols(con, p)
-        if not strcols:
-            continue
-        hits = _search_tokens(con, p, tokens, strcols)
-        if hits.empty:
-            continue
-
-        block = f"TABLE {meta['schema']}.{meta['table']} (columns: {', '.join(hits.columns.tolist())}):\n"
-        block += hits.to_string(index=False)
-        block += "\n\n"
-        if total_len + len(block) > MAX_CONTEXT_CHARS:
-            break
-        chunks.append(block)
-        total_len += len(block)
-
-    con.close()
-
-    if not chunks:
-        # fall back to schema-only view to let Gemini at least guide the user
-        names = list_tables(cat)
-        return "TABLES AVAILABLE:\n" + ", ".join(names) + "\n"
-    return "".join(chunks)
-# ---------------------------------------------------------
-
-
-# --------------- Gemini call ---------------
-def gemini_answer(question: str, context: str, model_name: str) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        raise SystemExit("Set GEMINI_API_KEY environment variable first (from Google AI Studio).")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-
-    prompt = (
-        "You are a careful data assistant working over a database export.\n"
-        "Use ONLY the database context below. If the answer is not present, reply exactly: Not found.\n\n"
-        f"User question:\n{question}\n\n"
-        f"Database context (snippets):\n{context}\n\n"
-        "Respond concisely with the value(s) found. If multiple plausible matches exist, "
-        "return the best one or a short comma-separated list. Do not invent columns or values."
-    )
-
+def _looks_like_phone(s: pd.Series) -> float:
+    if s is None or s.empty: return 0.0
+    pat = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
     try:
-        resp = model.generate_content(prompt)
-        text = (resp.text or "").strip()
-    except Exception as e:
-        text = f"Error calling Gemini: {e}"
-    return text
-# ------------------------------------------
+        vals = s.dropna().astype(str)
+        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
+    except Exception:
+        return 0.0
 
+def _looks_like_email(s: pd.Series) -> float:
+    if s is None or s.empty: return 0.0
+    pat = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+    try:
+        vals = s.dropna().astype(str)
+        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
+    except Exception:
+        return 0.0
 
-# --------------- Main answer flow ---------------
-def answer(root: str, q: str, model_name: str):
-    cat = ensure_catalog(root)
+class DBAgent:
+    def __init__(self):
+        with open(CAT, "r", encoding="utf-8") as f:
+            self.cat = json.load(f)
 
-    if meta_list_tables(q):
-        print(", ".join(list_tables(cat)))
-        return
+        self.model_dir = _latest_checkpoint(MODEL_BASE)
+        spm_path = _find_sp_model(self.model_dir)
+        print(f"[db-agent] model_dir: {self.model_dir}")
+        print(f"[db-agent] spm:       {spm_path}")
 
-    topn = meta_topn(q)
-    if topn:
-        n, frag = topn
-        key, meta, score = best_table(cat, frag)
-        if not meta or score < 10:
-            print("Not found")
-            return
-        con = duckdb.connect(database=":memory:")
-        p = _norm_path(meta["parquet"])
-        try:
-            df = con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
-            print(df.to_string(index=False) if not df.empty else "Not found")
-        except Exception:
-            print("Not found")
-        finally:
-            con.close()
-        return
+        self.tok = T5Tokenizer(vocab_file=str(spm_path), legacy=True)
+        if self.tok.pad_token is None: self.tok.add_special_tokens({"pad_token": "<pad>"})
+        if self.tok.eos_token is None: self.tok.add_special_tokens({"eos_token": "</s>"})
+        if self.tok.unk_token is None: self.tok.add_special_tokens({"unk_token": "<unk>"})
+        if self.tok.bos_token is None: self.tok.add_special_tokens({"bos_token": "<s>"})
 
-    ctx = build_context(cat, q)
-    ans = gemini_answer(q, ctx, model_name)
-    print(ans if ans else "Not found")
-# ------------------------------------------------
+        self.model = T5ForConditionalGeneration.from_pretrained(self.model_dir)
+        self.con = duckdb.connect(database=":memory:")
+        self.con.execute("PRAGMA threads=4;")
 
+    # ---------- NL→SQL ----------
+    def _gen_sql(self, question: str) -> str:
+        ids = self.tok(question, return_tensors="pt", truncation=True, max_length=128)
+        out = self.model.generate(**ids, max_length=128, num_beams=4, do_sample=False)
+        sql = self.tok.decode(out[0], skip_special_tokens=True).strip().rstrip(";")
+        if DEBUG: print(f"[db-agent] gen SQL: {sql}")
+        return sql
 
-# --------------- CLI ---------------
-def main():
-    ap = argparse.ArgumentParser(description="Gemini-powered NL Q&A over local Parquet export")
-    ap.add_argument("-e", "--export", help="Path to export root (folder containing 'parquet/')", default=None)
-    ap.add_argument("-m", "--model", help="Gemini model name (default from GEMINI_MODEL env or gemini-1.5-flash)", default=None)
-    ap.add_argument("question", nargs="*", help="Your natural-language question")
-    args = ap.parse_args()
+    def _map_tables_to_parquet(self, sql: str) -> str:
+        for key, meta in self.cat["tables"].items():
+            path = _sql_escape_like(_norm_path(meta["parquet"]))
+            pattern = rf'(?i)(?:["`])?{re.escape(key)}(?:["`])?'
+            sql = re.sub(pattern, f"parquet('{path}')", sql)
+        return sql
 
-    root = locate_export_root(args.export)
-    model_name = args.model or MODEL_NAME
+    def _tables(self):
+        return sorted([f"{v['schema']}.{v['table']}" for v in self.cat["tables"].values()], key=str.lower)
 
-    if args.question:
-        q = " ".join(args.question).strip()
-        answer(root, q, model_name)
-        return
+    def _best_table(self, frag: str):
+        frag = frag.lower()
+        best, best_score = None, -1
+        for key, meta in self.cat["tables"].items():
+            cand2 = meta["table"].lower()
+            score = max(int(frag in key.lower())*3, int(frag in cand2)*3, len(os.path.commonprefix([frag, cand2])))
+            if score > best_score:
+                best_score = score
+                best = (key, meta)
+        return best
 
-    # Interactive mode
-    print("Gemini DB Q&A over Parquet")
-    print(f"Export root: {root}")
-    print("Examples:")
-    print('  name of all tables')
-    print('  phone number of "rajendra shikwal"')
-    print('  customer code of PZ6115')
-    print('  top 5 adtAnnGifts')
-    print("Type 'exit' to quit.")
-    while True:
-        try:
-            q = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not q or q.lower() in {"exit", "quit"}:
-            break
-        answer(root, q, model_name)
+    # ---------- main ----------
+    def ask(self, q: str) -> str:
+        L = q.lower().strip()
 
+        # list tables
+        if (("list" in L or "show" in L or "name" in L) and "table" in L) or L in {"tables","list tables","show tables"}:
+            return ", ".join(self._tables())
+
+        # top N table
+        m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
+        if m:
+            n = int(m.group(1)); frag = m.group(2)
+            best = self._best_table(frag)
+            if not best: return "Not found"
+            _, meta = best
+            p = _norm_path(meta["parquet"])
+            try:
+                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
+                return df.to_string(index=False) if not df.empty else "Not found"
+            except Exception:
+                return "Not found"
+
+        # NL→SQL path first
+        sql = self._gen_sql(q)
+        if re.match(r"^\s*select\b", sql, flags=re.IGNORECASE):
+            try:
+                sql2 = self._map_tables_to_parquet(sql)
+                if DEBUG: print(f"[db-agent] remapped SQL: {sql2}")
+                df = self.con.execute(sql2).fetchdf()
+                if not df.empty:
+                    if df.shape == (1,1):
+                        v = str(df.iat[0,0]).strip()
+                        return v if v else "Not found"
+                    return df.head(5).to_string(index=False)
+            except Exception as e:
+                if DEBUG: print(f"[db-agent] SQL error: {e}")
+
+        # Fallback (robust)
+        return self._fallback(q)
+
+    # ---------- smart fallback ----------
+    def _fallback(self, q: str) -> str:
+        want = _wanted_field(q)        # 'phone' or 'email' or None
+        toks  = _tokens_from_question(q)
+        if DEBUG: print(f"[db-agent] want={want} tokens={toks}")
+
+        # A) If we have tokens (e.g., a name), search for matching rows and then return the requested field if any
+        if toks:
+            hit = self._search_for_tokens(toks, want=want)
+            if hit: return hit
+
+        # B) If user asked only 'email' / 'phone' with no tokens, sample likely columns across tables
+        if want in {"email","phone"}:
+            vals = self._sample_field_across_tables(want, k=8)
+            return ", ".join(vals) if vals else "Not found"
+
+        # C) Last resort: show any row that matches longest token
+        if toks:
+            hit = self._search_for_tokens([max(toks, key=len)], want=None, mode="OR")
+            if hit: return hit
+
+        return "Not found"
+
+    def _search_for_tokens(self, tokens, want=None, mode="AND"):
+        # Scan some tables; build flexible WHERE with all columns cast to text
+        for key, meta in list(self.cat["tables"].items())[:200]:
+            p = _norm_path(meta["parquet"])
+            try:
+                probe = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 200").fetchdf()
+            except Exception as e:
+                if DEBUG: print(f"[db-agent] probe error {key}: {e}")
+                continue
+            if probe.empty: continue
+
+            cols = list(probe.columns)
+            per_tok = []
+            for t in tokens:
+                t_esc = _sql_escape_like(t)
+                ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in cols]
+                per_tok.append("(" + " OR ".join(ors) + ")")
+            where = (" AND ".join(per_tok)) if mode == "AND" else (" OR ".join(per_tok))
+            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 25"
+            try:
+                df = self.con.execute(q2).fetchdf()
+            except Exception as e:
+                if DEBUG: print(f"[db-agent] scan err on {key}: {e}")
+                continue
+            if df.empty: continue
+
+            # If a specific field is desired, pick best value columns
+            if want:
+                cols_pick = self._pick_value_columns(df, want)
+                if cols_pick:
+                    # return distinct, non-null values compactly
+                    series = []
+                    for c in cols_pick:
+                        series.append(df[c].dropna().astype(str))
+                    cat = pd.concat(series) if series else pd.Series([], dtype=str)
+                    vals = list(dict.fromkeys([v.strip() for v in cat if v.strip()]))[:5]
+                    if vals:
+                        return ", ".join(vals)
+            # else just show a compact snippet
+            return f"{meta['schema']}.{meta['table']}\n" + df.head(5).to_string(index=False)
+        return None
+
+    def _pick_value_columns(self, df: pd.DataFrame, want: str):
+        # Rank columns by name cues + pattern fraction on sample
+        want = want.lower()
+        scores = []
+        sample = df.head(200)
+        for c in df.columns:
+            s = sample[c]
+            name_bonus = 0.0
+            pat_frac = 0.0
+            try:
+                if want == "phone":
+                    if PHONE_COL_RE.search(c): name_bonus += 0.6
+                    pat_frac = _looks_like_phone(s)
+                elif want == "email":
+                    if EMAIL_COL_RE.search(c): name_bonus += 0.6
+                    pat_frac = _looks_like_email(s)
+            except Exception:
+                pass
+            score = name_bonus + pat_frac  # both [0..1+]
+            if score > 0.15:  # threshold
+                scores.append((c, score))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return [c for c,_ in scores[:3]]
+
+    def _sample_field_across_tables(self, want: str, k=8):
+        vals = []
+        for key, meta in list(self.cat["tables"].items())[:200]:
+            p = _norm_path(meta["parquet"])
+            try:
+                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 500").fetchdf()
+            except Exception:
+                continue
+            if df.empty: continue
+            pick = self._pick_value_columns(df, want)
+            for c in pick:
+                col = df[c].dropna().astype(str)
+                if want == "phone":
+                    m = col[col.str.match(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$", na=False)]
+                else:
+                    m = col[col.str.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", na=False)]
+                for v in m.unique():
+                    v = v.strip()
+                    if v and v not in vals:
+                        vals.append(v)
+                        if len(vals) >= k:
+                            return vals
+        return vals
 
 if __name__ == "__main__":
-    main()
+    bot = DBAgent()
+    while True:
+        try:
+            s = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not s or s.lower() in {"exit","quit"}:
+            break
+        print(bot.ask(s))
