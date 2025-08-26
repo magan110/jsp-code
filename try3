@@ -1,508 +1,433 @@
-using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Linq;
+import os, json, re, glob, random, datetime
+import duckdb
+import pandas as pd
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 
-namespace sparshWebService.Controllers
-{
-	[Route("api/[controller]")]
-	[ApiController]
-	[Authorize]
-	public class GrcLeadController : ControllerBase
-	{
-		private readonly DatabaseHelper _dbHelper;
+# ---------- Paths & environment ----------
+DB_DIR      = "../db_export_bwlive"
+CAT         = os.path.join(DB_DIR, "catalog.json")
+MODEL_BASE  = "models/nl2sql_tiny"
+ENV_MODEL   = os.environ.get("AI_DB_AGENT_MODEL", "")
+ENV_SPM     = os.environ.get("AI_DB_AGENT_SPM", "")
+DEBUG       = os.environ.get("AI_DB_AGENT_DEBUG", "0") == "1"
 
-		public GrcLeadController(DatabaseHelper dbHelper)
-		{
-			_dbHelper = dbHelper;
-		}
+# ---------- Small-talk heuristics ----------
+GREET_WORDS = {"hi","hello","hey","yo","namaste","hola","sup","hii","hiii","hlo"}
+THANK_WORDS = {"thanks","thank you","ty","thx","shukriya","dhanyavaad"}
+BYE_WORDS   = {"bye","goodbye","see ya","see you","tata"}
+HELP_WORDS  = {"help","commands","examples","how to","what can you do"}
+JOKE_WORDS  = {"joke","funny","make me laugh"}
 
-		/// <summary>
-		/// Initializes data for GRC Lead Entry form (doc number + dropdown options), based on the provided procType/docuNumb.
-		/// Mirrors legacy JSP init: generates randNmSt when procType = 'A'; otherwise uses supplied docuNumb.
-		/// </summary>
-		[HttpPost("init")]
-		public IActionResult Initialize([FromBody] GrcLeadInitRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/init";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			try
-			{
-				if (request == null)
-				{
-					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: Request body is null.", 400, new { });
-					return BadRequest(new { code = 400, message = "Request body is required." });
-				}
-
-
-				// Determine randNmSt (like: select right(newId(), 8)) if procType == 'A'
-				string randNmSt;
-				if (string.Equals(request.ProcType, "A", StringComparison.OrdinalIgnoreCase))
-				{
-					var rs = _dbHelper.WebSessBean("select right(newId(), 8) as randNmSt", new Dictionary<string, object>());
-					var first = rs.FirstOrDefault();
-					if (first != null && first.ContainsKey("randNmSt"))
-						randNmSt = first["randNmSt"]?.ToString() ?? Guid.NewGuid().ToString("N").Substring(0, 8);
-					else
-						randNmSt = Guid.NewGuid().ToString("N").Substring(0, 8);
-				}
-				else
-				{
-					randNmSt = request.DocuNumb ?? string.Empty;
-				}
-
-				// Build dropdown options (aliased columns to ensure predictable keys)
-				// Add site types (Onsite/Offsite) and proc types (Add/Update) so Flutter can bind everything from one call
-				var siteTypesSql = @"select 'Onsite' as code, 'Onsite' as name
-									union all select 'Offsite','Offsite'";
-
-				var procTypesSql = @"select 'A' as code, 'Add' as name
-								 union all select 'U','Update'";
-
-				var measuresSql = @"select 'F2' as code, 'Feet Squre' as name
-									union all select 'FT' as code, 'Feet' as name
-									union all select 'M2' as code, 'Meter Squre' as name
-									union all select 'NO' as code, 'Numbers' as name
-									union all select 'RF' as code, 'Running Ft' as name";
-
-				var deliveryPeriodSql = @"select '01-03 month' as code, '01-03 month' as name
-										  union all select '04-06 month','04-06 month'
-										  union all select '07-12 month','07-12 month'
-										  union all select 'over 12 month','over 12 month'";
-
-				var projectKindSql = @"select 'residence / bunglow' as code,'residence / bunglow' as name
-									   union all select 'religious','religious'
-									   union all select 'hotel','hotel'
-									   union all select 'hospital','hospital'
-									   union all select 'Govt. Project','Govt. Project'
-									   union all select 'Commercial Project','Commercial Project'
-									   union all select 'high rise','high rise'
-									   union all select 'land scaping','land scaping'
-									   union all select 'educational institute','educational institute'
-									   union all select 'Others','Others'";
-
-				var contactPersonSql = @"select 'Owner' as code,'Owner' as name
-										 union all select 'builder','builder'
-										 union all select 'contractor','contractor'
-										 union all select 'architect','architect'
-										 union all select 'construction company','construction company'";
-
-				var siteTypes = ToOptions(_dbHelper.WebSessBean(siteTypesSql, new Dictionary<string, object>()));
-				var procTypes = ToOptions(_dbHelper.WebSessBean(procTypesSql, new Dictionary<string, object>()));
-				var measures = ToOptions(_dbHelper.WebSessBean(measuresSql, new Dictionary<string, object>()));
-				var deliveryPeriods = ToOptions(_dbHelper.WebSessBean(deliveryPeriodSql, new Dictionary<string, object>()));
-				var projectKinds = ToOptions(_dbHelper.WebSessBean(projectKindSql, new Dictionary<string, object>()));
-				var contactPersons = ToOptions(_dbHelper.WebSessBean(contactPersonSql, new Dictionary<string, object>()));
-
-				var response = new
-				{
-					code = 200,
-					message = "Initialized successfully.",
-					data = new
-					{
-						procType = request.ProcType,
-						procTypeLabel = string.Equals(request.ProcType, "A", StringComparison.OrdinalIgnoreCase) ? "Add" : "Update",
-						docuNumb = request.DocuNumb,
-						randNmSt,
-						defaultLeadDate = DateTime.Now.ToString("yyyy-MM-dd"),
-						options = new
-						{
-							siteTypes,
-							procTypes,
-							measures,
-							deliveryPeriods,
-							projectKinds,
-							contactPersons
-						}
-					}
-				};
-
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Initialized successfully.", 200, request);
-				return Ok(response);
-			}
-			catch (Exception ex)
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
-				return StatusCode(500, new { code = 500, message = "Internal server error.", error = ex.Message });
-			}
-		}
-
-		/// <summary>
-		/// Returns document numbers for Update mode for a given creator (maps JSP dropdown when procType = 'U').
-		/// </summary>
-		[HttpPost("documents")]
-		public IActionResult GetDocuments([FromBody] GrcLeadDocListRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/documents";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			if (request == null || string.IsNullOrWhiteSpace(request.CreateId))
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: CreateId is required.", 400, (object?)request ?? new { });
-				return BadRequest(new { code = 400, message = "CreateId is required." });
-			}
-
-			try
-			{
-				var sql = @"select a.docuNumb as code, a.docuNumb as name
-							from bwlive.dbo.dptGrcLeadGn a with (nolock)
-							where a.createId = @createId
-							order by a.docuNumb desc";
-				var rows = _dbHelper.WebSessBean(sql, new Dictionary<string, object> { { "@createId", request.CreateId } });
-				var options = ToOptions(rows);
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Documents fetched.", 200, request);
-				return Ok(new { code = 200, data = options });
-			}
-			catch (Exception ex)
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
-				return StatusCode(500, new { code = 500, message = ex.Message });
-			}
-		}
-
-		/// <summary>
-		/// Fetch lead details by docuNumb; includes both onsite/offsite fields.
-		/// </summary>
-		[HttpPost("details")]
-		public IActionResult GetLeadDetails([FromBody] GrcLeadDetailsRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/details";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			if (request == null || string.IsNullOrWhiteSpace(request.DocuNumb))
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: DocuNumb is required.", 400, (object?)request ?? new { });
-				return BadRequest(new { code = 400, message = "DocuNumb is required." });
-			}
-
-			try
-			{
-				var sql = @"select a.docuNumb,
-								   convert(varchar(10), a.leadDate, 111) as leadDate,
-								   a.leadQnty, a.siteName, a.mobileNo, a.siteAddr, a.siteRmrk,
-								   a.adhrNumb, a.archtNam, a.itxPanNo, a.gstnNumb, a.emailAdd,
-								   a.district, a.areaCode, a.retlPinC, a.stateNam, a.cityName, a.attchMnt
-							from bwlive.dbo.dptGrcLeadGn a with (nolock)
-							where a.docuNumb = @docuNumb";
-				var rows = _dbHelper.WebSessBean(sql, new Dictionary<string, object> { { "@docuNumb", request.DocuNumb } });
-				if (rows == null || rows.Count == 0)
-				{
-					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "NotFound: No lead found.", 404, request);
-					return NotFound(new { code = 404, message = "No lead found for provided DocuNumb." });
-				}
-				var data = rows.First();
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Lead details fetched.", 200, request);
-				return Ok(new { code = 200, data });
-			}
-			catch (Exception ex)
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
-				return StatusCode(500, new { code = 500, message = ex.Message });
-			}
-		}
-
-		/// <summary>
-		/// Fetches images for a given drawRand/docuNumb from imageData.cotDocAttch as base64 strings.
-		/// </summary>
-		[HttpPost("images")] 
-		public IActionResult GetImages([FromBody] GrcLeadImagesRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/images";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			if (request == null || string.IsNullOrWhiteSpace(request.DocuNumb))
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: DocuNumb is required.", 400, (object?)request ?? new { });
-				return BadRequest(new { code = 400, message = "DocuNumb is required." });
-			}
-
-			try
-			{
-				var sql = @"SELECT attachFl FROM imageData.dbo.cotDocAttch with (nolock)
-							WHERE docuNumb = @docuNumb";
-				var rows = _dbHelper.ImgSessBean(sql, new Dictionary<string, object> { { "@docuNumb", request.DocuNumb } });
-				var images = new List<string>();
-				foreach (var row in rows)
-				{
-					if (row.ContainsKey("attachFl") && row["attachFl"] is byte[] bytes && bytes.Length > 0)
-					{
-						images.Add(Convert.ToBase64String(bytes));
-					}
-					else if (row.ContainsKey("attachFl") && row["attachFl"] != null)
-					{
-						// If another provider/type is returned, handle accordingly here.
-					}
-				}
-
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Images fetched.", 200, request);
-				return Ok(new { code = 200, data = images });
-			}
-			catch (Exception ex)
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
-				return StatusCode(500, new { code = 500, message = ex.Message });
-			}
-		}
-
-		/// <summary>
-		/// Lookup districts for a given areaCode (maps frontend districtOpt).
-		/// </summary>
-		[HttpPost("lookups/districts")]
-		public IActionResult GetDistricts([FromBody] DistrictLookupRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/lookups/districts";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			if (request == null || string.IsNullOrWhiteSpace(request.AreaCode))
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: AreaCode is required.", 400, (object?)request ?? new { });
-				return BadRequest(new { code = 400, message = "AreaCode is required." });
-			}
-
-			// Waiting for backend SQL/stored procedure details; return 501 for now.
-			_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "NotImplemented: Provide SQL/proc for districts.", 501, request);
-			return StatusCode(501, new { code = 501, message = "District lookup not implemented. Please provide SQL/procedure details." });
-		}
-
-		/// <summary>
-		/// Lookup pincodes for a given district (maps frontend pinCodeNOpt).
-		/// </summary>
-		[HttpPost("lookups/pincodes")]
-		public IActionResult GetPincodes([FromBody] PincodeLookupRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/lookups/pincodes";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			if (request == null || string.IsNullOrWhiteSpace(request.District))
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: District is required.", 400, (object?)request ?? new { });
-				return BadRequest(new { code = 400, message = "District is required." });
-			}
-
-			// Waiting for backend SQL/stored procedure details; return 501 for now.
-			_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "NotImplemented: Provide SQL/proc for pincodes.", 501, request);
-			return StatusCode(501, new { code = 501, message = "Pincode lookup not implemented. Please provide SQL/procedure details." });
-		}
-
-		private static List<OptionDto> ToOptions(List<Dictionary<string, object>> rows)
-		{
-			return rows.Select(r => new OptionDto
-			{
-				Code = r.ContainsKey("code") ? r["code"]?.ToString() : null,
-				Name = r.ContainsKey("name") ? r["name"]?.ToString() : null
-			}).ToList();
-		}
-
-		/// <summary>
-		/// Saves a GRC lead (insert on ProcType='A', update otherwise). Returns the persisted docuNumb.
-		/// </summary>
-		[HttpPost("save")]
-		public IActionResult Save([FromBody] GrcLeadSaveRequest request)
-		{
-			string apiEndpoint = "/api/GrcLead/save";
-			string partnerId = Request.Headers.ContainsKey("PartnerID") ? Request.Headers["PartnerID"].ToString() : "UNKNOWN";
-
-			if (request == null)
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: Request body is null.", 400, new { });
-				return BadRequest(new { code = 400, message = "Request body is required." });
-			}
-
-			try
-			{
-				// Parse date if provided (expecting yyyy/MM/dd or dd/MM/yyyy). Fallback to today if missing.
-				DateTime? leadDate = null;
-				if (!string.IsNullOrWhiteSpace(request.LeadDate))
-				{
-					if (DateTime.TryParse(request.LeadDate, out var dt))
-						leadDate = dt.Date;
-				}
-
-				object Db(object? v) => v ?? DBNull.Value;
-
-				if (string.Equals(request.ProcType, "A", StringComparison.OrdinalIgnoreCase))
-				{
-					// Insert and return generated docuNumb (similar to JSP's newId logic)
-					var insertSql = @"
-						declare @doc nvarchar(20) = right(newid(), 8);
-						insert into bwlive.dbo.dptGrcLeadGn
-						(
-							docuNumb, leadDate, leadQnty, siteName, mobileNo, siteAddr, siteRmrk,
-							adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd,
-							district, areaCode, retlPinC, stateNam, cityName,
-							attchMnt, createId
-						)
-						values
-						(
-							@doc, @leadDate, @leadQnty, @siteName, @mobileNo, @siteAddr, @siteRmrk,
-							@adhrNumb, @archtNam, @itxPanNo, @gstnNumb, @emailAdd,
-							@district, @areaCode, @retlPinC, @stateNam, @cityName,
-							@attchMnt, @createId
-						);
-						select @doc as docuNumb;";
-
-					var parameters = new Dictionary<string, object>
-					{
-						{ "leadDate", Db(leadDate) },
-						{ "leadQnty", Db(request.LeadQnty) },
-						{ "siteName", Db(request.SiteName) },
-						{ "mobileNo", Db(request.MobileNo) },
-						{ "siteAddr", Db(request.SiteAddr) },
-						{ "siteRmrk", Db(request.SiteRmrk) },
-						{ "adhrNumb", Db(request.AdhrNumb) },
-						{ "archtNam", Db(request.ArchtNam) },
-						{ "itxPanNo", Db(request.ItxPanNo) },
-						{ "gstnNumb", Db(request.GstnNumb) },
-						{ "emailAdd", Db(request.EmailAdd) },
-						{ "district", Db(request.District) },
-						{ "areaCode", Db(request.AreaCode) },
-						{ "retlPinC", Db(request.RetlPinC) },
-						{ "stateNam", Db(request.StateNam) },
-						{ "cityName", Db(request.CityName) },
-						{ "attchMnt", Db(request.DrawRand) },
-						{ "createId", Db(request.CreateId) }
-					};
-
-					var rows = _dbHelper.WebSessBean(insertSql, parameters);
-					var newDoc = rows.FirstOrDefault()? ["docuNumb"]?.ToString();
-					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Lead inserted successfully.", 200, request);
-					return Ok(new { code = 200, message = "Inserted", docuNumb = newDoc });
-				}
-				else
-				{
-					if (string.IsNullOrWhiteSpace(request.DocuNumb))
-					{
-						_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "BadRequest: DocuNumb is required for update.", 400, request);
-						return BadRequest(new { code = 400, message = "DocuNumb is required for update." });
-					}
-
-					var updateSql = @"
-						update bwlive.dbo.dptGrcLeadGn set
-							leadDate = @leadDate,
-							leadQnty = @leadQnty,
-							siteName = @siteName,
-							mobileNo = @mobileNo,
-							siteAddr = @siteAddr,
-							siteRmrk = @siteRmrk,
-							adhrNumb = @adhrNumb,
-							archtNam = @archtNam,
-							itxPanNo = @itxPanNo,
-							gstnNumb = @gstnNumb,
-							emailAdd = @emailAdd,
-							district = @district,
-							areaCode = @areaCode,
-							retlPinC = @retlPinC,
-							stateNam = @stateNam,
-							cityName = @cityName,
-							attchMnt = @attchMnt
-						where docuNumb = @docuNumb;
-						select @docuNumb as docuNumb;";
-
-					var parameters = new Dictionary<string, object>
-					{
-						{ "docuNumb", request.DocuNumb },
-						{ "leadDate", Db(leadDate) },
-						{ "leadQnty", Db(request.LeadQnty) },
-						{ "siteName", Db(request.SiteName) },
-						{ "mobileNo", Db(request.MobileNo) },
-						{ "siteAddr", Db(request.SiteAddr) },
-						{ "siteRmrk", Db(request.SiteRmrk) },
-						{ "adhrNumb", Db(request.AdhrNumb) },
-						{ "archtNam", Db(request.ArchtNam) },
-						{ "itxPanNo", Db(request.ItxPanNo) },
-						{ "gstnNumb", Db(request.GstnNumb) },
-						{ "emailAdd", Db(request.EmailAdd) },
-						{ "district", Db(request.District) },
-						{ "areaCode", Db(request.AreaCode) },
-						{ "retlPinC", Db(request.RetlPinC) },
-						{ "stateNam", Db(request.StateNam) },
-						{ "cityName", Db(request.CityName) },
-						{ "attchMnt", Db(request.DrawRand) }
-					};
-
-					var rows = _dbHelper.WebSessBean(updateSql, parameters);
-					var doc = rows.FirstOrDefault()? ["docuNumb"]?.ToString();
-					_dbHelper.InsertIntoLog(partnerId, apiEndpoint, "Lead updated successfully.", 200, request);
-					return Ok(new { code = 200, message = "Updated", docuNumb = doc });
-				}
-			}
-			catch (Exception ex)
-			{
-				_dbHelper.InsertIntoLog(partnerId, apiEndpoint, $"Internal server error: {ex.Message}", 500, request);
-				return StatusCode(500, new { code = 500, message = ex.Message });
-			}
-		}
-	}
-
-	public class GrcLeadInitRequest
-	{
-		public string? ProcType { get; set; } = "A"; // 'A' = Add, else Update uses DocuNumb
-		public string? DocuNumb { get; set; }
-		public string? SiteType { get; set; }
-		// Optional selected values coming from client (if any)
-		public string? LeadMsrs { get; set; }
-		public string? DelvrPrd { get; set; }
-		public string? PrjctKnd { get; set; }
-		public string? CntPrsnt { get; set; }
-	}
-
-	public class OptionDto
-	{
-		public string? Code { get; set; }
-		public string? Name { get; set; }
-	}
-
-	public class DistrictLookupRequest
-	{
-		public string AreaCode { get; set; } = string.Empty;
-		public string? WhereList { get; set; }
-	}
-
-	public class PincodeLookupRequest
-	{
-		public string District { get; set; } = string.Empty;
-	}
-
-	public class GrcLeadDocListRequest
-	{
-		public string CreateId { get; set; } = string.Empty;
-	}
-
-	public class GrcLeadDetailsRequest
-	{
-		public string DocuNumb { get; set; } = string.Empty;
-	}
-
-	public class GrcLeadImagesRequest
-	{
-		public string DocuNumb { get; set; } = string.Empty;
-	}
-
-	public class GrcLeadSaveRequest
-	{
-		public string? ProcType { get; set; } // 'A' for add, otherwise update
-		public string? DocuNumb { get; set; }
-		public string? LeadDate { get; set; }
-		public string? LeadQnty { get; set; }
-		public string? SiteName { get; set; }
-		public string? MobileNo { get; set; }
-		public string? SiteAddr { get; set; }
-		public string? SiteRmrk { get; set; }
-		public string? AdhrNumb { get; set; }
-		public string? ArchtNam { get; set; }
-		public string? ItxPanNo { get; set; }
-		public string? GstnNumb { get; set; }
-		public string? EmailAdd { get; set; }
-		public string? District { get; set; }
-		public string? AreaCode { get; set; }
-		public string? RetlPinC { get; set; }
-		public string? StateNam { get; set; }
-		public string? CityName { get; set; }
-		public string? DrawRand { get; set; } // used as attchMnt docuNumb for images linkage
-		public string? CreateId { get; set; } // creator login id, used when inserting
-	}
+# Words we don't want to search for as entity tokens
+STOPWORDS = {
+    "what","is","are","of","for","about","the","a","an","this","that","these","those",
+    "show","give","get","find","list","name","names","code","codes","number","numbers",
+    "top","first","last","all","and","or","with","without","please","pls","zone",
 }
 
+# Column-name cues
+PHONE_COL_RE = re.compile(r"(mob|phone|phon|tel|contact|cell)", re.I)
+EMAIL_COL_RE = re.compile(r"(email|e\-?mail|mailid|mail_id|mail)", re.I)
+
+# ---------- Utils ----------
+def _norm_path(p: str) -> str:
+    return p.replace("\\", "/")
+
+def _sql_escape_like(s: str) -> str:
+    return (s or "").replace("'", "''")
+
+def _has_model_files(d: str) -> bool:
+    pats = [
+        "pytorch_model.bin", "model.safetensors",
+        "pytorch_model-*.bin", "model-*.safetensors",
+        "pytorch_model.bin.index.json", "model.safetensors.index.json",
+    ]
+    return any(glob.glob(os.path.join(d, p)) for p in pats)
+
+def _latest_checkpoint(base: str) -> str:
+    if ENV_MODEL:
+        use = os.path.abspath(ENV_MODEL)
+        if not os.path.isdir(use): raise FileNotFoundError(f"AI_DB_AGENT_MODEL not a folder: {use}")
+        if not _has_model_files(use): raise FileNotFoundError(f"No model files in {use}")
+        return use
+    if not os.path.isdir(base): raise FileNotFoundError(f"Model folder not found: {base}")
+    cands = []
+    for name in os.listdir(base):
+        full = os.path.join(base, name)
+        if os.path.isdir(full) and name.startswith("checkpoint-") and _has_model_files(full):
+            try: cands.append((int(name.split("-")[-1]), full))
+            except: pass
+    if cands:
+        cands.sort(key=lambda x: x[0])
+        return cands[-1][1]
+    if _has_model_files(base): return base
+    raise FileNotFoundError(f"No usable model in {base}. Put weights in base or in checkpoint-* subfolders.")
+
+def _find_sp_model(model_dir: str) -> str:
+    if ENV_SPM and os.path.isfile(ENV_SPM):
+        return os.path.abspath(ENV_SPM)
+    for name in ("spiece.model","spm.model","sentencepiece.model","tokenizer.model"):
+        p = os.path.join(model_dir, name)
+        if os.path.isfile(p): return os.path.abspath(p)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("spm.model","spiece.model","sentencepiece.model"):
+        p = os.path.join(here, "data", name)
+        if os.path.isfile(p): return os.path.abspath(p)
+    raise FileNotFoundError(
+        "SentencePiece .model not found. Copy data\\spm.model into the chosen checkpoint as spiece.model, "
+        "or set AI_DB_AGENT_SPM to its full path."
+    )
+
+def _wanted_field(q: str):
+    L = q.lower()
+    if re.search(r"\b(email|e\-?mail)\b", L): return "email"
+    if re.search(r"\b(mobile|phone|contact|tel|cell)\b", L): return "phone"
+    return None
+
+def _extract_name_hint(q: str):
+    # Prefer quoted phrase as the entity name
+    m = re.search(r"[\"“”'`](.+?)[\"“”'`]", q)
+    if m:
+        return m.group(1).strip()
+    # Else, remove common words and keep a compact join as hint
+    toks = _tokens_from_question(q)
+    if not toks:
+        return ""
+    return " ".join(toks[:3])
+
+def _tokens_from_question(q: str):
+    m = re.search(r"[\"“”'`](.+?)[\"“”'`]", q)
+    raw = re.findall(r"[A-Za-z0-9@+._/-]+", m.group(1) if m else q)
+    toks = []
+    for t in raw:
+        tl = t.lower()
+        if tl in STOPWORDS: continue
+        if any(c.isdigit() for c in t) or len(t) >= 3:
+            toks.append(t)
+    if not toks and raw:
+        toks = [max(raw, key=len)]
+    return toks[:6]
+
+def _looks_like_phone(s: pd.Series) -> float:
+    if s is None or s.empty: return 0.0
+    pat = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
+    try:
+        vals = s.dropna().astype(str)
+        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
+    except Exception:
+        return 0.0
+
+def _looks_like_email(s: pd.Series) -> float:
+    if s is None or s.empty: return 0.0
+    pat = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+    try:
+        vals = s.dropna().astype(str)
+        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
+    except Exception:
+        return 0.0
+
+# ---------- Chat layer ----------
+def is_probably_db_query(q: str) -> bool:
+    L = q.lower()
+    # strong DB cues
+    cues = [
+        r"\b(phone|mobile|contact|tel|email|e\-?mail)\b",
+        r"\b(code|customer|cust|retail|retl|party|employee|emp|sap|invoice|docu|pin|pincode)\b",
+        r"\b(list|show|top|count|where|select|table|rows?)\b",
+        r"[A-Za-z]{2,}\d{2,}",  # id-ish like PZ6115, 4101P158
+    ]
+    return any(re.search(x, L) for x in cues)
+
+def small_talk(q: str) -> str:
+    L = q.strip().lower()
+    words = set(re.findall(r"[a-z]+", L))
+
+    if words & GREET_WORDS:
+        return random.choice([
+            "hey! how can i help?",
+            "hello! ask me anything about your data—or just chat 🙂",
+            "hi! need a phone/email/code or some quick info?"
+        ])
+    if words & THANK_WORDS:
+        return random.choice([
+            "anytime!",
+            "you’re welcome ✨",
+            "glad to help."
+        ])
+    if words & BYE_WORDS:
+        return random.choice([
+            "bye! have a good one 👋",
+            "see you later!",
+            "catch you soon!"
+        ])
+    if any(x in L for x in HELP_WORDS):
+        return (
+            "i’m your data assistant + chat buddy. try:\n"
+            "• phone number of \"rajendra shikwal\"\n"
+            "• email of PZ6115\n"
+            "• top 5 adtAnnGifts\n"
+            "• name of all tables\n"
+            "you can also just chat: “tell me a joke”, “what can you do”, etc."
+        )
+    if "time" in L or "date" in L or "today" in L:
+        now = datetime.datetime.now()
+        return f"it’s {now.strftime('%Y-%m-%d %H:%M:%S')} on your machine."
+
+    if any(x in L for x in JOKE_WORDS):
+        return random.choice([
+            "why did the database admin break up with sql? too many joins. 😅",
+            "i told my boss i know sql. they said: prove it. i replied: SELECT * FROM compliments;",
+        ])
+
+    # generic fallback chat
+    return random.choice([
+        "got it—ask me anything about your database, or say 'help' for examples.",
+        "i’m here. what do you want to find?",
+        "cool. tell me who/what you’re looking for and i’ll fetch it."
+    ])
+
+# ---------- Agent ----------
+class DBAgent:
+    def __init__(self):
+        with open(CAT, "r", encoding="utf-8") as f:
+            self.cat = json.load(f)
+
+        self.model_dir = _latest_checkpoint(MODEL_BASE)
+        spm_path = _find_sp_model(self.model_dir)
+        print(f"[db-agent] model_dir: {self.model_dir}")
+        print(f"[db-agent] spm:       {spm_path}")
+
+        # tokenizer & model
+        self.tok = T5Tokenizer(vocab_file=str(spm_path), legacy=True)
+        if self.tok.pad_token is None: self.tok.add_special_tokens({"pad_token": "<pad>"})
+        if self.tok.eos_token is None: self.tok.add_special_tokens({"eos_token": "</s>"})
+        if self.tok.unk_token is None: self.tok.add_special_tokens({"unk_token": "<unk>"})
+        if self.tok.bos_token is None: self.tok.add_special_tokens({"bos_token": "<s>"})
+        self.model = T5ForConditionalGeneration.from_pretrained(self.model_dir)
+
+        # DuckDB
+        self.con = duckdb.connect(database=":memory:")
+        self.con.execute("PRAGMA threads=4;")
+
+    # ---------- NL→SQL ----------
+    def _gen_sql(self, question: str) -> str:
+        ids = self.tok(question, return_tensors="pt", truncation=True, max_length=128)
+        out = self.model.generate(**ids, max_length=128, num_beams=4, do_sample=False)
+        sql = self.tok.decode(out[0], skip_special_tokens=True).strip().rstrip(";")
+        if DEBUG: print(f"[db-agent] gen SQL: {sql}")
+        return sql
+
+    def _map_tables_to_parquet(self, sql: str) -> str:
+        for key, meta in self.cat["tables"].items():
+            path = _sql_escape_like(_norm_path(meta["parquet"]))
+            pattern = rf'(?i)(?:["`])?{re.escape(key)}(?:["`])?'
+            sql = re.sub(pattern, f"parquet('{path}')", sql)
+        return sql
+
+    def _tables(self):
+        return sorted([f"{v['schema']}.{v['table']}" for v in self.cat["tables"].values()], key=str.lower)
+
+    def _best_table(self, frag: str):
+        frag = frag.lower()
+        best, best_score = None, -1
+        for key, meta in self.cat["tables"].items():
+            cand2 = meta["table"].lower()
+            score = max(int(frag in key.lower())*3, int(frag in cand2)*3, len(os.path.commonprefix([frag, cand2])))
+            if score > best_score:
+                best_score = score
+                best = (key, meta)
+        return best
+
+    # ---------- Main chatbot entry ----------
+    def ask(self, q: str) -> str:
+        # If it doesn’t look like a DB query, do small talk
+        if not is_probably_db_query(q):
+            return small_talk(q)
+
+        L = q.lower().strip()
+
+        # quick control queries
+        if (("list" in L or "show" in L or "name" in L) and "table" in L) or L in {"tables","list tables","show tables"}:
+            return "here are your tables:\n- " + "\n- ".join(self._tables())
+
+        m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
+        if m:
+            n = int(m.group(1)); frag = m.group(2)
+            best = self._best_table(frag)
+            if not best: return "i couldn’t find a table matching that."
+            _, meta = best
+            p = _norm_path(meta["parquet"])
+            try:
+                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
+                return "here you go:\n" + (df.to_string(index=False) if not df.empty else "(no rows)")
+            except Exception:
+                return "sorry, i couldn’t read that table."
+
+        # NL→SQL path first
+        sql = self._gen_sql(q)
+        if re.match(r"^\s*select\b", sql, flags=re.IGNORECASE):
+            try:
+                sql2 = self._map_tables_to_parquet(sql)
+                if DEBUG: print(f"[db-agent] remapped SQL: {sql2}")
+                df = self.con.execute(sql2).fetchdf()
+                if df.empty:
+                    return self._fallback_natural(q, not_found=True)
+                return self._format_db_answer(q, df)
+            except Exception as e:
+                if DEBUG: print(f"[db-agent] SQL error: {e}")
+                # fall through to robust lexical fallback
+
+        # robust fallback
+        return self._fallback_natural(q)
+
+    # ---------- Smarter fallback + natural phrasing ----------
+    def _fallback_natural(self, q: str, not_found: bool = False) -> str:
+        want = _wanted_field(q)    # 'phone'/'email'/None
+        toks  = _tokens_from_question(q)
+        if DEBUG: print(f"[db-agent] want={want} tokens={toks}")
+
+        # Try tokens (AND, then OR)
+        for mode in ("AND","OR"):
+            df, meta = self._search_for_tokens_df(toks, mode=mode)
+            if df is not None and not df.empty:
+                if want:
+                    vals = self._extract_wanted_values(df, want, k=5)
+                    if vals:
+                        name_hint = _extract_name_hint(q)
+                        pretty = ", ".join(vals)
+                        if want == "phone":
+                            return f"phone for {name_hint or 'the match'}: {pretty}"
+                        else:
+                            return f"email for {name_hint or 'the match'}: {pretty}"
+                # else show a compact snippet
+                return f"i found matches in {meta['schema']}.{meta['table']}:\n" + df.head(5).to_string(index=False)
+
+        # If user asked only 'email' / 'phone' with no name, sample
+        if want in {"email","phone"} and not toks:
+            vals = self._sample_field_across_tables(want, k=8)
+            if vals:
+                pretty = ", ".join(vals)
+                return f"here are some {want}s i can see: {pretty}"
+            return "i couldn’t spot any right away; try adding a name in quotes, e.g. phone of \"rajendra shikwal\"."
+
+        # Truly nothing
+        if not_found:
+            return "i couldn’t find that. try adding a bit more detail, e.g. full name in quotes."
+        return "hmm, i didn’t get a match. can you add more detail, maybe the full name in quotes?"
+
+    def _search_for_tokens_df(self, tokens, mode="AND"):
+        if not tokens:
+            return None, None
+        for key, meta in list(self.cat["tables"].items())[:200]:
+            p = _norm_path(meta["parquet"])
+            try:
+                probe = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 200").fetchdf()
+            except Exception as e:
+                if DEBUG: print(f"[db-agent] probe error {key}: {e}")
+                continue
+            if probe.empty: continue
+
+            cols = list(probe.columns)
+            per_tok = []
+            for t in tokens:
+                t_esc = _sql_escape_like(t)
+                ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in cols]
+                per_tok.append("(" + " OR ".join(ors) + ")")
+            where = (" AND ".join(per_tok)) if mode == "AND" else (" OR ".join(per_tok))
+            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 25"
+            try:
+                df = self.con.execute(q2).fetchdf()
+            except Exception as e:
+                if DEBUG: print(f"[db-agent] scan err on {key}: {e}")
+                continue
+            if not df.empty:
+                return df, meta
+        return None, None
+
+    def _extract_wanted_values(self, df: pd.DataFrame, want: str, k=5):
+        # Rank columns by name cues + value pattern, then return distinct values
+        scores = []
+        sample = df.head(200)
+        for c in df.columns:
+            s = sample[c]
+            name_bonus = 0.0
+            pat_frac = 0.0
+            try:
+                if want == "phone":
+                    if PHONE_COL_RE.search(c): name_bonus += 0.6
+                    pat_frac = _looks_like_phone(s)
+                elif want == "email":
+                    if EMAIL_COL_RE.search(c): name_bonus += 0.6
+                    pat_frac = _looks_like_email(s)
+            except Exception:
+                pass
+            score = name_bonus + pat_frac
+            if score > 0.15:
+                scores.append((c, score))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        vals = []
+        for c,_ in scores:
+            series = df[c].dropna().astype(str)
+            if want == "phone":
+                series = series[series.str.match(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$", na=False)]
+            elif want == "email":
+                series = series[series.str.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", na=False)]
+            for v in series.unique():
+                v = v.strip()
+                if v and v not in vals:
+                    vals.append(v)
+                    if len(vals) >= k:
+                        return vals
+        return vals
+
+    def _sample_field_across_tables(self, want: str, k=8):
+        vals = []
+        for key, meta in list(self.cat["tables"].items())[:200]:
+            p = _norm_path(meta["parquet"])
+            try:
+                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 500").fetchdf()
+            except Exception:
+                continue
+            if df.empty: continue
+            for v in self._extract_wanted_values(df, want, k=k):
+                if v not in vals:
+                    vals.append(v)
+                    if len(vals) >= k:
+                        return vals
+        return vals
+
+    # ---------- Pretty formatting for DB answers ----------
+    def _format_db_answer(self, q: str, df: pd.DataFrame) -> str:
+        want = _wanted_field(q)
+        if df.shape == (1,1):
+            val = str(df.iat[0,0]).strip()
+            if want == "phone":
+                return f"phone: {val}" if val else "i didn’t find a phone there."
+            if want == "email":
+                return f"email: {val}" if val else "i didn’t find an email there."
+            return val or "no value found."
+        # multi-column or multi-row
+        if want in {"phone","email"}:
+            vals = self._extract_wanted_values(df, want, k=5)
+            if vals:
+                name_hint = _extract_name_hint(q)
+                pretty = ", ".join(vals)
+                if want == "phone":
+                    return f"phone for {name_hint or 'the match'}: {pretty}"
+                else:
+                    return f"email for {name_hint or 'the match'}: {pretty}"
+        # fallback: show a compact table
+        return "here’s what i found:\n" + df.head(5).to_string(index=False)
+
+# ---------- CLI ----------
+if __name__ == "__main__":
+    bot = DBAgent()
+    print("chat + db agent ready. try:\n- phone number of \"rajendra shikwal\"\n- email of PZ6115\n- name of all tables\n- hi / help / tell me a joke")
+    while True:
+        try:
+            s = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not s or s.lower() in {"exit","quit"}:
+            break
+        print(bot.ask(s))
