@@ -1,322 +1,970 @@
-import os, json, re, glob
-import duckdb
-import pandas as pd
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+<%@ include file="/Envr/JSP/SecurityCom.jsp"%>
+<!-- /BirlaWhite/Mobile/GrcLeadEntry.jsp -->
+<%@ page import="java.sql.*, java.util.Base64, java.io.ByteArrayInputStream, java.io.IOException, java.util.ArrayList, java.util.List" %>
 
-DB_DIR      = "../db_export_bwlive"
-CAT         = os.path.join(DB_DIR, "catalog.json")
-MODEL_BASE  = "models/nl2sql_tiny"
-ENV_MODEL   = os.environ.get("AI_DB_AGENT_MODEL", "")
-ENV_SPM     = os.environ.get("AI_DB_AGENT_SPM", "")
-DEBUG       = os.environ.get("AI_DB_AGENT_DEBUG", "0") == "1"
+<%
+ResultSet rset = null;
 
-# Words we don't want to search for as entity tokens
-STOPWORDS = {
-    "what","is","are","of","for","about","the","a","an","this","that","these","those",
-    "show","give","get","find","list","name","names","code","codes","number","numbers",
-    "top","first","last","all","and","or","with","without","please","pls","zone",
+String  sql = "",
+		procType = "A",
+		docuNumb = "",
+		mobileNo = "",
+		leadDate = "",
+		leadQnty = "",
+		siteName = "",
+		siteRmrk = "",
+		prdCdStr = "",
+		siteAddr = "",
+		upldFlNm = "",
+		uplodBtn = "",
+		randNmSt = "",
+		leadZone = "",
+		leadStat = "",
+		saleArea = "",
+		loctCity = "",
+		siteAdrs = "",
+		archctNm = "",
+		archctMo = "",
+		archctEm = "",
+		siteLoct = "",
+		grcItmRq = "",
+		qtyOfWrk = "",
+		timeFram = "",
+		disablFl = "",
+		areaCode = "",
+		itxPanNo = "",
+		gstnNumb = "",
+		emailAdd = "",
+		stateGeo = "",
+		district = "",
+		pinCodeS = "",
+		retlPinC = "",
+		cityCode = "",
+		location = "",
+		cityName = "",
+		loginTyp = "",
+		stMobNum = "",
+		stateNam = "",
+		leadMsrs = "",
+		areaCodS = "",
+		siteType = "",
+		retlAdd1 = "",
+		mouStrrs = "",
+		delvrPrd = "",
+		prjcKStr = "",
+		prjctKnd = "",
+		delvPStr = "",
+		cnPerStr = "",
+		cntPrsnt = "",
+		pinCdStr = "<option value=''></option>",
+		adhrNumb = "",
+		archtNam = "",
+		sitePinC = "",
+		drawRand = ("" + (Math.random() * 10000)).substring(0,16),
+		formName = "GrcLeadEntry";
+
+
+Double salesBag = 0.00,
+	   salesQty = 0.00;
+
+List<String> imageList = new ArrayList<>();
+
+if (XssFilter.parSmGet("procType") != null)
+	procType = XssFilter.parSmGet("procType");
+
+if (XssFilter.parSmGet("docuNumb") != null)
+	docuNumb = XssFilter.parSmGet("docuNumb");
+
+if (XssFilter.parSmGet("siteType") != null)
+	siteType = XssFilter.parSmGet("siteType");
+
+loginTyp = log.getUserType();
+if(log.getUserType().equals(""))
+{
+	procType = "U";
+	loginTyp = "S";
+}
+if(procType.equals("A"))
+{
+	sql = "select right(newId(), 8)";
+	rset = WebSessBean.selectRecord(sql);
+
+	rset.next();
+	randNmSt = rset.getString(1);
+}
+else //if(procType.equals("A"))
+{
+	randNmSt = docuNumb;
 }
 
-# Column-name cues
-PHONE_COL_RE = re.compile(r"(mob|phone|phon|tel|contact|cell)", re.I)
-EMAIL_COL_RE = re.compile(r"(email|e\-?mail|mailid|mail_id|mail)", re.I)
+sql = " select 'F2','Feet Squre' union all select 'FT','Feet' union all select 'M2','Meter Squre' union all select 'NO','Numbers' union all select 'RF','Running Ft' ";
+mouStrrs = WebSessBean.getSqlToOptionStr(sql, leadMsrs);
 
-def _norm_path(p: str) -> str:
-    return p.replace("\\", "/")
 
-def _sql_escape_like(s: str) -> str:
-    return (s or "").replace("'", "''")
+sql = " select '01-03 month','01-03 month' union all select '04-06 month','04-06 month' union all select '07-12 month','07-12 month' union all select 'over 12 month','over 12 month' ";
+delvPStr = WebSessBean.getSqlToOptionStr(sql, delvrPrd);
 
-def _has_model_files(d: str) -> bool:
-    pats = [
-        "pytorch_model.bin", "model.safetensors",
-        "pytorch_model-*.bin", "model-*.safetensors",
-        "pytorch_model.bin.index.json", "model.safetensors.index.json",
-    ]
-    return any(glob.glob(os.path.join(d, p)) for p in pats)
+sql = " select 'residence / bunglow','residence / bunglow' union all select 'religious','religious' union all select 'hotel','hotel' union all select 'hospital','hospital' union all select 'Govt. Project','Govt. Project' "
+	+ " union all select 'Commercial Project','Commercial Project' union all select 'high rise','high rise' union all select 'land scaping','land scaping' union all select 'educational institute','educational institute'  "
+	+ " union all select 'Others','Others' ";
+prjcKStr = WebSessBean.getSqlToOptionStr(sql, prjctKnd);
 
-def _latest_checkpoint(base: str) -> str:
-    if ENV_MODEL:
-        use = os.path.abspath(ENV_MODEL)
-        if not os.path.isdir(use): raise FileNotFoundError(f"AI_DB_AGENT_MODEL not a folder: {use}")
-        if not _has_model_files(use): raise FileNotFoundError(f"No model files in {use}")
-        return use
-    if not os.path.isdir(base): raise FileNotFoundError(f"Model folder not found: {base}")
-    cands = []
-    for name in os.listdir(base):
-        full = os.path.join(base, name)
-        if os.path.isdir(full) and name.startswith("checkpoint-") and _has_model_files(full):
-            try: cands.append((int(name.split("-")[-1]), full))
-            except: pass
-    if cands:
-        cands.sort(key=lambda x: x[0])
-        return cands[-1][1]
-    if _has_model_files(base): return base
-    raise FileNotFoundError(f"No usable model in {base}. Put weights in base or in checkpoint-* subfolders.")
+sql = " select 'Owner','Owner' union all select 'builder','builder' union all select 'contractor','contractor' union all select 'architect','architect' union all select 'construction company','construction company' ";
+cnPerStr = WebSessBean.getSqlToOptionStr(sql, cntPrsnt);
+%>
 
-def _find_sp_model(model_dir: str) -> str:
-    if ENV_SPM and os.path.isfile(ENV_SPM):
-        return os.path.abspath(ENV_SPM)
-    for name in ("spiece.model","spm.model","sentencepiece.model","tokenizer.model"):
-        p = os.path.join(model_dir, name)
-        if os.path.isfile(p): return os.path.abspath(p)
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("spm.model","spiece.model","sentencepiece.model"):
-        p = os.path.join(here, "data", name)
-        if os.path.isfile(p): return os.path.abspath(p)
-    raise FileNotFoundError(
-        "SentencePiece .model not found. Copy data\\spm.model into the chosen checkpoint as spiece.model, "
-        "or set AI_DB_AGENT_SPM to its full path."
-    )
+<script language="javascript">
 
-def _wanted_field(q: str):
-    L = q.lower()
-    if re.search(r"\b(email|e\-?mail)\b", L): return "email"
-    if re.search(r"\b(mobile|phone|contact|tel|cell)\b", L): return "phone"
-    return None
+function refreshed()
+{
+	document.<%=formName%>.method = "POST";
+	document.<%=formName%>.action = "<%=formName%>.jsp";
+	document.<%=formName%>.submit();
+}
 
-def _tokens_from_question(q: str):
-    # Prefer quoted phrase
-    m = re.search(r"[\"“”'`](.+?)[\"“”'`]", q)
-    raw = re.findall(r"[A-Za-z0-9@+._/-]+", m.group(1) if m else q)
-    toks = []
-    for t in raw:
-        tl = t.lower()
-        if tl in STOPWORDS: continue
-        # keep numbers and strings >=3 chars
-        if any(c.isdigit() for c in t) or len(t) >= 3:
-            toks.append(t)
-    if not toks and raw:
-        toks = [max(raw, key=len)]
-    return toks[:6]
+function deleter2()
+{
+	deleterCv("<%=formName%>", "abc1", "prjTable", 1);
+}
 
-def _looks_like_phone(s: pd.Series) -> float:
-    if s is None or s.empty: return 0.0
-    pat = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
-    try:
-        vals = s.dropna().astype(str)
-        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
-    except Exception:
-        return 0.0
+function addrow(prodCode,salesBag,salesQty)
+{
+	numrows = getNumRows();
+	var newRow = insertRowBw(document.all.prjTable);
 
-def _looks_like_email(s: pd.Series) -> float:
-    if s is None or s.empty: return 0.0
-    pat = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-    try:
-        vals = s.dropna().astype(str)
-        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
-    except Exception:
-        return 0.0
+	name = "abc1";
+	m = insertCellBw(newRow);
+	m.innerHTML = "<input type = 'checkbox' name = '" + name + "' value = '" + numrows + "'>";
 
-class DBAgent:
-    def __init__(self):
-        with open(CAT, "r", encoding="utf-8") as f:
-            self.cat = json.load(f)
+	name = "prodCode" + numrows;
+	m = insertCellBw(newRow);
+	m.innerHTML = "<select class='form-control' name='" + name + "' id='" + name + "' class='form-control form-control-solid'  value='" + prodCode + "'><%=prdCdStr%></select>";
+	//m.innerHTML = "<input type='text' name='" + name + "' id='" + name + "' class='form-control form-control-solid' value='" + prodCode + "'>";
+	
+	name = "salesBag" + numrows;
+	m = insertCellBw(newRow);
+	m.innerHTML = "<input type='text' name='" + name + "' id='" + name + "' class='form-control form-control-solid' value='" + salesBag + "' onchange=\"return BagConv(" + numrows + ", 'N')\">";
+	
 
-        self.model_dir = _latest_checkpoint(MODEL_BASE)
-        spm_path = _find_sp_model(self.model_dir)
-        print(f"[db-agent] model_dir: {self.model_dir}")
-        print(f"[db-agent] spm:       {spm_path}")
+	name = "salesQty" + numrows;
+	m = insertCellBw(newRow);
+	m.innerHTML = "<input type='text' name='" + name + "' id='" + name + "' class='form-control form-control-solid' value='" + salesQty + "' readonly>";
 
-        self.tok = T5Tokenizer(vocab_file=str(spm_path), legacy=True)
-        if self.tok.pad_token is None: self.tok.add_special_tokens({"pad_token": "<pad>"})
-        if self.tok.eos_token is None: self.tok.add_special_tokens({"eos_token": "</s>"})
-        if self.tok.unk_token is None: self.tok.add_special_tokens({"unk_token": "<unk>"})
-        if self.tok.bos_token is None: self.tok.add_special_tokens({"bos_token": "<s>"})
 
-        self.model = T5ForConditionalGeneration.from_pretrained(self.model_dir)
-        self.con = duckdb.connect(database=":memory:")
-        self.con.execute("PRAGMA threads=4;")
+	$("#prjTable").before(numrows);
+		eval("document.<%=formName%>.prodCode" + numrows).value = prodCode;
+		eval("document.<%=formName%>.salesBag" + numrows).value = salesBag;
+		eval("document.<%=formName%>.salesQty" + numrows).value = salesQty;
+	if($("select").select2 != null)
+		$("select").select2();
 
-    # ---------- NL→SQL ----------
-    def _gen_sql(self, question: str) -> str:
-        ids = self.tok(question, return_tensors="pt", truncation=True, max_length=128)
-        out = self.model.generate(**ids, max_length=128, num_beams=4, do_sample=False)
-        sql = self.tok.decode(out[0], skip_special_tokens=True).strip().rstrip(";")
-        if DEBUG: print(f"[db-agent] gen SQL: {sql}")
-        return sql
+	BagConv(numrows,"N");
+}
 
-    def _map_tables_to_parquet(self, sql: str) -> str:
-        for key, meta in self.cat["tables"].items():
-            path = _sql_escape_like(_norm_path(meta["parquet"]))
-            pattern = rf'(?i)(?:["`])?{re.escape(key)}(?:["`])?'
-            sql = re.sub(pattern, f"parquet('{path}')", sql)
-        return sql
+ var upldFlNm ;
+//var  upldFlNmDiv;
+function photoUpl()
+{
+	var flUpLnSt = "";
+	var docuType = "";
+	var filSeqNo = "Img1";
 
-    def _tables(self):
-        return sorted([f"{v['schema']}.{v['table']}" for v in self.cat["tables"].values()], key=str.lower)
 
-    def _best_table(self, frag: str):
-        frag = frag.lower()
-        best, best_score = None, -1
-        for key, meta in self.cat["tables"].items():
-            cand2 = meta["table"].lower()
-            score = max(int(frag in key.lower())*3, int(frag in cand2)*3, len(os.path.commonprefix([frag, cand2])))
-            if score > best_score:
-                best_score = score
-                best = (key, meta)
-        return best
+   	if(document.<%=formName%>.procType.value == "A")
+		upldFlNm = "<%=randNmSt%><%=loginIdM%>";
+	else
+	   upldFlNm = "<%=randNmSt%>";
 
-    # ---------- main ----------
-    def ask(self, q: str) -> str:
-        L = q.lower().strip()
+	document.<%=formName%>.upldFlNm.value = upldFlNm;
+//	alert(upldFlNm);
+	flUpLnSt = "/Envr/JSP/FileUpload.jsp?popupWin=Y&upDocNum=" + upldFlNm + "&fileDocu=0&fileType=jpg,jpeg&maxmSize=5&filSeqNo=" + filSeqNo + "&attFilTy=00";
 
-        # list tables
-        if (("list" in L or "show" in L or "name" in L) and "table" in L) or L in {"tables","list tables","show tables"}:
-            return ", ".join(self._tables())
+	createModal('Image Upload', '' + flUpLnSt + '')
+	return true;
+}
 
-        # top N table
-        m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
-        if m:
-            n = int(m.group(1)); frag = m.group(2)
-            best = self._best_table(frag)
-            if not best: return "Not found"
-            _, meta = best
-            p = _norm_path(meta["parquet"])
-            try:
-                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
-                return df.to_string(index=False) if not df.empty else "Not found"
-            except Exception:
-                return "Not found"
+function areaCodeChange()
+{
+	console.log("function called 1");
+	var rtnValue = districtOpt('<%=formName%>', 'areaCode', 'A', '', 'district');
+	if (rtnValue == false)
+		return false;
 
-        # NL→SQL path first
-        sql = self._gen_sql(q)
-        if re.match(r"^\s*select\b", sql, flags=re.IGNORECASE):
-            try:
-                sql2 = self._map_tables_to_parquet(sql)
-                if DEBUG: print(f"[db-agent] remapped SQL: {sql2}")
-                df = self.con.execute(sql2).fetchdf()
-                if not df.empty:
-                    if df.shape == (1,1):
-                        v = str(df.iat[0,0]).strip()
-                        return v if v else "Not found"
-                    return df.head(5).to_string(index=False)
-            except Exception as e:
-                if DEBUG: print(f"[db-agent] SQL error: {e}")
+	document.<%=formName%>.district.onchange = function ()
+	{
+		fillPinLoc1();
+		updateAddressFields();
 
-        # Fallback (robust)
-        return self._fallback(q)
+		console.log("function called");
 
-    # ---------- smart fallback ----------
-    def _fallback(self, q: str) -> str:
-        want = _wanted_field(q)        # 'phone' or 'email' or None
-        toks  = _tokens_from_question(q)
-        if DEBUG: print(f"[db-agent] want={want} tokens={toks}")
+	}
+	createEmptySelect("sitePinC");
+	return true;
+}
 
-        # A) If we have tokens (e.g., a name), search for matching rows and then return the requested field if any
-        if toks:
-            hit = self._search_for_tokens(toks, want=want)
-            if hit: return hit
+function fillPinLoc1()
+{
+    console.log("function called 3");
+	return pinCodeNOpt('<%=formName%>', 'district', '', 'sitePinC');
+} 
 
-        # B) If user asked only 'email' / 'phone' with no tokens, sample likely columns across tables
-        if want in {"email","phone"}:
-            vals = self._sample_field_across_tables(want, k=8)
-            return ", ".join(vals) if vals else "Not found"
+function photView()
+{	
+	var imgeView = "";
 
-        # C) Last resort: show any row that matches longest token
-        if toks:
-            hit = self._search_for_tokens([max(toks, key=len)], want=None, mode="OR")
-            if hit: return hit
+														
+	var atchNmId = "0", atchNmIO = "";
+	var filSeqNo = "Img1";
 
-        return "Not found"
+	if(atchNmIO != "")
+	{
+		atchNmId = atchNmIO;
+	}
 
-    def _search_for_tokens(self, tokens, want=None, mode="AND"):
-        # Scan some tables; build flexible WHERE with all columns cast to text
-        for key, meta in list(self.cat["tables"].items())[:200]:
-            p = _norm_path(meta["parquet"])
-            try:
-                probe = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 200").fetchdf()
-            except Exception as e:
-                if DEBUG: print(f"[db-agent] probe error {key}: {e}")
-                continue
-            if probe.empty: continue
+   	if(document.<%=formName%>.procType.value == "A")
+		upldFlNm = "<%=randNmSt%><%=loginIdM%>";
+	else
+	   upldFlNm = "<%=randNmSt%>";
 
-            cols = list(probe.columns)
-            per_tok = []
-            for t in tokens:
-                t_esc = _sql_escape_like(t)
-                ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in cols]
-                per_tok.append("(" + " OR ".join(ors) + ")")
-            where = (" AND ".join(per_tok)) if mode == "AND" else (" OR ".join(per_tok))
-            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 25"
-            try:
-                df = self.con.execute(q2).fetchdf()
-            except Exception as e:
-                if DEBUG: print(f"[db-agent] scan err on {key}: {e}")
-                continue
-            if df.empty: continue
+	imgeView = "/Envr/JSP/AtchFileShow.jsp?docuNumb=" + upldFlNm + "&atchNmId=" + atchNmId + "&filSeqNo=" + filSeqNo + "&attFilTy=00";
+	createModal('Image Upload', '' + imgeView + '')
+}
+	
+function submitValid()
+{
+	if(document.<%=formName%>.procType.value != "A")
+	{
+		if(!textValidApp(document.<%=formName%>.docuNumb, "Document No", false))
+			return false;
+	}
 
-            # If a specific field is desired, pick best value columns
-            if want:
-                cols_pick = self._pick_value_columns(df, want)
-                if cols_pick:
-                    # return distinct, non-null values compactly
-                    series = []
-                    for c in cols_pick:
-                        series.append(df[c].dropna().astype(str))
-                    cat = pd.concat(series) if series else pd.Series([], dtype=str)
-                    vals = list(dict.fromkeys([v.strip() for v in cat if v.strip()]))[:5]
-                    if vals:
-                        return ", ".join(vals)
-            # else just show a compact snippet
-            return f"{meta['schema']}.{meta['table']}\n" + df.head(5).to_string(index=False)
-        return None
+	if(!textValidApp(document.<%=formName%>.procType, "Process Type", false))
+		return false;
 
-    def _pick_value_columns(self, df: pd.DataFrame, want: str):
-        # Rank columns by name cues + pattern fraction on sample
-        want = want.lower()
-        scores = []
-        sample = df.head(200)
-        for c in df.columns:
-            s = sample[c]
-            name_bonus = 0.0
-            pat_frac = 0.0
-            try:
-                if want == "phone":
-                    if PHONE_COL_RE.search(c): name_bonus += 0.6
-                    pat_frac = _looks_like_phone(s)
-                elif want == "email":
-                    if EMAIL_COL_RE.search(c): name_bonus += 0.6
-                    pat_frac = _looks_like_email(s)
-            except Exception:
-                pass
-            score = name_bonus + pat_frac  # both [0..1+]
-            if score > 0.15:  # threshold
-                scores.append((c, score))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return [c for c,_ in scores[:3]]
+	if(!textValidApp(document.<%=formName%>.leadDate, "Date", false))
+		return false;
 
-    def _sample_field_across_tables(self, want: str, k=8):
-        vals = []
-        for key, meta in list(self.cat["tables"].items())[:200]:
-            p = _norm_path(meta["parquet"])
-            try:
-                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 500").fetchdf()
-            except Exception:
-                continue
-            if df.empty: continue
-            pick = self._pick_value_columns(df, want)
-            for c in pick:
-                col = df[c].dropna().astype(str)
-                if want == "phone":
-                    m = col[col.str.match(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$", na=False)]
-                else:
-                    m = col[col.str.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", na=False)]
-                for v in m.unique():
-                    v = v.strip()
-                    if v and v not in vals:
-                        vals.append(v)
-                        if len(vals) >= k:
-                            return vals
-        return vals
+	if(!textValidApp(document.<%=formName%>.leadQnty, "Qty", false))
+		return false;
 
-if __name__ == "__main__":
-    bot = DBAgent()
-    while True:
-        try:
-            s = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not s or s.lower() in {"exit","quit"}:
-            break
-        print(bot.ask(s))
+	if(!textValidApp(document.<%=formName%>.siteName, "Site Name", false))
+		return false;
+	if(!textValidApp(document.<%=formName%>.mobileNo, "Mobile No", false))
+		return false;
+	if(!textValidApp(document.<%=formName%>.siteAddr, "Address", false))
+		return false;
+
+	confirm("Press OK to save.")
+	{
+		document.<%=formName%>.method = "POST";
+		document.<%=formName%>.action = "<%=formName%>S.jsp";
+		document.<%=formName%>.submit();
+	}
+}
+
+function geoLocPnChng(currObjt) 
+{
+    if (currObjt == "G") 
+	{
+        if ("<%=mobilApp%>" == "true") 
+		{
+            chkdc();
+           // parseAndDisplayAddress();
+        }
+    }
+	else 
+	{
+        // Handle Pin Code selection if needed
+		//parseAndDisplayAddress();
+		 chkdc();
+    }
+}
+
+function setCust()
+{
+	document.<%=formName%>.concEmpl.value = "";
+	if(isEmpty(document.<%=formName%>.areaCode.value))
+	{
+	//	enableDisable("custCode", "D");
+		document.getElementById("district").innerHTML = "<select name=''  class='selectpicker' data-style='btn-info' ><option value=''>select</option></select>";
+	}
+	else
+	{
+		 fillDistLoc('');
+	
+	}
+}
+
+function fillDistLoc(currObjt)
+{
+	var wherList = "";
+		//wherList = whereAdd(wherList, "SW_06", document.<%=formName%>.areaCode.value);
+//		wherList = whereAdd(wherList, "SW_02", "12");
+	var rtnValue = districtOpt('<%=formName%>', 'areaCode', 'A', wherList, 'district');
+	if(rtnValue)
+	{
+		if(currObjt != "")
+		{
+			if(document.<%=formName%>.district !=  null)
+				document.<%=formName%>.district.value = currObjt.toUpperCase();
+		}
+
+		document.<%=formName%>.district.onchange = function fillPinCdLoc()
+		{
+			rtnValue = pinCodeNOpt('<%=formName%>', 'district', '', 'retlPinC');
+		}
+	}
+
+	if(document.<%=formName%>.retlPinC.value == "" || document.<%=formName%>.retlPinC ==  null)
+		createEmptySelect("retlPinC");
+}
+
+function retlPinCChang(currObjc)
+{
+ 
+	var cityName = splitSelectText(document.<%=formName%>.retlPinC)[1];
+	
+	document.<%=formName%>.location.value = cityName;
+	document.<%=formName%>.cityName.value = cityName;
+	document.getElementById("locationDiv").innerText = cityName
+
+	 fillDistLoc(splitSelectText(document.<%=formName%>.retlPinC)[2]);
+
+}
+
+function updateAddressFields() {
+    const addressString = document.getElementById('retlAdd1').value;
+
+    // Remove any leading or trailing spaces and normalize the address
+    const normalizedAddress = addressString.trim().replace(/\s+/g, ' ');
+
+    // Try to match the pincode in the address string
+    const pincodeRegex = /\b\d{6}\b/;
+    const pincodeMatch = normalizedAddress.match(pincodeRegex);
+    let pincode = '';
+    if (pincodeMatch) {
+        pincode = pincodeMatch[0];
+    }
+
+    // Remove the pincode from the address string
+    const addressWithoutPincode = normalizedAddress.replace(pincodeRegex, '');
+
+    // Split the address by comma and trim each part
+    const parts = addressWithoutPincode.split(',').map(part => part.trim());
+
+    // Extract city, district, and state from the parts
+    let city = '';
+    let district = '';
+    let state = '';
+    if (parts.length >= 3) {
+        city = parts[0];
+        district = parts[1];
+        state = parts.slice(2).join(', ');
+    } else if (parts.length === 2) {
+        city = parts[0];
+        state = parts[1];
+    } else if (parts.length === 1) {
+        city = parts[0];
+    }
+
+    // Update the input fields
+    document.getElementById('city1').value = city;
+    document.getElementById('district1').value = district;
+    document.getElementById('pincode1').value = pincode;
+    document.getElementById('state1').value = state;
+}
+
+</script>
+
+<!-- header display area begin -->
+<jsp:include page="/Envr/JSP/HeaderCom.jsp" flush="true">
+    <jsp:param name="mobFrend" value="B"/>
+</jsp:include>
+<!-- HEADER DISPLAY AREA ENDS -->
+<form name="<%=formName%>">
+    <div class="card card-xl-stretch p-6" ontouchstart="updateAddressFields()">
+        <div class="row p-6">
+            <h1 class="header-bw" align="center"> Process Details </h1>
+            <div class="col-md-4">
+                <label class="required">Define Onsite/Offsite</label>
+                <select name="siteType" id="siteType" onchange="refreshed()" value="">
+                    <%=WebSessBean.getSqlToOptionStr("select 'O', 'Onsite' union select 'F', 'Offsite' ",siteType)%>
+                </select>
+            </div>
+            <div class="col-md-4">
+                <label class="required">Process Type</label>
+                <select name="procType" id="procType" onchange="refreshed()" value="">
+                    <%=WebSessBean.getSqlToOptionStr("select 'A', 'Add' union select 'U', 'Update' ",procType)%>
+                </select>
+            </div>
+<%
+if(procType.equals("U"))
+{
+%>
+ 		<div class="col-md-4">
+			<label class="required">Document No</label>
+			<select name="docuNumb" id="docuNumb" onchange = "refreshed()">
+					<%=WebSessBean.getSqlToOptionStr("select a.docuNumb, a.docuNumb  from bwlive.dbo.dptGrcLeadGn a with (nolock) where a.createId = '" + loginIdM + "' ", docuNumb, false)%>
+			</select>
+		</div>
+<%
+}
+try 
+{	
+	if(!docuNumb.equals("") && siteType.equals("F"))
+	{
+		sql = "select a.docuNumb, convert(varchar(10), leadDate, 111), leadQnty, siteName, mobileNo, siteAddr, siteRmrk, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, areaCode, retlPinC , attchMnt from bwlive.dbo.dptGrcLeadGn a with (nolock) where docuNumb = '" + docuNumb + "' ";
+		rset = WebSessBean.selectRecord(sql);
+		if(rset.next())
+		{
+			docuNumb = rset.getString(1); 
+			leadDate = rset.getString(2); 
+			leadQnty = rset.getString(3); 
+			siteName = rset.getString(4);  
+			mobileNo = rset.getString(5);  
+			siteAddr = rset.getString(6);  
+			siteRmrk = rset.getString(7); 
+			adhrNumb = rset.getString(8); 
+			archtNam = rset.getString(9); 
+			itxPanNo = rset.getString(10); 
+			gstnNumb = rset.getString(11); 
+			emailAdd = rset.getString(12); 
+			district = rset.getString(13); 
+			areaCode = rset.getString(14); 
+			sitePinC = rset.getString(15); 
+			drawRand = rset.getString(16); 
+		}
+	}
+	if(!docuNumb.equals("") && siteType.equals("O"))
+	{
+		sql = "select a.docuNumb, convert(varchar(10), leadDate, 111), leadQnty, siteName, mobileNo, siteAddr, siteRmrk, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, stateNam, cityName, attchMnt from bwlive.dbo.dptGrcLeadGn a with (nolock) where docuNumb = '" + docuNumb + "' ";
+		rset = WebSessBean.selectRecord(sql);
+		if(rset.next())
+		{
+			docuNumb = rset.getString(1); 
+			leadDate = rset.getString(2); 
+			leadQnty = rset.getString(3); 
+			siteName = rset.getString(4);  
+			mobileNo = rset.getString(5);  
+			siteAddr = rset.getString(6);  
+			siteRmrk = rset.getString(7); 
+			adhrNumb = rset.getString(8); 
+			archtNam = rset.getString(9); 
+			itxPanNo = rset.getString(10); 
+			gstnNumb = rset.getString(11); 
+			emailAdd = rset.getString(12); 
+			district = rset.getString(13); 
+			stateNam = rset.getString(14); 
+			cityName = rset.getString(15); 
+			drawRand = rset.getString(16); 
+		}
+	
+	}
+%>	
+
+<div class="col-md-4">
+    <label>lead Date</label>
+    <input type="text" value="<%=leadDate%>" name="leadDate" id="leadDate" onChange="return isDate(this, false, '')" onClick="showCal('<%=formName%>','leadDate')">	<br>
+</div>
+<div class="col-md-4">
+    <label class="required">lead Qty</label>
+    <input type="text" value="<%=leadQnty%>" name="leadQnty" id="leadQnty" required><br>
+</div>
+<div class="col-md-4">
+    <label class="optional">Unit of Measurement</label><span class="optional">(optional)</span>
+    <select name="leadMsrs" id="leadMsrs"> <%=mouStrrs%> </select><br>
+</div>
+
+<%
+if(siteType.equals("F"))
+{
+%>
+		<br><h1 class="header-bw" align="center">Project Details </h1>
+		<div class="col-md-4">
+				<label class="control-label float-sm-left">Area *</label> 
+					<select name="areaCode" id="areaCode" data-live-search="true" onChange="return areaCodeChange()" class="selectpicker" value="<%=areaCode%>">
+						<%=WebSessBean.getArDesc(areaCode, true)%>
+					</select><br>
+		</div>
+
+<%
+}
+if(siteType.equals("O"))
+{
+%>
+<br>
+<h1 class="header-bw" align="center">Project Details </h1>
+<div class="col-md-4">
+    <label class="control-label float-sm-left">Area *</label> 
+    <select name="areaCode" id="areaCode" data-live-search="true" class="selectpicker" value="<%=areaCodS%>">
+        <%=WebSessBean.getArDesc(areaCodS, true)%>
+    </select><br>
+</div>
+<div class="col-md-4">
+    <label>Address Capture using Geo Location*(for Mobile)</label> 
+    <div class="card1">
+        <label class="check"> 
+            <input type="radio" name="geoLocPn" value="G" id="geoLocPn" onclick="geoLocPnChng('G')">
+            <span>Geo Location</span> 
+        </label>
+        <label class="check"> 
+            <input type="radio" name="geoLocPn" value="P" id="geoLocPn1" onclick="geoLocPnChng('P')">
+            <span>Pin Code</span> 
+        </label> 
+    </div>
+</div>
+<div class="col-md-4">
+    <label class="control-label float-sm-left">Address 1 *</label> 
+    <input type="text" id="retlAdd1" name="retlAdd1" class="form-control" value="<%=retlAdd1%>" onChange="updateAddressFields()">
+    <!--<input type="button" name="btnSaveExit" value="Submit" class="coloredBtn" onClick="updateAddressFields()">-->
+</div>
+<div style="display: none;">
+    <div class="col-md-4">
+        <label class="control-label float-sm-left">Pin Code *</label> 
+        <div>
+            <select name="retlPinC" id="retlPinC" class="form-control" onChange="return retlPinCChang()">
+                <%//=pinCdStr%>
+                <option value="">-- Select  Pin Code --</option>
+            </select> 
+        </div>
+    </div> 
+</div>
+	 <div class="col-md-4">
+        <label for="city">Area Code(G-MAP)</label>
+        <input type="text" id="city1" name="cityName" value="<%=cityName%>" readonly>
+    </div>
+    <div class="col-md-4">
+        <label for="district">Addres 2</label>
+        <input type="text" id="district1" name="district" value="<%=district%>" readonly>
+    </div>
+    <div class="col-md-4">
+        <label for="pincode">Pincode:</label>
+        <input type="text" id="pincode1" name="pinCodeS" value="<%=pinCodeS%>" readonly>
+    </div>
+    <div class="col-md-4">
+        <label for="state">Address 3</label>
+        <input type="text" id="state1" name="stateNam" value="<%=stateNam%>" readonly>
+    </div>
+
+<%
+} 
+if (siteType.equals("F"))
+{
+%>
+<div class="col-md-4">
+    <label class="control-label float-sm-left">City and District *</label>
+    <select name="district" id="district" class="selectpicker">
+        <option>Select District</option>
+    </select>
+    <label class="control-label" id="districtLabel"></label><br>
+</div>
+<div class="form-group col-md-4">
+    <label class="control-label float-sm-left">Pin Code *</label>
+    <select name="sitePinC" id="sitePinC" class="selectpicker">
+        <option value="">Select Pincode</option>
+    </select>
+    <label class="control-label" id="sitePinCLabel"></label>
+</div>
+<%
+}
+%>
+<div class="col-md-4">
+    <label class="required">Project Name</label>
+    <input type="text" value="<%=siteName%>" name="siteName" id="siteName" required> <br>
+</div>
+<div class="col-md-4">
+	<label class="">Delivery Period </label>
+	<select id="delvrPrd" name="delvrPrd" value="<%=delvrPrd%>"><%=delvPStr%></select>
+</div>
+<div class="col-md-4">
+	<label class="">Kind of project </label>
+	<select id="prjctKnd" name="prjctKnd" value="<%=prjctKnd%>"><%=prjcKStr%></select>
+</div>
+<div class="col-md-4">
+    <label class="required">Project Address</label>
+    <input type="text" value="<%=siteAddr%>" name="siteAddr" id="siteAddr" required>
+</div>
+<div class="col-md-4">
+    <label class="optional">Contact Person</label><span class="optional">(optional)</span>
+    <input type="text" value="<%=stMobNum%>" maxlength="10" name="stMobNum" id="stMobNum"><br>
+</div>
+<div class="col-md-4">
+	<label class="">Contact Person Type </label>
+	<select id="cntPrsnt" name="cntPrsnt" value="<%=cntPrsnt%>"><%=cnPerStr%></select>
+</div>
+<br>
+<div class="col-md-4">
+    <label class="required">Architect Name:</label>
+    <input type="text" value="<%=archtNam%>" name="archtNam" class="required" id="archtNam" required> <br>
+</div>
+<div class="col-md-4">
+    <label class="required">Mobile No</label>
+    <input type="text" value="<%=mobileNo%>" maxlength="10" name="mobileNo" id="mobileNo" required>
+</div>
+<div class="col-md-4">
+    <div class="d-flex flex-column mb-5 fv-row">
+        <label class="d-flex align-items-center fs-5 fw-bold mb-2">Email</label>
+        <input type='text' name='emailAdd' id="emailAdd" size='40' class="form-control" value='<%=emailAdd%>' maxlength='40' <%=disablFl%>>
+    </div>
+</div>
+<br>
+<h1 class="header-bw" align="center">Buyer Detail</h1>
+<div class="col-md-4" id="gstDiv">
+    <div class="d-flex flex-column mb-5 fv-row">
+        <label class=" d-flex align-items-center fs-5 fw-bold mb-2">GST Number </label>
+        <input type='text' name='gstnNumb' id="gstnNumb" placeholder="GSTIN" size='30' class="form-control" maxlength="15" value="<%=gstnNumb%>">        
+        <div style="display:none" id="gstnNumbDiv"></div>
+    </div>
+</div>
+<div class="col-md-4" id="panDiv">
+    <div class="d-flex flex-column mb-5 fv-row">
+        <label class=" d-flex align-items-center fs-5 fw-bold mb-2">PAN NO  </label>
+        <input type="text" size="10" maxlength="10" name="itxPanNo" id="itxPanNo" class="form-control" placeholder="PAN" value="<%=itxPanNo%>">
+        <input type="hidden" name="itxPanNoH" id="itxPanNoH" value="<%=itxPanNo%>">
+        <div id="itxPanNoDiv"></div>
+    </div>
+</div>
+<div class="col-md-4" id="panDiv">
+    <div class="d-flex flex-column mb-5 fv-row">
+        <label class=" d-flex align-items-center fs-5 fw-bold mb-2">AADHAR NO  </label>
+        <input type="text" size="10" maxlength="12" name="adhrNumb" id="adhrNumb" class="form-control" placeholder="AADHAR" value="<%=adhrNumb%>">
+        <input type="hidden" name="adhrNumb" id="adhrNumb" value="<%=adhrNumb%>">
+        <div id="adhNoDiv"></div>
+    </div>
+</div>
+<div class="col-md-4">
+    <label class="required">Remarks</label>
+    <input type="text" value="<%=siteRmrk%>" name="siteRmrk" id="siteRmrk" required>
+</div>
+</div>
+<div class="mt-5" align="center">
+<label class="control-label"> Upload Aadhar
+    <input type='button' name='uplodBtn' class='coloredBtnBig' value='Upload Image' onClick="openUpldWind('<%=drawRand%>', '', '', '.5',  'A', '00')"></td>
+    <input type="hidden" name="drawRand" value="<%=drawRand%>">
+	<td><script language='javascript'>document.write(atchFileShowJS('<%=drawRand%>', 0, '', 'A'))</script>
+</label>
+<label class="control-label"> Upload PAN
+    <input type='button' name='uplodBtn' class='coloredBtnBig' value='Upload Image' onClick="openUpldWind('<%=drawRand%>', '', '', '.5',  'B', '00')"></td>
+    <input type="hidden" name="drawRand" value="<%=drawRand%>">
+	<td><script language='javascript'>document.write(atchFileShowJS('<%=drawRand%>', 0, '', 'B'))</script>
+</label>
+<label class="control-label"> Upload Drawing
+    <input type='button' name='uplodBtn' class='coloredBtnBig' value='Upload Image' onClick="openUpldWind('<%=drawRand%>', '', '', '.5',  'C', '00')"></td>
+    <input type="hidden" name="drawRand" value="<%=drawRand%>">
+	<td><script language='javascript'>document.write(atchFileShowJS('<%=drawRand%>', 0, '', 'C'))</script>
+</label>
+<label class="control-label"> Upload GST
+    <input type='button' name='uplodBtn' class='coloredBtnBig' value='Upload Image' onClick="openUpldWind('<%=drawRand%>', '', '', '.5',  'D', '00')"></td>
+    <input type="hidden" name="drawRand" value="<%=drawRand%>">
+	<td><script language='javascript'>document.write(atchFileShowJS('<%=drawRand%>', 0, '', 'D'))</script>
+</label>
+</div>
+
+<%
+if(mobilApp)
+{
+%>
+		<!--		<div class="form-group col-md-6  col-12">
+					 <input type="button" name="getLocation" class="btn btn-secondary" value="Re Capture Location" onClick="getLocation()" /> 
+				</div> -->
+<%
+}
+%>
+<div style="display: none;">
+	<%@ include file="/Envr/JSP/LocaCapture.jsp"%> 
+</div>
+<%
+if(!procType.equals(""))
+{
+	try 
+	{
+		 // Assuming "attachFl" is the column containing image data
+		sql = " SELECT attachFl FROM imageData.dbo.cotDocAttch where docuNumb = '" + drawRand + "' ";
+		rset = KkrSessBean.selectRecord(sql);
+		// System.out.println("Executing SQL query: " + sql);
+
+    while (rset.next()) 
+	{
+        Blob blob = rset.getBlob("attachFl");
+        if (blob != null) 
+		{
+            int blobLength = (int) blob.length();
+            byte[] bytes = blob.getBytes(1, blobLength);
+            String imageData = Base64.getEncoder().encodeToString(bytes);
+            // System.out.println("Retrieved image data: " + imageData);
+            imageList.add(imageData);
+            blob.free();  // Close the Blob after usage
+        }
+    }
+
+    if (!imageList.isEmpty()) 
+	{
+        for (String imageData : imageList) 
+		{
+            byte[] decodedImageData = Base64.getDecoder().decode(imageData);
+
+            try (ByteArrayInputStream inputStream = new ByteArrayInputStream(decodedImageData)) 
+			{
+%>
+			<div class="col-md-2" align="center">
+                <img height="250px" width="400px" align="center" src="data:image/jpeg;base64,<%= Base64.getEncoder().encodeToString(decodedImageData) %>" alt="Image" />
+			</div>
+<%
+}
+catch (IOException e) 
+{
+  e.printStackTrace();
+}
+        }
+    }
+} 
+catch (Exception e) 
+{
+    e.printStackTrace();
+}
+}
+}
+catch(Exception e)
+{
+	throw new Exception("error in " + pageAddress + e + sql);
+}
+%>
+	<div class="mt-5" align="center">
+		<input type="button" name="btnSaveExit" value="Submit" class="coloredBtn" onClick="return submitValid()">
+	</div>
+</div>
+<jsp:include page="/Envr/JSP/FooterCom.jsp" flush="true"/>
+<script>
+ function chkdc()
+ {
+	Swal.fire({
+	  title: 'Are you at Purchaser shop?',
+	  text: "Press Yes to capture current location!",
+	  icon: 'warning',
+	  showCancelButton: true,
+	  confirmButtonColor: '#3085d6',
+	  cancelButtonColor: '#d33',
+	  confirmButtonText: 'Yes!'
+	}).then((result) => {
+	  if (result.isConfirmed) 
+	  {
+		 frmSubmt(true);
+	  }
+	})
+}
+ function frmSubmt(val)
+ {
+	 if(val)
+	 {
+		getLocation();
+		//parseAndDisplayAddress();
+	 } 
+ }
+ </script>
+
+
+
+
+<%@ include file="/Envr/JSP/SecurityCom.jsp"%>
+
+<% 
+/*
+Retailer Code Generation 
+Insert into rtmRetailer
+Update Image Data Table with Retailer Code and statFlag = Z to remove Pendency, in file name update reference can be taken 
+	If Existing Retailer then delete existing retailer Code from image Data and Update tmpRecord with retailer Code 
+
+Pending 
+	List to display in retailer master update 
+
+WebSessBean.setSqlToDsp(true);
+KkrSessBean.setSqlToDsp(true);
+*/
+
+ResultSet rset = null;
+
+String  sql = "",
+		msg = "",
+		procType = XssFilter.parSmGet("procType"),
+		areaCode = log.getArCode(),
+		docuType = "GRL",
+		mobileNo = "",
+		leadDate = "",
+		docuNumb = "",
+		pendWith = "",
+		leadQnty = "",
+		siteName = "",
+		siteRmrk = "",
+		prdCdStr = "",
+		siteAddr = "",
+		district = "",
+		stMobNum = "",
+		retlPinC = "",
+		location = "",
+		adhrNumb = "",
+		archtNam = "",
+		itxPanNo = "",
+		cityName = "",
+		areaCodS = "",
+		gstnNumb = "",
+		siteType = "",
+		emailAdd = "",
+		pinCodeS = "",
+		leadMsrs = "",
+		delvrPrd = "",
+		prjctKnd = "",
+		cntPrsnt = "",
+		sitePinC = "",
+		stateNam = "",
+		retlAdd1 = "",
+		attchMnt = "",
+		emailBdy = "";
+
+	mobileNo = XssFilter.parSmGet("mobileNo");
+	siteType = XssFilter.parSmGet("siteType");
+	procType = XssFilter.parSmGet("procType");
+	leadDate = XssFilter.parSmGet("leadDate");
+	leadQnty = XssFilter.parSmGet("leadQnty");
+	siteName = XssFilter.parSmGet("siteName");
+	siteRmrk = XssFilter.parSmGet("siteRmrk");
+	siteAddr = XssFilter.parSmGet("siteAddr");
+	district = XssFilter.parSmGet("district");
+	sitePinC = XssFilter.parSmGet("sitePinC");
+	adhrNumb = XssFilter.parSmGet("adhrNumb");
+	archtNam = XssFilter.parSmGet("archtNam");
+	itxPanNo = XssFilter.parSmGet("itxPanNo");
+	gstnNumb = XssFilter.parSmGet("gstnNumb");
+	emailAdd = XssFilter.parSmGet("emailAdd");
+	cityName = XssFilter.parSmGet("cityName");
+	pinCodeS = XssFilter.parSmGet("pinCodeS");
+	stateNam = XssFilter.parSmGet("stateNam");
+	stMobNum = XssFilter.parSmGet("stMobNum");
+	attchMnt = XssFilter.parSmGet("drawRand");
+	areaCodS = XssFilter.parSmGet("areaCodS");
+	leadMsrs = XssFilter.parSmGet("leadMsrs");
+	retlAdd1 = XssFilter.parSmGet("retlAdd1");
+	delvrPrd = XssFilter.parSmGet("delvrPrd");
+	prjctKnd = XssFilter.parSmGet("prjctKnd");
+	cntPrsnt = XssFilter.parSmGet("cntPrsnt");
+
+try	
+{
+	WebSessBean.setAutoCommit(false);
+
+	if(procType.equals("A") && siteType.equals("F"))
+	{
+		docuNumb = WebSessBean.getDocumentNo(docuType, areaCode);
+
+		sql = "insert into dptGrcLeadGn(docuNumb, docuDate, leadDate, areaCode, leadQnty, siteName, mobileNo, siteRmrk, siteAddr, pendWith, statFlag, createId, createDt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, retlPinC, stMobNum, attchMnt, leadMsrs, retlAdd1, delvrPrd, prjctKnd, cntPrsnt)			values(";
+		sql +="'" + docuNumb + "', " 
+			+ " convert(varchar(11), getdate(), 113), "  
+			+ "'" + WebSessBean.dmyTOymd(leadDate) + "', "  
+			+ "'" + areaCode + "', "  
+			+ "'" + leadQnty + "', "  
+			+ "'" + siteName + "', "  
+			+ "'" + mobileNo + "', "  
+			+ "'" + siteRmrk + "', "  
+			+ "'" + siteAddr + "', "  
+			+ "'1062', "  
+			+ "'N', "
+			+ "'" + loginIdM + "', "  
+			+ "getdate() , " 
+			+ " '" + adhrNumb + "', "  
+			+ " '" + archtNam + "', "  
+			+ " '" + itxPanNo + "', "  
+			+ " '" + gstnNumb + "', "  
+			+ " '" + emailAdd + "', "  
+			+ " '" + district + "', "  
+			+ " '" + sitePinC + "', "  
+			+ " '" + stMobNum + "', "  
+			+ " '" + attchMnt + "', "  
+			+ " '" + leadMsrs + "', "  
+			+ " '" + retlAdd1 + "', "
+			+ " '" + delvrPrd + "', "
+			+ " '" + prjctKnd + "', "
+			+ " '" + cntPrsnt + "') ";
+			
+		WebSessBean.updateRecord(sql);
+
+		WebSessBean.setDocumentNo(docuType, areaCode);
+	}
+	else if(procType.equals("U"))
+	{
+		docuNumb = XssFilter.parSmGet("docuNumb");
+		 sql = "update dptGrcLeadGn set   leadQnty = '" + leadQnty + "', "
+		 	 + "siteName = '" + siteName + "', "
+		 //	 + "siteName = '" + siteName + "', "
+		 	 + "mobileNo = '" + mobileNo + "', "
+		 	 + "siteRmrk = '" + siteRmrk + "', "
+		 	 + "siteAddr = '" + siteAddr + "', "
+		 	 + "updateId = '" + loginIdM + "', updateDt = getdate() , "
+			 + "adhrNumb = '" + adhrNumb + "', "
+			 + "archtNam = '" + archtNam + "', "
+			 + "itxPanNo = '" + itxPanNo + "', "
+			 + "gstnNumb = '" + gstnNumb + "', "
+			 + "emailAdd = '" + emailAdd + "', "
+			 + "district = '" + district + "', "
+			 + "retlPinC = '" + sitePinC + "' "
+			 + " where docuNumb = '" + docuNumb + "' ";
+		WebSessBean.updateRecord(sql);
+	}
+	if(siteType.equals("O"))
+	{
+	
+		docuNumb = WebSessBean.getDocumentNo(docuType, areaCode);
+
+		sql = "insert into dptGrcLeadGn(docuNumb, docuDate, leadDate, areaCode, leadQnty, siteName, mobileNo, siteRmrk, siteAddr, pendWith, statFlag, createId, createDt, adhrNumb, archtNam, itxPanNo, gstnNumb, emailAdd, district, pinCodeS, cityName, stateNam, attchMnt, stMobNum, leadMsrs, retlAdd1, delvrPrd, prjctKnd, cntPrsnt)			values(";
+		sql +="'" + docuNumb + "', " 
+			+ " convert(varchar(11), getdate(), 113), "  
+			+ "'" + WebSessBean.dmyTOymd(leadDate) + "', "  
+			+ "'" + areaCode + "', "  
+			+ "'" + leadQnty + "', "  
+			+ "'" + siteName + "', "  
+			+ "'" + mobileNo + "', "  
+			+ "'" + siteRmrk + "', "  
+			+ "'" + siteAddr + "', "  
+			+ "'1062', "  
+			+ "'N', "
+			+ "'" + loginIdM + "', "  
+			+ "getdate() , " 
+			+ " '" + adhrNumb + "', "  
+			+ " '" + archtNam + "', "  
+			+ " '" + itxPanNo + "', "  
+			+ " '" + gstnNumb + "', "  
+			+ " '" + emailAdd + "', "  
+			+ " '" + district + "', "  
+			+ " '" + pinCodeS + "', "  
+			+ " '" + cityName + "', "  
+			+ " '" + stateNam + "', "  
+			+ " '" + attchMnt + "', "  
+			+ " '" + stMobNum + "', "  
+			+ " '" + leadMsrs + "', "  
+			+ " '" + retlAdd1 + "', "
+			+ " '" + delvrPrd + "', "
+			+ " '" + prjctKnd + "', "
+			+ " '" + cntPrsnt + "') ";
+		WebSessBean.updateRecord(sql);
+
+}
+	WebSessBean.commitConn();
+
+	/*WebSessBean.rollbackConn();
+	KkrSessBean.rollbackConn();*/
+
+	msg = "Transaction has been completed successfully Successfully." ;
+
+	response.sendRedirect(errorPage + "?message=" + msg);
+}
+catch (Exception e)
+{
+	WebSessBean.rollbackConn();
+	KkrSessBean.rollbackConn();
+	throw new Exception("Error in updating details in " + e);
+}
+finally
+{
+	UtilBean.sessMgmtRst();
+	rset = WebSessBean.closeRset(rset);
+}
+%>
+
