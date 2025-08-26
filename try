@@ -1,467 +1,278 @@
--- SQL Server schema and seed for database: bwlive
--- Creates all tables + inserts dummy data
--- Safe to run multiple times (checks existence before creating tables)
+import re
+import os
+import sys
+import json
+import urllib.parse
+from collections import defaultdict
+from typing import List, Dict, Tuple
 
-USE [bwlive];
-GO
+import pandas as pd
+from sqlalchemy import create_engine, inspect, text
+from rapidfuzz import fuzz, process
 
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
+# ─── DB CONFIG (use your values) ─────────────────────────────────────────────
+SERVER   = "10.4.64.15"
+DATABASE = "bwlive"
+USER     = "birlawhite"
+PASSWORD = "M@nsv1530"
+ODBC_DRIVER = "ODBC Driver 17 for SQL Server"  # or "ODBC Driver 18 for SQL Server"
+# ─────────────────────────────────────────────────────────────────────────────
 
-BEGIN TRY
-  BEGIN TRAN;
+# Optional: where a pre-dumped schema.json exists (from your previous script).
+# If not present, we’ll read INFORMATION_SCHEMA live.
+SCHEMA_JSON = os.path.join(f"db_schema_{DATABASE}", "schema.json")
 
-  ------------------------------------------------------------
-  -- USERS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.users', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.users (
-      id              NVARCHAR(36)   NOT NULL PRIMARY KEY,
-      email           NVARCHAR(255)  NOT NULL UNIQUE,
-      name            NVARCHAR(255)  NULL,
-      password        NVARCHAR(255)  NOT NULL,
-      role            NVARCHAR(32)   NOT NULL,
-      department      NVARCHAR(255)  NULL,
-      phone           NVARCHAR(50)   NULL,
-      isActive        BIT            NOT NULL CONSTRAINT DF_users_isActive DEFAULT(1),
-      createdAt       DATETIME2(3)   NOT NULL CONSTRAINT DF_users_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)   NOT NULL CONSTRAINT DF_users_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_users_role CHECK (role IN (N'REQUESTER',N'APPROVER',N'PROCUREMENT_TEAM',N'ADMIN',N'VENDOR'))
-    );
-  END;
+# Search limits to keep things fast/safe
+MAX_TABLES_TO_QUERY = 25
+ROWS_PER_QUERY = 10
 
-  ------------------------------------------------------------
-  -- VENDORS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.vendors', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.vendors (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      name            NVARCHAR(255) NOT NULL,
-      email           NVARCHAR(255) NOT NULL UNIQUE,
-      phone           NVARCHAR(50)  NULL,
-      address         NVARCHAR(500) NULL,
-      contactPerson   NVARCHAR(255) NULL,
-      taxId           NVARCHAR(100) NULL,
-      status          NVARCHAR(32)  NOT NULL CONSTRAINT DF_vendors_status DEFAULT(N'PENDING'),
-      category        NVARCHAR(255) NULL,
-      rating          DECIMAL(3,2)  NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_vendors_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_vendors_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_vendors_status CHECK (status IN (N'PENDING',N'APPROVED',N'REJECTED',N'SUSPENDED'))
-    );
-  END;
+# Heuristic dictionaries (add as you like)
+SYNONYMS = {
+    "phone": ["phone", "mobile", "mob", "contact", "tel", "telephone", "cell", "phno", "ph", "contactno", "mobile_no", "mobileNo"],
+    "email": ["email", "mail", "e-mail", "emailid", "email_id"],
+    "name":  ["name", "fullname", "first", "last", "employee", "empname", "contactname", "person", "custname", "customername", "vendorname", "retailer", "party"],
+    "id":    ["id", "empid", "employeeid", "poornata_id", "customerid", "vendorid", "code", "custcode", "retlcode"],
+    "address": ["address", "addr", "street", "location"],
+    "dept":  ["department", "dept"],
+    "manager": ["manager", "reporting", "rpt_to", "report_to", "reportsto"],
+}
 
-  ------------------------------------------------------------
-  -- PRODUCTS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.products', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.products (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      name            NVARCHAR(255) NOT NULL,
-      description     NVARCHAR(1000) NULL,
-      category        NVARCHAR(255) NOT NULL,
-      sku             NVARCHAR(100) NULL UNIQUE,
-      unit            NVARCHAR(50)  NOT NULL,
-      price           DECIMAL(18,2) NOT NULL,
-      vendorId        NVARCHAR(36)  NOT NULL,
-      isActive        BIT           NOT NULL CONSTRAINT DF_products_isActive DEFAULT(1),
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_products_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_products_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT FK_products_vendor FOREIGN KEY (vendorId) REFERENCES dbo.vendors(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+# Column type hints (if schema.json contains types, we use them)
+TEXT_TYPES_HINT = ("char", "text", "nchar", "varchar", "nvarchar")
 
-  ------------------------------------------------------------
-  -- PURCHASE REQUISITIONS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.purchase_requisitions', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.purchase_requisitions (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      prNumber        NVARCHAR(50)  NOT NULL UNIQUE,
-      title           NVARCHAR(255) NOT NULL,
-      description     NVARCHAR(1000) NULL,
-      status          NVARCHAR(32)  NOT NULL CONSTRAINT DF_pr_status DEFAULT(N'DRAFT'),
-      priority        NVARCHAR(16)  NOT NULL CONSTRAINT DF_pr_priority DEFAULT(N'MEDIUM'),
-      budgetCode      NVARCHAR(100) NULL,
-      totalAmount     DECIMAL(18,2) NOT NULL CONSTRAINT DF_pr_total DEFAULT(0),
-      requesterId     NVARCHAR(36)  NOT NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_pr_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_pr_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_pr_status CHECK (status IN (N'DRAFT',N'SUBMITTED',N'UNDER_REVIEW',N'APPROVED',N'REJECTED',N'CANCELLED')),
-      CONSTRAINT CK_pr_priority CHECK (priority IN (N'LOW',N'MEDIUM',N'HIGH',N'URGENT')),
-      CONSTRAINT FK_pr_requester FOREIGN KEY (requesterId) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+# ─── Utilities ───────────────────────────────────────────────────────────────
 
-  ------------------------------------------------------------
-  -- PURCHASE REQUISITION ITEMS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.purchase_requisition_items', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.purchase_requisition_items (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      prId            NVARCHAR(36)  NOT NULL,
-      productId       NVARCHAR(36)  NOT NULL,
-      quantity        INT           NOT NULL,
-      unitPrice       DECIMAL(18,2) NOT NULL,
-      totalPrice      DECIMAL(18,2) NOT NULL,
-      description     NVARCHAR(500) NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_pri_createdAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT FK_pri_pr FOREIGN KEY (prId) REFERENCES dbo.purchase_requisitions(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_pri_product FOREIGN KEY (productId) REFERENCES dbo.products(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def make_engine():
+    params = urllib.parse.quote_plus(
+        f"Driver={{{ODBC_DRIVER}}};"
+        f"Server={SERVER};"
+        f"Database={DATABASE};"
+        f"UID={USER};"
+        f"PWD={PASSWORD};"
+        f"TrustServerCertificate=Yes;"
+        f"Encrypt=no;"
+    )
+    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
-  ------------------------------------------------------------
-  -- APPROVALS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.approvals', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.approvals (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      prId            NVARCHAR(36)  NOT NULL,
-      approverId      NVARCHAR(36)  NOT NULL,
-      status          NVARCHAR(32)  NOT NULL CONSTRAINT DF_approvals_status DEFAULT(N'PENDING'),
-      comments        NVARCHAR(1000) NULL,
-      level           INT           NOT NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_approvals_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_approvals_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_approvals_status CHECK (status IN (N'PENDING',N'APPROVED',N'REJECTED')),
-      CONSTRAINT FK_approvals_pr FOREIGN KEY (prId) REFERENCES dbo.purchase_requisitions(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_approvals_user FOREIGN KEY (approverId) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def load_schema(engine) -> List[Dict]:
+    """
+    Returns list of dicts: {schema, table, column, type, nullable, default}
+    Prefer local schema.json if present; else use INFORMATION_SCHEMA.
+    """
+    if os.path.exists(SCHEMA_JSON):
+        with open(SCHEMA_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-  ------------------------------------------------------------
-  -- PURCHASE ORDERS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.purchase_orders', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.purchase_orders (
-      id                      NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      poNumber                NVARCHAR(50)  NOT NULL UNIQUE,
-      prId                    NVARCHAR(36)  NULL,
-      vendorId                NVARCHAR(36)  NOT NULL,
-      status                  NVARCHAR(32)  NOT NULL CONSTRAINT DF_po_status DEFAULT(N'DRAFT'),
-      totalAmount             DECIMAL(18,2) NOT NULL CONSTRAINT DF_po_total DEFAULT(0),
-      orderDate               DATETIME2(3)  NOT NULL CONSTRAINT DF_po_orderDate DEFAULT(SYSDATETIME()),
-      expectedDeliveryDate    DATETIME2(3)  NULL,
-      createdBy               NVARCHAR(36)  NOT NULL,
-      createdAt               DATETIME2(3)  NOT NULL CONSTRAINT DF_po_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt               DATETIME2(3)  NOT NULL CONSTRAINT DF_po_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_po_status CHECK (status IN (N'DRAFT',N'PENDING_APPROVAL',N'APPROVED',N'SENT_TO_VENDOR',N'PARTIALLY_DELIVERED',N'DELIVERED',N'CANCELLED')),
-      CONSTRAINT FK_po_pr FOREIGN KEY (prId) REFERENCES dbo.purchase_requisitions(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_po_vendor FOREIGN KEY (vendorId) REFERENCES dbo.vendors(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_po_creator FOREIGN KEY (createdBy) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+    # Fallback: query INFORMATION_SCHEMA live
+    q = text("""
+        SELECT
+            TABLE_SCHEMA AS [schema],
+            TABLE_NAME   AS [table],
+            COLUMN_NAME  AS [column],
+            DATA_TYPE    AS [type]
+        FROM INFORMATION_SCHEMA.COLUMNS
+        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(q, conn)
+    df["nullable"] = True
+    df["default"] = ""
+    return df.to_dict(orient="records")
 
-  ------------------------------------------------------------
-  -- PURCHASE ORDER ITEMS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.purchase_order_items', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.purchase_order_items (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      poId            NVARCHAR(36)  NOT NULL,
-      productId       NVARCHAR(36)  NOT NULL,
-      quantity        INT           NOT NULL,
-      unitPrice       DECIMAL(18,2) NOT NULL,
-      totalPrice      DECIMAL(18,2) NOT NULL,
-      description     NVARCHAR(500) NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_poi_createdAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT FK_poi_po FOREIGN KEY (poId) REFERENCES dbo.purchase_orders(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_poi_product FOREIGN KEY (productId) REFERENCES dbo.products(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def tokenize(q: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9_]+", q.lower())
 
-  ------------------------------------------------------------
-  -- INVOICES
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.invoices', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.invoices (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      invoiceNumber   NVARCHAR(50)  NOT NULL UNIQUE,
-      poId            NVARCHAR(36)  NOT NULL,
-      vendorId        NVARCHAR(36)  NOT NULL,
-      amount          DECIMAL(18,2) NOT NULL,
-      status          NVARCHAR(32)  NOT NULL CONSTRAINT DF_invoice_status DEFAULT(N'PENDING'),
-      invoiceDate     DATETIME2(3)  NOT NULL CONSTRAINT DF_invoice_date DEFAULT(SYSDATETIME()),
-      dueDate         DATETIME2(3)  NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_invoice_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_invoice_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_invoice_status CHECK (status IN (N'PENDING',N'VERIFIED',N'APPROVED',N'PAID',N'PARTIALLY_PAID',N'OVERDUE',N'CANCELLED')),
-      CONSTRAINT FK_invoice_po FOREIGN KEY (poId) REFERENCES dbo.purchase_orders(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_invoice_vendor FOREIGN KEY (vendorId) REFERENCES dbo.vendors(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def best_match_columns(schema_rows: List[Dict], label_list: List[str]) -> Dict[str, List[Tuple[str, str, str, int]]]:
+    """
+    For each synonym label group, find columns whose names fuzzy-match any synonym.
+    Returns: label -> list of (schema, table, column, score)
+    """
+    results = defaultdict(list)
+    for row in schema_rows:
+        col = row["column"].lower()
+        stc = f"{row['schema']}.{row['table']}.{row['column']}".lower()
+        for label in label_list:
+            synonyms = SYNONYMS.get(label, [])
+            # direct hit first
+            for syn in synonyms:
+                score = fuzz.partial_ratio(col, syn.lower())
+                if score >= 75:
+                    results[label].append((row["schema"], row["table"], row["column"], score))
+                    break
+    # Dedup per label keeping highest score per column
+    dedupd = {}
+    for label, items in results.items():
+        keyd = {}
+        for s, t, c, sc in items:
+            key = (s, t, c)
+            if key not in keyd or sc > keyd[key]:
+                keyd[key] = sc
+        dedupd[label] = sorted([(s, t, c, sc) for (s, t, c), sc in keyd.items()],
+                               key=lambda x: x[3], reverse=True)
+    return dedupd
 
-  ------------------------------------------------------------
-  -- GOODS RECEIPT NOTES
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.goods_receipt_notes', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.goods_receipt_notes (
-      id              NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      grnNumber       NVARCHAR(50)  NOT NULL UNIQUE,
-      poId            NVARCHAR(36)  NOT NULL,
-      receivedBy      NVARCHAR(36)  NOT NULL,
-      receivedDate    DATETIME2(3)  NOT NULL CONSTRAINT DF_grn_receivedDate DEFAULT(SYSDATETIME()),
-      status          NVARCHAR(32)  NOT NULL CONSTRAINT DF_grn_status DEFAULT(N'DRAFT'),
-      notes           NVARCHAR(1000) NULL,
-      createdAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_grn_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt       DATETIME2(3)  NOT NULL CONSTRAINT DF_grn_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_grn_status CHECK (status IN (N'DRAFT',N'PARTIALLY_RECEIVED',N'FULLY_RECEIVED',N'QUALITY_CHECK_PENDING',N'QUALITY_CHECKED',N'ACCEPTED',N'REJECTED')),
-      CONSTRAINT FK_grn_po FOREIGN KEY (poId) REFERENCES dbo.purchase_orders(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_grn_user FOREIGN KEY (receivedBy) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def extract_entity(nlq: str) -> str:
+    """
+    Simple heuristic: words after ' of ' or quoted text become the entity.
+    e.g., "Phone number of rajendra shikwal" -> "rajendra shikwal"
+    """
+    m = re.search(r"\bof\s+(.+)$", nlq.strip(), flags=re.IGNORECASE)
+    if m:
+        ent = m.group(1).strip().strip("?")
+        return ent.strip("'\" ")
+    # quoted
+    m2 = re.search(r"[\"']([^\"']+)[\"']", nlq)
+    if m2:
+        return m2.group(1).strip()
+    # fallback: take last 2-4 tokens that look like a name
+    toks = tokenize(nlq)
+    common = set(sum(SYNONYMS.values(), []))
+    candidates = [t for t in toks if t not in common and not t.isdigit()]
+    return " ".join(candidates[-3:]) if candidates else nlq
 
-  ------------------------------------------------------------
-  -- GOODS RECEIPT NOTE ITEMS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.goods_receipt_note_items', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.goods_receipt_note_items (
-      id                NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      grnId             NVARCHAR(36)  NOT NULL,
-      productId         NVARCHAR(36)  NOT NULL,
-      quantity          INT           NOT NULL,
-      quantityAccepted  INT           NULL,
-      quantityRejected  INT           NULL,
-      qualityStatus     NVARCHAR(100) NULL,
-      notes             NVARCHAR(500) NULL,
-      createdAt         DATETIME2(3)  NOT NULL CONSTRAINT DF_grni_createdAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT FK_grni_grn FOREIGN KEY (grnId) REFERENCES dbo.goods_receipt_notes(id) ON UPDATE NO ACTION ON DELETE NO ACTION,
-      CONSTRAINT FK_grni_product FOREIGN KEY (productId) REFERENCES dbo.products(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def guess_intent(nlq: str) -> Dict:
+    """
+    Classify which attribute user wants (phone/email/address/etc.)
+    """
+    L = nlq.lower()
+    for label, words in SYNONYMS.items():
+        for w in words:
+            if re.search(rf"\b{re.escape(w)}\b", L):
+                return {"want": label}
+    # default: name lookup
+    return {"want": "name"}
 
-  ------------------------------------------------------------
-  -- PAYMENTS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.payments', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.payments (
-      id                NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      invoiceId         NVARCHAR(36)  NOT NULL,
-      amount            DECIMAL(18,2) NOT NULL,
-      paymentDate       DATETIME2(3)  NOT NULL CONSTRAINT DF_pay_paymentDate DEFAULT(SYSDATETIME()),
-      status            NVARCHAR(32)  NOT NULL CONSTRAINT DF_pay_status DEFAULT(N'PENDING'),
-      paymentMethod     NVARCHAR(100) NULL,
-      referenceNumber   NVARCHAR(100) NULL,
-      notes             NVARCHAR(1000) NULL,
-      createdAt         DATETIME2(3)  NOT NULL CONSTRAINT DF_pay_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt         DATETIME2(3)  NOT NULL CONSTRAINT DF_pay_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_pay_status CHECK (status IN (N'PENDING',N'PROCESSING',N'COMPLETED',N'FAILED',N'CANCELLED')),
-      CONSTRAINT FK_pay_invoice FOREIGN KEY (invoiceId) REFERENCES dbo.invoices(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def build_candidates(schema_rows: List[Dict], want_label: str) -> List[Dict]:
+    """
+    Choose tables that have BOTH:
+      - a column matching the 'want' (e.g., phone)
+      - and a 'name-like' column to search by entity
+    """
+    by_table = defaultdict(lambda: {"want_cols": [], "name_cols": [], "text_cols": []})
+    for r in schema_rows:
+        s, t, c, typ = r["schema"], r["table"], r["column"], str(r["type"]).lower()
+        key = (s, t)
+        if any(k in c.lower() for k in SYNONYMS.get(want_label, [])):
+            by_table[key]["want_cols"].append(c)
+        if any(k in c.lower() for k in SYNONYMS["name"]):
+            by_table[key]["name_cols"].append(c)
+        if any(tt in typ for tt in TEXT_TYPES_HINT):
+            by_table[key]["text_cols"].append(c)
 
-  ------------------------------------------------------------
-  -- DOCUMENTS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.documents', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.documents (
-      id            NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      name          NVARCHAR(255) NOT NULL,
-      fileName      NVARCHAR(255) NOT NULL,
-      filePath      NVARCHAR(500) NOT NULL,
-      fileType      NVARCHAR(100) NOT NULL,
-      fileSize      INT           NOT NULL,
-      category      NVARCHAR(50)  NOT NULL,
-      entityId      NVARCHAR(36)  NOT NULL,
-      entityType    NVARCHAR(100) NOT NULL,
-      uploadedBy    NVARCHAR(36)  NOT NULL,
-      isPublic      BIT           NOT NULL CONSTRAINT DF_docs_public DEFAULT(0),
-      createdAt     DATETIME2(3)  NOT NULL CONSTRAINT DF_docs_createdAt DEFAULT(SYSDATETIME()),
-      updatedAt     DATETIME2(3)  NOT NULL CONSTRAINT DF_docs_updatedAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_docs_category CHECK (category IN (N'CONTRACT',N'INVOICE',N'PURCHASE_ORDER',N'RECEIPT',N'CERTIFICATE',N'SPECIFICATION',N'OTHER')),
-      CONSTRAINT FK_docs_user FOREIGN KEY (uploadedBy) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+    cands = []
+    for (s, t), v in by_table.items():
+        if v["want_cols"] and (v["name_cols"] or v["text_cols"]):
+            cands.append({"schema": s, "table": t, **v})
+    return cands
 
-  ------------------------------------------------------------
-  -- NOTIFICATIONS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.notifications', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.notifications (
-      id            NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      title         NVARCHAR(255) NOT NULL,
-      message       NVARCHAR(1000) NOT NULL,
-      type          NVARCHAR(50)  NOT NULL,
-      userId        NVARCHAR(36)  NOT NULL,
-      isRead        BIT           NOT NULL CONSTRAINT DF_notifications_isRead DEFAULT(0),
-      createdAt     DATETIME2(3)  NOT NULL CONSTRAINT DF_notifications_createdAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT CK_notif_type CHECK (type IN (N'INFO',N'WARNING',N'ERROR',N'SUCCESS',N'APPROVAL_PENDING',N'DOCUMENT_UPLOADED',N'PAYMENT_DUE',N'DELIVERY_DELAYED')),
-      CONSTRAINT FK_notif_user FOREIGN KEY (userId) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def make_like_param(x: str) -> str:
+    return f"%{x}%"
 
-  ------------------------------------------------------------
-  -- AUDIT LOGS
-  ------------------------------------------------------------
-  IF OBJECT_ID('dbo.audit_logs', 'U') IS NULL
-  BEGIN
-    CREATE TABLE dbo.audit_logs (
-      id            NVARCHAR(36)  NOT NULL PRIMARY KEY,
-      action        NVARCHAR(255) NOT NULL,
-      entityType    NVARCHAR(100) NOT NULL,
-      entityId      NVARCHAR(36)  NOT NULL,
-      userId        NVARCHAR(36)  NULL,
-      oldValues     NVARCHAR(MAX) NULL,
-      newValues     NVARCHAR(MAX) NULL,
-      ipAddress     NVARCHAR(64)  NULL,
-      userAgent     NVARCHAR(255) NULL,
-      createdAt     DATETIME2(3)  NOT NULL CONSTRAINT DF_audit_createdAt DEFAULT(SYSDATETIME()),
-      CONSTRAINT FK_audit_user FOREIGN KEY (userId) REFERENCES dbo.users(id) ON UPDATE NO ACTION ON DELETE NO ACTION
-    );
-  END;
+def try_query(engine, schema: str, table: str, want_cols: List[str], name_cols: List[str], entity: str) -> pd.DataFrame:
+    """
+    Build a safe parameterized query using LIKE on name-like columns.
+    Returns up to ROWS_PER_QUERY rows.
+    """
+    full = f"[{schema}].[{table}]"
+    want_sel = ", ".join(f"[{wc}]" for wc in want_cols[:3])  # cap to keep narrow
+    if not want_sel:
+        want_sel = "*"
 
-  ------------------------------------------------------------
-  -- SEED DATA (id values are fixed for FK references)
-  ------------------------------------------------------------
-  -- USERS
-  IF NOT EXISTS (SELECT 1 FROM dbo.users WHERE id = 'u_admin')
-  BEGIN
-    INSERT INTO dbo.users (id,email,name,password,role,department,phone,isActive)
-    VALUES
-    ('u_admin','admin@company.com','Admin User','admin123','ADMIN','IT','+1-555-1000',1),
-    ('u_approver','approver@company.com','Alice Approver','pass123','APPROVER','Finance','+1-555-2000',1),
-    ('u_requester','requester@company.com','Ryan Requester','pass123','REQUESTER','Operations','+1-555-3000',1),
-    ('u_proc','proc@company.com','Paula Procurement','pass123','PROCUREMENT_TEAM','Procurement','+1-555-4000',1);
-  END;
+    # if name columns exist, search there; else fallback to all text columns
+    where_parts = []
+    params = {}
+    if name_cols:
+        for i, col in enumerate(name_cols[:4]):
+            where_parts.append(f"[{col}] LIKE :p{i}")
+            params[f"p{i}"] = make_like_param(entity)
+    else:
+        # shouldn't happen if we filtered cands, but guard anyway
+        where_parts.append("1=1")
 
-  -- VENDORS
-  IF NOT EXISTS (SELECT 1 FROM dbo.vendors WHERE id = 'v_acme')
-  BEGIN
-    INSERT INTO dbo.vendors (id,name,email,phone,address,contactPerson,taxId,status,category,rating)
-    VALUES
-    ('v_acme','ACME Supplies','sales@acme.com','+1-555-8100','123 Market St, Springfield','John Doe','TAX-ACME-001','APPROVED','Office',4.5),
-    ('v_globex','Globex Corp','contact@globex.com','+1-555-8200','456 Industrial Rd, Shelbyville','Jane Smith','TAX-GBX-002','PENDING','Manufacturing',4.0);
-  END;
+    sql = text(f"""
+        SELECT TOP {ROWS_PER_QUERY}
+            {want_sel},
+            {", ".join(f"[{c}]" for c in name_cols[:3])}
+        FROM {full}
+        WHERE {" OR ".join(where_parts)}
+    """)
+    with engine.connect() as conn:
+        try:
+            return pd.read_sql(sql, conn, params=params)
+        except Exception:
+            # Some columns may be NVARCHAR(MAX) with non-like-able types; fallback to SELECT * TOP N no WHERE
+            try:
+                q = text(f"SELECT TOP {ROWS_PER_QUERY} {want_sel} FROM {full}")
+                return pd.read_sql(q, conn)
+            except Exception:
+                return pd.DataFrame()
 
-  -- PRODUCTS
-  IF NOT EXISTS (SELECT 1 FROM dbo.products WHERE id = 'p_paper')
-  BEGIN
-    INSERT INTO dbo.products (id,name,description,category,sku,unit,price,vendorId,isActive)
-    VALUES
-    ('p_paper','A4 Paper 80gsm','High quality printing paper','Stationery','SKU-A4-80','pack',5.50,'v_acme',1),
-    ('p_ink','Printer Ink Black','Compatible with common printers','Supplies','SKU-INK-BLK','bottle',15.00,'v_acme',1),
-    ('p_bolts','Steel Bolts M8','M8 x 20mm bolts','Hardware','SKU-BOLT-M8','box',12.25,'v_globex',1);
-  END;
+def answer_nlq(nlq: str) -> None:
+    engine = make_engine()
+    schema_rows = load_schema(engine)
 
-  -- PURCHASE REQUISITIONS
-  IF NOT EXISTS (SELECT 1 FROM dbo.purchase_requisitions WHERE id = 'pr_1001')
-  BEGIN
-    INSERT INTO dbo.purchase_requisitions (id,prNumber,title,description,status,priority,budgetCode,totalAmount,requesterId)
-    VALUES
-    ('pr_1001','PR-1001','Office Paper Restock','Need paper for Q3','SUBMITTED','MEDIUM','BUD-IT-001',110.00,'u_requester'),
-    ('pr_1002','PR-1002','Printer Consumables','Ink refills required','DRAFT','LOW','BUD-OPS-002',45.00,'u_requester');
-  END;
+    intent = guess_intent(nlq)
+    entity = extract_entity(nlq)
+    want = intent["want"]
 
-  -- PR ITEMS
-  IF NOT EXISTS (SELECT 1 FROM dbo.purchase_requisition_items WHERE id = 'pri_1')
-  BEGIN
-    INSERT INTO dbo.purchase_requisition_items (id,prId,productId,quantity,unitPrice,totalPrice,description)
-    VALUES
-    ('pri_1','pr_1001','p_paper',20,5.50,110.00,'Boxes of A4 paper'),
-    ('pri_2','pr_1002','p_ink',3,15.00,45.00,'Black ink bottles');
-  END;
+    # Rank columns for the "want"
+    want_cols_ranked = best_match_columns(schema_rows, [want])
 
-  -- APPROVALS
-  IF NOT EXISTS (SELECT 1 FROM dbo.approvals WHERE id = 'ap_1')
-  BEGIN
-    INSERT INTO dbo.approvals (id,prId,approverId,status,comments,level)
-    VALUES
-    ('ap_1','pr_1001','u_approver','PENDING','Awaiting review',1);
-  END;
+    # Pick tables that have suitable columns
+    candidates = build_candidates(schema_rows, want)
 
-  -- PURCHASE ORDERS
-  IF NOT EXISTS (SELECT 1 FROM dbo.purchase_orders WHERE id = 'po_2001')
-  BEGIN
-    INSERT INTO dbo.purchase_orders (id,poNumber,prId,vendorId,status,totalAmount,orderDate,expectedDeliveryDate,createdBy)
-    VALUES
-    ('po_2001','PO-2001','pr_1001','v_acme','APPROVED',110.00,SYSDATETIME(),DATEADD(day,7,SYSDATETIME()),'u_proc');
-  END;
+    # Light ranking: prefer tables where column name match is strong
+    def score_table(cand):
+        s, t = cand["schema"], cand["table"]
+        col_hits = [sc for (cs, ct, cc, sc) in want_cols_ranked.get(want, []) if cs == s and ct == t]
+        return max(col_hits) if col_hits else 0
 
-  -- PO ITEMS
-  IF NOT EXISTS (SELECT 1 FROM dbo.purchase_order_items WHERE id = 'poi_1')
-  BEGIN
-    INSERT INTO dbo.purchase_order_items (id,poId,productId,quantity,unitPrice,totalPrice,description)
-    VALUES
-    ('poi_1','po_2001','p_paper',20,5.50,110.00,'A4 paper per PO');
-  END;
+    candidates.sort(key=score_table, reverse=True)
+    candidates = candidates[:MAX_TABLES_TO_QUERY]
 
-  -- INVOICES
-  IF NOT EXISTS (SELECT 1 FROM dbo.invoices WHERE id = 'inv_3001')
-  BEGIN
-    INSERT INTO dbo.invoices (id,invoiceNumber,poId,vendorId,amount,status,invoiceDate,dueDate)
-    VALUES
-    ('inv_3001','INV-3001','po_2001','v_acme',110.00,'PENDING',SYSDATETIME(),DATEADD(day,30,SYSDATETIME()));
-  END;
+    print(f"\nQuestion: {nlq}")
+    print(f"Detected intent: {want}  |  Entity: '{entity}'")
+    if not candidates:
+        print("No suitable tables found from schema hints.")
+        return
 
-  -- GRN
-  IF NOT EXISTS (SELECT 1 FROM dbo.goods_receipt_notes WHERE id = 'grn_4001')
-  BEGIN
-    INSERT INTO dbo.goods_receipt_notes (id,grnNumber,poId,receivedBy,receivedDate,status,notes)
-    VALUES
-    ('grn_4001','GRN-4001','po_2001','u_proc',SYSDATETIME(),'FULLY_RECEIVED','All items received in good condition');
-  END;
+    # Try querying each candidate until we get matches
+    engine.dispose()
+    engine = make_engine()
+    results = []
+    for cand in candidates:
+        df = try_query(engine, cand["schema"], cand["table"], cand["want_cols"], cand["name_cols"], entity)
+        if not df.empty:
+            results.append((cand, df))
 
-  -- GRN ITEMS
-  IF NOT EXISTS (SELECT 1 FROM dbo.goods_receipt_note_items WHERE id = 'grni_1')
-  BEGIN
-    INSERT INTO dbo.goods_receipt_note_items (id,grnId,productId,quantity,quantityAccepted,quantityRejected,qualityStatus,notes)
-    VALUES
-    ('grni_1','grn_4001','p_paper',20,20,0,'ACCEPTED','No issues');
-  END;
+    if not results:
+        print("No matching rows found (tried name-like search).")
+        print("Tip: Try another spelling or add more context (e.g., 'employee phone of ...').")
+        return
 
-  -- PAYMENTS
-  IF NOT EXISTS (SELECT 1 FROM dbo.payments WHERE id = 'pay_5001')
-  BEGIN
-    INSERT INTO dbo.payments (id,invoiceId,amount,status,paymentMethod,referenceNumber,notes)
-    VALUES
-    ('pay_5001','inv_3001',110.00,'PENDING','BANK_TRANSFER','REF-5001','Awaiting payment run');
-  END;
+    # Present best result first
+    for (cand, df) in results:
+        print(f"\n=== {cand['schema']}.{cand['table']}  (showing up to {len(df)} rows) ===")
+        # Bring likely columns to the front
+        front_cols = cand["want_cols"][:2] + cand["name_cols"][:2]
+        cols = list(dict.fromkeys(front_cols + list(df.columns)))
+        print(df[cols].to_string(index=False))
 
-  -- DOCUMENTS
-  IF NOT EXISTS (SELECT 1 FROM dbo.documents WHERE id = 'doc_6001')
-  BEGIN
-    INSERT INTO dbo.documents (id,name,fileName,filePath,fileType,fileSize,category,entityId,entityType,uploadedBy,isPublic)
-    VALUES
-    ('doc_6001','PO Document','PO-2001.pdf','/files/po/PO-2001.pdf','application/pdf',123456,'PURCHASE_ORDER','po_2001','PurchaseOrder','u_admin',0);
-  END;
+def main():
+    if len(sys.argv) > 1:
+        nlq = " ".join(sys.argv[1:])
+        answer_nlq(nlq)
+        return
 
-  -- NOTIFICATIONS
-  IF NOT EXISTS (SELECT 1 FROM dbo.notifications WHERE id = 'notif_7001')
-  BEGIN
-    INSERT INTO dbo.notifications (id,title,message,type,userId,isRead)
-    VALUES
-    ('notif_7001','Approval Pending','PR-1001 is awaiting your approval','APPROVAL_PENDING','u_approver',0);
-  END;
+    print("Natural-language DB Q&A. Type a question, or 'quit'.")
+    while True:
+        try:
+            q = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not q or q.lower() in {"quit", "exit"}:
+            break
+        answer_nlq(q)
 
-  -- AUDIT LOGS
-  IF NOT EXISTS (SELECT 1 FROM dbo.audit_logs WHERE id = 'al_8001')
-  BEGIN
-    INSERT INTO dbo.audit_logs (id,action,entityType,entityId,userId,oldValues,newValues,ipAddress,userAgent)
-    VALUES
-    ('al_8001','PR_CREATED','PurchaseRequisition','pr_1001','u_requester',NULL,'{"status":"SUBMITTED"}','127.0.0.1','seed-script');
-  END;
-
-  COMMIT;
-END TRY
-BEGIN CATCH
-  IF @@TRANCOUNT > 0 ROLLBACK;
-  DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
-  RAISERROR(@ErrMsg, 16, 1);
-END CATCH;
-GO
+if __name__ == "__main__":
+    main()
