@@ -1,15 +1,14 @@
-import os, json, re, glob, random, datetime
+import os, json, re, glob, random, datetime, difflib, unicodedata, math
 import duckdb
 import pandas as pd
-from transformers import T5Tokenizer, T5ForConditionalGeneration
 
 # ---------- Paths & environment ----------
 DB_DIR      = "../db_export_bwlive"
 CAT         = os.path.join(DB_DIR, "catalog.json")
-MODEL_BASE  = "models/nl2sql_tiny"
-ENV_MODEL   = os.environ.get("AI_DB_AGENT_MODEL", "")
-ENV_SPM     = os.environ.get("AI_DB_AGENT_SPM", "")
+CONTACTS_PQ = os.path.join(DB_DIR, "_ai_index_contacts.parquet")
+COLMETA_JS  = os.path.join(DB_DIR, "_ai_colmeta.json")
 DEBUG       = os.environ.get("AI_DB_AGENT_DEBUG", "0") == "1"
+REBUILD     = os.environ.get("AI_DB_AGENT_REBUILD", "0") == "1"
 
 # ---------- Small-talk heuristics ----------
 GREET_WORDS = {"hi","hello","hey","yo","namaste","hola","sup","hii","hiii","hlo"}
@@ -29,6 +28,9 @@ STOPWORDS = {
 PHONE_COL_RE = re.compile(r"(mob|phone|phon|tel|contact|cell)", re.I)
 EMAIL_COL_RE = re.compile(r"(email|e\-?mail|mailid|mail_id|mail)", re.I)
 
+PHONE_VAL_RE = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
+EMAIL_VAL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
 # ---------- Utils ----------
 def _norm_path(p: str) -> str:
     return p.replace("\\", "/")
@@ -36,47 +38,15 @@ def _norm_path(p: str) -> str:
 def _sql_escape_like(s: str) -> str:
     return (s or "").replace("'", "''")
 
-def _has_model_files(d: str) -> bool:
-    pats = [
-        "pytorch_model.bin", "model.safetensors",
-        "pytorch_model-*.bin", "model-*.safetensors",
-        "pytorch_model.bin.index.json", "model.safetensors.index.json",
-    ]
-    return any(glob.glob(os.path.join(d, p)) for p in pats)
+def _clean_str(x) -> str:
+    s = str(x or "").strip()
+    s = unicodedata.normalize("NFKC", s)
+    return s
 
-def _latest_checkpoint(base: str) -> str:
-    if ENV_MODEL:
-        use = os.path.abspath(ENV_MODEL)
-        if not os.path.isdir(use): raise FileNotFoundError(f"AI_DB_AGENT_MODEL not a folder: {use}")
-        if not _has_model_files(use): raise FileNotFoundError(f"No model files in {use}")
-        return use
-    if not os.path.isdir(base): raise FileNotFoundError(f"Model folder not found: {base}")
-    cands = []
-    for name in os.listdir(base):
-        full = os.path.join(base, name)
-        if os.path.isdir(full) and name.startswith("checkpoint-") and _has_model_files(full):
-            try: cands.append((int(name.split("-")[-1]), full))
-            except: pass
-    if cands:
-        cands.sort(key=lambda x: x[0])
-        return cands[-1][1]
-    if _has_model_files(base): return base
-    raise FileNotFoundError(f"No usable model in {base}. Put weights in base or in checkpoint-* subfolders.")
-
-def _find_sp_model(model_dir: str) -> str:
-    if ENV_SPM and os.path.isfile(ENV_SPM):
-        return os.path.abspath(ENV_SPM)
-    for name in ("spiece.model","spm.model","sentencepiece.model","tokenizer.model"):
-        p = os.path.join(model_dir, name)
-        if os.path.isfile(p): return os.path.abspath(p)
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("spm.model","spiece.model","sentencepiece.model"):
-        p = os.path.join(here, "data", name)
-        if os.path.isfile(p): return os.path.abspath(p)
-    raise FileNotFoundError(
-        "SentencePiece .model not found. Copy data\\spm.model into the chosen checkpoint as spiece.model, "
-        "or set AI_DB_AGENT_SPM to its full path."
-    )
+def _has_value(x) -> bool:
+    if x is None: return False
+    s = str(x).strip()
+    return len(s) > 0 and s.lower() not in {"none","null","nan","na","-","n/a"}
 
 def _wanted_field(q: str):
     L = q.lower()
@@ -85,11 +55,9 @@ def _wanted_field(q: str):
     return None
 
 def _extract_name_hint(q: str):
-    # Prefer quoted phrase as the entity name
     m = re.search(r"[\"“”'`](.+?)[\"“”'`]", q)
     if m:
         return m.group(1).strip()
-    # Else, remove common words and keep a compact join as hint
     toks = _tokens_from_question(q)
     if not toks:
         return ""
@@ -108,33 +76,29 @@ def _tokens_from_question(q: str):
         toks = [max(raw, key=len)]
     return toks[:6]
 
-def _looks_like_phone(s: pd.Series) -> float:
+def _looks_like_phone_series(s: pd.Series) -> float:
     if s is None or s.empty: return 0.0
-    pat = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
     try:
         vals = s.dropna().astype(str)
-        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
+        return float(vals.str.fullmatch(PHONE_VAL_RE, na=False).sum()) / max(1, len(vals))
     except Exception:
         return 0.0
 
-def _looks_like_email(s: pd.Series) -> float:
+def _looks_like_email_series(s: pd.Series) -> float:
     if s is None or s.empty: return 0.0
-    pat = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
     try:
         vals = s.dropna().astype(str)
-        return float(vals.str.fullmatch(pat, na=False).sum()) / max(1, len(vals))
+        return float(vals.str.fullmatch(EMAIL_VAL_RE, na=False).sum()) / max(1, len(vals))
     except Exception:
         return 0.0
 
-# ---------- Chat layer ----------
 def is_probably_db_query(q: str) -> bool:
     L = q.lower()
-    # strong DB cues
     cues = [
         r"\b(phone|mobile|contact|tel|email|e\-?mail)\b",
         r"\b(code|customer|cust|retail|retl|party|employee|emp|sap|invoice|docu|pin|pincode)\b",
         r"\b(list|show|top|count|where|select|table|rows?)\b",
-        r"[A-Za-z]{2,}\d{2,}",  # id-ish like PZ6115, 4101P158
+        r"[A-Za-z]{2,}\d{2,}",
     ]
     return any(re.search(x, L) for x in cues)
 
@@ -149,17 +113,9 @@ def small_talk(q: str) -> str:
             "hi! need a phone/email/code or some quick info?"
         ])
     if words & THANK_WORDS:
-        return random.choice([
-            "anytime!",
-            "you’re welcome ✨",
-            "glad to help."
-        ])
+        return random.choice(["anytime!", "you’re welcome ✨", "glad to help."])
     if words & BYE_WORDS:
-        return random.choice([
-            "bye! have a good one 👋",
-            "see you later!",
-            "catch you soon!"
-        ])
+        return random.choice(["bye! have a good one 👋", "see you later!", "catch you soon!"])
     if any(x in L for x in HELP_WORDS):
         return (
             "i’m your data assistant + chat buddy. try:\n"
@@ -172,58 +128,197 @@ def small_talk(q: str) -> str:
     if "time" in L or "date" in L or "today" in L:
         now = datetime.datetime.now()
         return f"it’s {now.strftime('%Y-%m-%d %H:%M:%S')} on your machine."
-
     if any(x in L for x in JOKE_WORDS):
         return random.choice([
             "why did the database admin break up with sql? too many joins. 😅",
             "i told my boss i know sql. they said: prove it. i replied: SELECT * FROM compliments;",
         ])
-
-    # generic fallback chat
     return random.choice([
         "got it—ask me anything about your database, or say 'help' for examples.",
         "i’m here. what do you want to find?",
         "cool. tell me who/what you’re looking for and i’ll fetch it."
     ])
 
+# ---------- Index builder (no ML) ----------
+def build_contacts_index(cat: dict, con: duckdb.DuckDBPyConnection, max_rows_per_table: int = 10000):
+    """
+    Create an index of contacts with guessed name/phone/email per row.
+    Writes:
+      - CONTACTS_PQ: Parquet with columns [name, phone, email, source_table, source_cols, rownum]
+      - COLMETA_JS:  JSON with column tags {table: {col: {"phone":bool,"email":bool,"name":bool}}}
+    """
+    all_records = []
+    colmeta = {}
+
+    tables = list(cat["tables"].items())
+    for key, meta in tables:
+        path = _norm_path(meta["parquet"])
+        if DEBUG: print(f"[index] scanning {key} -> {path}")
+        try:
+            # Sample up to N rows per table
+            df = con.execute(
+                f"SELECT * FROM parquet('{_sql_escape_like(path)}') LIMIT {max_rows_per_table}"
+            ).fetchdf()
+        except Exception as e:
+            if DEBUG: print(f"[index] skip {key}: {e}")
+            continue
+        if df.empty:
+            continue
+
+        # tag columns
+        tags = {}
+        sample = df.head(min(len(df), 2000))  # use small sample for speed
+        for c in df.columns:
+            s = sample[c]
+            c_l = c.lower()
+
+            is_phone = bool(PHONE_COL_RE.search(c)) or (_looks_like_phone_series(s) >= 0.15)
+            is_email = bool(EMAIL_COL_RE.search(c)) or (_looks_like_email_series(s) >= 0.08)
+
+            # name-ish: column name hints OR many alphabetic-space tokens
+            name_hint = any(w in c_l for w in ["name","contact","person","party","cust","retail","owner","sales","first","last","emp"])
+            if not name_hint:
+                try:
+                    vals = s.dropna().astype(str)
+                    alpha_frac = float(vals.str.match(r"^[A-Za-z][A-Za-z .,'&/-]{1,}$", na=False).sum()) / max(1, len(vals))
+                    is_name = alpha_frac >= 0.4
+                except Exception:
+                    is_name = False
+            else:
+                is_name = True
+
+            tags[c] = {"phone": is_phone, "email": is_email, "name": is_name}
+        colmeta[key] = tags
+
+        # build records
+        name_cols  = [c for c,t in tags.items() if t["name"]]
+        phone_cols = [c for c,t in tags.items() if t["phone"]]
+        email_cols = [c for c,t in tags.items() if t["email"]]
+
+        if not (name_cols or phone_cols or email_cols):
+            continue
+
+        n = len(df)
+        for i in range(n):
+            row = df.iloc[i]
+            # best name (first non-empty among name_cols)
+            name = ""
+            for c in name_cols:
+                v = _clean_str(row.get(c))
+                if _has_value(v):
+                    name = v
+                    break
+            # phone / email: first valid match in detected columns
+            phone = ""
+            for c in phone_cols:
+                v = _clean_str(row.get(c))
+                if _has_value(v) and PHONE_VAL_RE.fullmatch(v):
+                    phone = v; break
+            email = ""
+            for c in email_cols:
+                v = _clean_str(row.get(c))
+                if _has_value(v) and EMAIL_VAL_RE.fullmatch(v):
+                    email = v; break
+
+            if not (name or phone or email):
+                continue
+
+            all_records.append({
+                "name": name,
+                "phone": phone,
+                "email": email,
+                "source_table": key,
+                "source_cols": {"name": name_cols, "phone": phone_cols, "email": email_cols},
+                "rownum": i
+            })
+
+    if not all_records:
+        # create empty file to avoid rebuild loops
+        pd.DataFrame(columns=["name","phone","email","source_table","source_cols","rownum"]).to_parquet(CONTACTS_PQ, index=False)
+        with open(COLMETA_JS, "w", encoding="utf-8") as f: json.dump(colmeta, f, ensure_ascii=False, indent=2)
+        return
+
+    contacts = pd.DataFrame(all_records)
+    # dedupe
+    contacts["key"] = contacts[["name","phone","email"]].astype(str).agg("|".join, axis=1)
+    contacts = contacts.drop_duplicates(subset=["key"]).drop(columns=["key"])
+    contacts.to_parquet(CONTACTS_PQ, index=False)
+    with open(COLMETA_JS, "w", encoding="utf-8") as f:
+        json.dump(colmeta, f, ensure_ascii=False, indent=2)
+
+    if DEBUG:
+        print(f"[index] contacts rows: {len(contacts)}")
+        print(f"[index] colmeta tables: {len(colmeta)}")
+
 # ---------- Agent ----------
 class DBAgent:
     def __init__(self):
+        # Catalog
         with open(CAT, "r", encoding="utf-8") as f:
             self.cat = json.load(f)
-
-        self.model_dir = _latest_checkpoint(MODEL_BASE)
-        spm_path = _find_sp_model(self.model_dir)
-        print(f"[db-agent] model_dir: {self.model_dir}")
-        print(f"[db-agent] spm:       {spm_path}")
-
-        # tokenizer & model
-        self.tok = T5Tokenizer(vocab_file=str(spm_path), legacy=True)
-        if self.tok.pad_token is None: self.tok.add_special_tokens({"pad_token": "<pad>"})
-        if self.tok.eos_token is None: self.tok.add_special_tokens({"eos_token": "</s>"})
-        if self.tok.unk_token is None: self.tok.add_special_tokens({"unk_token": "<unk>"})
-        if self.tok.bos_token is None: self.tok.add_special_tokens({"bos_token": "<s>"})
-        self.model = T5ForConditionalGeneration.from_pretrained(self.model_dir)
 
         # DuckDB
         self.con = duckdb.connect(database=":memory:")
         self.con.execute("PRAGMA threads=4;")
 
-    # ---------- NL→SQL ----------
-    def _gen_sql(self, question: str) -> str:
-        ids = self.tok(question, return_tensors="pt", truncation=True, max_length=128)
-        out = self.model.generate(**ids, max_length=128, num_beams=4, do_sample=False)
-        sql = self.tok.decode(out[0], skip_special_tokens=True).strip().rstrip(";")
-        if DEBUG: print(f"[db-agent] gen SQL: {sql}")
-        return sql
+        # Ensure contact index exists (or rebuild requested)
+        if REBUILD or not (os.path.isfile(CONTACTS_PQ) and os.path.isfile(COLMETA_JS)):
+            build_contacts_index(self.cat, self.con)
 
-    def _map_tables_to_parquet(self, sql: str) -> str:
-        for key, meta in self.cat["tables"].items():
-            path = _sql_escape_like(_norm_path(meta["parquet"]))
-            pattern = rf'(?i)(?:["`])?{re.escape(key)}(?:["`])?'
-            sql = re.sub(pattern, f"parquet('{path}')", sql)
-        return sql
+        # Load index + meta
+        self.contacts = pd.read_parquet(CONTACTS_PQ) if os.path.isfile(CONTACTS_PQ) else pd.DataFrame(columns=["name","phone","email","source_table","source_cols","rownum"])
+        if os.path.isfile(COLMETA_JS):
+            with open(COLMETA_JS, "r", encoding="utf-8") as f:
+                self.colmeta = json.load(f)
+        else:
+            self.colmeta = {}
 
+    # ---------- Main chatbot entry ----------
+    def ask(self, q: str) -> str:
+        if not is_probably_db_query(q):
+            return small_talk(q)
+
+        L = q.lower().strip()
+
+        # list tables
+        if (("list" in L or "show" in L or "name" in L) and "table" in L) or L in {"tables","list tables","show tables"}:
+            return "here are your tables:\n- " + "\n- ".join(self._tables())
+
+        # top N table
+        m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
+        if m:
+            n = int(m.group(1)); frag = m.group(2)
+            best = self._best_table(frag)
+            if not best: return "i couldn’t find a table matching that."
+            _, meta = best
+            p = _norm_path(meta["parquet"])
+            try:
+                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
+                return "here you go:\n" + (df.to_string(index=False) if not df.empty else "(no rows)")
+            except Exception:
+                return "sorry, i couldn’t read that table."
+
+        # phone/email queries (use contact index)
+        want = _wanted_field(q)
+        if want in {"phone","email"}:
+            nm = _extract_name_hint(q)
+            if nm:
+                vals = self._lookup_contact(nm, want)
+                if vals:
+                    pretty = ", ".join(vals)
+                    return f"{want} for {nm}: {pretty}"
+                # fall through to broader search if not found in index
+            else:
+                # no name, sample across index
+                vals = self._sample_from_index(want, k=8)
+                if vals:
+                    return f"here are some {want}s i can see: " + ", ".join(vals)
+                # fall through
+
+        # generic token search across tables (no ML)
+        return self._fallback_token_scan(q)
+
+    # ---------- Helpers ----------
     def _tables(self):
         return sorted([f"{v['schema']}.{v['table']}" for v in self.cat["tables"].values()], key=str.lower)
 
@@ -238,94 +333,92 @@ class DBAgent:
                 best = (key, meta)
         return best
 
-    # ---------- Main chatbot entry ----------
-    def ask(self, q: str) -> str:
-        # If it doesn’t look like a DB query, do small talk
-        if not is_probably_db_query(q):
-            return small_talk(q)
+    def _lookup_contact(self, name: str, want: str, topk: int = 5):
+        if self.contacts.empty:
+            return []
 
-        L = q.lower().strip()
+        # Simple fast filters
+        cn = self.contacts.copy()
+        nm = name.lower()
+        # direct contains
+        mask = cn["name"].fillna("").astype(str).str.lower().str.contains(re.escape(nm))
+        subset = cn[mask]
+        if subset.empty:
+            # fallback: fuzzy against all names (limit to first 50k names to stay fast)
+            pool = cn["name"].fillna("").astype(str).head(50000).tolist()
+            scores = [(i, difflib.SequenceMatcher(None, nm, s.lower()).ratio()) for i, s in enumerate(pool)]
+            scores.sort(key=lambda x: x[1], reverse=True)
+            top_idx = [i for i,_ in scores[:200]]
+            subset = cn.iloc[top_idx]
 
-        # quick control queries
-        if (("list" in L or "show" in L or "name" in L) and "table" in L) or L in {"tables","list tables","show tables"}:
-            return "here are your tables:\n- " + "\n- ".join(self._tables())
+        # score rows by fuzzy similarity
+        subset = subset.assign(
+            _score=subset["name"].fillna("").astype(str).str.lower().apply(lambda s: difflib.SequenceMatcher(None, nm, s).ratio())
+        ).sort_values("_score", ascending=False)
 
-        m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
-        if m:
-            n = int(m.group(1)); frag = m.group(2)
-            best = self._best_table(frag)
-            if not best: return "i couldn’t find a table matching that."
-            _, meta = best
-            p = _norm_path(meta["parquet"])
-            try:
-                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT {n}").fetchdf()
-                return "here you go:\n" + (df.to_string(index=False) if not df.empty else "(no rows)")
-            except Exception:
-                return "sorry, i couldn’t read that table."
+        vals = []
+        if want == "phone":
+            for _, r in subset.iterrows():
+                v = _clean_str(r.get("phone",""))
+                if PHONE_VAL_RE.fullmatch(v) and v not in vals:
+                    vals.append(v)
+                    if len(vals) >= topk: break
+        elif want == "email":
+            for _, r in subset.iterrows():
+                v = _clean_str(r.get("email",""))
+                if EMAIL_VAL_RE.fullmatch(v) and v not in vals:
+                    vals.append(v)
+                    if len(vals) >= topk: break
+        return vals
 
-        # NL→SQL path first
-        sql = self._gen_sql(q)
-        if re.match(r"^\s*select\b", sql, flags=re.IGNORECASE):
-            try:
-                sql2 = self._map_tables_to_parquet(sql)
-                if DEBUG: print(f"[db-agent] remapped SQL: {sql2}")
-                df = self.con.execute(sql2).fetchdf()
-                if df.empty:
-                    return self._fallback_natural(q, not_found=True)
-                return self._format_db_answer(q, df)
-            except Exception as e:
-                if DEBUG: print(f"[db-agent] SQL error: {e}")
-                # fall through to robust lexical fallback
+    def _sample_from_index(self, want: str, k: int = 8):
+        vals = []
+        if self.contacts.empty: return vals
+        col = "phone" if want == "phone" else "email"
+        s = self.contacts[col].dropna().astype(str)
+        # keep only valid formatted values
+        if want == "phone":
+            s = s[s.str.fullmatch(PHONE_VAL_RE, na=False)]
+        else:
+            s = s[s.str.fullmatch(EMAIL_VAL_RE, na=False)]
+        for v in s.unique():
+            v = v.strip()
+            if v and v not in vals:
+                vals.append(v)
+                if len(vals) >= k: break
+        return vals
 
-        # robust fallback
-        return self._fallback_natural(q)
-
-    # ---------- Smarter fallback + natural phrasing ----------
-    def _fallback_natural(self, q: str, not_found: bool = False) -> str:
-        want = _wanted_field(q)    # 'phone'/'email'/None
-        toks  = _tokens_from_question(q)
-        if DEBUG: print(f"[db-agent] want={want} tokens={toks}")
-
-        # Try tokens (AND, then OR)
-        for mode in ("AND","OR"):
-            df, meta = self._search_for_tokens_df(toks, mode=mode)
-            if df is not None and not df.empty:
-                if want:
-                    vals = self._extract_wanted_values(df, want, k=5)
-                    if vals:
-                        name_hint = _extract_name_hint(q)
-                        pretty = ", ".join(vals)
-                        if want == "phone":
-                            return f"phone for {name_hint or 'the match'}: {pretty}"
-                        else:
-                            return f"email for {name_hint or 'the match'}: {pretty}"
-                # else show a compact snippet
-                return f"i found matches in {meta['schema']}.{meta['table']}:\n" + df.head(5).to_string(index=False)
-
-        # If user asked only 'email' / 'phone' with no name, sample
-        if want in {"email","phone"} and not toks:
-            vals = self._sample_field_across_tables(want, k=8)
-            if vals:
-                pretty = ", ".join(vals)
-                return f"here are some {want}s i can see: {pretty}"
-            return "i couldn’t spot any right away; try adding a name in quotes, e.g. phone of \"rajendra shikwal\"."
-
-        # Truly nothing
-        if not_found:
-            return "i couldn’t find that. try adding a bit more detail, e.g. full name in quotes."
-        return "hmm, i didn’t get a match. can you add more detail, maybe the full name in quotes?"
-
-    def _search_for_tokens_df(self, tokens, mode="AND"):
+    def _fallback_token_scan(self, q: str) -> str:
+        tokens = _tokens_from_question(q)
+        if DEBUG: print(f"[scan] tokens={tokens}")
         if not tokens:
-            return None, None
-        for key, meta in list(self.cat["tables"].items())[:200]:
+            return "hmm, i didn’t get a match. can you add more detail, maybe the full name in quotes?"
+
+        # Pass A: AND across tokens
+        hit = self._scan_tables(tokens, mode="AND", limit_tables=200)
+        if hit: return hit
+        # Pass B: OR across tokens
+        hit = self._scan_tables(tokens, mode="OR", limit_tables=200)
+        if hit: return hit
+        # Pass C: Longest token only, OR
+        hit = self._scan_tables([max(tokens, key=len)], mode="OR", limit_tables=200)
+        if hit: return hit
+
+        return "i couldn’t find that. try adding a bit more detail, e.g. full name in quotes."
+
+    def _scan_tables(self, tokens, mode="AND", limit_tables=200):
+        count = 0
+        for key, meta in self.cat["tables"].items():
+            if count >= limit_tables: break
             p = _norm_path(meta["parquet"])
             try:
                 probe = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 200").fetchdf()
             except Exception as e:
-                if DEBUG: print(f"[db-agent] probe error {key}: {e}")
+                if DEBUG: print(f"[scan] probe err {key}: {e}")
                 continue
-            if probe.empty: continue
+            if probe.empty: 
+                continue
+            count += 1
 
             cols = list(probe.columns)
             per_tok = []
@@ -334,93 +427,27 @@ class DBAgent:
                 ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in cols]
                 per_tok.append("(" + " OR ".join(ors) + ")")
             where = (" AND ".join(per_tok)) if mode == "AND" else (" OR ".join(per_tok))
-            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 25"
+            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 5"
+
             try:
                 df = self.con.execute(q2).fetchdf()
             except Exception as e:
-                if DEBUG: print(f"[db-agent] scan err on {key}: {e}")
+                if DEBUG: print(f"[scan] sql err {key}: {e}")
                 continue
+
             if not df.empty:
-                return df, meta
-        return None, None
+                # Natural language wrap
+                return f"i found matches in {meta['schema']}.{meta['table']}:\n" + df.to_string(index=False)
 
-    def _extract_wanted_values(self, df: pd.DataFrame, want: str, k=5):
-        # Rank columns by name cues + value pattern, then return distinct values
-        scores = []
-        sample = df.head(200)
-        for c in df.columns:
-            s = sample[c]
-            name_bonus = 0.0
-            pat_frac = 0.0
-            try:
-                if want == "phone":
-                    if PHONE_COL_RE.search(c): name_bonus += 0.6
-                    pat_frac = _looks_like_phone(s)
-                elif want == "email":
-                    if EMAIL_COL_RE.search(c): name_bonus += 0.6
-                    pat_frac = _looks_like_email(s)
-            except Exception:
-                pass
-            score = name_bonus + pat_frac
-            if score > 0.15:
-                scores.append((c, score))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        vals = []
-        for c,_ in scores:
-            series = df[c].dropna().astype(str)
-            if want == "phone":
-                series = series[series.str.match(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$", na=False)]
-            elif want == "email":
-                series = series[series.str.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", na=False)]
-            for v in series.unique():
-                v = v.strip()
-                if v and v not in vals:
-                    vals.append(v)
-                    if len(vals) >= k:
-                        return vals
-        return vals
-
-    def _sample_field_across_tables(self, want: str, k=8):
-        vals = []
-        for key, meta in list(self.cat["tables"].items())[:200]:
-            p = _norm_path(meta["parquet"])
-            try:
-                df = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 500").fetchdf()
-            except Exception:
-                continue
-            if df.empty: continue
-            for v in self._extract_wanted_values(df, want, k=k):
-                if v not in vals:
-                    vals.append(v)
-                    if len(vals) >= k:
-                        return vals
-        return vals
-
-    # ---------- Pretty formatting for DB answers ----------
-    def _format_db_answer(self, q: str, df: pd.DataFrame) -> str:
-        want = _wanted_field(q)
-        if df.shape == (1,1):
-            val = str(df.iat[0,0]).strip()
-            if want == "phone":
-                return f"phone: {val}" if val else "i didn’t find a phone there."
-            if want == "email":
-                return f"email: {val}" if val else "i didn’t find an email there."
-            return val or "no value found."
-        # multi-column or multi-row
-        if want in {"phone","email"}:
-            vals = self._extract_wanted_values(df, want, k=5)
-            if vals:
-                name_hint = _extract_name_hint(q)
-                pretty = ", ".join(vals)
-                if want == "phone":
-                    return f"phone for {name_hint or 'the match'}: {pretty}"
-                else:
-                    return f"email for {name_hint or 'the match'}: {pretty}"
-        # fallback: show a compact table
-        return "here’s what i found:\n" + df.head(5).to_string(index=False)
+        return None
 
 # ---------- CLI ----------
 if __name__ == "__main__":
+    # sanity: catalog present?
+    if not os.path.isfile(CAT):
+        print(f"catalog.json not found at {CAT}.")
+        raise SystemExit(1)
+
     bot = DBAgent()
     print("chat + db agent ready. try:\n- phone number of \"rajendra shikwal\"\n- email of PZ6115\n- name of all tables\n- hi / help / tell me a joke")
     while True:
