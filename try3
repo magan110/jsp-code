@@ -3,16 +3,20 @@ import duckdb
 import pandas as pd
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 
-# ----------------- FIXED MODEL LOCATION -----------------
-MODEL_BASE  = "models/nl2sql_tiny"     # << always use this
-# --------------------------------------------------------
-
+# =========================
+# Fixed locations & env
+# =========================
+MODEL_BASE  = "models/nl2sql_tiny"     # always use this model directory
 DB_DIR      = "../db_export_bwlive"
 CAT         = os.path.join(DB_DIR, "catalog.json")
-DEBUG       = os.environ.get("AI_DB_AGENT_DEBUG", "0") == "1"
-TABLE_SCAN_LIMIT = int(os.environ.get("AI_DB_AGENT_TABLE_LIMIT", "300"))
 
-# small-talk heuristics
+DEBUG               = os.environ.get("AI_DB_AGENT_DEBUG", "0") == "1"
+TABLE_SCAN_LIMIT    = int(os.environ.get("AI_DB_AGENT_TABLE_LIMIT", "300"))  # fallback scan tables cap
+ROW_LIMIT_PER_TABLE = int(os.environ.get("AI_DB_AGENT_ROW_LIMIT", "200"))    # rows probed per table when building row expr / sampling
+
+# =========================
+# Small-talk heuristics
+# =========================
 GREET_WORDS = {"hi","hello","hey","yo","namaste","hola","sup","hii","hiii","hlo"}
 THANK_WORDS = {"thanks","thank you","ty","thx","shukriya","dhanyavaad"}
 BYE_WORDS   = {"bye","goodbye","see ya","see you","tata"}
@@ -25,11 +29,13 @@ STOPWORDS = {
     "top","first","last","all","and","or","with","without","please","pls","zone",
 }
 
-PHONE_COL_RE = re.compile(r"(mob|phone|phon|tel|contact|cell)", re.I)
-EMAIL_COL_RE = re.compile(r"(email|e\-?mail|mailid|mail_id|mail)", re.I)
+# value-pattern regex (data-only)
 PHONE_VAL_RE = re.compile(r"^\s*\+?\s*(?:\d[\s().-]?){7,15}\s*$")
 EMAIL_VAL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
+# =========================
+# Utilities
+# =========================
 def _norm_path(p: str) -> str:
     return p.replace("\\", "/")
 
@@ -65,22 +71,6 @@ def _extract_name_hint(q: str):
     t = _tokens_from_question(q)
     return " ".join(t[:3]) if t else ""
 
-def _looks_like_phone_series(s: pd.Series) -> float:
-    if s is None or s.empty: return 0.0
-    try:
-        vals = s.dropna().astype(str)
-        return float(vals.str.fullmatch(PHONE_VAL_RE, na=False).sum()) / max(1, len(vals))
-    except Exception:
-        return 0.0
-
-def _looks_like_email_series(s: pd.Series) -> float:
-    if s is None or s.empty: return 0.0
-    try:
-        vals = s.dropna().astype(str)
-        return float(vals.str.fullmatch(EMAIL_VAL_RE, na=False).sum()) / max(1, len(vals))
-    except Exception:
-        return 0.0
-
 def _has_model_files(d: str) -> bool:
     pats = [
         "pytorch_model.bin", "model.safetensors",
@@ -103,7 +93,7 @@ def _latest_checkpoint(base: str) -> str:
         return cands[-1][1]
     if _has_model_files(base): return base
     raise FileNotFoundError(
-        f"No usable model files found in {base}. Put weights in {base} or in checkpoint-* subfolders "
+        f"No usable model files in {base}. Put weights in {base} or checkpoint-* subfolders "
         f"(expected pytorch_model.bin or model.safetensors)."
     )
 
@@ -159,6 +149,40 @@ def small_talk(q: str) -> str:
                           "i’m here. what do you want to find?",
                           "cool. tell me who/what you’re looking for and i’ll fetch it."])
 
+# =========================
+# Row-only search helpers
+# =========================
+def _row_text_expr(cols):
+    """
+    Concatenate ALL cell values of a row into one VARCHAR string,
+    so matching is strictly on row data (not column/table names).
+    """
+    if not cols:
+        return "''"
+    casts = [f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in cols]
+    return " || ' ' || ".join(casts)
+
+def _extract_values_by_regex(df: pd.DataFrame, val_re: re.Pattern, k: int = 5):
+    vals = []
+    for c in df.columns:
+        try:
+            s = df[c].dropna().astype(str).str.strip()
+        except Exception:
+            continue
+        if s.empty: 
+            continue
+        m = s[s.str.fullmatch(val_re, na=False)]
+        for v in m.unique():
+            v = v.strip()
+            if v and v not in vals:
+                vals.append(v)
+                if len(vals) >= k:
+                    return vals
+    return vals
+
+# =========================
+# Agent
+# =========================
 class DBAgent:
     def __init__(self):
         # Catalog
@@ -178,7 +202,6 @@ class DBAgent:
         if self.tok.eos_token is None: self.tok.add_special_tokens({"eos_token": "</s>"})
         if self.tok.unk_token is None: self.tok.add_special_tokens({"unk_token": "<unk>"})
         if self.tok.bos_token is None: self.tok.add_special_tokens({"bos_token": "<s>"})
-
         self.model = T5ForConditionalGeneration.from_pretrained(self.model_dir)
 
         # DuckDB
@@ -226,7 +249,7 @@ class DBAgent:
         if (("list" in L or "show" in L or "name" in L) and "table" in L) or L in {"tables","list tables","show tables"}:
             return "here are your tables:\n- " + "\n- ".join(self._tables())
 
-        # top N table
+        # top N table (data dump convenience)
         m = re.search(r"top\s+(\d+)\s+([A-Za-z0-9_.-]+)", L)
         if m:
             n = int(m.group(1)); frag = m.group(2)
@@ -240,14 +263,14 @@ class DBAgent:
             except Exception:
                 return "sorry, i couldn’t read that table."
 
-        # targeted quick asks (phone/email)
+        # direct phone/email ask → do row-only search first
         want = _wanted_field(q)
         if want in {"phone","email"}:
             hint = _extract_name_hint(q)
             if hint:
-                # try lexical fetch first across columns with name-ish values
-                txt = self._phone_email_lookup(hint, want)
-                if txt: return txt
+                txt = self._phone_email_lookup_rows_only(hint, want)
+                if txt:
+                    return txt
 
         # NL→SQL path
         sql = self._gen_sql(q)
@@ -261,88 +284,114 @@ class DBAgent:
             except Exception as e:
                 if DEBUG: print(f"[db-agent] SQL error: {e}")
 
-        # fallback lexical scan
-        return self._fallback_scan(q)
+        # fallback: row-only lexical scan
+        return self._fallback_row_only(q)
 
-    # ---------- phone/email helper ----------
-    def _phone_email_lookup(self, name_hint: str, want: str) -> str|None:
-        # scan a subset of tables quickly
+    # ---------- Row-only phone/email ----------
+    def _phone_email_lookup_rows_only(self, name_hint: str, want: str) -> str | None:
         tokens = [name_hint] + name_hint.split()
         tokens = list(dict.fromkeys([t for t in tokens if t]))
-        for key, meta in list(self.cat["tables"].items())[:TABLE_SCAN_LIMIT]:
-            p = _norm_path(meta["parquet"])
+        val_re   = PHONE_VAL_RE if want == "phone" else EMAIL_VAL_RE
+        want_lbl = "phone" if want == "phone" else "email"
+        results = []
+
+        for idx, (key, meta) in enumerate(self.cat["tables"].items()):
+            if idx >= TABLE_SCAN_LIMIT:
+                break
+            p = _norm_path(meta["parquet"]); p_esc = _sql_escape_like(p)
+            # sample to learn columns only
             try:
-                probe = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 300").fetchdf()
+                probe = self.con.execute(
+                    f"SELECT * FROM parquet('{p_esc}') LIMIT {min(ROW_LIMIT_PER_TABLE, 50)}"
+                ).fetchdf()
             except Exception:
                 continue
-            if probe.empty: continue
-
-            # build OR where on likely "name-ish" columns (or all text columns)
+            if probe.empty: 
+                continue
             cols = list(probe.columns)
-            nameish = [c for c in cols if any(k in c.lower() for k in ["name","party","person","cust","retl","owner","emp","contact"])]
-            target_cols = nameish or cols
-
+            rowtxt = _row_text_expr(cols)
             per_tok = []
             for t in tokens:
                 t_esc = _sql_escape_like(t)
-                ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in target_cols]
-                per_tok.append("(" + " OR ".join(ors) + ")")
-
+                per_tok.append(f"({rowtxt}) ILIKE '%{t_esc}%'")
             where = " AND ".join(per_tok) if len(per_tok) > 1 else per_tok[0]
-            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 50"
+            q2 = f"SELECT * FROM parquet('{p_esc}') WHERE {where} LIMIT 200"
             try:
                 df = self.con.execute(q2).fetchdf()
             except Exception:
                 continue
-            if df.empty: continue
+            if df.empty: 
+                continue
 
-            picks = self._extract_wanted_values(df, want, k=5)
-            if picks:
-                pretty = ", ".join(picks)
-                return f"{want} for {name_hint}: {pretty}"
+            picks = _extract_values_by_regex(df, val_re, k=5 - len(results))
+            for v in picks:
+                if v not in results:
+                    results.append(v)
+                    if len(results) >= 5:
+                        nm = name_hint.strip() or "the match"
+                        return f"{want_lbl} for {nm}: " + ", ".join(results)
+
+        if results:
+            nm = name_hint.strip() or "the match"
+            return f"{want_lbl} for {nm}: " + ", ".join(results)
         return None
 
-    # ---------- lexical scan fallback ----------
-    def _fallback_scan(self, q: str) -> str:
+    # ---------- Row-only lexical fallback ----------
+    def _fallback_row_only(self, q: str) -> str:
         toks = _tokens_from_question(q)
         if not toks:
             return "hmm, i didn’t get a match. can you add more detail, maybe the full name in quotes?"
 
-        for mode in ("AND","OR"):
-            hit = self._scan_tables(toks, mode=mode)
-            if hit: return hit
+        # Pass A: AND across tokens (row-only)
+        hit = self._scan_tables_row_only(toks, mode="AND")
+        if hit: return hit
 
-        hit = self._scan_tables([max(toks, key=len)], mode="OR")
+        # Pass B: OR across tokens
+        hit = self._scan_tables_row_only(toks, mode="OR")
+        if hit: return hit
+
+        # Pass C: Longest token only, OR
+        hit = self._scan_tables_row_only([max(toks, key=len)], mode="OR")
         if hit: return hit
 
         return "i couldn’t find that. try adding a bit more detail, e.g. full name in quotes."
 
-    def _scan_tables(self, tokens, mode="AND"):
+    def _scan_tables_row_only(self, tokens, mode="AND"):
         count = 0
         for key, meta in self.cat["tables"].items():
-            if count >= TABLE_SCAN_LIMIT: break
-            p = _norm_path(meta["parquet"])
+            if count >= TABLE_SCAN_LIMIT:
+                break
+            p = _norm_path(meta["parquet"]); p_esc = _sql_escape_like(p)
+            # Peek columns to build row text expr (we do not match on column names)
             try:
-                probe = self.con.execute(f"SELECT * FROM parquet('{_sql_escape_like(p)}') LIMIT 200").fetchdf()
+                probe = self.con.execute(
+                    f"SELECT * FROM parquet('{p_esc}') LIMIT {min(ROW_LIMIT_PER_TABLE, 50)}"
+                ).fetchdf()
             except Exception:
                 continue
-            if probe.empty: continue
+            if probe.empty:
+                continue
             count += 1
 
             cols = list(probe.columns)
+            rowtxt = _row_text_expr(cols)
+
             per_tok = []
             for t in tokens:
                 t_esc = _sql_escape_like(t)
-                ors = [f"CAST(\"{c}\" AS VARCHAR) ILIKE '%{t_esc}%'" for c in cols]
-                per_tok.append("(" + " OR ".join(ors) + ")")
+                per_tok.append(f"({rowtxt}) ILIKE '%{t_esc}%'")
+
             where = (" AND ".join(per_tok)) if mode == "AND" else (" OR ".join(per_tok))
-            q2 = f"SELECT * FROM parquet('{_sql_escape_like(p)}') WHERE {where} LIMIT 5"
+            q2 = f"SELECT * FROM parquet('{p_esc}') WHERE {where} LIMIT 5"
+
             try:
                 df = self.con.execute(q2).fetchdf()
             except Exception:
                 continue
+
             if not df.empty:
                 return f"i found matches in {meta['schema']}.{meta['table']}:\n" + df.to_string(index=False)
+
         return None
 
     # ---------- format answers ----------
@@ -354,47 +403,20 @@ class DBAgent:
             if want == "email": return f"email: {val}" if val else "i didn’t find an email there."
             return val or "no value found."
 
-        if want in {"phone","email"}:
-            vals = self._extract_wanted_values(df, want, k=5)
+        # for phone/email, extract purely by regex from data (no column-name bias)
+        if want == "phone":
+            vals = _extract_values_by_regex(df, PHONE_VAL_RE, k=5)
             if vals:
                 name_hint = _extract_name_hint(q)
-                pretty = ", ".join(vals)
-                return f"{want} for {name_hint or 'the match'}: {pretty}"
+                return f"phone for {name_hint or 'the match'}: " + ", ".join(vals)
+        if want == "email":
+            vals = _extract_values_by_regex(df, EMAIL_VAL_RE, k=5)
+            if vals:
+                name_hint = _extract_name_hint(q)
+                return f"email for {name_hint or 'the match'}: " + ", ".join(vals)
 
+        # fallback: compact table
         return "here’s what i found:\n" + df.head(5).to_string(index=False)
-
-    def _extract_wanted_values(self, df: pd.DataFrame, want: str, k=5):
-        scores = []
-        sample = df.head(200)
-        for c in df.columns:
-            s = sample[c]
-            name_bonus = 0.0
-            pat_frac = 0.0
-            try:
-                if want == "phone":
-                    if PHONE_COL_RE.search(c): name_bonus += 0.6
-                    pat_frac = _looks_like_phone_series(s)
-                elif want == "email":
-                    if EMAIL_COL_RE.search(c): name_bonus += 0.6
-                    pat_frac = _looks_like_email_series(s)
-            except Exception:
-                pass
-            score = name_bonus + pat_frac
-            if score > 0.15:
-                scores.append((c, score))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        vals = []
-        val_re = PHONE_VAL_RE if want == "phone" else EMAIL_VAL_RE
-        for c,_ in scores[:6]:
-            series = df[c].dropna().astype(str)
-            series = series[series.str.fullmatch(val_re, na=False)]
-            for v in series.unique():
-                v = v.strip()
-                if v and v not in vals:
-                    vals.append(v)
-                    if len(vals) >= k:
-                        return vals
-        return vals
 
 # -------------- CLI --------------
 if __name__ == "__main__":
@@ -412,7 +434,7 @@ if __name__ == "__main__":
               "2) Ensure SentencePiece file exists there (spiece.model/spm.model/sentencepiece.model).\n")
         raise
 
-    print("chat + db agent (nl2sql_tiny) ready. try:\n"
+    print("chat + db agent (nl2sql_tiny + row-only fallback) ready. try:\n"
           "- phone number of \"rajendra shikwal\"\n"
           "- email of PZ6115\n"
           "- name of all tables\n"
