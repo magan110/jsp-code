@@ -1,405 +1,330 @@
-// lib/core/services/contractor_service.dart
-import 'dart:async';
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 
-import '../models/contractor_models.dart';
-import '../utils/app_logger.dart';
-import 'api_service.dart';
+namespace RAKControllers.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class RetailerController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
 
-class ContractorService {
-  static final AppLogger _logger = AppLogger();
-
-  // Static caches
-  static List<String>? _contractorTypes;
-  static List<String>? _emiratesList;
-
-  // -------------------------------
-  // Registration
-  // -------------------------------
-  static Future<ContractorRegistrationResponse> registerContractor(
-    ContractorRegistrationRequest request,
-  ) async {
-    try {
-      _logger.info(
-        'Registering contractor: ${(request.firstName ?? '').trim()} ${(request.lastName ?? '').trim()}',
-      );
-
-      final raw = await ApiService.registerContractor(request.toJson());
-      _logger.debug('Register response raw: $raw');
-
-      // Normalize payload to a single map `p`
-      Map<String, dynamic> p = {};
-      if (raw is Map<String, dynamic>) {
-        if (raw.containsKey('success') ||
-            raw.containsKey('contractorId') ||
-            raw.containsKey('message')) {
-          p = raw;
-        } else if (raw['data'] is Map<String, dynamic>) {
-          p = (raw['data'] as Map<String, dynamic>);
-          // bubble up top-level fields if missing
-          p = {
-            ...p,
-            if (!p.containsKey('success') && raw['success'] != null)
-              'success': raw['success'],
-            if (!p.containsKey('message') && raw['message'] != null)
-              'message': raw['message'],
-            if (!p.containsKey('error') && raw['error'] != null)
-              'error': raw['error'],
-            if (!p.containsKey('contractorId') && raw['contractorId'] != null)
-              'contractorId': raw['contractorId'],
-            if (!p.containsKey('timestamp') && raw['timestamp'] != null)
-              'timestamp': raw['timestamp'],
-          };
+        public RetailerController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
         }
-      }
 
-      final success = p['success'] == true;
-      final contractorId = p['contractorId']?.toString();
-      final error = (p['error'] ?? (raw is Map ? raw['error'] : null))?.toString();
-      final timestampRaw =
-          (p['timestamp'] ?? (raw is Map ? raw['timestamp'] : null))?.toString();
-      final ts = DateTime.tryParse(timestampRaw ?? '') ?? DateTime.now();
+        // POST: api/Retailer/register
+        [HttpPost("register")]
+        public IActionResult Register([FromBody] RetailerRegisterRequest? req = null)
+        {
+            try
+            {
+                req ??= new RetailerRegisterRequest();
 
-      final message = (p['message'] ??
-              error ??
-              (success ? 'Contractor registered successfully' : 'Registration failed'))
-          .toString();
+                // --- sane defaults for NOT NULL columns not present in UI ---
+                // Fixed codes and required flags:
+                var isActive  = string.IsNullOrWhiteSpace(req.isActive) ? "Y" : req.isActive!.Trim(); // char(1)
+                var benfNmFl  = string.IsNullOrWhiteSpace(req.benfNmFl) ? "N" : req.benfNmFl!.Trim(); // char(1)
+                var schmAbFL  = string.IsNullOrWhiteSpace(req.schmAbFL) ? "N" : req.schmAbFL!.Trim(); // char(1)
+                var ubsRtlF1  = string.IsNullOrWhiteSpace(req.ubsRtlF1) ? "N" : req.ubsRtlF1!.Trim(); // char(1)
 
-      return ContractorRegistrationResponse(
-        success: success,
-        message: message,
-        contractorId: contractorId,
-        error: error,
-        timestamp: ts,
-      );
-    } catch (e) {
-      _logger.error('Contractor registration failed: $e');
-      return ContractorRegistrationResponse(
-        success: false,
-        message: 'Registration failed: $e',
-        error: e.toString(),
-        timestamp: DateTime.now(),
-      );
-    }
-  }
+                // char lengths: pad/trim to exact where needed
+                string FixLen(string? s, int len) {
+                    s = (s ?? "").Trim();
+                    if (s.Length > len) return s.Substring(0, len);
+                    return s;
+                }
 
-  // -------------------------------
-  // Config data (dropdowns)
-  // -------------------------------
-  static Future<List<String>> getContractorTypes({bool forceRefresh = false}) async {
-    if (_contractorTypes != null && !forceRefresh) return _contractorTypes!;
-    try {
-      _logger.info('Fetching contractor types');
-      final result = await ApiService.getContractorTypes();
+                // map / normalize a few
+                var areaCode = FixLen(req.areaCode, 3);
+                var retlCode = FixLen(req.retlCode, 8);       // if you don’t have it, pass "" and let DB/trigger fill if any
+                var custCode = FixLen(req.custCode, 8);
+                var sapRtlCd = FixLen(req.sapRtlCd, 10);
 
-      if (result is Map && result['success'] == true) {
-        final payload = result['data'];
-        if (payload is List) {
-          _contractorTypes = payload.cast<String>();
-          return _contractorTypes!;
-        } else if (payload is Map && payload['data'] is List) {
-          _contractorTypes = (payload['data'] as List).cast<String>();
-          return _contractorTypes!;
+                // Required-bank fields (not in UI) -> empty string fallback
+                var bankAcNo = req.bankAcNo ?? "";
+                var benfName = req.benfName ?? (req.firmName ?? "");
+                var bankBnDs = req.bankBnDs ?? "";  // branch district/desc
+                var bankBnNo = req.bankBnNo ?? "";
+                var bankIFSC = req.bankIFSC ?? "";
+
+                // Required identity/phones
+                var offTelN1 = req.offTelN1 ?? (req.officeTelephone ?? "");
+                var offTelN2 = req.offTelN2 ?? ""; // fallback empty
+                var emailAdd = req.emailAdd ?? (req.email ?? "");
+                var itxPanNo = req.itxPanNo ?? (req.panNumber ?? "");
+                var mobileNo = req.mobileNo ?? (req.mobile ?? "");
+
+                // More required
+                var retlAdd3 = req.retlAdd3 ?? (req.address3 ?? "-");
+                var district = req.district ?? (req.districtUi ?? "");
+                var retlPinC = req.retlPinC ?? ""; // pin is required — keep empty if you truly don’t have it
+                var retlCatg = string.IsNullOrWhiteSpace(req.retlCatg)
+                    ? (req.retailCategory switch { "Urban" => "U", "Rural" => "R", "Direct Dealer" => "D", _ => "U" })
+                    : req.retlCatg!.Trim();
+
+                var typeOfBs  = req.typeOfBs  ?? "Retail";
+                var busSttYr  = req.busSttYr  ?? DateTime.Now.Year.ToString().PadLeft(4, '0');
+                var busBwYrs  = req.busBwYrs  ?? "0000";
+                var locStxNo  = req.locStxNo  ?? (req.stockistCode ?? "");  // NOT NULL
+                var createId  = string.IsNullOrWhiteSpace(req.createId) ? "web" : req.createId!;
+                var createDt  = DateTime.Now;
+
+                // Optional (NULLable) values:
+                object? OrDbNull(string? v) => string.IsNullOrWhiteSpace(v) ? (object?)DBNull.Value : v.Trim();
+
+                var sql = @"
+INSERT INTO dbo.rtmRetailer
+(
+    retlCode, sapRtlCd, retlName, retlChNm, contName, custCode, areaCode, location,
+    cityName, mrktName, retlAdd1, retlAdd2, retlAdd3, district, retlPinC,
+    benfNmFl, bankAcNo, benfName, bankBnNm, bankBnDs, bankBnNo, bankIFSC, ifscCtNm,
+    retlCatg, panGstFl, itxPanNo, gstnNumb, idCardTy, idCardNo, kycVerFl, kycVerDt,
+    bnkKycFl, bnkKycDt, concEmpl, offTelN1, offTelN2, mobileNo, emailAdd,
+    typeOfBs, busSttYr, busBwYrs, pntNptTy, isActive, createId, createDt, updateId, updateDt,
+    locStxNo, retlClss, rtDocCnt, schmAbFL, exclUpld, sapInsDt, sapUpdDt, retRefNo, adhrName, panCName,
+    schmEfDt, uniqueCd, locaCapr, latitute, lgtitute, cenLoctn, cenPopln, ubsRtlFl, retlType, refDDCod,
+    schmEmpl, retlTrSt, retlCtCh, locUpdNo, finlRermk, rtlCtInd, rtlCtgBw, retlInCt, cityCode, lstLocDt,
+    lstLcUsr, alliedCd, posiCode, ubsRtlF1, sistrCnF
+)
+VALUES
+(
+    @retlCode, @sapRtlCd, @retlName, @retlChNm, @contName, @custCode, @areaCode, @location,
+    @cityName, @mrktName, @retlAdd1, @retlAdd2, @retlAdd3, @district, @retlPinC,
+    @benfNmFl, @bankAcNo, @benfName, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC, @ifscCtNm,
+    @retlCatg, @panGstFl, @itxPanNo, @gstnNumb, @idCardTy, @idCardNo, @kycVerFl, @kycVerDt,
+    @bnkKycFl, @bnkKycDt, @concEmpl, @offTelN1, @offTelN2, @mobileNo, @emailAdd,
+    @typeOfBs, @busSttYr, @busBwYrs, @pntNptTy, @isActive, @createId, @createDt, @updateId, @updateDt,
+    @locStxNo, @retlClss, @rtDocCnt, @schmAbFL, @exclUpld, @sapInsDt, @sapUpdDt, @retRefNo, @adhrName, @panCName,
+    @schmEfDt, @uniqueCd, @locaCapr, @latitute, @lgtitute, @cenLoctn, @cenPopln, @ubsRtlFl, @retlType, @refDDCod,
+    @schmEmpl, @retlTrSt, @retlCtCh, @locUpdNo, @finlRermk, @rtlCtInd, @rtlCtgBw, @retlInCt, @cityCode, @lstLocDt,
+    @lstLcUsr, @alliedCd, @posiCode, @ubsRtlF1, @sistrCnF
+);
+
+SELECT SCOPE_IDENTITY() AS NewId;";
+
+                var p = new Dictionary<string, object?>
+                {
+                    // required identities / names from UI
+                    ["@retlCode"]  = retlCode,                       // if you generate server-side, replace with code
+                    ["@sapRtlCd"]  = sapRtlCd,
+                    ["@retlName"]  = req.firmName ?? "",             // store as Retailer Name
+                    ["@retlChNm"]  = req.firmName ?? "",             // channel name -> same as firm for now
+                    ["@contName"]  = req.proprietorName ?? "",       // contact name
+                    ["@custCode"]  = custCode,
+                    ["@areaCode"]  = areaCode,
+                    ["@location"]  = req.area ?? "",                 // UI Area as location
+
+                    ["@cityName"]  = OrDbNull(req.cityName),
+                    ["@mrktName"]  = OrDbNull(req.marketName),
+                    ["@retlAdd1"]  = OrDbNull(req.address1),
+                    ["@retlAdd2"]  = OrDbNull(req.address2),
+                    ["@retlAdd3"]  = retlAdd3,
+                    ["@district"]  = district,
+                    ["@retlPinC"]  = retlPinC,
+
+                    ["@benfNmFl"]  = benfNmFl,
+                    ["@bankAcNo"]  = bankAcNo,
+                    ["@benfName"]  = benfName,
+                    ["@bankBnNm"]  = OrDbNull(req.bankBranchName),
+                    ["@bankBnDs"]  = bankBnDs,
+                    ["@bankBnNo"]  = bankBnNo,
+                    ["@bankIFSC"]  = bankIFSC,
+                    ["@ifscCtNm"]  = OrDbNull(req.ifscCityName),
+
+                    ["@retlCatg"]  = retlCatg,
+                    ["@panGstFl"]  = OrDbNull(req.panGstFlag),       // 'P'/'G' or 'Y'/'N'
+                    ["@itxPanNo"]  = itxPanNo,
+                    ["@gstnNumb"]  = OrDbNull(req.gstNumber),
+                    ["@idCardTy"]  = OrDbNull(req.idCardType),
+                    ["@idCardNo"]  = OrDbNull(req.aadharNumber),
+                    ["@kycVerFl"]  = OrDbNull(req.kycVerifiedFlag),
+                    ["@kycVerDt"]  = (object?)req.kycVerifiedDate ?? DBNull.Value,
+
+                    ["@bnkKycFl"]  = OrDbNull(req.bankKycFlag),
+                    ["@bnkKycDt"]  = (object?)req.bankKycDate ?? DBNull.Value,
+                    ["@concEmpl"]  = OrDbNull(req.concernEmployee),
+                    ["@offTelN1"]  = offTelN1,
+                    ["@offTelN2"]  = offTelN2,
+                    ["@mobileNo"]  = mobileNo,
+                    ["@emailAdd"]  = emailAdd,
+
+                    ["@typeOfBs"]  = typeOfBs,
+                    ["@busSttYr"]  = busSttYr,
+                    ["@busBwYrs"]  = busBwYrs,
+                    ["@pntNptTy"]  = OrDbNull(req.painterNptType),
+                    ["@isActive"]  = isActive,
+                    ["@createId"]  = createId,
+                    ["@createDt"]  = createDt,
+                    ["@updateId"]  = DBNull.Value,
+                    ["@updateDt"]  = DBNull.Value,
+
+                    ["@locStxNo"]  = locStxNo,
+                    ["@retlClss"]  = OrDbNull(req.retailClass),
+                    ["@rtDocCnt"]  = DBNull.Value,
+                    ["@schmAbFL"]  = schmAbFL,
+                    ["@exclUpld"]  = OrDbNull(req.excludeUploadFlag),
+                    ["@sapInsDt"]  = DBNull.Value,
+                    ["@sapUpdDt"]  = DBNull.Value,
+                    ["@retRefNo"]  = OrDbNull(req.retailRefNo),
+                    ["@adhrName"]  = OrDbNull(req.aadharName),
+                    ["@panCName"]  = OrDbNull(req.panCardName),
+
+                    ["@schmEfDt"]  = DBNull.Value,
+                    ["@uniqueCd"]  = OrDbNull(req.uniqueCode),
+                    ["@locaCapr"]  = OrDbNull(req.locationCapacity),  // long text ok
+                    ["@latitute"]  = OrDbNull(req.latitude),
+                    ["@lgtitute"]  = OrDbNull(req.longitude),
+                    ["@cenLoctn"]  = OrDbNull(req.centerLocation),
+                    ["@cenPopln"]  = DBNull.Value,
+                    ["@ubsRtlFl"]  = OrDbNull(req.ubsRetailFlag),
+                    ["@retlType"]  = OrDbNull(req.retailType),
+                    ["@refDDCod"]  = OrDbNull(req.refDDCode),
+
+                    ["@schmEmpl"]  = OrDbNull(req.schemeEmployee),
+                    ["@retlTrSt"]  = OrDbNull(req.retailTrStatus),
+                    ["@retlCtCh"]  = OrDbNull(req.retailCtChange),
+                    ["@locUpdNo"]  = DBNull.Value,
+                    ["@finlRermk"] = OrDbNull(req.finalRemark),
+                    ["@rtlCtInd"]  = OrDbNull(req.rtlCtInd),
+                    ["@rtlCtgBw"]  = OrDbNull(req.rtlCtgBw),
+                    ["@retlInCt"]  = OrDbNull(req.retailInCt),
+                    ["@cityCode"]  = OrDbNull(req.cityCode),
+                    ["@lstLocDt"]  = DBNull.Value,
+
+                    ["@lstLcUsr"]  = OrDbNull(req.lastLocUser),
+                    ["@alliedCd"]  = OrDbNull(req.alliedCode),
+                    ["@posiCode"]  = OrDbNull(req.posiCode),
+                    ["@ubsRtlF1"]  = ubsRtlF1,
+                    ["@sistrCnF"]  = OrDbNull(req.sisterConcernFlag),
+                };
+
+                var res = _db.WebSessBean(sql, p);
+                var newId = res?.FirstOrDefault()?["NewId"]?.ToString();
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Retailer registered successfully",
+                    retailerId = newId,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Retailer registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
         }
-      }
-      _logger.warning('Using fallback contractor types');
-    } catch (e) {
-      _logger.error('Failed to fetch contractor types: $e');
     }
-    _contractorTypes = ContractorTypes.all;
-    return _contractorTypes!;
-  }
 
-  static Future<List<String>> getEmiratesList({bool forceRefresh = false}) async {
-    if (_emiratesList != null && !forceRefresh) return _emiratesList!;
-    try {
-      _logger.info('Fetching emirates list');
-      final result = await ApiService.getEmiratesList();
+    // DTO lining up with Flutter fields, plus DB-only fields you may send as "".
+    public class RetailerRegisterRequest
+    {
+        // From UI
+        public string? processType { get; set; }             // Add/Update (not stored)
+        public string? retailCategory { get; set; }          // mapped -> retlCatg (U/R/D)
+        public string? area { get; set; }                    // -> location
+        public string? districtUi { get; set; }              // -> district if district not sent
+        public string? gstNumber { get; set; }               // -> gstnNumb
+        public string? panNumber { get; set; }               // -> itxPanNo
+        public string? mobile { get; set; }                  // -> mobileNo
+        public string? address1 { get; set; }                // -> retlAdd1
+        public string? address2 { get; set; }                // -> retlAdd2
+        public string? address3 { get; set; }                // -> retlAdd3
+        public string? firmName { get; set; }                // -> retlName/retlChNm
+        public string? officeTelephone { get; set; }         // -> offTelN1
+        public string? email { get; set; }                   // -> emailAdd
+        public string? tallyRetailerCode { get; set; }       // (optional)
+        public string? concernEmployee { get; set; }         // -> concEmpl
+        public string? aadharNumber { get; set; }            // -> idCardNo
+        public string? proprietorName { get; set; }          // -> contName
+        public string? schemeRequired { get; set; }          // (optional UI)
 
-      if (result is Map && result['success'] == true) {
-        final payload = result['data'];
-        if (payload is List) {
-          _emiratesList = payload.cast<String>();
-          return _emiratesList!;
-        } else if (payload is Map && payload['data'] is List) {
-          _emiratesList = (payload['data'] as List).cast<String>();
-          return _emiratesList!;
-        }
-      }
-      _logger.warning('Using fallback emirates list');
-    } catch (e) {
-      _logger.error('Failed to fetch emirates list: $e');
+        // Server/DB-bound (you can fill many with "")
+        public string? retlCode { get; set; }
+        public string? sapRtlCd { get; set; }
+        public string? contName { get; set; }
+        public string? custCode { get; set; }
+        public string? areaCode { get; set; }
+        public string? location { get; set; }
+        public string? cityName { get; set; }
+        public string? mrktName { get; set; }
+        public string? retlAdd1 { get; set; }
+        public string? retlAdd2 { get; set; }
+        public string? retlAdd3 { get; set; }
+        public string? district { get; set; }
+        public string? retlPinC { get; set; }
+
+        public string? benfNmFl { get; set; }
+        public string? bankAcNo { get; set; }
+        public string? benfName { get; set; }
+        public string? bankBnNm { get; set; }
+        public string? bankBnDs { get; set; }
+        public string? bankBnNo { get; set; }
+        public string? bankIFSC { get; set; }
+        public string? ifscCtNm { get; set; }
+
+        public string? retlCatg { get; set; }
+        public string? panGstFl { get; set; }
+        public string? itxPanNo { get; set; }
+        public string? idCardType { get; set; }
+        public string? kycVerifiedFlag { get; set; }
+        public DateTime? kycVerifiedDate { get; set; }
+        public string? bankKycFlag { get; set; }
+        public DateTime? bankKycDate { get; set; }
+        public string? concEmpl { get; set; }
+        public string? offTelN1 { get; set; }
+        public string? offTelN2 { get; set; }
+        public string? mobileNo { get; set; }
+        public string? emailAdd { get; set; }
+
+        public string? typeOfBs { get; set; }
+        public string? busSttYr { get; set; }
+        public string? busBwYrs { get; set; }
+        public string? pntNptTy { get; set; }
+        public string? isActive { get; set; }
+        public string? createId { get; set; }
+        public string? updateId { get; set; }
+        public string? locStxNo { get; set; }
+        public string? retailClass { get; set; }
+        public string? excludeUploadFlag { get; set; }
+        public string? retailRefNo { get; set; }
+        public string? aadharName { get; set; }
+        public string? panCardName { get; set; }
+        public string? uniqueCode { get; set; }
+        public string? locationCapacity { get; set; } // locaCapr (MAX)
+        public string? latitude { get; set; }
+        public string? longitude { get; set; }
+        public string? centerLocation { get; set; }
+        public string? ubsRetailFlag { get; set; }
+        public string? retailType { get; set; }
+        public string? refDDCode { get; set; }
+        public string? schemeEmployee { get; set; }
+        public string? retailTrStatus { get; set; }
+        public string? retailCtChange { get; set; }
+        public string? finalRemark { get; set; }
+        public string? rtlCtInd { get; set; }
+        public string? rtlCtgBw { get; set; }
+        public string? retailInCt { get; set; }
+        public string? cityCode { get; set; }
+        public string? lastLocUser { get; set; }
+        public string? alliedCode { get; set; }
+        public string? posiCode { get; set; }
+        public string? ubsRtlF1 { get; set; }
+        public string? sisterConcernFlag { get; set; }
+
+        // Convenience: stockist code from UI read-only field
+        public string? stockistCode { get; set; }
     }
-    _emiratesList = EmiratesConstants.all;
-    return _emiratesList!;
-  }
-
-  // -------------------------------
-  // Validation
-  // -------------------------------
-
-  static bool isValidMobileNumber(String mobileNumber) {
-    // UAE mobile: +971XXXXXXXXX or 05XXXXXXXX
-    final regex = RegExp(r'^(\+971|971|0)?[5][0-9]{8}$');
-    return regex.hasMatch(mobileNumber.replaceAll(' ', '').replaceAll('-', ''));
-  }
-
-  static bool isValidIban(String iban) {
-    // UAE IBAN: AE + 21 digits
-    final regex = RegExp(r'^AE\d{21}$');
-    return regex.hasMatch(iban.replaceAll(' ', ''));
-  }
-
-  static bool isValidDate(String date) {
-    if (date.isEmpty) return false;
-    try {
-      DateTime.parse(date);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  static String? validateRequiredField(String? value, String fieldName) {
-    if (value == null || value.trim().isEmpty) {
-      return '$fieldName is required';
-    }
-    return null;
-  }
-
-  static String? validateMobileNumber(String? value) {
-    if (value == null || value.trim().isEmpty) {
-      return 'Mobile number is required';
-    }
-    if (!isValidMobileNumber(value)) {
-      return 'Please enter a valid UAE mobile number';
-    }
-    return null;
-  }
-
-  static String? validateIban(String? value) {
-    if (value != null && value.isNotEmpty && !isValidIban(value)) {
-      return 'Please enter a valid UAE IBAN (AE followed by 21 digits)';
-    }
-    return null;
-  }
-
-  static String? validateEmail(String? value) {
-    if (value != null && value.isNotEmpty) {
-      final regex = RegExp(r'^[^@]+@[^@]+\.[^@]+$');
-      if (!regex.hasMatch(value)) {
-        return 'Please enter a valid email address';
-      }
-    }
-    return null;
-  }
-
-  // -------------------------------
-  // Formatting
-  // -------------------------------
-
-  /// Accepts nullable and returns nullable so your request model can stay nullable-friendly.
-  static String? formatMobileNumber(String? mobile) {
-    if (mobile == null || mobile.isEmpty) return null;
-    String cleaned = mobile.replaceAll(RegExp(r'[^0-9+]'), '');
-    if (cleaned.startsWith('05')) {
-      cleaned = '+971${cleaned.substring(1)}';
-    } else if (cleaned.startsWith('5')) {
-      cleaned = '+971$cleaned';
-    } else if (!cleaned.startsWith('+971')) {
-      cleaned = '+971$cleaned';
-    }
-    return cleaned;
-  }
-
-  static String formatIban(String iban) {
-    String cleaned = iban.replaceAll(' ', '').toUpperCase();
-    final buffer = StringBuffer();
-    for (int i = 0; i < cleaned.length; i += 4) {
-      final end = (i + 4 <= cleaned.length) ? i + 4 : cleaned.length;
-      buffer.write(cleaned.substring(i, end));
-      if (end < cleaned.length) buffer.write(' ');
-    }
-    return buffer.toString();
-  }
-
-  // -------------------------------
-  // Cache
-  // -------------------------------
-  static void clearCache() {
-    _contractorTypes = null;
-    _emiratesList = null;
-  }
 }
-
-
-
-
-
-
-
-
-
-
-
-// lib/core/models/contractor_models.dart
-class ContractorRegistrationRequest {
-  // Personal
-  final String? contractorType;
-  final String? firstName;
-  final String? middleName;
-  final String? lastName;
-  final String? mobileNumber;
-  final String? address;
-  final String? area;
-  final String? emirates;
-  final String? reference;
-  final String? profilePhoto;
-
-  // Bank
-  final String? accountHolderName;
-  final String? ibanNumber;
-  final String? bankName;
-  final String? branchName;
-  final String? bankAddress;
-
-  // VAT
-  final String? vatCertificate;
-  final String? firmName;
-  final String? vatAddress;
-  final String? taxRegistrationNumber;
-  final String? vatEffectiveDate;
-
-  // License
-  final String? licenseDocument;
-  final String? licenseNumber;
-  final String? issuingAuthority;
-  final String? licenseType;
-  final String? establishmentDate;
-  final String? licenseExpiryDate;
-  final String? tradeName;
-  final String? responsiblePerson;
-  final String? licenseAddress;
-  final String? effectiveDate;
-
-  ContractorRegistrationRequest({
-    this.contractorType,
-    this.firstName,
-    this.middleName,
-    this.lastName,
-    this.mobileNumber,
-    this.address,
-    this.area,
-    this.emirates,
-    this.reference,
-    this.profilePhoto,
-    this.accountHolderName,
-    this.ibanNumber,
-    this.bankName,
-    this.branchName,
-    this.bankAddress,
-    this.vatCertificate,
-    this.firmName,
-    this.vatAddress,
-    this.taxRegistrationNumber,
-    this.vatEffectiveDate,
-    this.licenseDocument,
-    this.licenseNumber,
-    this.issuingAuthority,
-    this.licenseType,
-    this.establishmentDate,
-    this.licenseExpiryDate,
-    this.tradeName,
-    this.responsiblePerson,
-    this.licenseAddress,
-    this.effectiveDate,
-  });
-
-  Map<String, dynamic> toJson() => {
-        "contractorType": contractorType,
-        "firstName": firstName,
-        "middleName": middleName,
-        "lastName": lastName,
-        "mobileNumber": mobileNumber,
-        "address": address,
-        "area": area,
-        "emirates": emirates,
-        "reference": reference,
-        "profilePhoto": profilePhoto,
-        "accountHolderName": accountHolderName,
-        "ibanNumber": ibanNumber,
-        "bankName": bankName,
-        "branchName": branchName,
-        "bankAddress": bankAddress,
-        "vatCertificate": vatCertificate,
-        "firmName": firmName,
-        "vatAddress": vatAddress,
-        "taxRegistrationNumber": taxRegistrationNumber,
-        "vatEffectiveDate": vatEffectiveDate,
-        "licenseDocument": licenseDocument,
-        "licenseNumber": licenseNumber,
-        "issuingAuthority": issuingAuthority,
-        "licenseType": licenseType,
-        "establishmentDate": establishmentDate,
-        "licenseExpiryDate": licenseExpiryDate,
-        "tradeName": tradeName,
-        "responsiblePerson": responsiblePerson,
-        "licenseAddress": licenseAddress,
-        "effectiveDate": effectiveDate,
-      };
-}
-
-class ContractorRegistrationResponse {
-  final bool success;
-  final String? message;
-  final String? contractorId;
-  final String? error;
-  final DateTime? timestamp;
-
-  ContractorRegistrationResponse({
-    required this.success,
-    this.message,
-    this.contractorId,
-    this.error,
-    this.timestamp,
-  });
-
-  factory ContractorRegistrationResponse.fromApi(Map<String, dynamic> json) {
-    return ContractorRegistrationResponse(
-      success: json['success'] == true,
-      message: json['message']?.toString(),
-      contractorId: json['contractorId']?.toString(),
-      error: json['error']?.toString(),
-      timestamp: DateTime.tryParse(json['timestamp']?.toString() ?? ''),
-    );
-  }
-
-  factory ContractorRegistrationResponse.fromJson(Map<String, dynamic> json) {
-    if (json.containsKey('success') || json.containsKey('contractorId')) {
-      return ContractorRegistrationResponse.fromApi(json);
-    }
-    final data = (json['data'] is Map<String, dynamic>)
-        ? json['data'] as Map<String, dynamic>
-        : <String, dynamic>{};
-    return ContractorRegistrationResponse.fromApi(data);
-  }
-}
-
-class ContractorTypes {
-  static const List<String> all = <String>[
-    'Maintenance Contractor',
-    'Petty contractors',
-  ];
-}
-
-class EmiratesConstants {
-  static const List<String> all = <String>[
-    'Dubai',
-    'Abu Dhabi',
-    'Sharjah',
-    'Ajman',
-    'Umm Al Quwain',
-    'Ras Al Khaimah',
-    'Fujairah',
-  ];
-}
-
