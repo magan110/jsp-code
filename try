@@ -1,8 +1,13 @@
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 
 namespace RAKControllers.Controllers
 {
@@ -11,14 +16,15 @@ namespace RAKControllers.Controllers
     public class ContractorController : ControllerBase
     {
         private readonly DatabaseHelper _dbHelper;
-        private readonly IWebHostEnvironment _hostingEnvironment;
 
-        public ContractorController(DatabaseHelper dbHelper, IWebHostEnvironment hostingEnvironment)
+        public ContractorController(DatabaseHelper dbHelper)
         {
             _dbHelper = dbHelper;
-            _hostingEnvironment = hostingEnvironment;
         }
 
+        // ---------------------------
+        // POST: api/Contractor/register
+        // ---------------------------
         [HttpPost("register")]
         public IActionResult RegisterContractor([FromBody] ContractorRegistrationRequest request = null)
         {
@@ -30,6 +36,15 @@ namespace RAKControllers.Controllers
                     request = new ContractorRegistrationRequest();
                 }
 
+                // Parse dates safely - use null if parsing fails
+                DateTime? dobParsed                = SafeParseDate(request.DateOfBirth);
+                DateTime? emiratesIssueParsed      = SafeParseDate(request.EmiratesIdIssueDate);
+                DateTime? emiratesExpiryParsed     = SafeParseDate(request.EmiratesIdExpiryDate);
+                DateTime? vatDateParsed            = SafeParseDate(request.VatEffectiveDate);
+                DateTime? establishmentDateParsed  = SafeParseDate(request.EstablishmentDate);
+                DateTime? licenseExpiryParsed      = SafeParseDate(request.LicenseExpiryDate);
+                DateTime? effectiveDateParsed      = SafeParseDate(request.EffectiveDate);
+
                 // Insert contractor registration with all optional fields
                 var insertQuery = @"
                     INSERT INTO CONTRACTORS
@@ -39,23 +54,14 @@ namespace RAKControllers.Controllers
                      vatcert, firmname, vataddrs, trnnumbr, vatdatee,
                      licdoc, licnumbr, issauthr, lictypee, estdatee, licexpdt, tradname, respprsn, licaddrs, effdatee,
                      createdt, isactive)
+                    OUTPUT INSERTED.contrcid
                     VALUES
                     (@contrtyp, @firstnme, @middlnme, @lastnmee, @mobileno, @addresss, @areaname, @emirates, @referenc,
                      @profphot, @emirfrnt, @emirback, @emiratid, @idholder, @datebrth, @national, @issuedte, @exprydte, @occupatn, @employer,
                      @acchldrn, @ibannmbr, @bankname, @branchnm, @bankaddr,
                      @vatcert, @firmname, @vataddrs, @trnnumbr, @vatdatee,
                      @licdoc, @licnumbr, @issauthr, @lictypee, @estdatee, @licexpdt, @tradname, @respprsn, @licaddrs, @effdatee,
-                     GETDATE(), 'Y');
-                    SELECT SCOPE_IDENTITY();";
-
-                // Parse dates safely - use null if parsing fails
-                DateTime? dobParsed = SafeParseDate(request.DateOfBirth);
-                DateTime? emiratesIssueParsed = SafeParseDate(request.EmiratesIdIssueDate);
-                DateTime? emiratesExpiryParsed = SafeParseDate(request.EmiratesIdExpiryDate);
-                DateTime? vatDateParsed = SafeParseDate(request.VatEffectiveDate);
-                DateTime? establishmentDateParsed = SafeParseDate(request.EstablishmentDate);
-                DateTime? licenseExpiryParsed = SafeParseDate(request.LicenseExpiryDate);
-                DateTime? effectiveDateParsed = SafeParseDate(request.EffectiveDate);
+                     GETDATE(), 'Y');";
 
                 var parameters = new Dictionary<string, object>
                 {
@@ -64,16 +70,17 @@ namespace RAKControllers.Controllers
                     { "@firstnme", SafeString(request.FirstName) },
                     { "@middlnme", SafeStringOrNull(request.MiddleName) },
                     { "@lastnmee", SafeString(request.LastName) },
-                    { "@mobileno", SafeString(request.MobileNumber) },
+                    { "@mobileno", SafeString(request.MobileNumber) },   // normalized below
                     { "@addresss", SafeString(request.Address) },
                     { "@areaname", SafeString(request.Area) },
                     { "@emirates", SafeString(request.Emirates) },
                     { "@referenc", SafeString(request.Reference) },
                     { "@profphot", SafeStringOrNull(request.ProfilePhoto) },
+
                     // Emirates ID Details
                     { "@emirfrnt", SafeStringOrNull(request.EmiratesIdFront) },
                     { "@emirback", SafeStringOrNull(request.EmiratesIdBack) },
-                    { "@emiratid", SafeString(request.EmiratesIdNumber) },
+                    { "@emiratid", SafeString(request.EmiratesIdNumber) }, // normalized below
                     { "@idholder", SafeString(request.IdHolderName) },
                     { "@datebrth", dobParsed ?? (object)DBNull.Value },
                     { "@national", SafeString(request.Nationality) },
@@ -81,20 +88,23 @@ namespace RAKControllers.Controllers
                     { "@exprydte", emiratesExpiryParsed ?? (object)DBNull.Value },
                     { "@occupatn", SafeStringOrNull(request.Occupation) },
                     { "@employer", SafeStringOrNull(request.Employer) },
+
                     // Bank Details
                     { "@acchldrn", SafeStringOrNull(request.AccountHolderName) },
-                    { "@ibannmbr", SafeStringOrNull(request.IbanNumber) },
+                    { "@ibannmbr", SafeStringOrNull(request.IbanNumber) }, // normalized below
                     { "@bankname", SafeStringOrNull(request.BankName) },
                     { "@branchnm", SafeStringOrNull(request.BranchName) },
                     { "@bankaddr", SafeStringOrNull(request.BankAddress) },
+
                     // VAT Certificate Details
                     { "@vatcert", SafeStringOrNull(request.VatCertificate) },
                     { "@firmname", SafeStringOrNull(request.FirmName) },
                     { "@vataddrs", SafeStringOrNull(request.VatAddress) },
                     { "@trnnumbr", SafeStringOrNull(request.TaxRegistrationNumber) },
                     { "@vatdatee", vatDateParsed ?? (object)DBNull.Value },
+
                     // Commercial License Details
-                    { "@licdoc", SafeStringOrNull(request.LicenseDocument) },
+                    { "@licdoc",   SafeStringOrNull(request.LicenseDocument) },
                     { "@licnumbr", SafeString(request.LicenseNumber) },
                     { "@issauthr", SafeString(request.IssuingAuthority) },
                     { "@lictypee", SafeString(request.LicenseType) },
@@ -106,20 +116,29 @@ namespace RAKControllers.Controllers
                     { "@effdatee", effectiveDateParsed ?? (object)DBNull.Value }
                 };
 
-                var result = _dbHelper.WebSessBean(insertQuery, parameters);
-                var contractorId = result?.FirstOrDefault()?.Values?.FirstOrDefault()?.ToString() ?? "0";
+                // Normalize a few inputs to match DB constraints/validation
+                parameters["@mobileno"] = DigitsOnly(parameters["@mobileno"]?.ToString() ?? "");
+                parameters["@emiratid"] = DigitsOnly(parameters["@emiratid"]?.ToString() ?? "");
+                if (parameters["@ibannmbr"] is DBNull == false)
+                {
+                    parameters["@ibannmbr"] = IBANNormalize(parameters["@ibannmbr"]?.ToString());
+                }
+
+                // Execute and fetch the new ID
+                var rows = _dbHelper.WebSessBean(insertQuery, parameters);
+                var contractorId = rows?.FirstOrDefault()?["contrcid"]?.ToString() ?? "0";
 
                 return Ok(new
                 {
                     success = true,
                     message = "Contractor registered successfully",
-                    contractorId = contractorId,
+                    contractorId,
                     timestamp = DateTime.Now
                 });
             }
             catch (Exception ex)
             {
-                // Even if database fails, return success with error details
+                // Keep your pattern of returning 200 with success=false
                 return Ok(new
                 {
                     success = false,
@@ -130,8 +149,308 @@ namespace RAKControllers.Controllers
             }
         }
 
+        // ---------------------------
+        // GET: api/Contractor/list
+        // ---------------------------
+        [HttpGet("list")]
+        public IActionResult GetContractors([FromQuery] int page = 1, [FromQuery] int pageSize = 10, [FromQuery] string search = "")
+        {
+            try
+            {
+                var offset = Math.Max(0, (page - 1) * Math.Max(1, pageSize));
+                pageSize = Math.Max(1, Math.Min(100, pageSize)); // Limit pageSize
+
+                var searchCondition = string.IsNullOrEmpty(search) ? "" :
+                    "AND (firstnme LIKE @Search OR lastnmee LIKE @Search OR mobileno LIKE @Search OR emiratid LIKE @Search OR contrtyp LIKE @Search)";
+
+                var query = $@"
+                    SELECT contrcid, contrtyp, firstnme, middlnme, lastnmee, mobileno, areaname, emirates,
+                           referenc, emiratid, national, createdt, isactive
+                    FROM CONTRACTORS
+                    WHERE isactive = 'Y' {searchCondition}
+                    ORDER BY createdt DESC
+                    OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@Offset", offset },
+                    { "@PageSize", pageSize }
+                };
+                if (!string.IsNullOrEmpty(search))
+                {
+                    parameters.Add("@Search", $"%{search}%");
+                }
+
+                var contractors = _dbHelper.WebSessBean(query, parameters) ?? new List<Dictionary<string, object>>();
+
+                // Get total count
+                var countQuery = $@"
+                    SELECT COUNT(*) as TotalCount
+                    FROM CONTRACTORS
+                    WHERE isactive = 'Y' {searchCondition}";
+                var countParams = new Dictionary<string, object>();
+                if (!string.IsNullOrEmpty(search))
+                {
+                    countParams.Add("@Search", $"%{search}%");
+                }
+
+                var countResult = _dbHelper.WebSessBean(countQuery, countParams);
+                var totalCountStr = countResult?.FirstOrDefault()?["TotalCount"]?.ToString() ?? "0";
+                int.TryParse(totalCountStr, out int total);
+
+                return Ok(new
+                {
+                    success = true,
+                    data = contractors,
+                    pagination = new
+                    {
+                        page,
+                        pageSize,
+                        totalCount = total,
+                        totalPages = (int)Math.Ceiling((double)total / pageSize)
+                    },
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return Ok(new
+                {
+                    success = false,
+                    data = new List<object>(),
+                    message = "Failed to retrieve contractors",
+                    error = ex.Message,
+                    pagination = new { page = 1, pageSize = 10, totalCount = 0, totalPages = 0 },
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // ---------------------------
+        // GET: api/Contractor/{contractorId}
+        // ---------------------------
+        [HttpGet("{contractorId}")]
+        public IActionResult GetContractor(int contractorId = 0)
+        {
+            try
+            {
+                if (contractorId <= 0)
+                {
+                    return Ok(new
+                    {
+                        success = false,
+                        message = "Invalid contractor ID",
+                        data = (object)null,
+                        timestamp = DateTime.Now
+                    });
+                }
+
+                var query = @"
+                    SELECT * FROM CONTRACTORS
+                    WHERE contrcid = @contrcid AND isactive = 'Y'";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@contrcid", contractorId }
+                };
+
+                var result = _dbHelper.WebSessBean(query, parameters);
+                if (result == null || result.Count == 0)
+                {
+                    return Ok(new
+                    {
+                        success = false,
+                        message = "Contractor not found",
+                        data = (object)null,
+                        timestamp = DateTime.Now
+                    });
+                }
+
+                return Ok(new
+                {
+                    success = true,
+                    data = result[0],
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return Ok(new
+                {
+                    success = false,
+                    message = "Failed to retrieve contractor",
+                    error = ex.Message,
+                    data = (object)null,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // ---------------------------
+        // PUT: api/Contractor/{contractorId}
+        // ---------------------------
+        [HttpPut("{contractorId}")]
+        public IActionResult UpdateContractor(int contractorId = 0, [FromBody] ContractorUpdateRequest request = null)
+        {
+            try
+            {
+                if (contractorId <= 0)
+                {
+                    return Ok(new
+                    {
+                        success = false,
+                        message = "Invalid contractor ID",
+                        timestamp = DateTime.Now
+                    });
+                }
+
+                if (request == null)
+                {
+                    request = new ContractorUpdateRequest();
+                }
+
+                // Check if contractor exists
+                var checkQuery = "SELECT COUNT(*) as Cnt FROM CONTRACTORS WHERE contrcid = @contrcid AND isactive = 'Y'";
+                var checkParams = new Dictionary<string, object> { { "@contrcid", contractorId } };
+                var checkResult = _dbHelper.WebSessBean(checkQuery, checkParams);
+                var count = checkResult?.FirstOrDefault()?["Cnt"]?.ToString() ?? "0";
+                if (count == "0")
+                {
+                    return Ok(new
+                    {
+                        success = false,
+                        message = "Contractor not found",
+                        timestamp = DateTime.Now
+                    });
+                }
+
+                // Update contractor (only fields present in the Flutter Update request)
+                var updateQuery = @"
+                    UPDATE CONTRACTORS
+                    SET contrtyp = @contrtyp, firstnme = @firstnme, middlnme = @middlnme, lastnmee = @lastnmee,
+                        mobileno = @mobileno, addresss = @addresss, areaname = @areaname, emirates = @emirates,
+                        referenc = @referenc, national = @national, occupatn = @occupatn, employer = @employer,
+                        acchldrn = @acchldrn, ibannmbr = @ibannmbr, bankname = @bankname, branchnm = @branchnm, bankaddr = @bankaddr,
+                        firmname = @firmname, vataddrs = @vataddrs, trnnumbr = @trnnumbr,
+                        licnumbr = @licnumbr, issauthr = @issauthr, lictypee = @lictypee, tradname = @tradname, respprsn = @respprsn, licaddrs = @licaddrs,
+                        updatedt = GETDATE()
+                    WHERE contrcid = @contrcid";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@contrcid", contractorId },
+
+                    { "@contrtyp",  SafeString(request.ContractorType) },
+                    { "@firstnme",  SafeString(request.FirstName) },
+                    { "@middlnme",  SafeStringOrNull(request.MiddleName) },
+                    { "@lastnmee",  SafeString(request.LastName) },
+
+                    { "@mobileno",  DigitsOnly(SafeString(request.MobileNumber)) },
+                    { "@addresss",  SafeString(request.Address) },
+                    { "@areaname",  SafeString(request.Area) },
+                    { "@emirates",  SafeString(request.Emirates) },
+                    { "@referenc",  SafeString(request.Reference) },
+
+                    { "@national",  SafeString(request.Nationality) },
+                    { "@occupatn",  SafeStringOrNull(request.Occupation) },
+                    { "@employer",  SafeStringOrNull(request.Employer) },
+
+                    { "@acchldrn",  SafeStringOrNull(request.AccountHolderName) },
+                    { "@ibannmbr",  request.IbanNumber?.Trim().Length > 0 ? IBANNormalize(request.IbanNumber) : (object)DBNull.Value },
+                    { "@bankname",  SafeStringOrNull(request.BankName) },
+                    { "@branchnm",  SafeStringOrNull(request.BranchName) },
+                    { "@bankaddr",  SafeStringOrNull(request.BankAddress) },
+
+                    { "@firmname",  SafeStringOrNull(request.FirmName) },
+                    { "@vataddrs",  SafeStringOrNull(request.VatAddress) },
+                    { "@trnnumbr",  SafeStringOrNull(request.TaxRegistrationNumber) },
+
+                    { "@licnumbr",  SafeString(request.LicenseNumber) },
+                    { "@issauthr",  SafeString(request.IssuingAuthority) },
+                    { "@lictypee",  SafeString(request.LicenseType) },
+                    { "@tradname",  SafeString(request.TradeName) },
+                    { "@respprsn",  SafeString(request.ResponsiblePerson) },
+                    { "@licaddrs",  SafeString(request.LicenseAddress) }
+                };
+
+                _dbHelper.WebExecute(updateQuery, parameters);
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Contractor updated successfully",
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return Ok(new
+                {
+                    success = false,
+                    message = "Update completed with warnings",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // ---------------------------
+        // DELETE: api/Contractor/{contractorId}
+        // ---------------------------
+        [HttpDelete("{contractorId}")]
+        public IActionResult DeleteContractor(int contractorId = 0)
+        {
+            try
+            {
+                if (contractorId <= 0)
+                {
+                    return Ok(new
+                    {
+                        success = false,
+                        message = "Invalid contractor ID",
+                        timestamp = DateTime.Now
+                    });
+                }
+
+                // Soft delete - set IsActive to 'N'
+                var deleteQuery = @"
+                    UPDATE CONTRACTORS
+                    SET isactive = 'N', updatedt = GETDATE()
+                    WHERE contrcid = @contrcid AND isactive = 'Y'";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@contrcid", contractorId }
+                };
+
+                var rowsAffected = _dbHelper.WebExecute(deleteQuery, parameters);
+
+                return Ok(new
+                {
+                    success = true,
+                    message = rowsAffected > 0 ? "Contractor deleted successfully" : "Contractor not found or already deleted",
+                    rowsAffected,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return Ok(new
+                {
+                    success = false,
+                    message = "Delete completed with warnings",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // ---------------------------
+        // POST: api/Contractor/upload-document
+        // ---------------------------
         [HttpPost("upload-document")]
-        public async Task<IActionResult> UploadDocument([FromForm] DocumentUploadRequest request)
+        [Consumes("multipart/form-data")]
+        public IActionResult UploadDocument([FromForm] DocumentUploadRequest request = null)
         {
             try
             {
@@ -171,19 +490,17 @@ namespace RAKControllers.Controllers
 
                 // Generate unique filename
                 var fileName = $"{Guid.NewGuid()}{fileExtension}";
-                var uploadsPath = Path.Combine(_hostingEnvironment.WebRootPath, "uploads", "contractor-documents");
-                
+                var uploadsPath = Path.Combine(Directory.GetCurrentDirectory(), "uploads", "contractor-documents");
                 if (!Directory.Exists(uploadsPath))
                 {
                     Directory.CreateDirectory(uploadsPath);
                 }
-                
                 var filePath = Path.Combine(uploadsPath, fileName);
 
                 // Save file
                 using (var stream = new FileStream(filePath, FileMode.Create))
                 {
-                    await request.File.CopyToAsync(stream);
+                    request.File.CopyTo(stream);
                 }
 
                 return Ok(new
@@ -208,45 +525,92 @@ namespace RAKControllers.Controllers
             }
         }
 
-        // Other methods remain the same...
-
-        // Helper methods for safe data handling
-        private static string SafeString(string input)
+        // ---------------------------
+        // GET: api/Contractor/contractor-types
+        // ---------------------------
+        [HttpGet("contractor-types")]
+        public IActionResult GetContractorTypes()
         {
-            return string.IsNullOrWhiteSpace(input) ? "" : input.Trim();
+            var contractorTypes = new[]
+            {
+                "Maintenance Contractor",
+                "Petty contractors"
+            };
+
+            return Ok(new
+            {
+                success = true,
+                data = contractorTypes,
+                timestamp = DateTime.Now
+            });
         }
+
+        // ---------------------------
+        // GET: api/Contractor/emirates-list
+        // ---------------------------
+        [HttpGet("emirates-list")]
+        public IActionResult GetEmiratesList()
+        {
+            var emirates = new[]
+            {
+                "Dubai",
+                "Abu Dhabi",
+                "Sharjah",
+                "Ajman",
+                "Umm Al Quwain",
+                "Ras Al Khaimah",
+                "Fujairah"
+            };
+
+            return Ok(new
+            {
+                success = true,
+                data = emirates,
+                timestamp = DateTime.Now
+            });
+        }
+
+        // ---------------------------
+        // Helpers
+        // ---------------------------
+        private static string SafeString(string input)
+            => string.IsNullOrWhiteSpace(input) ? "" : input.Trim();
 
         private static object SafeStringOrNull(string input)
-        {
-            return string.IsNullOrWhiteSpace(input) ? (object)DBNull.Value : input.Trim();
-        }
+            => string.IsNullOrWhiteSpace(input) ? (object)DBNull.Value : input.Trim();
 
         private static DateTime? SafeParseDate(string dateString)
         {
             if (string.IsNullOrWhiteSpace(dateString))
                 return null;
 
-            // Try multiple date formats
             var formats = new[] { "yyyy-MM-dd", "MM/dd/yyyy", "dd/MM/yyyy", "yyyy/MM/dd", "MM-dd-yyyy", "dd-MM-yyyy" };
             foreach (var format in formats)
             {
-                if (DateTime.TryParseExact(dateString, format, null, System.Globalization.DateTimeStyles.None, out DateTime result))
+                if (DateTime.TryParseExact(dateString, format, CultureInfo.InvariantCulture, DateTimeStyles.None, out var result))
                 {
                     return result;
                 }
             }
-
             // Fallback to general parsing
-            if (DateTime.TryParse(dateString, out DateTime generalResult))
+            if (DateTime.TryParse(dateString, out var generalResult))
             {
                 return generalResult;
             }
-
             return null;
         }
+
+        private static string DigitsOnly(string input)
+            => new string((input ?? "").Where(char.IsDigit).ToArray());
+
+        private static string IBANNormalize(string input)
+            => string.IsNullOrWhiteSpace(input) ? "" : input.Replace(" ", "").ToUpperInvariant();
     }
 
+    // ---------------------------
     // Request Models
+    // ---------------------------
+
     public class ContractorRegistrationRequest
     {
         // Personal Details
@@ -260,7 +624,7 @@ namespace RAKControllers.Controllers
         public string Emirates { get; set; } = "";
         public string Reference { get; set; } = "";
         public string ProfilePhoto { get; set; } = "";
-        
+
         // Emirates ID Details
         public string EmiratesIdFront { get; set; } = "";
         public string EmiratesIdBack { get; set; } = "";
@@ -272,21 +636,21 @@ namespace RAKControllers.Controllers
         public string EmiratesIdExpiryDate { get; set; } = "";
         public string Occupation { get; set; } = "";
         public string Employer { get; set; } = "";
-        
+
         // Bank Details
         public string AccountHolderName { get; set; } = "";
         public string IbanNumber { get; set; } = "";
         public string BankName { get; set; } = "";
         public string BranchName { get; set; } = "";
         public string BankAddress { get; set; } = "";
-        
+
         // VAT Certificate Details
         public string VatCertificate { get; set; } = "";
         public string FirmName { get; set; } = "";
         public string VatAddress { get; set; } = "";
         public string TaxRegistrationNumber { get; set; } = "";
         public string VatEffectiveDate { get; set; } = "";
-        
+
         // Commercial License Details
         public string LicenseDocument { get; set; } = "";
         public string LicenseNumber { get; set; } = "";
@@ -300,11 +664,48 @@ namespace RAKControllers.Controllers
         public string EffectiveDate { get; set; } = "";
     }
 
+    public class ContractorUpdateRequest
+    {
+        // Personal Details
+        public string ContractorType { get; set; } = "";
+        public string FirstName { get; set; } = "";
+        public string MiddleName { get; set; } = "";
+        public string LastName { get; set; } = "";
+        public string MobileNumber { get; set; } = "";
+        public string Address { get; set; } = "";
+        public string Area { get; set; } = "";
+        public string Emirates { get; set; } = "";
+        public string Reference { get; set; } = "";
+        public string Nationality { get; set; } = "";
+        public string Occupation { get; set; } = "";
+        public string Employer { get; set; } = "";
+
+        // Bank Details
+        public string AccountHolderName { get; set; } = "";
+        public string IbanNumber { get; set; } = "";
+        public string BankName { get; set; } = "";
+        public string BranchName { get; set; } = "";
+        public string BankAddress { get; set; } = "";
+
+        // VAT Details
+        public string FirmName { get; set; } = "";
+        public string VatAddress { get; set; } = "";
+        public string TaxRegistrationNumber { get; set; } = "";
+
+        // Commercial License Details
+        public string LicenseNumber { get; set; } = "";
+        public string IssuingAuthority { get; set; } = "";
+        public string LicenseType { get; set; } = "";
+        public string TradeName { get; set; } = "";
+        public string ResponsiblePerson { get; set; } = "";
+        public string LicenseAddress { get; set; } = "";
+    }
+
     public class DocumentUploadRequest
     {
         [Required]
         public IFormFile File { get; set; }
-        
+
         public string DocumentType { get; set; } = "";
     }
 }
