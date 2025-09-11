@@ -1,1306 +1,214 @@
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-
-namespace MyFirstApi.Controllers
-{
-    /// <summary>
-    /// DTO for individual detail rows.
-    /// </summary>
-    public class DsrDetailDto
-    {
-        public string RepoCatg { get; set; }
-        public string CatgPack { get; set; }
-        public decimal ProdQnty { get; set; }
-        public decimal ProjQnty { get; set; }
-        public string ActnRemk { get; set; }
-        public DateTime? TargetDt { get; set; }
-    }
-
-    /// <summary>
-    /// DTO carrying only the fields relevant to the chosen activity,
-    /// plus detail collections.
-    /// </summary>
-    public class DsrEntryDto
-    {
-        public string ActivityType { get; set; }  // e.g. "Office Work"
-        public DateTime SubmissionDate { get; set; }  // → createDt
-        public DateTime ReportDate { get; set; }  // → docuDate
-        public string CreateId { get; set; } = "2948";
-        public string AreaCode { get; set; } = "";
-        public string Purchaser { get; set; } = ""; // cusRtlFl
-        public string PurchaserCode { get; set; } = "";
-        public string deptCode { get; set; } = "";
-        public string statflag { get; set; } = "N";
-        public string cusRtlCd { get; set; } = "";
-        public string dsrRem01 { get; set; } = "";
-        public string dsrRem02 { get; set; } = "";
-        public string dsrRem03 { get; set; } = "";
-        public string dsrRem04 { get; set; } = "";
-        public string dsrRem05 { get; set; } = "";
-        public string dsrRem06 { get; set; } = "";
-        public string dsrRem07 { get; set; } = "";
-        public string dsrRem08 { get; set; } = "";
-        public string latitude { get; set; } = "";
-        public string longitude { get; set; } = "";
-
-        public string DsrParam { get; set; } = "";
-
-        // ←— NEW: the document number to update (only sent in PUT/update scenarios)
-        public string? DocuNumb { get; set; }
-
-
-
-        /// <summary>
-        /// Regular detail rows.
-        /// </summary>
-        public List<DsrDetailDto> Details { get; set; } = new();
-
-        /// <summary>
-        /// Market‐mapping rows (for param 01 or 50).
-        /// </summary>
-        public List<DsrDetailDto> MarketDetails { get; set; } = new();
-
-        /// <summary>
-        /// "A" = Add; "U" = Update.
-        /// </summary>
-        public string ProcessType { get; set; } = "A";
-    }
-
-    public class ExceptionItem
-    {
-        public string PendWith { get; set; }
-        public string UserCode { get; set; }
-        public string ExcpType { get; set; }
-        public string ExcpDate { get; set; }
-        public string ExcpRemk { get; set; }
-        public string StatFlag { get; set; }
-    }
-
-    public class ExceptionSubmitModel
-    {
-        public string ProcType { get; set; }
-        public string CreateId { get; set; }
-        public List<ExceptionItem> Items { get; set; }
-    }
-
-    [Route("api/[controller]")]
-    [ApiController]
-    public class DsrTryController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-        public DsrTryController(DatabaseHelper db) => _db = db;
-
-        [HttpGet("getProcessTypes")]
-        public IActionResult GetProcessTypes()
-        {
-            var processTypes = new List<(string Code, string Description)>
-            {
-                ("A", "Add"),
-                ("U", "Update")
-            };
-            return Ok(processTypes.Select(pt => new { pt.Code, pt.Description }));
-        }
-
-        [HttpGet("getAreaCodes")]
-        public IActionResult GetAreaCodes()
-        {
-            try
-            {
-                const string sql = @"
-SELECT DISTINCT
-    m.areaCode AS Code,
-    m.areaDesc AS Name
-FROM dbo.rtmRetailer r
-INNER JOIN dbo.bkmAreaMast m
-  ON r.areaCode = m.areaCode
-WHERE m.isActive = 'Y'
-  AND ISNULL(m.isOnlyDp, 'N') <> 'Y'
-ORDER BY m.areaCode;";
-                var rows = _db.WebSessBean(sql, new Dictionary<string, object>())
-                              as List<Dictionary<string, object>>;
-                if (rows == null || rows.Count == 0)
-                    return NotFound("No Area Codes found.");
-                var list = rows
-                    .Select(r => new
-                    {
-                        Code = r["Code"].ToString(),
-                        Name = r["Name"].ToString()
-                    })
-                    .ToList();
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        [HttpGet("getPurchaserOptions")]
-        public IActionResult GetPurchaserOptions()
-        {
-            var opts = new[] {
-                new { Code="C",  Description="Purchaser (Non Trade)" },
-                new { Code="AD", Description="AUTHORISED DEALER" }
-            };
-            return Ok(opts);
-        }
-
-        [HttpGet("getQualityOptions")]
-        public IActionResult GetQualityOptions() =>
-            Ok(new[] { "Average", "Medium", "Good" });
-
-        [HttpGet("getStatusOptions")]
-        public IActionResult GetStatusOptions() =>
-            Ok(new[] { "Yet To be Checked By Purchaser", "Approved", "Rejected" });
-
-        [HttpGet("getProductOptions")]
-        public IActionResult GetProductOptions() =>
-            Ok(new[] { "White Cement", "Wall Care Putty", "Textura", "Levelplast", "Wall Primer" });
-
-        [HttpGet("getBtlActivityTypes")]
-        public IActionResult GetTypes() => Ok(new[] {
-            "Retailer Meet","Rural Retailer Meet","Stockiest Meet","Painter Meet",
-            "Architect Meet","Counter Meet","Painter Training Program","Other BTL Activities"
-        });
-
-        [HttpPost]
-        [ProducesResponseType(StatusCodes.Status201Created)]
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult Submit([FromBody] DsrEntryDto dto)
-        {
-            if (dto == null)
-                return BadRequest("Request body is missing.");
-            if (string.IsNullOrWhiteSpace(dto.CreateId))
-                return BadRequest("CreateId (login) is required.");
-            if (string.IsNullOrWhiteSpace(dto.ActivityType))
-                return BadRequest("ActivityType is required.");
-
-            // 1️⃣ Lookup deptCode always, and areaCode only if not provided
-            const string empSql = @"
-SELECT deptCode, areaCode
-  FROM prmEmployee
- WHERE loginIdM = @LoginId";
-            var empParams = new Dictionary<string, object>
-            {
-                ["@LoginId"] = dto.CreateId
-            };
-            var empResult = _db.WebSessBean(empSql, empParams)
-                              as List<Dictionary<string, object>>;
-            if (empResult == null || empResult.Count == 0)
-                return BadRequest($"No employee for loginId '{dto.CreateId}'.");
-
-            dto.deptCode = empResult[0]["deptCode"]?.ToString() ?? "";
-            var lookupArea = empResult[0]["areaCode"]?.ToString() ?? "";
-            if (string.IsNullOrWhiteSpace(dto.AreaCode))
-                dto.AreaCode = lookupArea;
-
-            // 2️⃣ Map ActivityType → param code & dsrParTy
-            var activityMap = new Dictionary<string, (string Param, short ParTy)>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Office Work"] = ("53", 83),
-                ["Internal Team Meetings"] = ("52", 83),
-                ["Meeting with New Purchaser"] = ("50", 83),
-                ["Phone Call with Builder"] = ("12", 83),
-                ["Meetings with Contractor / Stockist"] = ("13", 83),
-                ["Visit to Get / Check Sampling at Site"] = ("31", 83),
-                ["BTL Activities"] = ("51", 83),
-                ["On Leave / Holiday / Off Day"] = ("54", 83),
-                ["Any Other Activity"] = ("60", 83),
-                ["Phone Call with Unregistered Purchasers"] = ("61", 83),
-                ["Work From Home"] = ("55", 83),
-            };
-            var match = activityMap.FirstOrDefault(kvp =>
-                dto.ActivityType.StartsWith(kvp.Key, StringComparison.OrdinalIgnoreCase));
-            if (match.Key == null)
-                return BadRequest($"Unknown ActivityType '{dto.ActivityType}'.");
-            var meta = match.Value;
-
-            try
-            {
-                // 3️⃣ Generate document number
-                const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
-                var genParams = new Dictionary<string, object>
-                {
-                    ["@DocType"] = "DSR",
-                    ["@AreaCode"] = dto.AreaCode
-                };
-                var genResult = _db.WebSessBean(genSql, genParams)
-                              as List<Dictionary<string, object>>;
-                var docuNumb = genResult?.FirstOrDefault()?["docuNumb"]?.ToString();
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                    return StatusCode(500, "Failed to generate document number.");
-
-                // 4️⃣ Update the sequence
-                const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
-                _db.WebSessBean(updSql, genParams);
-
-                // 5️⃣ Insert master row
-                const string masterSql = @"
-INSERT INTO dptDSRActvt
-  (docuNumb, dsrParam, docuDate,
-   cusRtlFl, cusRtlCd,
-   dsrRem01, dsrRem02, dsrRem03, dsrRem04, dsrRem05,
-   dsrRem06, dsrRem07, dsrRem08, dsrRem09, dsrParTy,
-   deptCode, statFlag, createId, createDt,
-   locaCapr, latitute, lgtitute,
-   areaCode)
-VALUES
-  (@docuNumb, @dsrParam, @reportDate,
-   @cusRtlFl, @custRtlCd,
-   @r1, @r2, @r3, @r4, @r5,
-   @r6, @r7, @r8, '', @dsrParTy,
-   @deptCode, @statflag, @createId, @submissionDate,
-   @r9, @latitude, @longitude,
-   @areaCode);";
-                var r = new string[9];
-                r[1] = dto.dsrRem01;
-                r[2] = dto.dsrRem02;
-                r[3] = dto.dsrRem03;
-                r[4] = dto.dsrRem04;
-                r[5] = dto.dsrRem05;
-                r[6] = dto.dsrRem06;
-                r[7] = dto.dsrRem07;
-                r[8] = dto.dsrRem08;
-
-                var masterParams = new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = docuNumb,
-                    ["@dsrParam"] = meta.Param,
-                    ["@reportDate"] = dto.ReportDate,
-                    ["@cusRtlFl"] = dto.Purchaser,
-                    ["@custRtlCd"] = dto.PurchaserCode,
-                    ["@r1"] = r[1],
-                    ["@r2"] = r[2],
-                    ["@r3"] = r[3],
-                    ["@r4"] = r[4],
-                    ["@r5"] = r[5],
-                    ["@r6"] = r[6],
-                    ["@r7"] = r[7],
-                    ["@r8"] = r[8],
-                    ["@r9"] = "",
-                    ["@dsrParTy"] = meta.ParTy,
-                    ["@deptCode"] = dto.deptCode,
-                    ["@statflag"] = dto.statflag,
-                    ["@createId"] = dto.CreateId,
-                    ["@submissionDate"] = dto.SubmissionDate,
-                    ["@latitude"] = dto.latitude,
-                    ["@longitude"] = dto.longitude,
-                    ["@areaCode"] = dto.AreaCode
-                };
-                _db.WebSessBean(masterSql, masterParams);
-
-                // 6️⃣ On Update, delete old details
-                if (dto.ProcessType == "U")
-                {
-                    const string delSql = "DELETE FROM dptDSRActvtDtl WHERE docuNumb = @docuNumb";
-                    _db.WebSessBean(delSql, new Dictionary<string, object>
-                    {
-                        ["@docuNumb"] = docuNumb
-                    });
-                }
-
-                // 7️⃣ Insert regular detail rows
-                for (int i = 0; i < dto.Details.Count; i++)
-                {
-                    var d = dto.Details[i];
-                    if (string.IsNullOrEmpty(d.RepoCatg)
-                        && d.ProdQnty == 0
-                        && d.ProjQnty == 0)
-                        continue;
-
-                    const string detailSql = @"
-INSERT INTO dptDSRActvtDtl
-  (docuNumb, docuSrNo, repoCatg, catgPack,
-   prodQnty, projQnty, actnRemk, targetDt,
-   statFlag, createId, createDt)
-VALUES
-  (@docuNumb, @docuSrNo, @repoCatg, @catgPack,
-   @prodQnty, @projQnty, @actnRemk, @targetDt,
-   'N', @createId, GETDATE());";
-                    var pd = new Dictionary<string, object>
-                    {
-                        ["@docuNumb"] = docuNumb,
-                        ["@docuSrNo"] = i + 1,
-                        ["@repoCatg"] = d.RepoCatg,
-                        ["@catgPack"] = d.CatgPack,
-                        ["@prodQnty"] = d.ProdQnty,
-                        ["@projQnty"] = d.ProjQnty,
-                        ["@actnRemk"] = d.ActnRemk,
-                        ["@targetDt"] = d.TargetDt?.ToString("yyyy-MM-dd") ?? (object)DBNull.Value,
-                        ["@createId"] = dto.CreateId
-                    };
-                    _db.WebSessBean(detailSql, pd);
-                }
-
-                // 8️⃣ Insert market‐mapping rows if needed
-                if ((meta.Param == "01" || meta.Param == "50") && dto.MarketDetails.Any())
-                {
-                    for (int j = 0; j < dto.MarketDetails.Count; j++)
-                    {
-                        var m = dto.MarketDetails[j];
-                        if (string.IsNullOrEmpty(m.RepoCatg)
-                            && m.ProdQnty == 0
-                            && m.ProjQnty == 0)
-                            continue;
-
-                        const string marketSql = @"
-INSERT INTO dptDSRActvtDtl
-  (docuNumb, docuSrNo, repoCatg,
-   prodQnty, projQnty, actnRemk, targetDt,
-   mrktData, statFlag, createId, createDt)
-VALUES
-  (@docuNumb, @docuSrNo, @repoCatg,
-   @prodQnty, @projQnty, @actnRemk, @targetDt,
-   '01', 'N', @createId, GETDATE());";
-                        var pm = new Dictionary<string, object>
-                        {
-                            ["@docuNumb"] = docuNumb,
-                            ["@docuSrNo"] = dto.Details.Count + j + 1,
-                            ["@repoCatg"] = m.RepoCatg,
-                            ["@prodQnty"] = m.ProdQnty,
-                            ["@projQnty"] = m.ProjQnty,
-                            ["@actnRemk"] = m.ActnRemk,
-                            ["@targetDt"] = m.TargetDt?.ToString("yyyy-MM-dd") ?? (object)DBNull.Value,
-                            ["@createId"] = dto.CreateId
-                        };
-                        _db.WebSessBean(marketSql, pm);
-                    }
-                }
-
-                return CreatedAtAction(nameof(Submit), new { docuNumb }, dto);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-
-        //[HttpPost("generateAndUpdateDocNo")]
-        //public IActionResult GenerateAndUpdateDocNo([FromBody] DsrEntryDto dto)
-        //{
-        //    if (dto == null || string.IsNullOrWhiteSpace(dto.AreaCode))
-        //        return BadRequest("AreaCode is required.");
-
-        //    try
-        //    {
-        //        const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
-        //        var genParams = new Dictionary<string, object>
-        //        {
-        //            ["@DocType"] = "DSR",
-        //            ["@AreaCode"] = dto.AreaCode
-        //        };
-        //        var r1 = _db.WebSessBean(genSql, genParams)
-        //                   as List<Dictionary<string, object>>;
-        //        var docuNumb = r1?.FirstOrDefault()?["docuNumb"]?.ToString();
-        //        if (string.IsNullOrWhiteSpace(docuNumb))
-        //            return StatusCode(500, "Failed to generate document number.");
-
-        //        const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
-        //        _db.WebSessBean(updSql, genParams);
-
-        //        return Ok(new { DocumentNumber = docuNumb });
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        return StatusCode(500, ex.Message);
-        //    }
-        //}
-
-        [HttpPost("generateDocumentNumber")]
-        public IActionResult GenerateDocumentNumber([FromBody] string areaCode)
-        {
-            if (string.IsNullOrWhiteSpace(areaCode))
-                return BadRequest("AreaCode is required.");
-
-            try
-            {
-                var key = $"DocumentNumber_{areaCode}";
-                if (HttpContext.Session.TryGetValue(key, out var existing))
-                {
-                    var num = System.Text.Encoding.UTF8.GetString(existing);
-                    return Ok(new { DocumentNumber = num });
-                }
-
-                const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
-                var genParams = new Dictionary<string, object>
-                {
-                    ["@DocType"] = "DSR",
-                    ["@AreaCode"] = areaCode
-                };
-                var r1 = _db.WebSessBean(genSql, genParams)
-                           as List<Dictionary<string, object>>;
-                var docuNumb = r1?.FirstOrDefault()?["docuNumb"]?.ToString();
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                    return StatusCode(500, "Failed to generate document number.");
-
-                const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
-                _db.WebSessBean(updSql, genParams);
-
-                HttpContext.Session.Set(key, System.Text.Encoding.UTF8.GetBytes(docuNumb));
-                return Ok(new { DocumentNumber = docuNumb });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-
-        [HttpGet("getDocumentNumbers")]
-        public IActionResult GetDocumentNumbers([FromQuery] string dsrParam)
-        {
-            const string createId = "2948";
-
-            if (string.IsNullOrWhiteSpace(dsrParam))
-                return BadRequest("dsrParam is required.");
-
-            const string sql = @"
-SELECT docuNumb
-  FROM dptDSRActvt
- WHERE createId = @CreateId
-   AND dsrParam  = @DsrParam";
-
-            var parms = new Dictionary<string, object>
-            {
-                ["@CreateId"] = createId,
-                ["@DsrParam"] = dsrParam
-            };
-
-            var rows = _db.WebSessBean(sql, parms)
-                          as List<Dictionary<string, object>>;
-
-            if (rows == null || rows.Count == 0)
-                return NotFound("No documents found.");
-
-            var list = rows
-                .Select(r => new { DocuNumb = r["docuNumb"].ToString() })
-                .ToList();
-
-            return Ok(list);
-        }
-
-        [HttpPut("update")]
-        [ProducesResponseType(StatusCodes.Status204NoContent)]
-        [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public IActionResult Update([FromBody] DsrEntryDto dto)
-        {
-            if (dto == null)
-                return BadRequest("Request body is missing.");
-            if (string.IsNullOrWhiteSpace(dto.CreateId))
-                return BadRequest("CreateId is required.");
-            // must supply the document number to update
-            if (string.IsNullOrWhiteSpace(dto.Details?.FirstOrDefault()?.RepoCatg) && string.IsNullOrWhiteSpace(dto.ProcessType))
-                return BadRequest("ProcessType is required.");
-            //if (string.IsNullOrWhiteSpace(dto.AreaCode))
-            //    return BadRequest("AreaCode is required.");
-            // we expect the Flutter side to pass DocuNumb in a custom field:
-            // let's assume you've added `public string DocuNumb { get; set; }` to DsrEntryDto
-            var docuNumb = dto.DocuNumb;
-            if (string.IsNullOrWhiteSpace(docuNumb))
-                return BadRequest("You must supply a DocuNumb to update.");
-
-            // 1️⃣ Re‑lookup deptCode / areaCode
-            const string empSql = @"
-SELECT deptCode, areaCode
-  FROM prmEmployee 
- WHERE loginIdM = @LoginId";
-            var emp = _db.WebSessBean(empSql, new Dictionary<string, object>
-            {
-                ["@LoginId"] = dto.CreateId
-            }) as List<Dictionary<string, object>>;
-            if (emp == null || emp.Count == 0)
-                return BadRequest($"No employee found for CreateId '{dto.CreateId}'.");
-            var deptCode = emp[0]["deptCode"]?.ToString() ?? "";
-            var areaCode = emp[0]["areaCode"]?.ToString() ?? dto.AreaCode;
-
-            // 2️⃣ Perform the master‐row UPDATE
-            const string updateMasterSql = @"
-UPDATE dptDSRActvt
-   SET dsrParam   = @dsrParam,
-       docuDate   = @reportDate,
-       dsrRem01   = @r1,
-       dsrRem02   = @r2,
-       dsrRem03   = @r3,
-       dsrRem04   = @r4,
-       dsrRem05   = @r5,
-       dsrRem06   = @r6,
-       dsrRem07   = @r7,
-       dsrRem08   = @r8,
-       latitute   = @latitude,
-       lgtitute   = @longitude,
-       updateId   = @updateId,
-       updateDt   = GETDATE()
- WHERE docuNumb  = @docuNumb";
-            var updParams = new Dictionary<string, object>
-            {
-                ["@docuNumb"] = docuNumb,
-                ["@dsrParam"] = dto.DsrParam,
-                ["@reportDate"] = dto.ReportDate,
-                ["@cusRtlFl"] = dto.Purchaser,
-                ["@cusRtlCd"] = dto.PurchaserCode,
-                ["@r1"] = dto.dsrRem01,
-                ["@r2"] = dto.dsrRem02,
-                ["@r3"] = dto.dsrRem03,
-                ["@r4"] = dto.dsrRem04,
-                ["@r5"] = dto.dsrRem05,
-                ["@r6"] = dto.dsrRem06,
-                ["@r7"] = dto.dsrRem07,
-                ["@r8"] = dto.dsrRem08,
-                ["@latitude"] = dto.latitude,
-                ["@longitude"] = dto.longitude,
-                ["@areaCode"] = areaCode,
-                ["@deptCode"] = deptCode,
-                ["@updateId"] = dto.CreateId
-            };
-            try
-            {
-                _db.WebSessBean(updateMasterSql, updParams);
-
-                // 3️⃣ Delete old detail rows
-                const string deleteDetailsSql = @"
-DELETE FROM dptDSRActvtDtl
- WHERE docuNumb = @docuNumb";
-                _db.WebSessBean(deleteDetailsSql, new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = docuNumb
-                });
-
-                // 4️⃣ Re‑insert all incoming Details
-                for (var i = 0; i < dto.Details.Count; i++)
-                {
-                    var d = dto.Details[i];
-                    if (string.IsNullOrWhiteSpace(d.RepoCatg)
-                       && d.ProdQnty == 0
-                       && d.ProjQnty == 0)
-                        continue;
-
-                    const string detailSql = @"
-INSERT INTO dptDSRActvtDtl
-  (docuNumb, docuSrNo, repoCatg, catgPack,
-   prodQnty, projQnty, actnRemk, targetDt,
-   statFlag, createId, createDt)
-VALUES
-  (@docuNumb, @srNo, @repoCatg, @catgPack,
-   @prodQnty, @projQnty, @actnRemk, @targetDt,
-   'N', @createId, GETDATE())";
-                    var pd = new Dictionary<string, object>
-                    {
-                        ["@docuNumb"] = docuNumb,
-                        ["@srNo"] = i + 1,
-                        ["@repoCatg"] = d.RepoCatg,
-                        ["@catgPack"] = d.CatgPack,
-                        ["@prodQnty"] = d.ProdQnty,
-                        ["@projQnty"] = d.ProjQnty,
-                        ["@actnRemk"] = d.ActnRemk,
-                        ["@targetDt"] = d.TargetDt?.ToString("yyyy-MM-dd") ?? (object)DBNull.Value,
-                        ["@createId"] = dto.CreateId
-                    };
-                    _db.WebSessBean(detailSql, pd);
-                }
-
-                return NoContent();
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Error updating DSR: {ex.Message}");
-            }
-        }
-
-        [HttpGet("getExceptionMetadataa")]
-        public IActionResult GetExceptionsMetadataa([FromQuery] string procType = "N")
-        {
-            try
-            {
-                var rawExcp = _db.WebSessBean(
-                    "SELECT paramCod AS Code, paramDes AS Description " +
-                    "  FROM wcmParametr " +
-                    " WHERE paramTyp='70' AND paramCod IN('D')",
-                    new Dictionary<string, object>())
-                  as List<Dictionary<string, object>>;
-
-                var exceptionTypes = rawExcp
-                    .Select(r => new
-                    {
-                        Code = r["Code"].ToString(),
-                        Description = r["Description"].ToString()
-                    })
-                    .ToList();
-
-                var statusFlags = new[]
-                {
-                    new { Code = "A", Description = "Approve" },
-                    new { Code = "R", Description = "Reject" }
-                };
-
-                var pendWith = "2948";
-
-                return Ok(new
-                {
-                    ExceptionTypes = exceptionTypes,
-                    StatusFlags = statusFlags,
-                    PendWith = pendWith
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        [HttpGet("getEmployee")]
-        public IActionResult GetEmployee([FromQuery] string loginId)
-        {
-            if (string.IsNullOrWhiteSpace(loginId))
-                return BadRequest("You must provide a loginId query parameter.");
-
-            try
-            {
-                const string sql = @"
-SELECT *
-  FROM prmEmployee
- WHERE loginIdM = @LoginId";
-                var parms = new Dictionary<string, object>
-                {
-                    ["@LoginId"] = loginId
-                };
-                var raw = _db.WebSessBean(sql, parms)
-                             as List<Dictionary<string, object>>
-                          ?? new List<Dictionary<string, object>>();
-
-                if (!raw.Any())
-                    return NotFound($"No employee found with loginId='{loginId}'.");
-
-                return Ok(raw[0]);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        [HttpPost("submitExceptions")]
-
-        [ProducesResponseType(201)]
-
-        [ProducesResponseType(200)]
-
-        [ProducesResponseType(400)]
-
-        [ProducesResponseType(409)]
-
-        [ProducesResponseType(500)]
-
-        public IActionResult SubmitExceptions([FromBody] ExceptionSubmitModel model)
-
-        {
-
-            if (model == null) return BadRequest("Request body is missing.");
-
-            if (string.IsNullOrWhiteSpace(model.ProcType) || string.IsNullOrWhiteSpace(model.CreateId))
-
-                return BadRequest("ProcType and CreateId are required.");
-
-            if (model.Items == null || model.Items.Count == 0)
-
-                return BadRequest("You must supply at least one exception in 'items'.");
-
-            var procType = model.ProcType.Trim().ToUpperInvariant();
-
-            if (procType != "N" && procType != "A")
-
-                return BadRequest("ProcType must be 'N' (new) or 'A' (approval).");
-
-            var today = DateTime.Today;
-
-            var errors = new List<string>();
-
-            // First pass: validate everything & pre-read any rows we need.
-
-            var prepared = new List<(string Kind, ExceptionItem item, DateTime excpDat1, IDictionary<string, object>? existingRow)>();
-
-            foreach (var item in model.Items)
-
-            {
-
-                if (item == null) { errors.Add("Item is null."); continue; }
-
-                if (string.IsNullOrWhiteSpace(item.UserCode))
-
-                { errors.Add("UserCode is required."); continue; }
-
-                var excpType = (item.ExcpType ?? "D").Trim().ToUpperInvariant();
-
-                if (excpType != "D")
-
-                { errors.Add($"ExcpType '{item.ExcpType}' not allowed. Only 'D' is permitted."); continue; }
-
-                if (!TryParseDate(item.ExcpDate, out var excpDat1))
-
-                { errors.Add($"ExcpDate '{item.ExcpDate}' is invalid. Use dd/MM/yyyy or yyyy-MM-dd."); continue; }
-
-                if (excpDat1 > today)
-
-                { errors.Add($"ExcpDate {excpDat1:dd/MM/yyyy} cannot be in the future."); continue; }
-
-                // Exceptions are for DSR dates older than 3 days (JSP guidance)
-
-                if (excpDat1 >= today.AddDays(-3))
-
-                { errors.Add($"ExcpDate {excpDat1:dd/MM/yyyy} is within last 3 days; exception not required."); continue; }
-
-                var excpRemk = (item.ExcpRemk ?? "").Trim();
-
-                if (excpRemk.Length > 50)
-
-                { errors.Add("ExcpRemk cannot exceed 50 characters."); continue; }
-
-                if (procType == "N")
-
-                {
-
-                    // New exception must be raised for self (JSP does that)
-
-                    if (!item.UserCode.Equals(model.CreateId, StringComparison.OrdinalIgnoreCase))
-
-                    { errors.Add("New exception must be raised for self (UserCode must equal CreateId)."); continue; }
-
-                    // PendWith: keep from payload for now (matches your current endpoint usage)
-
-                    if (string.IsNullOrWhiteSpace(item.PendWith))
-
-                    { errors.Add("PendWith is required for new exceptions (server can compute later)."); continue; }
-
-                    // Check if one already exists for same user/type/date
-
-                    const string checkSql = @"
-
-                select top 1 statFlag, excpDat2
-
-                from dptGenExcpn with (nolock)
-
-                where usrCdExc = @UserCode and excpType = @ExcpType and excpDat1 = @ExcpDat1";
-
-                    var existing = _db.WebSessBean(checkSql, new Dictionary<string, object>
-                    {
-
-                        ["@UserCode"] = item.UserCode,
-
-                        ["@ExcpType"] = excpType,
-
-                        ["@ExcpDat1"] = excpDat1
-
-                    });
-
-                    IDictionary<string, object>? row = (existing != null && existing.Count > 0) ? existing[0] : null;
-
-                    if (row != null)
-
-                    {
-
-                        var statFlag = row.ContainsKey("statFlag") ? row["statFlag"]?.ToString() : null;
-
-                        DateTime? excpDat2 = null;
-                        if (row.ContainsKey("excpDat2") && row["excpDat2"] != null)
-                        {
-                            if (DateTime.TryParse(row["excpDat2"].ToString(), out DateTime parsed))
-                                excpDat2 = parsed;
-                        }
-
-                    }
-
-                    prepared.Add(("NEW", item, excpDat1, row));
-
-                }
-
-                else // Approvals
-
-                {
-
-                    var desired = (item.StatFlag ?? "").Trim().ToUpperInvariant();
-
-                    if (desired != "A" && desired != "R")
-
-                    { errors.Add("For approvals, StatFlag must be 'A' or 'R'."); continue; }
-
-                    // Ensure the pending row exists and is assigned to this approver
-
-                    const string findPendingSql = @"
-
-                select top 1 statFlag
-
-                from dptGenExcpn with (nolock)
-
-                where usrCdExc=@UserCode and excpType=@ExcpType and excpDat1=@ExcpDat1
-
-                  and pendWith=@ApproverId and statFlag='N'";
-
-                    var pending = _db.WebSessBean(findPendingSql, new Dictionary<string, object>
-                    {
-
-                        ["@UserCode"] = item.UserCode,
-
-                        ["@ExcpType"] = excpType,
-
-                        ["@ExcpDat1"] = excpDat1,
-
-                        ["@ApproverId"] = model.CreateId
-
-                    });
-
-                    if (pending == null || pending.Count == 0)
-
-                    { errors.Add($"No pending request for {excpDat1:dd/MM/yyyy} assigned to you."); continue; }
-
-                    prepared.Add(("APPR", item, excpDat1, null));
-
-                }
-
-            }
-
-            if (errors.Count > 0)
-
-                return BadRequest(new { message = "Validation failed.", errors });
-
-            // Second pass: perform DML
-
-            try
-
-            {
-
-                foreach (var p in prepared)
-
-                {
-
-                    var excpType = (p.item.ExcpType ?? "D").Trim().ToUpperInvariant();
-
-                    if (p.Kind == "NEW")
-
-                    {
-
-                        // If we had a previously rejected/expired approved row, reset it; else insert fresh.
-
-                        if (p.existingRow != null)
-
-                        {
-
-                            const string updSql = @"
-
-                        update dptGenExcpn
-
-                           set excpRemk = @ExcpRemk,
-
-                               pendWith = @PendWith,
-
-                               statFlag = 'N',
-
-                               createId = @CreateId,
-
-                               createDt = GETDATE(),
-
-                               excpDat2 = NULL
-
-                         where usrCdExc=@UserCode and excpType=@ExcpType and excpDat1=@ExcpDat1";
-
-                            _db.WebSessBean(updSql, new Dictionary<string, object>
-                            {
-
-                                ["@ExcpRemk"] = (p.item.ExcpRemk ?? "").Trim(),
-
-                                ["@PendWith"] = p.item.PendWith,
-
-                                ["@CreateId"] = model.CreateId,
-
-                                ["@UserCode"] = p.item.UserCode,
-
-                                ["@ExcpType"] = excpType,
-
-                                ["@ExcpDat1"] = p.excpDat1
-
-                            });
-
-                        }
-
-                        else
-
-                        {
-
-                            const string insSql = @"
-
-                        insert into dptGenExcpn
-
-                          (usrCdExc, excpType, excpDat1, excpDat2, usrTyExc, excpRemk, pendWith, statFlag, createId, createDt)
-
-                        values
-
-                          (@UserCode, @ExcpType, @ExcpDat1, NULL, 'E', @ExcpRemk, @PendWith, 'N', @CreateId, GETDATE())";
-
-                            _db.WebSessBean(insSql, new Dictionary<string, object>
-                            {
-
-                                ["@UserCode"] = p.item.UserCode,
-
-                                ["@ExcpType"] = excpType,
-
-                                ["@ExcpDat1"] = p.excpDat1,
-
-                                ["@ExcpRemk"] = (p.item.ExcpRemk ?? "").Trim(),
-
-                                ["@PendWith"] = p.item.PendWith,
-
-                                ["@CreateId"] = model.CreateId
-
-                            });
-
-                        }
-
-                    }
-
-                    else // APPR
-
-                    {
-
-                        var desired = (p.item.StatFlag ?? "").Trim().ToUpperInvariant();
-
-                        const string approveSql = @"
-
-                    update dptGenExcpn
-
-                       set statFlag = @NewStatus,
-
-                           excpDat2 = case when @NewStatus='A' then dateadd(day,3,cast(getdate() as date)) else NULL end
-
-                     where usrCdExc=@UserCode
-
-                       and excpType=@ExcpType
-
-                       and excpDat1=@ExcpDat1
-
-                       and pendWith=@ApproverId
-
-                       and statFlag='N'";
-
-                        _db.WebSessBean(approveSql, new Dictionary<string, object>
-                        {
-
-                            ["@NewStatus"] = desired,
-
-                            ["@UserCode"] = p.item.UserCode,
-
-                            ["@ExcpType"] = excpType,
-
-                            ["@ExcpDat1"] = p.excpDat1,
-
-                            ["@ApproverId"] = model.CreateId
-
-                        });
-
-                    }
-
-                }
-
-                // Return 201 for new, 200 for approvals
-
-                return StatusCode(procType == "N" ? 201 : 200);
-
-            }
-
-            catch (Exception ex)
-
-            {
-
-                return StatusCode(500, $"Error saving exceptions: {ex.Message}");
-
-            }
-
-        }
-
-        // --- helpers ---
-
-        private static bool TryParseDate(string input, out DateTime date)
-
-        {
-
-            var formats = new[] { "dd/MM/yyyy", "d/M/yyyy", "yyyy-MM-dd" };
-
-            return DateTime.TryParseExact(
-
-                input,
-
-                formats,
-
-                System.Globalization.CultureInfo.InvariantCulture,
-
-                System.Globalization.DateTimeStyles.None,
-
-                out date
-
-            );
-
-        }
-
-
-
-        
-
-
-
-        [HttpGet("getPurchaserCode")]
-        public IActionResult GetPurchaserCode(
-            [FromQuery] string areaCode,
-            [FromQuery] string purchaserFlag
-        )
-        {
-            if (string.IsNullOrWhiteSpace(areaCode) ||
-                string.IsNullOrWhiteSpace(purchaserFlag))
-            {
-                return BadRequest("You must supply both areaCode and purchaserFlag");
-            }
-
-            // Build IN(...) filter
-            string[] typeFilter = purchaserFlag.ToUpperInvariant() switch
-            {
-                "C" => new[] { "PT", "BL", "TL", "LU" },
-                "AD" => new[] { "AD", "UR" },
-                _ => new[] { purchaserFlag }
-            };
-            var inParams = typeFilter.Select((_, i) => $"@p{i}").ToArray();
-            var inClause = string.Join(", ", inParams);
-
-            var sql = $@"
-SELECT
-    custCode AS Code,
-    sapCusCd  AS SapCode,
-    custName  AS Name,
-    custType  AS Type,
-    custCity  AS City,
-    isActive  AS Status,
-    mobileNo  AS Mobile,
-    itxPanNo  AS PanNo,
-    emailAdd  AS Email
-  FROM dbo.dpmCustomer
- WHERE areaCode = @AreaCode
-   AND custType IN ({inClause})
-   AND isActive='Y'
- ORDER BY custCode";
-
-            var parameters = new Dictionary<string, object>
-            {
-                ["@AreaCode"] = areaCode
-            };
-            for (int i = 0; i < typeFilter.Length; i++)
-                parameters[inParams[i]] = typeFilter[i];
-
-            try
-            {
-                var raw = _db.WebSessBean(sql, parameters)
-                           as List<Dictionary<string, object>>
-                        ?? new List<Dictionary<string, object>>();
-
-                var codes = raw.Select(r => new
-                {
-                    Code = r["Code"]?.ToString(),
-                    SapCode = r["SapCode"]?.ToString(),
-                    Name = r["Name"]?.ToString(),
-                    Type = r["Type"]?.ToString(),
-                    City = r["City"]?.ToString(),
-                    Status = r["Status"]?.ToString(),
-                    Mobile = r["Mobile"]?.ToString(),
-                    PanNo = r["PanNo"]?.ToString(),
-                    Email = r["Email"]?.ToString()
-                })
-                .ToList();
-
-                return Ok(new { PurchaserCodes = codes });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-
-
-        }
-        [HttpGet("getApprovalAuthority")]
-        public IActionResult GetApprovalAuthority([FromQuery] string loginId)
-        {
-            if (string.IsNullOrWhiteSpace(loginId))
-                return BadRequest("loginId is required.");
-
-            // find current pending‐with for this user
-            const string pendSql = @"
-SELECT TOP 1 pendWith
-  FROM dptGenExcpn WITH (NOLOCK)
- WHERE createId = @LoginId
-   AND statFlag = 'N'
- ORDER BY createDt DESC";
-            var p1 = new Dictionary<string, object> { ["@LoginId"] = loginId };
-            var pendRows = _db.WebSessBean(pendSql, p1) as List<Dictionary<string, object>>;
-            if (pendRows == null || pendRows.Count == 0)
-                return NotFound("No pending exception found.");
-
-            var approverId = pendRows[0]["pendWith"].ToString();
-
-            // lookup their name
-            const string nameSql = @"
-SELECT emplName 
-  FROM wcvLoginMas WITH (NOLOCK)
- WHERE loginIdM = @ApproverId";
-            var p2 = new Dictionary<string, object> { ["@ApproverId"] = approverId };
-            var nameRows = _db.WebSessBean(nameSql, p2) as List<Dictionary<string, object>>;
-            var approverName = nameRows?.FirstOrDefault()?["emplName"]?.ToString()
-                                ?? approverId;
-
-            return Ok(new { ApproverId = approverId, ApproverName = approverName });
-        }
-
-        /// <summary>
-        /// 2️⃣ Exception Type dropdown (already had getExceptionMetadata)
-        /// </summary>
-        // → use your existing GetExceptionMetadata endpoint
-
-        /// <summary>
-        /// 3️⃣ Employee list for the add/approval table
-        /// </summary>
-        [HttpGet("getEmployees")]
-        public IActionResult GetEmployees(
-            [FromQuery] string procType = "N",
-            [FromQuery] string loginId = null,
-            [FromQuery] string emplCode = "")
-        {
-            if (string.IsNullOrWhiteSpace(loginId))
-                return BadRequest("loginId is required.");
-
-            string sql;
-            var parms = new Dictionary<string, object> { ["@LoginId"] = loginId };
-
-            if (procType.Equals("N", StringComparison.OrdinalIgnoreCase))
-            {
-                sql = @"
-SELECT 
-    loginIdM        AS UserCode,
-    emplName        AS Name,
-    ''              AS ExceptionType,
-    ''              AS ExcpDate,
-    ''              AS Remarks
-FROM prmEmployee WITH (NOLOCK)
-WHERE loginIdM = @LoginId";
-            }
-            else
-            {
-                sql = @"
-SELECT 
-    a.createId      AS UserCode,
-    b.emplName      AS Name,
-    ''              AS ExceptionType,
-    CONVERT(char(10), a.excpDat1, 103) AS ExcpDate,
-    a.excpRemk      AS Remarks
-FROM dptGenExcpn a WITH (NOLOCK)
-JOIN prmEmployee b ON a.createId = b.loginIdM
-WHERE a.pendWith = @LoginId
-  AND a.statFlag = 'N'";
-                if (!string.IsNullOrWhiteSpace(emplCode))
-                {
-                    sql += " AND b.loginIdM = @EmplCode";
-                    parms["@EmplCode"] = emplCode;
-                }
-            }
-
-            var rows = _db.WebSessBean(sql, parms)
-                       as List<Dictionary<string, object>>
-                    ?? new List<Dictionary<string, object>>();
-
-            var list = rows.Select(r => new
-            {
-                UserCode = r["UserCode"].ToString(),
-                Name = r["Name"].ToString(),
-                ExceptionType = r["ExceptionType"].ToString(),
-                ExcpDate = r["ExcpDate"].ToString(),
-                Remarks = r["Remarks"].ToString()
-            }).ToList();
-
-            return Ok(list);
-        }
-
-        /// <summary>
-        /// 4️⃣ History table below (sorted by CreateDate descending)
-        /// </summary>
-        [HttpGet("getExceptionHistory")]
-        public IActionResult GetExceptionHistory(
-            [FromQuery] string procType = "N",
-            [FromQuery] string loginId = null)
-        {
-            if (string.IsNullOrWhiteSpace(loginId))
-                return BadRequest("loginId is required.");
-
-            var whereClause = procType.Equals("N", StringComparison.OrdinalIgnoreCase)
-                ? "createId = @LoginId"
-                : "pendWith = @LoginId";
-
-            var sql = $@"
-SELECT 
-    dbo.wcfLoginVal('N', usrCdExc)                                  AS Employee,
-    CONVERT(varchar(11), excpDat1, 113)                             AS ExcpDate,
-    excpRemk                                                      AS Remarks,
-    CASE 
-      WHEN statFlag = 'A' THEN 'Approved by ' 
-      WHEN statFlag = 'N' THEN 'Pending For Approval with '
-      ELSE 'Rejected by ' 
-    END + dbo.wcfLoginVal('N', pendWith)                            AS Status,
-    CONVERT(varchar(11), createDt, 113)                             AS CreateDate
-FROM dptGenExcpn WITH (NOLOCK)
-WHERE {whereClause}
-ORDER BY createDt DESC";
-
-            var parms = new Dictionary<string, object> { ["@LoginId"] = loginId };
-            var rows = _db.WebSessBean(sql, parms) as List<Dictionary<string, object>>
-                      ?? new List<Dictionary<string, object>>();
-
-            // return raw dictionary list or project into a strongly‐typed DTO
-            return Ok(rows);
-        }
-        [HttpGet("getExceptionMetadata")]
-        public IActionResult GetExceptionMetadata([FromQuery] string procType = "N")
-        {
-            try
-            {
-                var raw = _db.WebSessBean(
-                    "SELECT paramCod AS Code, paramDes AS Description " +
-                    " FROM wcmParametr WHERE paramTyp='70' AND paramCod IN('D')",
-                    new Dictionary<string, object>())
-                  as List<Dictionary<string, object>>;
-
-                var exceptions = raw.Select(r => new
-                {
-                    Code = r["Code"].ToString(),
-                    Description = r["Description"].ToString()
-                }).ToList();
-
-                var status = new[]
-                {
-                    new { Code = "A", Description = "Approve" },
-                    new { Code = "R", Description = "Reject" }
-                };
-
-                // pendWith would be resolved same as in JSP
-                var pendWith = "2948";
-
-                return Ok(new
-                {
-                    ExceptionTypes = exceptions,
-                    StatusFlags = status,
-                    PendWith = pendWith
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-    }
-
+Target dart2js failed: ProcessException: Process exited abnormally with exit code 1:
+lib/core/services/contractor_service.dart:127:3:
+Error: Can't have modifier 'static' here.
+  static Future<List<String>> getContractorTypes({bool forceRefresh = false}) async {
+  ^^^^^^
+lib/core/services/contractor_service.dart:154:3:
+Error: Can't have modifier 'static' here.
+  static Future<List<String>> getEmiratesList({bool forceRefresh = false}) async {
+  ^^^^^^
+lib/core/services/contractor_service.dart:185:3:
+Error: Can't have modifier 'static' here.
+  static bool isValidMobileNumber(String mobileNumber) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:191:3:
+Error: Can't have modifier 'static' here.
+  static bool isValidIban(String iban) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:197:3:
+Error: Can't have modifier 'static' here.
+  static bool isValidDate(String date) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:207:3:
+Error: Can't have modifier 'static' here.
+  static String? validateRequiredField(String? value, String fieldName) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:214:3:
+Error: Can't have modifier 'static' here.
+  static String? validateMobileNumber(String? value) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:224:3:
+Error: Can't have modifier 'static' here.
+  static String? validateIban(String? value) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:231:3:
+Error: Can't have modifier 'static' here.
+  static String? validateEmail(String? value) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:245:3:
+Error: Can't have modifier 'static' here.
+  static String formatMobileNumber(String? mobile) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:258:3:
+Error: Can't have modifier 'static' here.
+  static String formatIban(String iban) {
+  ^^^^^^
+lib/core/services/contractor_service.dart:272:3:
+Error: Can't have modifier 'static' here.
+  static void clearCache() {
+  ^^^^^^
+lib/core/services/contractor_service.dart:276:1:
+Error: Expected a declaration, but got '}'.
 }
+^
+lib/features/registration/screens/contractor_registration_screen.dart:107:55:
+Error: Member not found: 'ContractorService.getContractorTypes'.
+      final contractorTypes = await ContractorService.getContractorTypes();
+                                                      ^^^^^^^^^^^^^^^^^^
+lib/features/registration/screens/contractor_registration_screen.dart:108:48:
+Error: Member not found: 'ContractorService.getEmiratesList'.
+      final emirates = await ContractorService.getEmiratesList();
+                                               ^^^^^^^^^^^^^^^
+lib/features/registration/screens/contractor_registration_screen.dart:581:36:
+Error: Member not found: 'ContractorService.validateMobileNumber'.
+          return ContractorService.validateMobileNumber(value);
+                                   ^^^^^^^^^^^^^^^^^^^^
+lib/features/registration/screens/contractor_registration_screen.dart:584:36:
+Error: Member not found: 'ContractorService.validateIban'.
+          return ContractorService.validateIban(value);
+                                   ^^^^^^^^^^^^
+lib/features/registration/screens/contractor_registration_screen.dart:767:43:
+Error: Member not found: 'ContractorService.formatMobileNumber'.
+          mobileNumber: ContractorService.formatMobileNumber(
+                                          ^^^^^^^^^^^^^^^^^^
+lib/features/registration/screens/contractor_registration_screen.dart:783:35:
+Error: Member not found: 'ContractorService.formatIban'.
+              : ContractorService.formatIban(_ibanController.text.trim()),
+                                  ^^^^^^^^^^
+lib/core/services/contractor_service.dart:102:56:
+Error: No named parameter with the name 'stackTrace'.
+    _logger.error('Contractor registration failed', e, stackTrace: st);
+                                                       ^^^^^^^^^^
+lib/core/services/contractor_service.dart:128:9:
+Error: Undefined name '_contractorTypes'.
+    if (_contractorTypes != null && !forceRefresh) return _contractorTypes!;
+        ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:128:59:
+Error: Undefined name '_contractorTypes'.
+    if (_contractorTypes != null && !forceRefresh) return _contractorTypes!;
+                                                          ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:131:7:
+Error: Undefined name '_logger'.
+      _logger.info('Fetching contractor types');
+      ^^^^^^^
+lib/core/services/contractor_service.dart:137:11:
+Error: Setter not found: '_contractorTypes'.
+          _contractorTypes = payload.cast<String>();
+          ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:138:18:
+Error: Undefined name '_contractorTypes'.
+          return _contractorTypes!;
+                 ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:140:11:
+Error: Setter not found: '_contractorTypes'.
+          _contractorTypes = (payload['data'] as List).cast<String>();
+          ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:141:18:
+Error: Undefined name '_contractorTypes'.
+          return _contractorTypes!;
+                 ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:145:7:
+Error: Undefined name '_logger'.
+      _logger.warning('Using fallback contractor types');
+      ^^^^^^^
+lib/core/services/contractor_service.dart:147:7:
+Error: Undefined name '_logger'.
+      _logger.error('Failed to fetch contractor types', e);
+      ^^^^^^^
+lib/core/services/contractor_service.dart:150:5:
+Error: Setter not found: '_contractorTypes'.
+    _contractorTypes = ContractorTypes.all;
+    ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:151:12:
+Error: Undefined name '_contractorTypes'.
+    return _contractorTypes!;
+           ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:155:9:
+Error: Undefined name '_emiratesList'.
+    if (_emiratesList != null && !forceRefresh) return _emiratesList!;
+        ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:155:56:
+Error: Undefined name '_emiratesList'.
+    if (_emiratesList != null && !forceRefresh) return _emiratesList!;
+                                                       ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:158:7:
+Error: Undefined name '_logger'.
+      _logger.info('Fetching emirates list');
+      ^^^^^^^
+lib/core/services/contractor_service.dart:164:11:
+Error: Setter not found: '_emiratesList'.
+          _emiratesList = payload.cast<String>();
+          ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:165:18:
+Error: Undefined name '_emiratesList'.
+          return _emiratesList!;
+                 ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:167:11:
+Error: Setter not found: '_emiratesList'.
+          _emiratesList = (payload['data'] as List).cast<String>();
+          ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:168:18:
+Error: Undefined name '_emiratesList'.
+          return _emiratesList!;
+                 ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:172:7:
+Error: Undefined name '_logger'.
+      _logger.warning('Using fallback emirates list');
+      ^^^^^^^
+lib/core/services/contractor_service.dart:174:7:
+Error: Undefined name '_logger'.
+      _logger.error('Failed to fetch emirates list', e);
+      ^^^^^^^
+lib/core/services/contractor_service.dart:177:5:
+Error: Setter not found: '_emiratesList'.
+    _emiratesList = EmiratesConstants.all;
+    ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:178:12:
+Error: Undefined name '_emiratesList'.
+    return _emiratesList!;
+           ^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:273:5:
+Error: Setter not found: '_contractorTypes'.
+    _contractorTypes = null;
+    ^^^^^^^^^^^^^^^^
+lib/core/services/contractor_service.dart:274:5:
+Error: Setter not found: '_emiratesList'.
+    _emiratesList = null;
+    ^^^^^^^^^^^^^
+/C:/Users/Magan.Dhaniya-mkt/AppData/Local/Pub/Cache/hosted/pub.dev/pdfx-2.9.2/lib/src/renderer/web/pdfjs.dart:136:12:
+Warning: Initializers for parameters are ignored on static interop external functions.
+    double offsetX = 0,
+           ^
+/C:/Users/Magan.Dhaniya-mkt/AppData/Local/Pub/Cache/hosted/pub.dev/pdfx-2.9.2/lib/src/renderer/web/pdfjs.dart:137:12:
+Warning: Initializers for parameters are ignored on static interop external functions.
+    double offsetY = 0,
+           ^
+/C:/Users/Magan.Dhaniya-mkt/AppData/Local/Pub/Cache/hosted/pub.dev/pdfx-2.9.2/lib/src/renderer/web/pdfjs.dart:138:10:
+Warning: Initializers for parameters are ignored on static interop external functions.
+    bool dontFlip = false,
+         ^
+/C:/Users/Magan.Dhaniya-mkt/AppData/Local/Pub/Cache/hosted/pub.dev/pdfx-2.9.2/lib/src/renderer/web/pdfjs.dart:205:12:
+Warning: Initializers for parameters are ignored on static interop external functions.
+    String intent = 'display',
+           ^
+/C:/Users/Magan.Dhaniya-mkt/AppData/Local/Pub/Cache/hosted/pub.dev/pdfx-2.9.2/lib/src/renderer/web/pdfjs.dart:206:10:
+Warning: Initializers for parameters are ignored on static interop external functions.
+    bool enableWebGL = false,
+         ^
+/C:/Users/Magan.Dhaniya-mkt/AppData/Local/Pub/Cache/hosted/pub.dev/pdfx-2.9.2/lib/src/renderer/web/pdfjs.dart:207:10:
+Warning: Initializers for parameters are ignored on static interop external functions.
+    bool renderInteractiveForms = false,
+         ^
+Error: Compilation failed.
+  Command: C:\Users\Magan.Dhaniya-mkt\Downloads\flutter_windows_3.35.3-stable\flutter\bin\cache\dart-sdk\bin\dart.exe
+  compile js
+  --platform-binaries=C:\Users\Magan.Dhaniya-mkt\Downloads\flutter_windows_3.35.3-stable\flutter\bin\cache\flutter_web_s
+  dk\kernel --invoker=flutter_tool -Ddart.vm.product=true -DFLUTTER_VERSION=3.35.3 -DFLUTTER_CHANNEL=stable
+  -DFLUTTER_GIT_URL=https://github.com/flutter/flutter.git -DFLUTTER_FRAMEWORK_REVISION=a402d9a437
+  -DFLUTTER_ENGINE_REVISION=ddf47dd3ff -DFLUTTER_DART_VERSION=3.9.2 -DFLUTTER_WEB_USE_SKIA=true
+  -DFLUTTER_WEB_USE_SKWASM=false
+  -DFLUTTER_WEB_CANVASKIT_URL=https://www.gstatic.com/flutter-canvaskit/ddf47dd3ff96dbde6d9c614db0d7f019d7c7a2b7/
+  --native-null-assertions --no-source-maps -O4 --minify -o
+  D:\Rak_app\.dart_tool\flutter_build\94145e9d16089728364152c7780495e8\app.dill
+  --packages=D:\Rak_app\.dart_tool\package_config.json --cfe-only
+  D:\Rak_app\.dart_tool\flutter_build\94145e9d16089728364152c7780495e8\main.dart
