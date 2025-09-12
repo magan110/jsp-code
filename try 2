@@ -1,769 +1,199 @@
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using RAKControllers.DataAccess;
-using System.ComponentModel.DataAnnotations;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace RAKControllers.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    public class ContractorController : ControllerBase
+    [Produces("application/json")]
+    public class RetailerOnboardingController : ControllerBase
     {
-        private readonly DatabaseHelper _dbHelper;
+        private readonly DatabaseHelper _db;
+        public RetailerOnboardingController(DatabaseHelper dbHelper) => _db = dbHelper;
 
-        public ContractorController(DatabaseHelper dbHelper)
-        {
-            _dbHelper = dbHelper;
-        }
-
+        // POST: api/RetailerOnboarding/register
         [HttpPost("register")]
-        public IActionResult RegisterContractor([FromBody] ContractorRegistrationRequest request = null)
+        [Consumes("application/json")]
+        public IActionResult RegisterRetailer([FromBody] RetailerOnboardingRequest? request = null)
         {
             try
             {
-                // Handle null request gracefully
-                if (request == null)
+                request ??= new RetailerOnboardingRequest();
+
+                // Dates: keep NULL if not provided ("" is invalid for smalldatetime)
+                DateTime? estDate = SafeParseDate(request.EstablishmentDate);
+                DateTime? expDate = SafeParseDate(request.ExpiryDate);
+                DateTime? effvDate = SafeParseDate(request.EffectiveRegistrationDate);
+
+                // Generate retlCode (8 chars)
+                string retlCode = GenerateRetailerCode();
+
+                // Map Flutter → table; everything NOT from Flutter => "" (empty string)
+                var p = new Dictionary<string, object?>
                 {
-                    request = new ContractorRegistrationRequest();
-                }
+                    // Required identity/audit
+                    ["@retlCode"] = retlCode,
+                    ["@sapRtlCd"] = "",       // not in Flutter → ""
+                    ["@createId"] = "",       // not in Flutter → ""
+                    ["@createDt"] = DateTime.Now, // audit we set server-side
+                    ["@isActive"] = "Y",      // default active
 
-                // Insert contractor registration with all optional fields
-                var insertQuery = @"
-                    INSERT INTO CONTRACTORS
-                    (contrtyp, firstnme, middlnme, lastnmee, mobileno, addresss, areaname, emirates, referenc,
-                     profphot, emirfrnt, emirback, emiratid, idholder, datebrth, national, issuedte, exprydte, occupatn, employer,
-                     acchldrn, ibannmbr, bankname, branchnm, bankaddr,
-                     vatcert, firmname, vataddrs, trnnumbr, vatdatee,
-                     licdoc, licnumbr, issauthr, lictypee, estdatee, licexpdt, tradname, respprsn, licaddrs, effdatee,
-                     createdt, isactive)
-                    VALUES
-                    (@contrtyp, @firstnme, @middlnme, @lastnmee, @mobileno, @addresss, @areaname, @emirates, @referenc,
-                     @profphot, @emirfrnt, @emirback, @emiratid, @idholder, @datebrth, @national, @issuedte, @exprydte, @occupatn, @employer,
-                     @acchldrn, @ibannmbr, @bankname, @branchnm, @bankaddr,
-                     @vatcert, @firmname, @vataddrs, @trnnumbr, @vatdatee,
-                     @licdoc, @licnumbr, @issauthr, @lictypee, @estdatee, @licexpdt, @tradname, @respprsn, @licaddrs, @effdatee,
-                     GETDATE(), 'Y');
-                    SELECT SCOPE_IDENTITY();";
+                    // Names / Address (from Flutter or "")
+                    ["@retlName"] = SafeStringOrEmpty(request.FirmName),
+                    ["@retlChNm"] = SafeStringOrEmpty(request.FirmName),
+                    ["@contName"] = SafeStringOrEmpty(request.ResponsiblePerson),
+                    ["@location"] = SafeStringOrEmpty(request.RegisteredAddress),
+                    ["@retlAdd1"] = SafeStringOrEmpty(request.RegisteredAddress),
+                    ["@retlAdd2"] = "",
+                    ["@retlAdd3"] = "",
+                    ["@district"] = "",
+                    ["@retlPinC"] = "",
 
-                // Parse dates safely - use null if parsing fails
-                DateTime? dobParsed = SafeParseDate(request.DateOfBirth);
-                DateTime? emiratesIssueParsed = SafeParseDate(request.EmiratesIdIssueDate);
-                DateTime? emiratesExpiryParsed = SafeParseDate(request.EmiratesIdExpiryDate);
-                DateTime? vatDateParsed = SafeParseDate(request.VatEffectiveDate);
-                DateTime? establishmentDateParsed = SafeParseDate(request.EstablishmentDate);
-                DateTime? licenseExpiryParsed = SafeParseDate(request.LicenseExpiryDate);
-                DateTime? effectiveDateParsed = SafeParseDate(request.EffectiveDate);
+                    // Codes / fixed fields (not in Flutter → "")
+                    ["@custCode"] = "",
+                    ["@areaCode"] = "",
+                    ["@locStxNo"] = "",
+                    ["@retlCatg"] = "",
+                    ["@typeOfBs"] = "",
+                    ["@busSttYr"] = "",
+                    ["@busBwYrs"] = "",
+                    ["@schmAbFL"] = "",
+                    ["@ubsRtlF1"] = "",
 
-                var parameters = new Dictionary<string, object>
-                {
-                    // Personal Details
-                    { "@contrtyp", SafeString(request.ContractorType) },
-                    { "@firstnme", SafeString(request.FirstName) },
-                    { "@middlnme", SafeStringOrNull(request.MiddleName) },
-                    { "@lastnmee", SafeString(request.LastName) },
-                    { "@mobileno", SafeString(request.MobileNumber) },
-                    { "@addresss", SafeString(request.Address) },
-                    { "@areaname", SafeString(request.Area) },
-                    { "@emirates", SafeString(request.Emirates) },
-                    { "@referenc", SafeString(request.Reference) },
-                    { "@profphot", SafeStringOrNull(request.ProfilePhoto) },
+                    // Phones / email (not in Flutter → "")
+                    ["@offTelN1"] = "",
+                    ["@offTelN2"] = "",
+                    ["@mobileNo"] = "",
+                    ["@emailAdd"] = "",
 
-                    // Emirates ID Details
-                    { "@emirfrnt", SafeStringOrNull(request.EmiratesIdFront) },
-                    { "@emirback", SafeStringOrNull(request.EmiratesIdBack) },
-                    { "@emiratid", SafeString(request.EmiratesIdNumber) },
-                    { "@idholder", SafeString(request.IdHolderName) },
-                    { "@datebrth", dobParsed ?? (object)DBNull.Value },
-                    { "@national", SafeString(request.Nationality) },
-                    { "@issuedte", emiratesIssueParsed ?? (object)DBNull.Value },
-                    { "@exprydte", emiratesExpiryParsed ?? (object)DBNull.Value },
-                    { "@occupatn", SafeStringOrNull(request.Occupation) },
-                    { "@employer", SafeStringOrNull(request.Employer) },
+                    // KYC flags (not in Flutter → "")
+                    ["@benfNmFl"] = "",
+                    ["@itxPanNo"] = "",
 
-                    // Bank Details
-                    { "@acchldrn", SafeStringOrNull(request.AccountHolderName) },
-                    { "@ibannmbr", SafeStringOrNull(request.IbanNumber) },
-                    { "@bankname", SafeStringOrNull(request.BankName) },
-                    { "@branchnm", SafeStringOrNull(request.BranchName) },
-                    { "@bankaddr", SafeStringOrNull(request.BankAddress) },
+                    // Bank (map what exists in Flutter; not present → "")
+                    ["@bankAcNo"] = "",
+                    ["@benfName"] = SafeStringOrEmpty(request.AccountHolderName),
+                    ["@bankBnNm"] = SafeStringOrEmpty(request.BranchName),
+                    ["@bankBnDs"] = SafeStringOrEmpty(request.BranchAddress),
+                    ["@bankBnNo"] = "",
+                    ["@bankIFSC"] = "",
+                    ["@ibannmbr"] = SafeStringOrEmpty(request.IbanNumber), // added column
 
-                    // VAT Certificate Details
-                    { "@vatcert", SafeStringOrNull(request.VatCertificate) },
-                    { "@firmname", SafeStringOrNull(request.FirmName) },
-                    { "@vataddrs", SafeStringOrNull(request.VatAddress) },
-                    { "@trnnumbr", SafeStringOrNull(request.TaxRegistrationNumber) },
-                    { "@vatdatee", vatDateParsed ?? (object)DBNull.Value },
+                    // VAT / License (map; dates stay NULL if not supplied)
+                    ["@gstnNumb"] = SafeStringOrEmpty(request.TaxRegistrationNumber),
+                    ["@licnumbr"] = SafeStringOrEmpty(request.LicenseNumber),
+                    ["@issauthr"] = SafeStringOrEmpty(request.IssuingAuthority),
+                    ["@tradname"] = SafeStringOrEmpty(request.TradeName),
+                    ["@respprsn"] = SafeStringOrEmpty(request.ResponsiblePerson),
+                    ["@estdatee"] = (object?)estDate ?? DBNull.Value,
+                    ["@licexpdt"] = (object?)expDate ?? DBNull.Value,
+                    ["@effregdt"] = (object?)effvDate ?? DBNull.Value,
 
-                    // Commercial License Details
-                    { "@licdoc", SafeStringOrNull(request.LicenseDocument) },
-                    { "@licnumbr", SafeString(request.LicenseNumber) },
-                    { "@issauthr", SafeString(request.IssuingAuthority) },
-                    { "@lictypee", SafeString(request.LicenseType) },
-                    { "@estdatee", establishmentDateParsed ?? (object)DBNull.Value },
-                    { "@licexpdt", licenseExpiryParsed ?? (object)DBNull.Value },
-                    { "@tradname", SafeString(request.TradeName) },
-                    { "@respprsn", SafeString(request.ResponsiblePerson) },
-                    { "@licaddrs", SafeString(request.LicenseAddress) },
-                    { "@effdatee", effectiveDateParsed ?? (object)DBNull.Value }
+                    // Location
+                    ["@latitute"] = SafeStringOrEmpty(request.Latitude),
+                    ["@lgtitute"] = SafeStringOrEmpty(request.Longitude),
                 };
 
-                var result = _dbHelper.WebSessBean(insertQuery, parameters);
-
-                var contractorId = result?.FirstOrDefault()?.Values?.FirstOrDefault()?.ToString() ?? "0";
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Contractor registered successfully",
-                    contractorId = contractorId,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                // Even if database fails, return success with error details
-                return Ok(new
-                {
-                    success = false,
-                    message = "Registration completed with warnings",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        [HttpGet("list")]
-        public IActionResult GetContractors([FromQuery] int page = 1, [FromQuery] int pageSize = 10, [FromQuery] string search = "")
-        {
-            try
-            {
-                var offset = Math.Max(0, (page - 1) * Math.Max(1, pageSize));
-                pageSize = Math.Max(1, Math.Min(100, pageSize)); // Limit pageSize
-
-                var searchCondition = string.IsNullOrEmpty(search) ? "" :
-                    "AND (firstnme LIKE @Search OR lastnmee LIKE @Search OR mobileno LIKE @Search OR emiratid LIKE @Search OR contrtyp LIKE @Search)";
-
-                var query = $@"
-                    SELECT contrcid, contrtyp, firstnme, middlnme, lastnmee, mobileno, areaname, emirates,
-                           referenc, emiratid, national, createdt, isactive
-                    FROM CONTRACTORS
-                    WHERE isactive = 'Y' {searchCondition}
-                    ORDER BY createdt DESC
-                    OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@Offset", offset },
-                    { "@PageSize", pageSize }
-                };
-
-                if (!string.IsNullOrEmpty(search))
-                {
-                    parameters.Add("@Search", $"%{search}%");
-                }
-
-                var contractors = _dbHelper.WebSessBean(query, parameters) ?? new List<Dictionary<string, object>>();
-
-                // Get total count
-                var countQuery = $@"
-                    SELECT COUNT(*) as TotalCount
-                    FROM CONTRACTORS
-                    WHERE isactive = 'Y' {searchCondition}";
-
-                var countParams = new Dictionary<string, object>();
-                if (!string.IsNullOrEmpty(search))
-                {
-                    countParams.Add("@Search", $"%{search}%");
-                }
-
-                var countResult = _dbHelper.WebSessBean(countQuery, countParams);
-                var totalCount = countResult?.FirstOrDefault()?["TotalCount"]?.ToString() ?? "0";
-                int.TryParse(totalCount.ToString(), out int total);
-
-                return Ok(new
-                {
-                    success = true,
-                    data = contractors,
-                    pagination = new
-                    {
-                        page = page,
-                        pageSize = pageSize,
-                        totalCount = total,
-                        totalPages = (int)Math.Ceiling((double)total / pageSize)
-                    },
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return Ok(new
-                {
-                    success = false,
-                    data = new List<object>(),
-                    message = "Failed to retrieve contractors",
-                    error = ex.Message,
-                    pagination = new { page = 1, pageSize = 10, totalCount = 0, totalPages = 0 },
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        [HttpGet("{contractorId}")]
-        public IActionResult GetContractor(int contractorId = 0)
-        {
-            try
-            {
-                if (contractorId <= 0)
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "Invalid contractor ID",
-                        data = (object)null,
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                var query = @"
-                    SELECT * FROM CONTRACTORS
-                    WHERE contrcid = @contrcid AND isactive = 'Y'";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@contrcid", contractorId }
-                };
-
-                var result = _dbHelper.WebSessBean(query, parameters);
-
-                if (result == null || result.Count == 0)
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "Contractor not found",
-                        data = (object)null,
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                return Ok(new
-                {
-                    success = true,
-                    data = result[0],
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return Ok(new
-                {
-                    success = false,
-                    message = "Failed to retrieve contractor",
-                    error = ex.Message,
-                    data = (object)null,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        [HttpPut("{contractorId}")]
-        public IActionResult UpdateContractor(int contractorId = 0, [FromBody] ContractorUpdateRequest request = null)
-        {
-            try
-            {
-                if (contractorId <= 0)
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "Invalid contractor ID",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                if (request == null)
-                {
-                    request = new ContractorUpdateRequest();
-                }
-
-                // Check if contractor exists
-                var checkQuery = "SELECT COUNT(*) as Count FROM CONTRACTORS WHERE contrcid = @contrcid AND isactive = 'Y'";
-                var checkParams = new Dictionary<string, object> { { "@contrcid", contractorId } };
-                var checkResult = _dbHelper.WebSessBean(checkQuery, checkParams);
-
-                var count = checkResult?.FirstOrDefault()?["Count"]?.ToString() ?? "0";
-                if (count == "0")
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "Contractor not found",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                // Update contractor
-                var updateQuery = @"
-                    UPDATE CONTRACTORS
-                    SET contrtyp = @contrtyp, firstnme = @firstnme, middlnme = @middlnme, lastnmee = @lastnmee,
-                        mobileno = @mobileno, addresss = @addresss, areaname = @areaname, emirates = @emirates,
-                        referenc = @referenc, national = @national, occupatn = @occupatn, employer = @employer,
-                        acchldrn = @acchldrn, ibannmbr = @ibannmbr, bankname = @bankname, branchnm = @branchnm, bankaddr = @bankaddr,
-                        firmname = @firmname, vataddrs = @vataddrs, trnnumbr = @trnnumbr,
-                        licnumbr = @licnumbr, issauthr = @issauthr, lictypee = @lictypee, tradname = @tradname, respprsn = @respprsn, licaddrs = @licaddrs,
-                        updatedt = GETDATE()
-                    WHERE contrcid = @contrcid";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@contrcid", contractorId },
-                    { "@contrtyp", SafeString(request.ContractorType) },
-                    { "@firstnme", SafeString(request.FirstName) },
-                    { "@middlnme", SafeStringOrNull(request.MiddleName) },
-                    { "@lastnmee", SafeString(request.LastName) },
-                    { "@mobileno", SafeString(request.MobileNumber) },
-                    { "@addresss", SafeString(request.Address) },
-                    { "@areaname", SafeString(request.Area) },
-                    { "@emirates", SafeString(request.Emirates) },
-                    { "@referenc", SafeString(request.Reference) },
-                    { "@national", SafeString(request.Nationality) },
-                    { "@occupatn", SafeStringOrNull(request.Occupation) },
-                    { "@employer", SafeStringOrNull(request.Employer) },
-                    { "@acchldrn", SafeStringOrNull(request.AccountHolderName) },
-                    { "@ibannmbr", SafeStringOrNull(request.IbanNumber) },
-                    { "@bankname", SafeStringOrNull(request.BankName) },
-                    { "@branchnm", SafeStringOrNull(request.BranchName) },
-                    { "@bankaddr", SafeStringOrNull(request.BankAddress) },
-                    { "@firmname", SafeStringOrNull(request.FirmName) },
-                    { "@vataddrs", SafeStringOrNull(request.VatAddress) },
-                    { "@trnnumbr", SafeStringOrNull(request.TaxRegistrationNumber) },
-                    { "@licnumbr", SafeString(request.LicenseNumber) },
-                    { "@issauthr", SafeString(request.IssuingAuthority) },
-                    { "@lictypee", SafeString(request.LicenseType) },
-                    { "@tradname", SafeString(request.TradeName) },
-                    { "@respprsn", SafeString(request.ResponsiblePerson) },
-                    { "@licaddrs", SafeString(request.LicenseAddress) }
-                };
-
-                _dbHelper.WebExecute(updateQuery, parameters);
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Contractor updated successfully",
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return Ok(new
-                {
-                    success = false,
-                    message = "Update completed with warnings",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        [HttpDelete("{contractorId}")]
-        public IActionResult DeleteContractor(int contractorId = 0)
-        {
-            try
-            {
-                if (contractorId <= 0)
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "Invalid contractor ID",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                // Soft delete - set IsActive to 'N'
-                var deleteQuery = @"
-                    UPDATE CONTRACTORS
-                    SET isactive = 'N', updatedt = GETDATE()
-                    WHERE contrcid = @contrcid AND isactive = 'Y'";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@contrcid", contractorId }
-                };
-
-                var rowsAffected = _dbHelper.WebExecute(deleteQuery, parameters);
-
-                return Ok(new
-                {
-                    success = true,
-                    message = rowsAffected > 0 ? "Contractor deleted successfully" : "Contractor not found or already deleted",
-                    rowsAffected = rowsAffected,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return Ok(new
-                {
-                    success = false,
-                    message = "Delete completed with warnings",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        [HttpPost("upload-document")]
-        public IActionResult UploadDocument([FromForm] DocumentUploadRequest request = null)
-        {
-            try
-            {
-                if (request?.File == null || request.File.Length == 0)
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "No file provided",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                // Validate file type
-                var allowedExtensions = new[] { ".jpg", ".jpeg", ".png", ".pdf" };
-                var fileExtension = Path.GetExtension(request.File.FileName)?.ToLowerInvariant() ?? "";
-
-                if (!allowedExtensions.Contains(fileExtension))
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "Invalid file type. Only JPG, PNG, and PDF files are allowed.",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                // Validate file size (10MB limit)
-                if (request.File.Length > 10 * 1024 * 1024)
-                {
-                    return Ok(new
-                    {
-                        success = false,
-                        message = "File size cannot exceed 10MB",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                // Generate unique filename
-                var fileName = $"{Guid.NewGuid()}{fileExtension}";
-                var uploadsPath = Path.Combine(Directory.GetCurrentDirectory(), "uploads", "contractor-documents");
-
-                if (!Directory.Exists(uploadsPath))
-                {
-                    Directory.CreateDirectory(uploadsPath);
-                }
-
-                var filePath = Path.Combine(uploadsPath, fileName);
-
-                // Save file
-                using (var stream = new FileStream(filePath, FileMode.Create))
-                {
-                    request.File.CopyTo(stream);
-                }
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "File uploaded successfully",
-                    fileName = fileName,
-                    filePath = $"/uploads/contractor-documents/{fileName}",
-                    documentType = SafeString(request.DocumentType),
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return Ok(new
-                {
-                    success = false,
-                    message = "Upload completed with warnings",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        [HttpGet("contractor-types")]
-        public IActionResult GetContractorTypes()
-        {
-            var contractorTypes = new[]
-            {
-                "Maintenance Contractor",
-                "Petty contractors"
-            };
-
-            return Ok(new
-            {
-                success = true,
-                data = contractorTypes,
-                timestamp = DateTime.Now
-            });
-        }
-
-        [HttpGet("emirates-list")]
-        public IActionResult GetEmiratesList()
-        {
-            var emirates = new[]
-            {
-                "Dubai",
-                "Abu Dhabi",
-                "Sharjah",
-                "Ajman",
-                "Umm Al Quwain",
-                "Ras Al Khaimah",
-                "Fujairah"
-            };
-
-            return Ok(new
-            {
-                success = true,
-                data = emirates,
-                timestamp = DateTime.Now
-            });
-        }
-
-        // Helper methods for safe data handling
-        private static string SafeString(string input)
-        {
-            return string.IsNullOrWhiteSpace(input) ? "" : input.Trim();
-        }
-
-        private static object SafeStringOrNull(string input)
-        {
-            return string.IsNullOrWhiteSpace(input) ? (object)DBNull.Value : input.Trim();
-        }
-
-        private static DateTime? SafeParseDate(string dateString)
-        {
-            if (string.IsNullOrWhiteSpace(dateString))
-                return null;
-
-            // Try multiple date formats
-            var formats = new[] { "yyyy-MM-dd", "MM/dd/yyyy", "dd/MM/yyyy", "yyyy/MM/dd", "MM-dd-yyyy", "dd-MM-yyyy" };
-
-            foreach (var format in formats)
-            {
-                if (DateTime.TryParseExact(dateString, format, null, System.Globalization.DateTimeStyles.None, out DateTime result))
-                {
-                    return result;
-                }
-            }
-
-            // Fallback to general parsing
-            if (DateTime.TryParse(dateString, out DateTime generalResult))
-            {
-                return generalResult;
-            }
-
-            return null;
-        }
-    }
-
-    // Request Models
-    public class ContractorRegistrationRequest
-    {
-        // Personal Details
-        public string ContractorType { get; set; } = "";
-        public string FirstName { get; set; } = "";
-        public string MiddleName { get; set; } = "";
-        public string LastName { get; set; } = "";
-        public string MobileNumber { get; set; } = "";
-        public string Address { get; set; } = "";
-        public string Area { get; set; } = "";
-        public string Emirates { get; set; } = "";
-        public string Reference { get; set; } = "";
-        public string ProfilePhoto { get; set; } = "";
-
-        // Emirates ID Details
-        public string EmiratesIdFront { get; set; } = "";
-        public string EmiratesIdBack { get; set; } = "";
-        public string EmiratesIdNumber { get; set; } = "";
-        public string IdHolderName { get; set; } = "";
-        public string DateOfBirth { get; set; } = "";
-        public string Nationality { get; set; } = "";
-        public string EmiratesIdIssueDate { get; set; } = "";
-        public string EmiratesIdExpiryDate { get; set; } = "";
-        public string Occupation { get; set; } = "";
-        public string Employer { get; set; } = "";
-
-        // Bank Details
-        public string AccountHolderName { get; set; } = "";
-        public string IbanNumber { get; set; } = "";
-        public string BankName { get; set; } = "";
-        public string BranchName { get; set; } = "";
-        public string BankAddress { get; set; } = "";
-
-        // VAT Certificate Details
-        public string VatCertificate { get; set; } = "";
-        public string FirmName { get; set; } = "";
-        public string VatAddress { get; set; } = "";
-        public string TaxRegistrationNumber { get; set; } = "";
-        public string VatEffectiveDate { get; set; } = "";
-
-        // Commercial License Details
-        public string LicenseDocument { get; set; } = "";
-        public string LicenseNumber { get; set; } = "";
-        public string IssuingAuthority { get; set; } = "";
-        public string LicenseType { get; set; } = "";
-        public string EstablishmentDate { get; set; } = "";
-        public string LicenseExpiryDate { get; set; } = "";
-        public string TradeName { get; set; } = "";
-        public string ResponsiblePerson { get; set; } = "";
-        public string LicenseAddress { get; set; } = "";
-        public string EffectiveDate { get; set; } = "";
-    }
-
-    public class ContractorUpdateRequest
-    {
-        // Personal Details
-        public string ContractorType { get; set; } = "";
-        public string FirstName { get; set; } = "";
-        public string MiddleName { get; set; } = "";
-        public string LastName { get; set; } = "";
-        public string MobileNumber { get; set; } = "";
-        public string Address { get; set; } = "";
-        public string Area { get; set; } = "";
-        public string Emirates { get; set; } = "";
-        public string Reference { get; set; } = "";
-        public string Nationality { get; set; } = "";
-        public string Occupation { get; set; } = "";
-        public string Employer { get; set; } = "";
-
-        // Bank Details
-        public string AccountHolderName { get; set; } = "";
-        public string IbanNumber { get; set; } = "";
-        public string BankName { get; set; } = "";
-        public string BranchName { get; set; } = "";
-        public string BankAddress { get; set; } = "";
-
-        // VAT Details
-        public string FirmName { get; set; } = "";
-        public string VatAddress { get; set; } = "";
-        public string TaxRegistrationNumber { get; set; } = "";
-
-        // Commercial License Details
-        public string LicenseNumber { get; set; } = "";
-        public string IssuingAuthority { get; set; } = "";
-        public string LicenseType { get; set; } = "";
-        public string TradeName { get; set; } = "";
-        public string ResponsiblePerson { get; set; } = "";
-        public string LicenseAddress { get; set; } = "";
-    }
-
-}
-
-
-
-
-
-
-
-
-
-
-
-
--- Create CONTRACTORS table for storing contractor registration data
-CREATE TABLE CONTRACTORS (
-    contrcid INT IDENTITY(1,1) PRIMARY KEY,
-
-    -- Contractor Type
-    contrtyp NVARCHAR(50) NOT NULL,
-
-    -- Personal Details
-    firstnme NVARCHAR(100) NOT NULL,
-    middlnme NVARCHAR(100) NULL,
-    lastnmee NVARCHAR(100) NOT NULL,
-    mobileno NVARCHAR(15) NOT NULL,
-    addresss NVARCHAR(500) NOT NULL,
-    areaname NVARCHAR(100) NOT NULL,
-    emirates NVARCHAR(50) NOT NULL,
-    referenc NVARCHAR(50) NOT NULL,
-
-    -- Document Images
-    profphot NVARCHAR(500) NULL,
-    emirfrnt NVARCHAR(500) NULL,
-    emirback NVARCHAR(500) NULL,
-    vatcert NVARCHAR(500) NULL,
-    licdoc NVARCHAR(500) NULL,
-
-    -- Emirates ID Details
-    emiratid NVARCHAR(20) NOT NULL UNIQUE,
-    idholder NVARCHAR(200) NOT NULL,
-    datebrth DATE NOT NULL,
-    national NVARCHAR(100) NOT NULL,
-    issuedte DATE NOT NULL,
-    exprydte DATE NOT NULL,
-    occupatn NVARCHAR(200) NULL,
-    employer NVARCHAR(500) NULL,
-
-    -- Bank Details (Optional)
-    acchldrn NVARCHAR(200) NULL,
-    ibannmbr NVARCHAR(50) NULL,
-    bankname NVARCHAR(200) NULL,
-    branchnm NVARCHAR(200) NULL,
-    bankaddr NVARCHAR(500) NULL,
-
-    -- VAT Certificate Details (Optional)
-    firmname NVARCHAR(200) NULL,
-    vataddrs NVARCHAR(500) NULL,
-    trnnumbr NVARCHAR(50) NULL,
-    vatdatee DATE NULL,
-
-    -- Commercial License Details
-    licnumbr NVARCHAR(50) NOT NULL,
-    issauthr NVARCHAR(200) NOT NULL,
-    lictypee NVARCHAR(100) NOT NULL,
-    estdatee DATE NOT NULL,
-    licexpdt DATE NOT NULL,
-    tradname NVARCHAR(200) NOT NULL,
-    respprsn NVARCHAR(200) NOT NULL,
-    licaddrs NVARCHAR(500) NOT NULL,
-    effdatee DATE NOT NULL,
-
-    -- System Fields
-    createdt DATETIME DEFAULT GETDATE(),
-    updatedt DATETIME NULL,
-    isactive CHAR(1) DEFAULT 'Y' CHECK (isactive IN ('Y', 'N')),
-
-    -- Indexes for better performance
-    INDEX IX_CONTRACTORS_mobileno (mobileno),
-    INDEX IX_CONTRACTORS_emiratid (emiratid),
-    INDEX IX_CONTRACTORS_isactive (isactive),
-    INDEX IX_CONTRACTORS_createdt (createdt DESC),
-    INDEX IX_CONTRACTORS_contrtyp (contrtyp)
+                var sql = @"
+INSERT INTO dbo.rtmRetailer
+(
+    retlCode, sapRtlCd, retlName, retlChNm, contName, custCode, areaCode, location,
+    retlAdd1, retlAdd2, retlAdd3, district, retlPinC,
+    benfNmFl, bankAcNo, benfName, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    retlCatg, itxPanNo, offTelN1, offTelN2, mobileNo, emailAdd, typeOfBs, busSttYr, busBwYrs,
+    isActive, createId, createDt, locStxNo, schmAbFL, ubsRtlF1,
+    gstnNumb, licnumbr, issauthr, estdatee, licexpdt, tradname, respprsn, effregdt,
+    ibannmbr, latitute, lgtitute
+)
+VALUES
+(
+    @retlCode, @sapRtlCd, @retlName, @retlChNm, @contName, @custCode, @areaCode, @location,
+    @retlAdd1, @retlAdd2, @retlAdd3, @district, @retlPinC,
+    @benfNmFl, @bankAcNo, @benfName, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @retlCatg, @itxPanNo, @offTelN1, @offTelN2, @mobileNo, @emailAdd, @typeOfBs, @busSttYr, @busBwYrs,
+    @isActive, @createId, @createDt, @locStxNo, @schmAbFL, @ubsRtlF1,
+    @gstnNumb, @licnumbr, @issauthr, @estdatee, @licexpdt, @tradname, @respprsn, @effregdt,
+    @ibannmbr, @latitute, @lgtitute
 );
 
--- Add some sample constraints
-ALTER TABLE CONTRACTORS
-ADD CONSTRAINT CK_CONTRACTORS_emirates
-CHECK (emirates IN ('Dubai', 'Abu Dhabi', 'Sharjah', 'Ajman', 'Umm Al Quwain', 'Ras Al Khaimah', 'Fujairah'));
+SELECT @retlCode AS RetailerCode;
+";
 
-ALTER TABLE CONTRACTORS
-ADD CONSTRAINT CK_CONTRACTORS_contrtyp
-CHECK (contrtyp IN ('Maintenance Contractor', 'Petty contractors'));
+                var res = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var code = res.FirstOrDefault()?["RetailerCode"]?.ToString() ?? retlCode;
 
--- Mobile number validation for UAE format
-ALTER TABLE CONTRACTORS
-ADD CONSTRAINT CK_CONTRACTORS_mobileno
-CHECK (mobileno LIKE '[50|52|54|55|56|58][0-9][0-9][0-9][0-9][0-9][0-9][0-9]');
+                return Ok(new
+                {
+                    success = true,
+                    message = "Retailer onboarded successfully",
+                    retailerCode = code,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Onboarding failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
 
--- Emirates ID number validation (15 digits)
-ALTER TABLE CONTRACTORS
-ADD CONSTRAINT CK_CONTRACTORS_emiratid
-CHECK (LEN(emiratid) = 15 AND ISNUMERIC(emiratid) = 1);
+        // -------- helpers --------
+        private static string SafeStringOrEmpty(string? s)
+            => string.IsNullOrWhiteSpace(s) ? "" : s.Trim();
 
--- License number should not be empty
-ALTER TABLE CONTRACTORS
-ADD CONSTRAINT CK_CONTRACTORS_licnumbr
-CHECK (LEN(LTRIM(RTRIM(licnumbr))) > 0);
+        private static DateTime? SafeParseDate(string? dateString)
+        {
+            if (string.IsNullOrWhiteSpace(dateString)) return null;
+            var fmts = new[] { "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
+                               "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy" };
+            foreach (var f in fmts)
+                if (DateTime.TryParseExact(dateString, f, null,
+                    System.Globalization.DateTimeStyles.None, out var dt)) return dt;
+            if (DateTime.TryParse(dateString, out var any)) return any;
+            return null;
+        }
+
+        private static string GenerateRetailerCode()
+        {
+            var n = (int)(DateTime.UtcNow - new DateTime(2020, 1, 1)).TotalSeconds % 9999999;
+            return "R" + n.ToString().PadLeft(7, '0'); // 8 chars
+        }
+    }
+
+    // DTO: only fields that exist in the Flutter code
+    public class RetailerOnboardingRequest
+    {
+        // VAT
+        public string? FirmName { get; set; }
+        public string? TaxRegistrationNumber { get; set; }
+        public string? RegisteredAddress { get; set; }
+        public string? EffectiveRegistrationDate { get; set; }
+
+        // License
+        public string? LicenseNumber { get; set; }
+        public string? IssuingAuthority { get; set; }
+        public string? EstablishmentDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? TradeName { get; set; }
+        public string? ResponsiblePerson { get; set; }
+
+        // Bank
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }     // no column; ignored/empty
+        public string? BranchName { get; set; }
+        public string? BranchAddress { get; set; }
+
+        // Location
+        public string? Latitude { get; set; }
+        public string? Longitude { get; set; }
+    }
+}
