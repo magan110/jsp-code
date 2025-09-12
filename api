@@ -1,332 +1,84 @@
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Linq;
+class RetailerOnboardingRequest {
+  final String? firmName;
+  final String? taxRegistrationNumber;
+  final String? registeredAddress;
+  final String? effectiveRegistrationDate;
 
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class RetailerController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
+  final String? licenseNumber;
+  final String? issuingAuthority;
+  final String? establishmentDate;
+  final String? expiryDate;
+  final String? tradeName;
+  final String? responsiblePerson;
 
-        public RetailerController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
+  final String? accountHolderName;
+  final String? ibanNumber;
+  final String? bankName;       // controller ignores/mapped to "" if not present
+  final String? branchName;
+  final String? branchAddress;
 
-        // POST: api/Retailer/register
-        [HttpPost("register")]
-        public IActionResult Register([FromBody] RetailerRegisterRequest? req = null)
-        {
-            try
-            {
-                req ??= new RetailerRegisterRequest();
+  final String? latitude;
+  final String? longitude;
 
-                // --- sane defaults for NOT NULL columns not present in UI ---
-                // Fixed codes and required flags:
-                var isActive  = string.IsNullOrWhiteSpace(req.isActive) ? "Y" : req.isActive!.Trim(); // char(1)
-                var benfNmFl  = string.IsNullOrWhiteSpace(req.benfNmFl) ? "N" : req.benfNmFl!.Trim(); // char(1)
-                var schmAbFL  = string.IsNullOrWhiteSpace(req.schmAbFL) ? "N" : req.schmAbFL!.Trim(); // char(1)
-                var ubsRtlF1  = string.IsNullOrWhiteSpace(req.ubsRtlF1) ? "N" : req.ubsRtlF1!.Trim(); // char(1)
+  RetailerOnboardingRequest({
+    this.firmName,
+    this.taxRegistrationNumber,
+    this.registeredAddress,
+    this.effectiveRegistrationDate,
+    this.licenseNumber,
+    this.issuingAuthority,
+    this.establishmentDate,
+    this.expiryDate,
+    this.tradeName,
+    this.responsiblePerson,
+    this.accountHolderName,
+    this.ibanNumber,
+    this.bankName,
+    this.branchName,
+    this.branchAddress,
+    this.latitude,
+    this.longitude,
+  });
 
-                // char lengths: pad/trim to exact where needed
-                string FixLen(string? s, int len) {
-                    s = (s ?? "").Trim();
-                    if (s.Length > len) return s.Substring(0, len);
-                    return s;
-                }
+  Map<String, dynamic> toJson() => {
+        "firmName": firmName,
+        "taxRegistrationNumber": taxRegistrationNumber,
+        "registeredAddress": registeredAddress,
+        "effectiveRegistrationDate": effectiveRegistrationDate,
+        "licenseNumber": licenseNumber,
+        "issuingAuthority": issuingAuthority,
+        "establishmentDate": establishmentDate,
+        "expiryDate": expiryDate,
+        "tradeName": tradeName,
+        "responsiblePerson": responsiblePerson,
+        "accountHolderName": accountHolderName,
+        "ibanNumber": ibanNumber,
+        "bankName": bankName,
+        "branchName": branchName,
+        "branchAddress": branchAddress,
+        "latitude": latitude,
+        "longitude": longitude,
+      };
+}
 
-                // map / normalize a few
-                var areaCode = FixLen(req.areaCode, 3);
-                var retlCode = FixLen(req.retlCode, 8);       // if you don’t have it, pass "" and let DB/trigger fill if any
-                var custCode = FixLen(req.custCode, 8);
-                var sapRtlCd = FixLen(req.sapRtlCd, 10);
+class RetailerOnboardingResponse {
+  final bool success;
+  final String message;
+  final String? retailerCode;
 
-                // Required-bank fields (not in UI) -> empty string fallback
-                var bankAcNo = req.bankAcNo ?? "";
-                var benfName = req.benfName ?? (req.firmName ?? "");
-                var bankBnDs = req.bankBnDs ?? "";  // branch district/desc
-                var bankBnNo = req.bankBnNo ?? "";
-                var bankIFSC = req.bankIFSC ?? "";
+  RetailerOnboardingResponse({
+    required this.success,
+    required this.message,
+    this.retailerCode,
+  });
 
-                // Required identity/phones
-                var offTelN1 = req.offTelN1 ?? (req.officeTelephone ?? "");
-                var offTelN2 = req.offTelN2 ?? ""; // fallback empty
-                var emailAdd = req.emailAdd ?? (req.email ?? "");
-                var itxPanNo = req.itxPanNo ?? (req.panNumber ?? "");
-                var mobileNo = req.mobileNo ?? (req.mobile ?? "");
-
-                // More required
-                var retlAdd3 = req.retlAdd3 ?? (req.address3 ?? "-");
-                var district = req.district ?? (req.districtUi ?? "");
-                var retlPinC = req.retlPinC ?? ""; // pin is required — keep empty if you truly don’t have it
-                var retlCatg = string.IsNullOrWhiteSpace(req.retlCatg)
-                    ? (req.retailCategory switch { "Urban" => "U", "Rural" => "R", "Direct Dealer" => "D", _ => "U" })
-                    : req.retlCatg!.Trim();
-
-                var typeOfBs  = req.typeOfBs  ?? "Retail";
-                var busSttYr  = req.busSttYr  ?? DateTime.Now.Year.ToString().PadLeft(4, '0');
-                var busBwYrs  = req.busBwYrs  ?? "0000";
-                var locStxNo  = req.locStxNo  ?? (req.stockistCode ?? "");  // NOT NULL
-                var createId  = string.IsNullOrWhiteSpace(req.createId) ? "web" : req.createId!;
-                var createDt  = DateTime.Now;
-
-                // Optional (NULLable) values:
-                object? OrDbNull(string? v) => string.IsNullOrWhiteSpace(v) ? (object?)DBNull.Value : v.Trim();
-
-                var sql = @"
-INSERT INTO dbo.rtmRetailer
-(
-    retlCode, sapRtlCd, retlName, retlChNm, contName, custCode, areaCode, location,
-    cityName, mrktName, retlAdd1, retlAdd2, retlAdd3, district, retlPinC,
-    benfNmFl, bankAcNo, benfName, bankBnNm, bankBnDs, bankBnNo, bankIFSC, ifscCtNm,
-    retlCatg, panGstFl, itxPanNo, gstnNumb, idCardTy, idCardNo, kycVerFl, kycVerDt,
-    bnkKycFl, bnkKycDt, concEmpl, offTelN1, offTelN2, mobileNo, emailAdd,
-    typeOfBs, busSttYr, busBwYrs, pntNptTy, isActive, createId, createDt, updateId, updateDt,
-    locStxNo, retlClss, rtDocCnt, schmAbFL, exclUpld, sapInsDt, sapUpdDt, retRefNo, adhrName, panCName,
-    schmEfDt, uniqueCd, locaCapr, latitute, lgtitute, cenLoctn, cenPopln, ubsRtlFl, retlType, refDDCod,
-    schmEmpl, retlTrSt, retlCtCh, locUpdNo, finlRermk, rtlCtInd, rtlCtgBw, retlInCt, cityCode, lstLocDt,
-    lstLcUsr, alliedCd, posiCode, ubsRtlF1, sistrCnF
-)
-VALUES
-(
-    @retlCode, @sapRtlCd, @retlName, @retlChNm, @contName, @custCode, @areaCode, @location,
-    @cityName, @mrktName, @retlAdd1, @retlAdd2, @retlAdd3, @district, @retlPinC,
-    @benfNmFl, @bankAcNo, @benfName, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC, @ifscCtNm,
-    @retlCatg, @panGstFl, @itxPanNo, @gstnNumb, @idCardTy, @idCardNo, @kycVerFl, @kycVerDt,
-    @bnkKycFl, @bnkKycDt, @concEmpl, @offTelN1, @offTelN2, @mobileNo, @emailAdd,
-    @typeOfBs, @busSttYr, @busBwYrs, @pntNptTy, @isActive, @createId, @createDt, @updateId, @updateDt,
-    @locStxNo, @retlClss, @rtDocCnt, @schmAbFL, @exclUpld, @sapInsDt, @sapUpdDt, @retRefNo, @adhrName, @panCName,
-    @schmEfDt, @uniqueCd, @locaCapr, @latitute, @lgtitute, @cenLoctn, @cenPopln, @ubsRtlFl, @retlType, @refDDCod,
-    @schmEmpl, @retlTrSt, @retlCtCh, @locUpdNo, @finlRermk, @rtlCtInd, @rtlCtgBw, @retlInCt, @cityCode, @lstLocDt,
-    @lstLcUsr, @alliedCd, @posiCode, @ubsRtlF1, @sistrCnF
-);
-
-SELECT SCOPE_IDENTITY() AS NewId;";
-
-                var p = new Dictionary<string, object?>
-                {
-                    // required identities / names from UI
-                    ["@retlCode"]  = retlCode,                       // if you generate server-side, replace with code
-                    ["@sapRtlCd"]  = sapRtlCd,
-                    ["@retlName"]  = req.firmName ?? "",             // store as Retailer Name
-                    ["@retlChNm"]  = req.firmName ?? "",             // channel name -> same as firm for now
-                    ["@contName"]  = req.proprietorName ?? "",       // contact name
-                    ["@custCode"]  = custCode,
-                    ["@areaCode"]  = areaCode,
-                    ["@location"]  = req.area ?? "",                 // UI Area as location
-
-                    ["@cityName"]  = OrDbNull(req.cityName),
-                    ["@mrktName"]  = OrDbNull(req.marketName),
-                    ["@retlAdd1"]  = OrDbNull(req.address1),
-                    ["@retlAdd2"]  = OrDbNull(req.address2),
-                    ["@retlAdd3"]  = retlAdd3,
-                    ["@district"]  = district,
-                    ["@retlPinC"]  = retlPinC,
-
-                    ["@benfNmFl"]  = benfNmFl,
-                    ["@bankAcNo"]  = bankAcNo,
-                    ["@benfName"]  = benfName,
-                    ["@bankBnNm"]  = OrDbNull(req.bankBranchName),
-                    ["@bankBnDs"]  = bankBnDs,
-                    ["@bankBnNo"]  = bankBnNo,
-                    ["@bankIFSC"]  = bankIFSC,
-                    ["@ifscCtNm"]  = OrDbNull(req.ifscCityName),
-
-                    ["@retlCatg"]  = retlCatg,
-                    ["@panGstFl"]  = OrDbNull(req.panGstFlag),       // 'P'/'G' or 'Y'/'N'
-                    ["@itxPanNo"]  = itxPanNo,
-                    ["@gstnNumb"]  = OrDbNull(req.gstNumber),
-                    ["@idCardTy"]  = OrDbNull(req.idCardType),
-                    ["@idCardNo"]  = OrDbNull(req.aadharNumber),
-                    ["@kycVerFl"]  = OrDbNull(req.kycVerifiedFlag),
-                    ["@kycVerDt"]  = (object?)req.kycVerifiedDate ?? DBNull.Value,
-
-                    ["@bnkKycFl"]  = OrDbNull(req.bankKycFlag),
-                    ["@bnkKycDt"]  = (object?)req.bankKycDate ?? DBNull.Value,
-                    ["@concEmpl"]  = OrDbNull(req.concernEmployee),
-                    ["@offTelN1"]  = offTelN1,
-                    ["@offTelN2"]  = offTelN2,
-                    ["@mobileNo"]  = mobileNo,
-                    ["@emailAdd"]  = emailAdd,
-
-                    ["@typeOfBs"]  = typeOfBs,
-                    ["@busSttYr"]  = busSttYr,
-                    ["@busBwYrs"]  = busBwYrs,
-                    ["@pntNptTy"]  = OrDbNull(req.painterNptType),
-                    ["@isActive"]  = isActive,
-                    ["@createId"]  = createId,
-                    ["@createDt"]  = createDt,
-                    ["@updateId"]  = DBNull.Value,
-                    ["@updateDt"]  = DBNull.Value,
-
-                    ["@locStxNo"]  = locStxNo,
-                    ["@retlClss"]  = OrDbNull(req.retailClass),
-                    ["@rtDocCnt"]  = DBNull.Value,
-                    ["@schmAbFL"]  = schmAbFL,
-                    ["@exclUpld"]  = OrDbNull(req.excludeUploadFlag),
-                    ["@sapInsDt"]  = DBNull.Value,
-                    ["@sapUpdDt"]  = DBNull.Value,
-                    ["@retRefNo"]  = OrDbNull(req.retailRefNo),
-                    ["@adhrName"]  = OrDbNull(req.aadharName),
-                    ["@panCName"]  = OrDbNull(req.panCardName),
-
-                    ["@schmEfDt"]  = DBNull.Value,
-                    ["@uniqueCd"]  = OrDbNull(req.uniqueCode),
-                    ["@locaCapr"]  = OrDbNull(req.locationCapacity),  // long text ok
-                    ["@latitute"]  = OrDbNull(req.latitude),
-                    ["@lgtitute"]  = OrDbNull(req.longitude),
-                    ["@cenLoctn"]  = OrDbNull(req.centerLocation),
-                    ["@cenPopln"]  = DBNull.Value,
-                    ["@ubsRtlFl"]  = OrDbNull(req.ubsRetailFlag),
-                    ["@retlType"]  = OrDbNull(req.retailType),
-                    ["@refDDCod"]  = OrDbNull(req.refDDCode),
-
-                    ["@schmEmpl"]  = OrDbNull(req.schemeEmployee),
-                    ["@retlTrSt"]  = OrDbNull(req.retailTrStatus),
-                    ["@retlCtCh"]  = OrDbNull(req.retailCtChange),
-                    ["@locUpdNo"]  = DBNull.Value,
-                    ["@finlRermk"] = OrDbNull(req.finalRemark),
-                    ["@rtlCtInd"]  = OrDbNull(req.rtlCtInd),
-                    ["@rtlCtgBw"]  = OrDbNull(req.rtlCtgBw),
-                    ["@retlInCt"]  = OrDbNull(req.retailInCt),
-                    ["@cityCode"]  = OrDbNull(req.cityCode),
-                    ["@lstLocDt"]  = DBNull.Value,
-
-                    ["@lstLcUsr"]  = OrDbNull(req.lastLocUser),
-                    ["@alliedCd"]  = OrDbNull(req.alliedCode),
-                    ["@posiCode"]  = OrDbNull(req.posiCode),
-                    ["@ubsRtlF1"]  = ubsRtlF1,
-                    ["@sistrCnF"]  = OrDbNull(req.sisterConcernFlag),
-                };
-
-                var res = _db.WebSessBean(sql, p);
-                var newId = res?.FirstOrDefault()?["NewId"]?.ToString();
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Retailer registered successfully",
-                    retailerId = newId,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Retailer registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-    }
-
-    // DTO lining up with Flutter fields, plus DB-only fields you may send as "".
-    public class RetailerRegisterRequest
-    {
-        // From UI
-        public string? processType { get; set; }             // Add/Update (not stored)
-        public string? retailCategory { get; set; }          // mapped -> retlCatg (U/R/D)
-        public string? area { get; set; }                    // -> location
-        public string? districtUi { get; set; }              // -> district if district not sent
-        public string? gstNumber { get; set; }               // -> gstnNumb
-        public string? panNumber { get; set; }               // -> itxPanNo
-        public string? mobile { get; set; }                  // -> mobileNo
-        public string? address1 { get; set; }                // -> retlAdd1
-        public string? address2 { get; set; }                // -> retlAdd2
-        public string? address3 { get; set; }                // -> retlAdd3
-        public string? firmName { get; set; }                // -> retlName/retlChNm
-        public string? officeTelephone { get; set; }         // -> offTelN1
-        public string? email { get; set; }                   // -> emailAdd
-        public string? tallyRetailerCode { get; set; }       // (optional)
-        public string? concernEmployee { get; set; }         // -> concEmpl
-        public string? aadharNumber { get; set; }            // -> idCardNo
-        public string? proprietorName { get; set; }          // -> contName
-        public string? schemeRequired { get; set; }          // (optional UI)
-
-        // Server/DB-bound (you can fill many with "")
-        public string? retlCode { get; set; }
-        public string? sapRtlCd { get; set; }
-        public string? contName { get; set; }
-        public string? custCode { get; set; }
-        public string? areaCode { get; set; }
-        public string? location { get; set; }
-        public string? cityName { get; set; }
-        public string? mrktName { get; set; }
-        public string? retlAdd1 { get; set; }
-        public string? retlAdd2 { get; set; }
-        public string? retlAdd3 { get; set; }
-        public string? district { get; set; }
-        public string? retlPinC { get; set; }
-
-        public string? benfNmFl { get; set; }
-        public string? bankAcNo { get; set; }
-        public string? benfName { get; set; }
-        public string? bankBnNm { get; set; }
-        public string? bankBnDs { get; set; }
-        public string? bankBnNo { get; set; }
-        public string? bankIFSC { get; set; }
-        public string? ifscCtNm { get; set; }
-
-        public string? retlCatg { get; set; }
-        public string? panGstFl { get; set; }
-        public string? itxPanNo { get; set; }
-        public string? idCardType { get; set; }
-        public string? kycVerifiedFlag { get; set; }
-        public DateTime? kycVerifiedDate { get; set; }
-        public string? bankKycFlag { get; set; }
-        public DateTime? bankKycDate { get; set; }
-        public string? concEmpl { get; set; }
-        public string? offTelN1 { get; set; }
-        public string? offTelN2 { get; set; }
-        public string? mobileNo { get; set; }
-        public string? emailAdd { get; set; }
-
-        public string? typeOfBs { get; set; }
-        public string? busSttYr { get; set; }
-        public string? busBwYrs { get; set; }
-        public string? pntNptTy { get; set; }
-        public string? isActive { get; set; }
-        public string? createId { get; set; }
-        public string? updateId { get; set; }
-        public string? locStxNo { get; set; }
-        public string? retailClass { get; set; }
-        public string? excludeUploadFlag { get; set; }
-        public string? retailRefNo { get; set; }
-        public string? aadharName { get; set; }
-        public string? panCardName { get; set; }
-        public string? uniqueCode { get; set; }
-        public string? locationCapacity { get; set; } // locaCapr (MAX)
-        public string? latitude { get; set; }
-        public string? longitude { get; set; }
-        public string? centerLocation { get; set; }
-        public string? ubsRetailFlag { get; set; }
-        public string? retailType { get; set; }
-        public string? refDDCode { get; set; }
-        public string? schemeEmployee { get; set; }
-        public string? retailTrStatus { get; set; }
-        public string? retailCtChange { get; set; }
-        public string? finalRemark { get; set; }
-        public string? rtlCtInd { get; set; }
-        public string? rtlCtgBw { get; set; }
-        public string? retailInCt { get; set; }
-        public string? cityCode { get; set; }
-        public string? lastLocUser { get; set; }
-        public string? alliedCode { get; set; }
-        public string? posiCode { get; set; }
-        public string? ubsRtlF1 { get; set; }
-        public string? sisterConcernFlag { get; set; }
-
-        // Convenience: stockist code from UI read-only field
-        public string? stockistCode { get; set; }
-    }
+  factory RetailerOnboardingResponse.fromJson(Map<String, dynamic> json) {
+    return RetailerOnboardingResponse(
+      success: json["success"] == true,
+      message: (json["message"] ?? "").toString(),
+      retailerCode: json["retailerCode"]?.toString(),
+    );
+  }
 }
 
 
@@ -334,346 +86,223 @@ SELECT SCOPE_IDENTITY() AS NewId;";
 
 
 
-retailer_service.dart
+
+
+// lib/core/services/retailer_onboarding_service.dart
+// ignore_for_file: avoid_print
 
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
-class RetailerService {
-  static const String _base = 'http://10.4.64.23:8521';
-
-  static Future<_RetailerRegisterResponse> registerRetailer(
-      RetailerRegisterRequest req) async {
-    final url = Uri.parse('$_base/api/Retailer/register');
-    final res = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode(req.toJson()),
-    );
-
-    if (res.statusCode == 200) {
-      final m = jsonDecode(res.body) as Map<String, dynamic>;
-      return _RetailerRegisterResponse(
-        success: m['success'] == true,
-        message: m['message']?.toString() ?? '',
-        retailerId: m['retailerId']?.toString(),
-      );
-    } else {
-      throw Exception('Register failed: ${res.statusCode} ${res.body}');
-    }
-  }
-}
-
-class _RetailerRegisterResponse {
-  final bool success;
-  final String message;
-  final String? retailerId;
-  _RetailerRegisterResponse({
-    required this.success,
-    required this.message,
-    this.retailerId,
+class RetailerOnboardingRequest {
+  RetailerOnboardingRequest({
+    this.firmName,
+    this.taxRegistrationNumber,
+    this.registeredAddress,
+    this.effectiveRegistrationDate,
+    this.licenseNumber,
+    this.issuingAuthority,
+    this.establishmentDate,
+    this.expiryDate,
+    this.tradeName,
+    this.responsiblePerson,
+    this.accountHolderName,
+    this.ibanNumber,
+    this.bankName,
+    this.branchName,
+    this.branchAddress,
+    this.latitude,
+    this.longitude,
   });
-}
 
-class RetailerRegisterRequest {
-  // -------- UI fields --------
-  String? processType;
-  String? retailCategory;       // 'Urban'|'Rural'|'Direct Dealer'
-  String? area;                 // -> location
-  String? districtUi;
-  String? gstNumber;
-  String? panNumber;
-  String? mobile;
-  String? address1;
-  String? address2;
-  String? address3;
+  // VAT
   String? firmName;
-  String? officeTelephone;
-  String? email;
-  String? tallyRetailerCode;
-  String? concernEmployee;
-  String? aadharNumber;
-  String? proprietorName;
-  String? schemeRequired;
+  String? taxRegistrationNumber;
+  String? registeredAddress;
+  String? effectiveRegistrationDate;
 
-  // ------- DB-required proxies / codes -------
-  String? retlCode = '';   // if server generates, leave empty
-  String? sapRtlCd = '';
-  String? custCode = '';
-  String? areaCode = '';   // 3-char (pass actual if you have it)
-  String? cityName;
-  String? mrktName;
+  // Trade License
+  String? licenseNumber;
+  String? issuingAuthority;
+  String? establishmentDate;
+  String? expiryDate;
+  String? tradeName;
+  String? responsiblePerson;
 
-  // Non-null required (filled empty/“N” server-side if null)
-  String? retlPinC = '';       // pincode if you capture; else ''
-  String? benfNmFl = 'N';
-  String? bankAcNo = '';
-  String? benfName;
-  String? bankBnDs = '';
-  String? bankBnNo = '';
-  String? bankIFSC = '';
-  String? retlCatg;            // server maps from retailCategory if null
-  String? itxPanNo;
-  String? offTelN1;
-  String? offTelN2 = '';
-  String? mobileNo;
-  String? emailAdd;
-  String? typeOfBs = 'Retail';
-  String? busSttYr;
-  String? busBwYrs = '0000';
-  String? isActive = 'Y';
-  String? createId = 'app';
-  String? locStxNo = '';       // stockist code (from UI predefined)
+  // Bank
+  String? accountHolderName;
+  String? ibanNumber;
+  String? bankName;
+  String? branchName;
+  String? branchAddress;
 
-  // Optional/nullable
-  String? bankBnNm;
-  String? ifscCtNm;
-  String? panGstFl;
-  String? idCardType;
-  String? kycVerifiedFlag;
-  DateTime? kycVerifiedDate;
-  String? bankKycFlag;
-  DateTime? bankKycDate;
-  String? pntNptTy;
-  String? updateId;
-  String? retailClass;
-  String? excludeUploadFlag;
-  String? retailRefNo;
-  String? aadharName;
-  String? panCardName;
-  String? uniqueCode;
-  String? locationCapacity;
+  // Location
   String? latitude;
   String? longitude;
-  String? centerLocation;
-  String? ubsRetailFlag;
-  String? retailType;
-  String? refDDCode;
-  String? schemeEmployee;
-  String? retailTrStatus;
-  String? retailCtChange;
-  String? finalRemark;
-  String? rtlCtInd;
-  String? rtlCtgBw;
-  String? retailInCt;
-  String? cityCode;
-  String? lastLocUser;
-  String? alliedCode;
-  String? posiCode;
-  String? ubsRtlF1 = 'N';
-  String? sisterConcernFlag;
 
-  String? stockistCode = '4401S711'; // from your UI
-
-  Map<String, dynamic> toJson() {
-    String? mapCat(String? c) {
-      switch (c) {
-        case 'Urban': return 'U';
-        case 'Rural': return 'R';
-        case 'Direct Dealer': return 'D';
-        default: return null;
-      }
-    }
-
+  // send empty string for null/empty fields (your requirement)
+  Map<String, dynamic> toJsonSanitized() {
+    String s(String? v) => (v == null || v.trim().isEmpty) ? "" : v.trim();
     return {
-      // UI direct
-      'processType': processType,
-      'retailCategory': retailCategory,
-      'area': area,
-      'districtUi': districtUi,
-      'gstNumber': gstNumber,
-      'panNumber': panNumber,
-      'mobile': mobile,
-      'address1': address1,
-      'address2': address2,
-      'address3': address3,
-      'firmName': firmName,
-      'officeTelephone': officeTelephone,
-      'email': email,
-      'tallyRetailerCode': tallyRetailerCode,
-      'concernEmployee': concernEmployee,
-      'aadharNumber': aadharNumber,
-      'proprietorName': proprietorName,
-      'schemeRequired': schemeRequired,
-
-      // DB related (server will still default/clean)
-      'retlCode': retlCode ?? '',
-      'sapRtlCd': sapRtlCd ?? '',
-      'custCode': custCode ?? '',
-      'areaCode': areaCode ?? '',
-      'cityName': cityName,
-      'mrktName': mrktName,
-
-      'retlPinC': retlPinC ?? '',
-      'benfNmFl': benfNmFl ?? 'N',
-      'bankAcNo': bankAcNo ?? '',
-      'benfName': benfName ?? (firmName ?? ''),
-      'bankBnDs': bankBnDs ?? '',
-      'bankBnNo': bankBnNo ?? '',
-      'bankIFSC': bankIFSC ?? '',
-      'retlCatg': mapCat(retailCategory),
-
-      'itxPanNo': itxPanNo ?? panNumber,
-      'offTelN1': offTelN1 ?? officeTelephone,
-      'offTelN2': offTelN2 ?? '',
-      'mobileNo': mobileNo ?? mobile,
-      'emailAdd': emailAdd ?? email,
-      'typeOfBs': typeOfBs ?? 'Retail',
-      'busSttYr': busSttYr ?? DateTime.now().year.toString(),
-      'busBwYrs': busBwYrs ?? '0000',
-      'isActive': isActive ?? 'Y',
-      'createId': createId ?? 'app',
-      'locStxNo': locStxNo ?? stockistCode,
-
-      // Optionals
-      'bankBnNm': bankBnNm,
-      'ifscCtNm': ifscCtNm,
-      'panGstFl': panGstFl,
-      'idCardType': idCardType,
-      'kycVerifiedFlag': kycVerifiedFlag,
-      'kycVerifiedDate': kycVerifiedDate?.toIso8601String(),
-      'bankKycFlag': bankKycFlag,
-      'bankKycDate': bankKycDate?.toIso8601String(),
-      'pntNptTy': pntNptTy,
-      'updateId': updateId,
-      'retailClass': retailClass,
-      'excludeUploadFlag': excludeUploadFlag,
-      'retailRefNo': retailRefNo,
-      'aadharName': aadharName,
-      'panCardName': panCardName,
-      'uniqueCode': uniqueCode,
-      'locationCapacity': locationCapacity,
-      'latitude': latitude,
-      'longitude': longitude,
-      'centerLocation': centerLocation,
-      'ubsRetailFlag': ubsRetailFlag,
-      'retailType': retailType,
-      'refDDCode': refDDCode,
-      'schemeEmployee': schemeEmployee,
-      'retailTrStatus': retailTrStatus,
-      'retailCtChange': retailCtChange,
-      'finalRemark': finalRemark,
-      'rtlCtInd': rtlCtInd,
-      'rtlCtgBw': rtlCtgBw,
-      'retailInCt': retailInCt,
-      'cityCode': cityCode,
-      'lastLocUser': lastLocUser,
-      'alliedCode': alliedCode,
-      'posiCode': posiCode,
-      'ubsRtlF1': ubsRtlF1 ?? 'N',
-      'sisterConcernFlag': sisterConcernFlag,
-
-      // convenience
-      'stockistCode': stockistCode,
-      'district': districtUi, // send if you want server to take this
+      "firmName": s(firmName),
+      "taxRegistrationNumber": s(taxRegistrationNumber),
+      "registeredAddress": s(registeredAddress),
+      "effectiveRegistrationDate": s(effectiveRegistrationDate),
+      "licenseNumber": s(licenseNumber),
+      "issuingAuthority": s(issuingAuthority),
+      "establishmentDate": s(establishmentDate),
+      "expiryDate": s(expiryDate),
+      "tradeName": s(tradeName),
+      "responsiblePerson": s(responsiblePerson),
+      "accountHolderName": s(accountHolderName),
+      "ibanNumber": s(ibanNumber),
+      "bankName": s(bankName),
+      "branchName": s(branchName),
+      "branchAddress": s(branchAddress),
+      "latitude": s(latitude),
+      "longitude": s(longitude),
     };
   }
 }
 
+class RetailerOnboardingResponse {
+  final bool success;
+  final String message;
+  final String? retailerCode;
 
+  RetailerOnboardingResponse({
+    required this.success,
+    required this.message,
+    this.retailerCode,
+  });
 
+  factory RetailerOnboardingResponse.fail(String msg) =>
+      RetailerOnboardingResponse(success: false, message: msg);
+}
 
+class RetailerOnboardingService {
+  static const String _base = 'http://10.4.64.23:8521';
+  static const String _path = '/api/RetailerOnboarding/register';
 
+  static Future<RetailerOnboardingResponse> register(
+    RetailerOnboardingRequest req,
+  ) async {
+    final url = Uri.parse('$_base$_path');
+    final body = jsonEncode(req.toJsonSanitized());
 
+    print('[RetailerOnboarding] POST $url');
+    print('[RetailerOnboarding] BODY $body');
 
+    http.Response resp;
+    try {
+      resp = await http.post(
+        url,
+        headers: const {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: body,
+      );
+    } catch (e) {
+      return RetailerOnboardingResponse.fail('Network error: $e');
+    }
 
-
-
--- 1) Tally Retailer Code (from your form)
-ALTER TABLE dbo.rtmRetailer
-ADD tlyrtlcd VARCHAR(20) NULL;   -- 8-char column name
-
--- 2) Process Type (Add/Update) – optional audit of the user’s intent
-ALTER TABLE dbo.rtmRetailer
-ADD prcstype CHAR(1) NULL;       -- 8-char column name, e.g. 'A' or 'U'
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import 'dart:convert';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
-
-import '../../../screens/home_screen.dart';
-import '../../../core/widgets/file_upload_widget.dart';
-import '../../../core/widgets/modern_dropdown.dart';
-
-class RetailerRegistration extends StatelessWidget {
-  const RetailerRegistration({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return const RetailerRegistrationPage();
+    if (resp.statusCode >= 200 && resp.statusCode < 300) {
+      try {
+        final map = jsonDecode(resp.body) as Map<String, dynamic>;
+        final ok = (map['success'] == true) ||
+            (map['status']?.toString().toLowerCase() == 'ok');
+        return RetailerOnboardingResponse(
+          success: ok,
+          message: map['message']?.toString() ?? 'OK',
+          retailerCode:
+              map['retlCode']?.toString() ?? map['retailerCode']?.toString(),
+        );
+      } catch (_) {
+        return RetailerOnboardingResponse(success: true, message: 'Registered');
+      }
+    } else {
+      String msg = 'HTTP ${resp.statusCode}';
+      try {
+        final map = jsonDecode(resp.body) as Map<String, dynamic>;
+        msg = map['message']?.toString() ?? map['error']?.toString() ?? msg;
+      } catch (_) {}
+      return RetailerOnboardingResponse.fail(msg);
+    }
   }
 }
 
-class RetailerRegistrationPage extends StatefulWidget {
-  const RetailerRegistrationPage({super.key});
 
-  @override
-  State<RetailerRegistrationPage> createState() =>
-      _RetailerRegistrationPageState();
+
+
+
+
+
+
+
+
+
+
+// lib/features/retail/screens/retailer_onboarding_screen.dart
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:web/web.dart' as web;
+import 'dart:js_interop';
+
+// IMPORTANT: service import (use your real package name from pubspec.yaml)
+import 'package:rak_web/core/services/retailer_onboarding_service.dart';
+
+@JS()
+@staticInterop
+class WindowWithGeoLocation {}
+
+extension WindowGeoLocationExtension on WindowWithGeoLocation {
+  external JSPromise<JSAny?> requestGeoPosition();
 }
 
-class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
+class RetailerOnboardingApp extends StatefulWidget {
+  const RetailerOnboardingApp({super.key});
+
+  @override
+  State<RetailerOnboardingApp> createState() =>
+      _RetailerOnboardingAppState();
+}
+
+class _RetailerOnboardingAppState extends State<RetailerOnboardingApp>
     with TickerProviderStateMixin {
   final _formKey = GlobalKey<FormState>();
-  String? _areasCode;
-  List<String>? _areas;
-  List<String>? _states;
+  final bool _isVATRequired = true;
+  bool _isSubmitting = false;
+  bool _isGettingLocation = false;
 
-  // Upload widget variables (not sent to API per your rule)
-  String? _retailerProfileImage;
-  String? _panGstImage;
-  String? _aadharImage;
+  // Controllers
+  final firmNameController = TextEditingController();
+  final taxRegNumberController = TextEditingController();
+  final registeredAddressController = TextEditingController();
+  final effectiveDateController = TextEditingController();
 
-  // Form controllers
-  TextEditingController ProcesTp = TextEditingController(); // Add/Update
-  TextEditingController retailCat = TextEditingController(); // Urban/Rural/Direct Dealer
-  TextEditingController Area = TextEditingController();
-  TextEditingController District = TextEditingController();
-  TextEditingController GST = TextEditingController();
-  TextEditingController PAN = TextEditingController();
-  TextEditingController Mobile = TextEditingController();
-  TextEditingController Address = TextEditingController();
-  TextEditingController Scheme = TextEditingController();
-  TextEditingController firmNameController = TextEditingController();
-  TextEditingController officeTelephoneController = TextEditingController();
-  TextEditingController emailController = TextEditingController();
-  TextEditingController address2Controller = TextEditingController();
-  TextEditingController address3Controller = TextEditingController();
-  TextEditingController tallyRetailerCodeController = TextEditingController(); // NEW FIELD
-  TextEditingController concernEmployeeController = TextEditingController();
-  TextEditingController aadharCardController = TextEditingController();
-  TextEditingController proprietorNameController = TextEditingController();
+  final licenseNumberController = TextEditingController();
+  final issuingAuthorityController = TextEditingController();
+  final establishmentDateController = TextEditingController();
+  final expiryDateController = TextEditingController();
+  final tradeNameController = TextEditingController();
+  final responsiblePersonController = TextEditingController();
 
-  // Animations
+  final accountNameController = TextEditingController();
+  final ibanController = TextEditingController();
+  final bankNameController = TextEditingController();
+  final branchNameController = TextEditingController();
+  final branchAddressController = TextEditingController();
+
+  final latitudeController = TextEditingController();
+  final longitudeController = TextEditingController();
+
+  // Animation
   AnimationController? _mainController;
   AnimationController? _fabController;
   Animation<double>? _fadeAnimation;
   Animation<Offset>? _slideAnimation;
   Animation<double>? _scaleAnimation;
-
-  bool _isSubmitting = false;
-  String? selectedOption;
-
-  Future<String> retailCodes(String cat) async {
-    final categoryMap = {'Urban': 'URB', 'Rural': 'RUR', 'Direct Dealer': 'DDR'};
-    return categoryMap[cat] ?? '';
-  }
 
   @override
   void initState() {
@@ -694,169 +323,137 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
     );
     _slideAnimation =
         Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-          CurvedAnimation(
-            parent: _mainController!,
-            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-          ),
-        );
+      CurvedAnimation(
+        parent: _mainController!,
+        curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+      ),
+    );
     _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
       CurvedAnimation(
         parent: _mainController!,
         curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
       ),
     );
+
     _mainController?.forward();
     _fabController?.forward();
-  }
 
-  void _showError(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.warning, color: Colors.white, size: 20),
-            const SizedBox(width: 8),
-            Expanded(child: Text(message)),
-          ],
-        ),
-        backgroundColor: Colors.orange,
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 4),
-      ),
-    );
-  }
-
-  Future<void> _handleSubmit() async {
-    if (!_formKey.currentState!.validate()) {
-      _showError('Please fill all required fields');
-      return;
-    }
-
-    setState(() {
-      _isSubmitting = true;
-    });
-
-    try {
-      // (Optional) derive codes if you want
-      final retailCode = await retailCodes(retailCat.text);
-      final processType = (ProcesTp.text.trim().toLowerCase().startsWith('u')) ? 'U' : 'A'; // A=Add, U=Update
-
-      // Build payload matching your controller (RetailerController.Register)
-      final payload = <String, dynamic>{
-        // === UI fields mapped ===
-        'processType': ProcesTp.text.trim().isEmpty ? 'Add' : ProcesTp.text.trim(),
-        'retailCategory': retailCat.text.trim().isEmpty ? 'Urban' : retailCat.text.trim(),
-        'area': Area.text.trim(),                      // maps to location (server)
-        'districtUi': District.text.trim(),            // server may use when 'district' not sent
-        'gstNumber': GST.text.trim().isEmpty ? null : GST.text.trim(),
-        'panNumber': PAN.text.trim().isEmpty ? null : PAN.text.trim(),
-        'mobile': Mobile.text.trim(),
-        'address1': Address.text.trim(),
-        'address2': address2Controller.text.trim().isEmpty ? null : address2Controller.text.trim(),
-        'address3': address3Controller.text.trim().isEmpty ? null : address3Controller.text.trim(),
-        'firmName': firmNameController.text.trim().isEmpty ? null : firmNameController.text.trim(),
-        'officeTelephone': officeTelephoneController.text.trim().isEmpty ? null : officeTelephoneController.text.trim(),
-        'email': emailController.text.trim().isEmpty ? null : emailController.text.trim(),
-        'tallyRetailerCode': tallyRetailerCodeController.text.trim().isEmpty ? null : tallyRetailerCodeController.text.trim(),
-        'concernEmployee': concernEmployeeController.text.trim().isEmpty ? null : concernEmployeeController.text.trim(),
-        'aadharNumber': aadharCardController.text.trim().isEmpty ? null : aadharCardController.text.trim(),
-        'proprietorName': proprietorNameController.text.trim().isEmpty ? null : proprietorNameController.text.trim(),
-        'schemeRequired': Scheme.text.trim().isEmpty ? null : Scheme.text.trim(),
-
-        // === NEW COLUMNS you added (8-char names) ===
-        'tlyrtlcd': tallyRetailerCodeController.text.trim().isEmpty ? null : tallyRetailerCodeController.text.trim(),
-        'prcstype': processType, // 'A' or 'U'
-
-        // === DB-required proxies the server expects ===
-        'retlCode': '',              // if server/trigger generates, keep empty
-        'sapRtlCd': '',              // optional
-        'custCode': '',              // optional
-        'areaCode': '',              // table requires char(3); if you have it, send it; else server should handle default
-        'retlPinC': '',              // pincode (table NOT NULL) – server will store empty string if unknown
-        'benfNmFl': 'N',
-        'bankAcNo': '',
-        'bankBnDs': '',
-        'bankBnNo': '',
-        'bankIFSC': '',
-        'typeOfBs': 'Retail',
-        'busSttYr': DateTime.now().year.toString(),
-        'busBwYrs': '0000',
-        'isActive': 'Y',
-        'createId': 'app',
-        'locStxNo': '4401S711',      // your predefined Stockist Code
-        'ubsRtlF1': 'N',
-      };
-
-      final url = Uri.parse('http://10.4.64.23:8521/api/Retailer/register');
-      final res = await http.post(
-        url,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
-
-      if (res.statusCode == 200) {
-        final m = jsonDecode(res.body) as Map<String, dynamic>;
-        final ok = m['success'] == true;
-        if (ok) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              backgroundColor: Colors.green,
-              content: Row(
-                children: [
-                  const Icon(Icons.check_circle, color: Colors.white),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text('Retailer registered (ID: ${m['retailerId'] ?? 'N/A'})')),
-                ],
-              ),
-            ),
-          );
-          if (!mounted) return;
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (_) => const HomeScreen()),
-          );
-        } else {
-          _showError('Registration failed: ${m['message'] ?? 'Unknown error'}');
-        }
-      } else {
-        _showError('Register failed: ${res.statusCode} ${res.body}');
-      }
-    } catch (e) {
-      _showError('Error: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isSubmitting = false;
-        });
-      }
-    }
+    // Autofill GPS (best effort)
+    _initLocation();
   }
 
   @override
   void dispose() {
     _mainController?.dispose();
     _fabController?.dispose();
-    ProcesTp.dispose();
-    retailCat.dispose();
-    Area.dispose();
-    District.dispose();
-    GST.dispose();
-    PAN.dispose();
-    Mobile.dispose();
-    Address.dispose();
-    Scheme.dispose();
+
     firmNameController.dispose();
-    officeTelephoneController.dispose();
-    emailController.dispose();
-    address2Controller.dispose();
-    address3Controller.dispose();
-    tallyRetailerCodeController.dispose();
-    concernEmployeeController.dispose();
-    aadharCardController.dispose();
-    proprietorNameController.dispose();
+    taxRegNumberController.dispose();
+    registeredAddressController.dispose();
+    effectiveDateController.dispose();
+
+    licenseNumberController.dispose();
+    issuingAuthorityController.dispose();
+    establishmentDateController.dispose();
+    expiryDateController.dispose();
+    tradeNameController.dispose();
+    responsiblePersonController.dispose();
+
+    accountNameController.dispose();
+    ibanController.dispose();
+    bankNameController.dispose();
+    branchNameController.dispose();
+    branchAddressController.dispose();
+
+    latitudeController.dispose();
+    longitudeController.dispose();
     super.dispose();
+  }
+
+  // ------------------- GEOLOCATION -------------------
+  Future<void> _initLocation() async {
+    setState(() => _isGettingLocation = true);
+    try {
+      await _getWebLocation();
+    } catch (e) {
+      _toast('Could not fetch location: $e');
+    } finally {
+      if (mounted) setState(() => _isGettingLocation = false);
+    }
+  }
+
+  Future<void> _getWebLocation() async {
+    try {
+      // Load cached values if present
+      final lastLat = web.window.localStorage.getItem('lastLat');
+      final lastLng = web.window.localStorage.getItem('lastLng');
+      if (lastLat != null && lastLng != null && mounted) {
+        latitudeController.text =
+            double.parse(lastLat).toStringAsFixed(6);
+        longitudeController.text =
+            double.parse(lastLng).toStringAsFixed(6);
+      }
+
+      // Ask JS helper
+      final jsWindow = web.window as WindowWithGeoLocation;
+      final result = await jsWindow.requestGeoPosition().toDart;
+
+      if (result != null) {
+        final resultDart = result.dartify();
+        if (resultDart is Map<String, dynamic>) {
+          if (resultDart['ok'] == true) {
+            final lat = resultDart['lat'] as num?;
+            final lng = resultDart['lng'] as num?;
+            if (lat != null && lng != null && mounted) {
+              latitudeController.text = lat.toStringAsFixed(6);
+              longitudeController.text = lng.toStringAsFixed(6);
+            }
+          } else {
+            final err = resultDart['error']?.toString() ?? 'Unknown error';
+            _toast('Web geolocation failed: $err');
+          }
+        }
+      }
+    } catch (e) {
+      _toast('Web geolocation error: $e');
+    }
+  }
+
+  // ------------------- VALIDATION -------------------
+  String? _validateTaxRegNumber(String? value) {
+    if (_isVATRequired && (value == null || value.isEmpty)) {
+      return 'Please enter Tax Registration Number';
+    }
+    if (value != null && value.isNotEmpty && !RegExp(r'^\d{15}$').hasMatch(value)) {
+      return 'Tax Registration Number must be 15 digits';
+    }
+    return null;
+  }
+
+  String? _validateLicense(String? value) {
+    if (value == null || value.isEmpty) return 'Please enter License Number';
+    if (value.length > 20) return 'Max 20 characters allowed';
+    return null;
+  }
+
+  String? _validateIBAN(String? value) {
+    if (value != null && value.isNotEmpty && !RegExp(r'^AE\d{21}$').hasMatch(value)) {
+      return 'IBAN must start with AE and be 23 characters';
+    }
+    return null;
+  }
+
+  String? _validateRequired(String? value, String fieldName) {
+    if (value == null || value.isEmpty) return 'Please enter $fieldName';
+    return null;
+  }
+
+  // ------------------- UI -------------------
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+    );
   }
 
   @override
@@ -864,233 +461,275 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
     return Scaffold(
       backgroundColor: Colors.grey.shade50,
       appBar: _buildModernAppBar(),
-      body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Colors.blue.shade50, Colors.white, Colors.grey.shade50],
-          ),
-        ),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Form(
-            key: _formKey,
-            child: Column(
-              children: [
-                _buildAnimatedHeader(),
-                const SizedBox(height: 30),
-                _buildModernSection(
-                  title: 'Basic Details',
-                  icon: Icons.person_rounded,
-                  children: [
-                    ModernDropdown(
-                      label: 'Process Type',
-                      icon: Icons.swap_horiz_outlined,
-                      items: const ['Add', 'Update'],
-                      value: ProcesTp.text.isNotEmpty ? ProcesTp.text : null,
-                      onChanged: (value) {
-                        setState(() {
-                          ProcesTp.text = value ?? '';
-                        });
-                      },
-                      delay: const Duration(milliseconds: 50),
-                    ),
-                    const SizedBox(height: 16),
-                    ModernDropdown(
-                      label: 'Retailer Category',
-                      icon: Icons.store_outlined,
-                      items: const ['Urban', 'Rural', 'Direct Dealer'],
-                      value: retailCat.text.isNotEmpty ? retailCat.text : null,
-                      onChanged: (value) {
-                        setState(() {
-                          retailCat.text = value ?? '';
-                        });
-                      },
-                      delay: const Duration(milliseconds: 100),
-                    ),
-                    const SizedBox(height: 16),
-                    ModernDropdown(
-                      label: 'Area',
-                      icon: Icons.location_on_outlined,
-                      items: _states ?? [],
-                      value: Area.text.isNotEmpty ? Area.text : null,
-                      onChanged: (value) {
-                        setState(() {
-                          Area.text = value ?? '';
-                          District.text = '';
-                        });
-                      },
-                      delay: const Duration(milliseconds: 150),
-                    ),
-                    const SizedBox(height: 16),
-                    ModernDropdown
-                    (
-                      label: 'District',
-                      icon: Icons.location_city_outlined,
-                      items: _areas ?? [],
-                      value: District.text.isNotEmpty ? District.text : null,
-                      onChanged: (value) {
-                        setState(() {
-                          District.text = value ?? '';
-                        });
-                      },
-                      delay: const Duration(milliseconds: 200),
-                    ),
-                    const SizedBox(height: 16),
-                    _buildClickableOptions('Register With PAN/GST', [
-                      'GST',
-                      'PAN',
-                    ]),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: GST,
-                      label: 'GST Number',
-                      icon: Icons.receipt_long_outlined,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: PAN,
-                      label: 'PAN Number',
-                      icon: Icons.credit_card_outlined,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: firmNameController,
-                      label: 'Firm Name',
-                      icon: Icons.business_outlined,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: Mobile,
-                      label: 'Mobile',
-                      icon: Icons.phone_outlined,
-                      isPhone: true,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: officeTelephoneController,
-                      label: 'Office Telephone',
-                      icon: Icons.call_outlined,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: emailController,
-                      label: 'Email',
-                      icon: Icons.email_outlined,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: Address,
-                      label: 'Address 1',
-                      icon: Icons.home_outlined,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: address2Controller,
-                      label: 'Address 2',
-                      icon: Icons.home_outlined,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: address3Controller,
-                      label: 'Address 3',
-                      icon: Icons.home_outlined,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: tallyRetailerCodeController,
-                      label: 'Tally Retailer Code',
-                      icon: Icons.qr_code_outlined,
-                      isRequired: false,
-                    ),
-                  ],
+      body: FadeTransition(
+        opacity: _fadeAnimation ?? const AlwaysStoppedAnimation(1.0),
+        child: SlideTransition(
+          position: _slideAnimation ?? const AlwaysStoppedAnimation(Offset.zero),
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Colors.blue.shade50,
+                  Colors.white,
+                  Colors.grey.shade50,
+                ],
+              ),
+            ),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: ScaleTransition(
+                scale: _scaleAnimation ?? const AlwaysStoppedAnimation(1.0),
+                child: Form(
+                  key: _formKey,
+                  child: Column(
+                    children: [
+                      _buildAnimatedHeader(),
+                      const SizedBox(height: 30),
+
+                      // Trade License
+                      _buildModernSection(
+                        title: 'Trade License Details',
+                        icon: Icons.assignment_rounded,
+                        children: [
+                          _buildModernTextField(
+                            controller: licenseNumberController,
+                            label: 'License Number',
+                            icon: Icons.confirmation_number,
+                            validator: _validateLicense,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: issuingAuthorityController,
+                            label: 'Issuing Authority',
+                            icon: Icons.account_balance,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernDateField(
+                            controller: establishmentDateController,
+                            label: 'Establishment Date',
+                            icon: Icons.event,
+                            context: context,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernDateField(
+                            controller: expiryDateController,
+                            label: 'Expiry Date',
+                            icon: Icons.event_busy,
+                            context: context,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: tradeNameController,
+                            label: 'Trade Name',
+                            icon: Icons.store,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: responsiblePersonController,
+                            label: 'Responsible Person',
+                            icon: Icons.person,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: registeredAddressController,
+                            label: 'Registered Address',
+                            icon: Icons.location_on,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernDateField(
+                            controller: effectiveDateController,
+                            label: 'Effective Registration Date',
+                            icon: Icons.calendar_today,
+                            context: context,
+                          ),
+                          const SizedBox(height: 16),
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.blue.shade50,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.blue.shade200),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(Icons.info_outline, color: Colors.blue.shade700),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    'License Numbers vary across Emirates. (Max 20 Characters)',
+                                    style: TextStyle(fontSize: 12, color: Colors.blue.shade700),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 20),
+
+                      // VAT
+                      if (_isVATRequired)
+                        _buildModernSection(
+                          title: 'VAT Registration Details',
+                          icon: Icons.receipt_long,
+                          isOptional: true,
+                          children: [
+                            _buildModernTextField(
+                              controller: taxRegNumberController,
+                              label: 'Tax Registration Number',
+                              icon: Icons.numbers,
+                              validator: _validateTaxRegNumber,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildModernTextField(
+                              controller: firmNameController,
+                              label: 'Firm Name',
+                              icon: Icons.business,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildModernDateField(
+                              controller: effectiveDateController,
+                              label: 'Effective Registration Date',
+                              icon: Icons.calendar_today,
+                              context: context,
+                            ),
+                            const SizedBox(height: 16),
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.orange.shade50,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Colors.orange.shade200),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.info_outline, color: Colors.orange.shade700),
+                                  const SizedBox(width: 8),
+                                  const Expanded(
+                                    child: Text(
+                                      'Required only if the firm\'s Annual Turnover exceeds AED 375,000.',
+                                      style: TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+
+                      const SizedBox(height: 20),
+
+                      // Bank
+                      _buildModernSection(
+                        title: 'Bank Details',
+                        icon: Icons.account_balance_outlined,
+                        isOptional: true,
+                        children: [
+                          _buildModernTextField(
+                            controller: accountNameController,
+                            label: 'Account Holder Name',
+                            icon: Icons.person_outline_rounded,
+                            isRequired: false,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: ibanController,
+                            label: 'IBAN Number',
+                            icon: Icons.account_balance_wallet_outlined,
+                            isRequired: false,
+                            validator: _validateIBAN,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: bankNameController,
+                            label: 'Bank Name',
+                            icon: Icons.business_outlined,
+                            isRequired: false,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: branchNameController,
+                            label: 'Branch Name',
+                            icon: Icons.location_on_outlined,
+                            isRequired: false,
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: branchAddressController,
+                            label: 'Branch Address',
+                            icon: Icons.location_city_outlined,
+                            isRequired: false,
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 20),
+
+                      // Location
+                      _buildModernSection(
+                        title: 'Location Details',
+                        icon: Icons.location_on_outlined,
+                        isOptional: true,
+                        children: [
+                          _buildModernTextField(
+                            controller: latitudeController,
+                            label: 'Latitude',
+                            icon: Icons.my_location,
+                            isRequired: false,
+                            suffix: IconButton(
+                              tooltip: 'Refresh location',
+                              icon: const Icon(Icons.gps_fixed),
+                              onPressed: _isGettingLocation ? null : () async {
+                                HapticFeedback.selectionClick();
+                                await _initLocation();
+                              },
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          _buildModernTextField(
+                            controller: longitudeController,
+                            label: 'Longitude',
+                            icon: Icons.my_location,
+                            isRequired: false,
+                            suffix: IconButton(
+                              tooltip: 'Refresh location',
+                              icon: const Icon(Icons.gps_fixed),
+                              onPressed: _isGettingLocation ? null : () async {
+                                HapticFeedback.selectionClick();
+                                await _initLocation();
+                              },
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              const Icon(Icons.info_outline, size: 16, color: Colors.grey),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  _isGettingLocation
+                                      ? 'Fetching GPS…'
+                                      : (latitudeController.text.isEmpty || longitudeController.text.isEmpty)
+                                          ? 'Tap the GPS icon if fields are empty.'
+                                          : 'Coordinates captured from your device GPS.',
+                                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 40),
+                      _buildAnimatedSubmitButton(),
+                      const SizedBox(height: 40),
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 20),
-                _buildModernSection(
-                  title: 'Contact Details',
-                  icon: Icons.contact_page_outlined,
-                  children: [
-                    _buildPredefinedField('Stockist Code', '4401S711'),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: concernEmployeeController,
-                      label: 'Concern Employee',
-                      icon: Icons.person_outline_rounded,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    FileUploadWidget(
-                      label: 'Retailer Profile Image',
-                      icon: Icons.camera_alt_outlined,
-                      onFileSelected: (value) =>
-                          setState(() => _retailerProfileImage = value),
-                      allowedExtensions: const ['*'],
-                      maxSizeInMB: 5.0,
-                      currentFilePath: _retailerProfileImage,
-                      formType: 'retailer',
-                    ),
-                    const SizedBox(height: 16),
-                    FileUploadWidget(
-                      label: 'PAN / GST No Image Upload / View',
-                      icon: Icons.file_upload_outlined,
-                      onFileSelected: (value) =>
-                          setState(() => _panGstImage = value),
-                      allowedExtensions: const ['jpg', 'jpeg', 'png', 'pdf'],
-                      maxSizeInMB: 5.0,
-                      currentFilePath: _panGstImage,
-                      formType: 'retailer',
-                    ),
-                    const SizedBox(height: 16),
-                    ModernDropdown(
-                      label: 'Scheme Required',
-                      icon: Icons.card_giftcard_outlined,
-                      items: const ['Yes', 'No'],
-                      value: Scheme.text.isNotEmpty ? Scheme.text : null,
-                      onChanged: (value) {
-                        setState(() {
-                          Scheme.text = value ?? '';
-                        });
-                      },
-                      delay: const Duration(milliseconds: 250),
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: aadharCardController,
-                      label: 'Aadhar Card No',
-                      icon: Icons.perm_identity_outlined,
-                      isRequired: false,
-                    ),
-                    const SizedBox(height: 16),
-                    FileUploadWidget(
-                      label: 'Aadhar Card Upload',
-                      icon: Icons.file_upload_outlined,
-                      onFileSelected: (value) =>
-                          setState(() => _aadharImage = value),
-                      allowedExtensions: const ['jpg', 'jpeg', 'png', 'pdf'],
-                      maxSizeInMB: 5.0,
-                      currentFilePath: _aadharImage,
-                      formType: 'retailer',
-                    ),
-                    const SizedBox(height: 16),
-                    _buildModernTextField(
-                      controller: proprietorNameController,
-                      label: 'Proprietor / Partner Name',
-                      icon: Icons.person_outline_rounded,
-                      isRequired: false,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 40),
-                _buildAnimatedSubmitButton(),
-                const SizedBox(height: 40),
-              ],
+              ),
             ),
           ),
         ),
@@ -1107,34 +746,14 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
         statusBarColor: Colors.transparent,
         statusBarIconBrightness: Brightness.dark,
       ),
-      leading: Navigator.of(context).canPop()
-          ? Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: IconButton(
-                icon: const Icon(Icons.arrow_back),
-                onPressed: () {
-                  if (Navigator.canPop(context)) {
-                    Navigator.pop(context);
-                  } else {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => const HomeScreen(),
-                      ),
-                    );
-                  }
-                },
-              ),
-            )
-          : null,
       title: const Text(
-        'Retailer Registration',
+        'Retailer Onboarding',
         style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
       ),
       actions: [
         IconButton(
           icon: const Icon(Icons.help_outline_rounded),
-          onPressed: () => _showHelpDialog(),
+          onPressed: _showHelpDialog,
         ),
       ],
     );
@@ -1153,7 +772,7 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           BoxShadow(
-            color: Colors.blue.withOpacity(0.2),
+            color: Colors.blue.withValues(alpha: 0.2),
             blurRadius: 20,
             offset: const Offset(0, 10),
           ),
@@ -1162,19 +781,9 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
       child: const Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'Welcome!',
-            style: TextStyle(
-              fontSize: 32,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
+          _FadeSlide(text: 'Welcome!', big: true),
           SizedBox(height: 8),
-          Text(
-            'Complete your retailer registration',
-            style: TextStyle(fontSize: 16, color: Colors.white70),
-          ),
+          _FadeSlide(text: 'Complete your retailer registration'),
         ],
       ),
     );
@@ -1192,7 +801,7 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
+            color: Colors.grey.withValues(alpha: 0.1),
             blurRadius: 10,
             offset: const Offset(0, 5),
           ),
@@ -1201,14 +810,12 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // header
+          // Header
           Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
               color: Colors.blue.shade50,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(16),
-              ),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
             ),
             child: Row(
               children: [
@@ -1219,7 +826,7 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
                     color: Colors.blue,
                     shape: BoxShape.circle,
                   ),
-                  child: Icon(icon, color: Colors.white, size: 24),
+                  child: const Icon(Icons.layers, color: Colors.white, size: 24),
                 ),
                 const SizedBox(width: 16),
                 Expanded(
@@ -1237,18 +844,28 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
                       if (isOptional)
                         Text(
                           'Optional',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade500,
-                          ),
+                          style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
                         ),
                     ],
                   ),
                 ),
+                if (title == 'Location Details')
+                  AnimatedOpacity(
+                    duration: const Duration(milliseconds: 250),
+                    opacity: _isGettingLocation ? 1 : 0,
+                    child: const Padding(
+                      padding: EdgeInsets.only(right: 6),
+                      child: SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
-          // content
+          // Content
           Padding(
             padding: const EdgeInsets.all(20),
             child: Column(
@@ -1264,183 +881,140 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
   Widget _buildModernTextField({
     required TextEditingController controller,
     required String label,
-    required dynamic icon,
-    bool isPhone = false,
+    required IconData icon,
     bool isRequired = true,
-    List<TextInputFormatter>? inputFormatters,
+    String? Function(String?)? validator,
+    Widget? suffix,
   }) {
-    return TextFormField(
-      controller: controller,
-      decoration: InputDecoration(
-        labelText: isRequired ? '$label *' : label,
-        prefixIcon: icon is Icon
-            ? icon
-            : Icon(icon as IconData, color: Colors.grey.shade600),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        focusedBorder: const OutlineInputBorder(
-          borderRadius: BorderRadius.all(Radius.circular(12)),
-          borderSide: BorderSide(color: Colors.blue, width: 2),
-        ),
-        filled: true,
-        fillColor: Colors.grey.shade50,
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: 16,
-        ),
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      builder: (context, value, child) => Transform.translate(
+        offset: Offset(0, 20 * (1 - value)),
+        child: Opacity(opacity: value, child: child),
       ),
-      keyboardType: isPhone ? TextInputType.phone : TextInputType.text,
-      inputFormatters: inputFormatters,
-      validator: (value) {
-        if (isRequired && (value == null || value.trim().isEmpty)) {
-          return 'Please enter $label';
-        }
-        if (isPhone && value != null && value.isNotEmpty) {
-          if (!RegExp(r'^[50|52|54|55|56|58]\d{7}$').hasMatch(value)) {
-            return 'Please enter valid UAE mobile number';
-          }
-        }
-        return null;
-      },
-    );
-  }
-
-  Widget _buildClickableOptions(String label, List<String> options) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.w500,
-            color: Colors.grey.shade700,
+      child: TextFormField(
+        controller: controller,
+        decoration: InputDecoration(
+          labelText: isRequired ? '$label *' : label,
+          prefixIcon: Icon(icon, color: Colors.grey.shade600),
+          suffixIcon: suffix,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: Colors.grey.shade300),
           ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: Colors.grey.shade300),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(color: Colors.blue, width: 2),
+          ),
+          filled: true,
+          fillColor: Colors.grey.shade50,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
         ),
-        const SizedBox(height: 12),
-        Row(
-          children: options.map((option) {
-            return Padding(
-              padding: const EdgeInsets.only(right: 16.0),
-              child: InkWell(
-                onTap: () {
-                  setState(() {
-                    selectedOption = option;
-                  });
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: selectedOption == option
-                          ? Colors.blue
-                          : Colors.grey,
-                    ),
-                    borderRadius: BorderRadius.circular(8),
-                    color: selectedOption == option
-                        ? Colors.blue.withOpacity(0.1)
-                        : Colors.transparent,
-                  ),
-                  child: Text(
-                    option,
-                    style: TextStyle(
-                      color: selectedOption == option
-                          ? Colors.blue
-                          : Colors.grey,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-              ),
-            );
-          }).toList(),
-        ),
-      ],
+        validator: validator ?? (isRequired ? (v) => _validateRequired(v, label) : null),
+      ),
     );
   }
 
-  Widget _buildPredefinedField(String label, String value) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SizedBox(
-          height: 56,
-          child: TextFormField(
-            initialValue: value,
-            enabled: false,
-            decoration: InputDecoration(
-              labelText: label,
-              prefixIcon: const Icon(Icons.lock_outlined, color: Colors.grey),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide(color: Colors.grey.shade300),
+  Widget _buildModernDateField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    required BuildContext context,
+    bool isRequired = true,
+  }) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      builder: (context, value, child) => Transform.translate(
+        offset: Offset(0, 20 * (1 - value)),
+        child: Opacity(opacity: value, child: child),
+      ),
+      child: TextFormField(
+        controller: controller,
+        readOnly: true,
+        decoration: InputDecoration(
+          labelText: isRequired ? '$label *' : label,
+          prefixIcon: Icon(icon, color: Colors.grey.shade600),
+          suffixIcon: const Icon(Icons.calendar_today_rounded, color: Colors.grey),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: Colors.grey.shade300),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: Colors.grey.shade300),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(color: Colors.blue, width: 2),
+          ),
+          filled: true,
+          fillColor: Colors.grey.shade50,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+        ),
+        onTap: () async {
+          final date = await showDatePicker(
+            context: context,
+            initialDate: DateTime.now(),
+            firstDate: DateTime(1900),
+            lastDate: DateTime(2100),
+            builder: (context, child) => Theme(
+              data: Theme.of(context).copyWith(
+                colorScheme: const ColorScheme.light(primary: Colors.blue),
               ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide(color: Colors.grey.shade300),
-              ),
-              focusedBorder: const OutlineInputBorder(
-                borderRadius: BorderRadius.all(Radius.circular(12)),
-                borderSide: BorderSide(color: Colors.blue, width: 2),
-              ),
-              filled: true,
-              fillColor: Colors.grey.shade100,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 16,
-              ),
+              child: child!,
             ),
-          ),
-        ),
-        const SizedBox(height: 16.0),
-      ],
+          );
+          if (date != null && mounted) {
+            controller.text = date.toString().split(' ').first;
+          }
+        },
+        validator: isRequired ? (v) => _validateRequired(v, label) : null,
+      ),
     );
   }
 
   Widget _buildAnimatedSubmitButton() {
-    return SizedBox(
-      width: double.infinity,
-      height: 56,
-      child: ElevatedButton(
-        onPressed: _isSubmitting ? null : _handleSubmit,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: Colors.blue.shade700,
-          foregroundColor: Colors.white,
-          elevation: 8,
-          shadowColor: Colors.blue.withOpacity(0.3),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) =>
+          Transform.scale(scale: 0.8 + (0.2 * value), child: child),
+      child: SizedBox(
+        width: double.infinity,
+        height: 56,
+        child: ElevatedButton(
+          onPressed: _isSubmitting ? null : _submitForm,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.blue.shade700,
+            foregroundColor: Colors.white,
+            elevation: 8,
+            shadowColor: Colors.blue.withValues(alpha: 0.3),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           ),
-        ),
-        child: _isSubmitting
-            ? const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
+          child: _isSubmitting
+              ? const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: 20, height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                     ),
-                  ),
-                  SizedBox(width: 16),
-                  Text('Submitting...'),
-                ],
-              )
-            : const Text(
-                'Submit Registration',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
+                    SizedBox(width: 16),
+                    Text('Submitting...', style: TextStyle(fontSize: 16)),
+                  ],
+                )
+              : const Text('Submit Registration',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        ),
       ),
     );
   }
@@ -1454,29 +1028,16 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.help_outline_rounded,
-                size: 48,
-                color: Colors.blue,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Registration Help',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Fill in all required fields marked with *. Contact details are important for verification.',
+            children: const [
+              Icon(Icons.help_outline_rounded, size: 48, color: Colors.blue),
+              SizedBox(height: 16),
+              Text('Registration Help',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              SizedBox(height: 16),
+              Text(
+                'Fill in all required fields marked with *.\n'
+                'VAT Registration is required only if your firm\'s Annual Turnover exceeds AED 375,000.',
                 textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Got it'),
-                ),
               ),
             ],
           ),
@@ -1484,5 +1045,117 @@ class _RetailerRegistrationPageState extends State<RetailerRegistrationPage>
       ),
     );
   }
+
+  // ------------------- SUBMIT -------------------
+  Future<void> _submitForm() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() => _isSubmitting = true);
+
+    try {
+      final req = RetailerOnboardingRequest(
+        // Trade License
+        licenseNumber: licenseNumberController.text,
+        issuingAuthority: issuingAuthorityController.text,
+        establishmentDate: establishmentDateController.text,
+        expiryDate: expiryDateController.text,
+        tradeName: tradeNameController.text,
+        responsiblePerson: responsiblePersonController.text,
+        registeredAddress: registeredAddressController.text,
+
+        // VAT
+        effectiveRegistrationDate: effectiveDateController.text,
+        taxRegistrationNumber: taxRegNumberController.text,
+        firmName: firmNameController.text,
+
+        // Bank
+        accountHolderName: accountNameController.text,
+        ibanNumber: ibanController.text,
+        bankName: bankNameController.text,
+        branchName: branchNameController.text,
+        branchAddress: branchAddressController.text,
+
+        // Location
+        latitude: latitudeController.text,
+        longitude: longitudeController.text,
+      );
+
+      final resp = await RetailerOnboardingService.register(req);
+
+      if (!mounted) return;
+      if (resp.success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.white, size: 20),
+                const SizedBox(width: 8),
+                Expanded(child: Text('Registered. Retailer ID: ${resp.retailerId ?? 'N/A'}')),
+              ],
+            ),
+            backgroundColor: Colors.green,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        Navigator.pop(context);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error, color: Colors.white, size: 20),
+                const SizedBox(width: 8),
+                Expanded(child: Text('Failed: ${resp.message}')),
+              ],
+            ),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error, color: Colors.white, size: 20),
+              const SizedBox(width: 8),
+              Expanded(child: Text('Error: $e')),
+            ],
+          ),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
+  }
 }
 
+class _FadeSlide extends StatelessWidget {
+  final String text;
+  final bool big;
+  const _FadeSlide({required this.text, this.big = false});
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 800),
+      curve: Curves.easeOut,
+      builder: (context, value, child) =>
+          Transform.translate(offset: Offset(0, 30 * (1 - value)),
+              child: Opacity(opacity: value, child: child)),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: big ? 32 : 16,
+          fontWeight: big ? FontWeight.bold : FontWeight.normal,
+          color: big ? Colors.white : Colors.white70,
+        ),
+      ),
+    );
+  }
+}
