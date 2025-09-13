@@ -127,19 +127,29 @@ namespace RAKControllers.Controllers
                         // Generate document number for new entries
                         docuNumb = GenerateDocumentNumber("CAE", request.AreaCode);
 
+                        // Validate and truncate data to match catExcpnsEp schema
+                        string truncatedDocuNumb = docuNumb?.Length > 16 ? docuNumb.Substring(0, 16) : docuNumb ?? "";
+                        string truncatedCatActNo = request.CatActNo?.Length > 16 ? request.CatActNo.Substring(0, 16) : request.CatActNo ?? "";
+                        string truncatedPendWith = request.PendWith?.Length > 20 ? request.PendWith.Substring(0, 20) : request.PendWith ?? "";
+                        string truncatedRandNmSt = request.RandNmSt?.Length > 20 ? request.RandNmSt.Substring(0, 20) : request.RandNmSt ?? "";
+                        string truncatedLoginIdM = request.LoginIdM?.Length > 10 ? request.LoginIdM.Substring(0, 10) : request.LoginIdM ?? "";
+
                         // Insert main record into catExcpnsEp
                         string sql = @"INSERT INTO catExcpnsEp(docuNumb, docuDate, catActNo, noOfTtPr, pendWith, statFlag, randNmSt, createId, createDt)
                                       VALUES (@docuNumb, CONVERT(varchar(11), getdate(), 113), @catActNo, @noOfTtPr, @pendWith, 'T', @randNmSt, @loginIdM, getdate())";
 
                         _dbHelper.WebExecute(sql, new Dictionary<string, object>
                         {
-                            { "@docuNumb", docuNumb },
-                            { "@catActNo", request.CatActNo },
+                            { "@docuNumb", truncatedDocuNumb },
+                            { "@catActNo", truncatedCatActNo },
                             { "@noOfTtPr", "0" },
-                            { "@pendWith", request.PendWith },
-                            { "@randNmSt", request.RandNmSt },
-                            { "@loginIdM", request.LoginIdM }
+                            { "@pendWith", truncatedPendWith },
+                            { "@randNmSt", truncatedRandNmSt },
+                            { "@loginIdM", truncatedLoginIdM }
                         });
+
+                        // Update docuNumb to use the truncated version for consistency
+                        docuNumb = truncatedDocuNumb;
 
                         // Update activity reference
                         sql = "UPDATE catActPreSl SET refDocNo = @docuNumb WHERE docuNumb = @catActNo";
@@ -187,18 +197,24 @@ namespace RAKControllers.Controllers
                             decimal expenseAmt = Convert.ToDecimal(expense.ExpnsAmt);
                             totalExpenseAmount += expenseAmt;
 
+                            // Validate and truncate data to match catExcpnsEpDtl schema
+                            string truncatedDocuNumb = docuNumb?.Length > 16 ? docuNumb.Substring(0, 16) : docuNumb ?? "";
+                            string truncatedExpnsTye = i.ToString().Length > 2 ? i.ToString().Substring(0, 2) : i.ToString();
+                            string truncatedExpnsBil = expense.ExpnsBil?.Length > 20 ? expense.ExpnsBil.Substring(0, 20) : expense.ExpnsBil ?? "";
+                            string truncatedLoginIdM = request.LoginIdM?.Length > 10 ? request.LoginIdM.Substring(0, 10) : request.LoginIdM ?? "";
+
                             string sql = @"INSERT INTO catExcpnsEpDtl(docuNumb, expnsTye, expnsDat, expnsAmt, expAmtEx, expnsBil, createId, createDt)
                                           VALUES (@docuNumb, @expnsTye, @expnsDat, @expnsAmt, @expAmtEx, @expnsBil, @loginIdM, getdate())";
 
                             _dbHelper.WebExecute(sql, new Dictionary<string, object>
                             {
-                                { "@docuNumb", docuNumb },
-                                { "@expnsTye", i.ToString() },
+                                { "@docuNumb", truncatedDocuNumb },
+                                { "@expnsTye", truncatedExpnsTye },
                                 { "@expnsDat", ConvertToSqlDate(request.MeetDate) },
                                 { "@expnsAmt", expense.ExpnsAmt },
                                 { "@expAmtEx", expense.ExpAmtEx ?? "0" },
-                                { "@expnsBil", expense.ExpnsBil },
-                                { "@loginIdM", request.LoginIdM }
+                                { "@expnsBil", truncatedExpnsBil },
+                                { "@loginIdM", truncatedLoginIdM }
                             });
                         }
                     }
@@ -572,6 +588,13 @@ namespace RAKControllers.Controllers
 
         private void UpdateBudgetUsage(string zoneCode, string catActNo, string loginIdM, decimal totalExpenseAmount)
         {
+            // Truncate data to match ettExpncBud schema constraints
+            string truncatedZoneCode = zoneCode?.Length > 10 ? zoneCode.Substring(0, 10) : zoneCode ?? "";
+            string truncatedCatActNo = catActNo?.Length > 16 ? catActNo.Substring(0, 16) : catActNo ?? "";
+            string truncatedLoginIdM = loginIdM?.Length > 10 ? loginIdM.Substring(0, 10) : loginIdM ?? "";
+            string truncatedFincYear = GetCurrentFinancialYear();
+            if (truncatedFincYear.Length > 2) truncatedFincYear = truncatedFincYear.Substring(truncatedFincYear.Length - 2); // Get last 2 digits
+
             // Update budget status to 'C' (Closed) - Updated to match ettExpncBud schema
             string sql = @"UPDATE ettExpncBud SET statFlag = 'C', updateDt = GETDATE(), updateId = @loginIdM
                           WHERE zoneCode = @zoneCode AND expnsTyp = '11' AND fincYear = @fincYear
@@ -579,23 +602,27 @@ namespace RAKControllers.Controllers
 
             _dbHelper.WebExecute(sql, new Dictionary<string, object>
             {
-                { "@zoneCode", zoneCode },
-                { "@catActNo", catActNo },
-                { "@loginIdM", loginIdM },
-                { "@fincYear", GetCurrentFinancialYear() }
+                { "@zoneCode", truncatedZoneCode },
+                { "@catActNo", truncatedCatActNo },
+                { "@loginIdM", truncatedLoginIdM },
+                { "@fincYear", truncatedFincYear }
             });
 
-            // Insert new budget record - Updated column names to match schema
+            // Insert new budget record - Truncate nrtnRmrk to fit varchar(100)
+            string remark = "Budget Use in Casc Activity Expns";
+            if (remark.Length > 100) remark = remark.Substring(0, 100);
+
             sql = @"INSERT INTO ettExpncBud(zoneCode, expnsTyp, fincYear, schBdIdn, catActDc, docuDate, nrtnRmrk, budAmtDb, budAmtCr, statFlag, createId, createDt)
                    VALUES (@zoneCode, '11', @fincYear, 1, @catActNo, CONVERT(varchar(11), GETDATE(), 113),
-                   'Budget Use in Casc Activity Expns', @expnsAmt, 0, 'N', 'System', getdate())";
+                   @remark, @expnsAmt, 0, 'N', 'System', getdate())";
 
             _dbHelper.WebExecute(sql, new Dictionary<string, object>
             {
-                { "@zoneCode", zoneCode },
-                { "@fincYear", GetCurrentFinancialYear() },
-                { "@catActNo", catActNo },
-                { "@expnsAmt", totalExpenseAmount }
+                { "@zoneCode", truncatedZoneCode },
+                { "@fincYear", truncatedFincYear },
+                { "@catActNo", truncatedCatActNo },
+                { "@expnsAmt", totalExpenseAmount },
+                { "@remark", remark }
             });
         }
 
