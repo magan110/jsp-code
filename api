@@ -1,766 +1,231 @@
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Http;
-using System.ComponentModel.DataAnnotations;
-using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
 using RAKControllers.DataAccess;
-using System.Data;
+using System.IdentityModel.Tokens.Jwt;
+using System.Text;
 
-namespace RAKControllers.Controllers
+var builder = WebApplication.CreateBuilder(args);
+
+// Controllers & Swagger
+builder.Services.AddControllers();
+builder.Services.AddSwaggerGen();
+
+// ---- CORS: allow your Flutter web origins (adjust as needed) ----
+const string CorsPolicy = "AllowFlutterWeb";
+builder.Services.AddCors(options =>
 {
-    [ApiController]
-    [Route("api/[controller]")]
-    public class ExpertMeetClaimController : ControllerBase
+    options.AddPolicy(CorsPolicy, p => p
+        .WithOrigins(
+            "http://localhost:8520",     // flutter dev on localhost
+            "http://10.4.64.23:8520",    // flutter served from this host:port (if applicable)
+            "http://10.166.220.55:8081"  // IIS site hosting Flutter (if applicable)
+        )
+        .AllowAnyHeader()
+        .AllowAnyMethod()
+        // .AllowCredentials() // only if you actually use cookies; don't combine with AllowAnyOrigin
+    );
+});
+
+// Connection strings
+var connectionStrings = builder.Configuration.GetSection("ConnectionStrings").Get<Dictionary<string, string>>();
+
+// DatabaseHelper
+builder.Services.AddSingleton(provider =>
+    new DatabaseHelper(connectionStrings["bwlive"]));
+
+// HttpClient
+builder.Services.AddHttpClient();
+
+// Authentication (JWT)
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
     {
-        private readonly ILogger<ExpertMeetClaimController> _logger;
-        private readonly DatabaseHelper _dbHelper;
-
-        public ExpertMeetClaimController(ILogger<ExpertMeetClaimController> logger, DatabaseHelper dbHelper)
+        options.TokenValidationParameters = new TokenValidationParameters
         {
-            _logger = logger;
-            _dbHelper = dbHelper;
-        }
+            ValidateIssuer = true,
+            ValidateAudience = false,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = "Birla White IT",
 
-        // GET endpoint to initialize form data (equivalent to refreshed() function in Java)
-        [HttpGet("form-data")]
-        public async Task<ActionResult<ApiResponse<ExpertMeetClaimFormData>>> GetFormData(
-            [FromQuery] string procType = "A",
-            [FromQuery] string docuNumb = "",
-            [FromQuery] string catActNo = "",
-            [FromQuery] string areaCode = "",
-            [FromQuery] string loginIdM = "")
-        {
-            try
+            // NOTE: this uses ServiceProvider inside configuration time (anti-pattern),
+            // but keeping your original approach for now. Consider refactoring later.
+            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
             {
-                var formData = new ExpertMeetClaimFormData();
+                var jwtToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
+                var userID = jwtToken.Claims.FirstOrDefault(c => c.Type == "userID")?.Value;
 
-                // Set basic form parameters
-                formData.ProcType = procType;
-                formData.DocuNumb = docuNumb;
-                formData.CatActNo = catActNo;
-                formData.AreaCode = areaCode;
-
-                // Check start date validation (equivalent to strtDays check in Java)
-                string sql = "SELECT case when getdate() > '01 Feb 2025' then '1' else 0 end as strtDays";
-                var strtDaysResult = await _dbHelper.ExecuteScalarAsync(sql);
-                if (strtDaysResult?.ToString() == "1")
+                if (userID != null)
                 {
-                    return BadRequest(new ApiResponse<ExpertMeetClaimFormData>
+                    // Be careful: BuildServiceProvider creates a SECOND container.
+                    // Prefer a scoped accessor or service locator set AFTER build.
+                    var dbHelper = builder.Services.BuildServiceProvider().GetRequiredService<DatabaseHelper>();
+                    var appregId = dbHelper.GetSecretKey(userID);
+                    if (!string.IsNullOrEmpty(appregId))
                     {
-                        Success = false,
-                        Message = "Entry is not allowed."
-                    });
-                }
-
-                // Generate random number for new entries
-                if (procType == "A")
-                {
-                    sql = "select right(newId(), 8)";
-                    var randResult = await _dbHelper.ExecuteScalarAsync(sql);
-                    formData.RandNmSt = randResult?.ToString() ?? "";
-                }
-                else
-                {
-                    formData.RandNmSt = docuNumb;
-                }
-
-                // Get dropdown options
-                formData.ProcessTypeOptions = GetProcessTypeOptions(procType);
-                formData.DocumentOptions = await GetDocumentOptions(loginIdM);
-                formData.ActivityOptions = await GetActivityOptions(loginIdM);
-
-                // If updating existing record, get existing data
-                if ((procType == "U" || procType == "D") && !string.IsNullOrEmpty(docuNumb))
-                {
-                    await LoadExistingClaimData(formData, docuNumb, loginIdM);
-                }
-
-                // If activity is selected, load activity details
-                if (!string.IsNullOrEmpty(catActNo))
-                {
-                    await LoadActivityDetails(formData, catActNo);
-                }
-
-                return Ok(new ApiResponse<ExpertMeetClaimFormData>
-                {
-                    Success = true,
-                    Data = formData,
-                    Message = "Form data loaded successfully"
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error loading form data");
-                return StatusCode(500, new ApiResponse<ExpertMeetClaimFormData>
-                {
-                    Success = false,
-                    Message = "Error loading form data: " + ex.Message
-                });
-            }
-        }
-
-
-
-
-        // POST endpoint for form submission (equivalent to CascActExpnS.jsp)
-        [HttpPost("submit")]
-        public async Task<ActionResult<ApiResponse<string>>> SubmitClaim([FromBody] ExpertMeetClaimSubmission request)
-        {
-            try
-            {
-                if (!ModelState.IsValid)
-                {
-                    return BadRequest(new ApiResponse<string>
-                    {
-                        Success = false,
-                        Message = "Invalid request data",
-                        Errors = ModelState.Values.SelectMany(v => v.Errors.Select(e => e.ErrorMessage)).ToList()
-                    });
-                }
-
-                string docuNumb = "";
-                string message = "";
-
-                // Start transaction
-                using (var transaction = _dbHelper.BeginTransaction())
-                {
-                    try
-                    {
-                        if (request.ProcType == "A")
-                        {
-                            // Generate document number for new entries
-                            docuNumb = await GenerateDocumentNumber("CAE", request.AreaCode);
-
-                            // Insert main record into catExcpnsEp
-                            string sql = @"INSERT INTO catExcpnsEp(docuNumb, docuDate, catActNo, noOfTtPr, pendWith, statFlag, randNmSt, createId, createDt)
-                                          VALUES (@docuNumb, CONVERT(varchar(11), getdate(), 113), @catActNo, @noOfTtPr, @pendWith, 'T', @randNmSt, @loginIdM, getdate())";
-
-                            await _dbHelper.ExecuteNonQueryAsync(sql, new
-                            {
-                                docuNumb = docuNumb,
-                                catActNo = request.CatActNo,
-                                noOfTtPr = "0",
-                                pendWith = request.PendWith,
-                                randNmSt = request.RandNmSt,
-                                loginIdM = request.LoginIdM
-                            });
-
-                            // Update activity reference
-                            sql = "UPDATE catActPreSl SET refDocNo = @docuNumb WHERE docuNumb = @catActNo";
-                            await _dbHelper.ExecuteNonQueryAsync(sql, new { docuNumb = docuNumb, catActNo = request.CatActNo });
-
-                            message = $"Insert Successful. Your Document No: {docuNumb}";
-                        }
-                        else if (request.ProcType == "U")
-                        {
-                            docuNumb = request.DocuNumb;
-
-                            // Update main record
-                            string sql = @"UPDATE catExcpnsEp SET pendWith = @pendWith, statFlag = 'T', updateDt = getdate(), updateId = @loginIdM
-                                          WHERE docuNumb = @docuNumb AND createId = @loginIdM";
-
-                            await _dbHelper.ExecuteNonQueryAsync(sql, new
-                            {
-                                pendWith = request.PendWith,
-                                docuNumb = docuNumb,
-                                loginIdM = request.LoginIdM
-                            });
-
-                            // Delete existing expense details
-                            sql = "DELETE FROM catExcpnsEpDtl WHERE docuNumb = @docuNumb AND createId = @loginIdM";
-                            await _dbHelper.ExecuteNonQueryAsync(sql, new { docuNumb = docuNumb, loginIdM = request.LoginIdM });
-
-                            message = "Update Successful";
-                        }
-
-                        // Insert expense details and calculate total amount
-                        decimal totalExpenseAmount = 0;
-                        if (request.ExpenseDetails != null && request.ExpenseDetails.Count > 0)
-                        {
-                            for (int i = 0; i < request.ExpenseDetails.Count; i++)
-                            {
-                                var expense = request.ExpenseDetails[i];
-                                decimal expenseAmt = Convert.ToDecimal(expense.ExpnsAmt);
-                                totalExpenseAmount += expenseAmt;
-
-                                string sql = @"INSERT INTO catExcpnsEpDtl(docuNumb, expnsTye, expnsDat, expnsAmt, expAmtEx, expnsBil, createId, createDt)
-                                              VALUES (@docuNumb, @expnsTye, @expnsDat, @expnsAmt, @expAmtEx, @expnsBil, @loginIdM, getdate())";
-
-                                await _dbHelper.ExecuteNonQueryAsync(sql, new
-                                {
-                                    docuNumb = docuNumb,
-                                    expnsTye = i.ToString(),
-                                    expnsDat = ConvertToSqlDate(request.MeetDate),
-                                    expnsAmt = expense.ExpnsAmt,
-                                    expAmtEx = expense.ExpAmtEx ?? "0",
-                                    expnsBil = expense.ExpnsBil,
-                                    loginIdM = request.LoginIdM
-                                });
-                            }
-                        }
-
-                        // Update budget usage (equivalent to ettExpncBud updates in Java)
-                        await UpdateBudgetUsage(request.ZoneCode, request.CatActNo, request.LoginIdM, totalExpenseAmount);
-
-                        // Update attachment info if any
-                        await UpdateAttachmentInfo(docuNumb, request.LoginIdM);
-
-                        transaction.Commit();
-
-                        _logger.LogInformation("Expert meet claim processed successfully. Document: {DocumentNo}", docuNumb);
-
-                        return Ok(new ApiResponse<string>
-                        {
-                            Success = true,
-                            Data = docuNumb,
-                            Message = message
-                        });
+                        return new[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(appregId)) };
                     }
-                    catch (Exception)
+                }
+                throw new SecurityTokenInvalidSigningKeyException("Invalid PartnerID or SecretKey.");
+            }
+        };
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var authHeader = context.Request.Headers["Authorization"].ToString();
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+                {
+                    context.Token = authHeader.Replace("Bearer ", "");
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseHttpsRedirection();
+
+// -------- Pipeline ORDER (important for CORS) --------
+app.UseStaticFiles();
+
+// If you keep a custom auth middleware, put CORS BEFORE it and let OPTIONS through there
+app.UseCors(CorsPolicy);
+
+// Your custom middleware (must not block OPTIONS)
+app.UseMiddleware<AuthenticationMiddleware>();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Ensure preflight OPTIONS always returns with CORS headers
+app.MapMethods("{*path}", new[] { "OPTIONS" }, () => Results.Ok()).RequireCors(CorsPolicy);
+
+app.MapControllers();
+
+app.Run();
+
+
+
+
+
+
+
+using System;
+using System.Collections.Generic;
+using Microsoft.Data.SqlClient;
+
+namespace RAKControllers.DataAccess
+{
+    public class DatabaseHelper
+    {
+        private readonly string _bwliveConnectionString;
+
+        public DatabaseHelper(string bwliveConnectionString)
+        {
+            _bwliveConnectionString = bwliveConnectionString;
+        }
+
+        // General method to execute SELECT queries for any connection string
+        private List<Dictionary<string, object>> ExecuteSelectQuery(string connectionString, string query, Dictionary<string, object> parameters)
+        {
+            var resultList = new List<Dictionary<string, object>>();
+
+            using (var conn = new SqlConnection(connectionString))
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                foreach (var param in parameters)
+                {
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                }
+
+                conn.Open();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
                     {
-                        transaction.Rollback();
-                        throw;
+                        var row = new Dictionary<string, object>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row[reader.GetName(i)] = reader[i];
+                        }
+                        resultList.Add(row);
                     }
                 }
             }
-            catch (Exception ex)
+
+            return resultList;
+        }
+
+        // General method to execute INSERT, UPDATE, or DELETE queries for any connection string
+        private int ExecuteCommand(string connectionString, string query, Dictionary<string, object> parameters)
+        {
+            using (var conn = new SqlConnection(connectionString))
+            using (var cmd = new SqlCommand(query, conn))
             {
-                _logger.LogError(ex, "Error processing expert meet claim");
-                return StatusCode(500, new ApiResponse<string>
+                foreach (var param in parameters)
                 {
-                    Success = false,
-                    Message = "Error processing expert meet claim: " + ex.Message
-                });
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
+                }
+
+                conn.Open();
+                return cmd.ExecuteNonQuery(); // Returns the number of rows affected
             }
         }
 
-
-
-        [HttpPost("upload-image")]
-        public async Task<ActionResult<ApiResponse<string>>> UploadImage([FromForm] ImageUploadRequest request)
+        private int ExecuteCommandInternal(string connectionString, string query, Dictionary<string, object> parameters)
         {
-            try
+            using (var conn = new SqlConnection(connectionString))
             {
-                if (request.Image == null || request.Image.Length == 0)
+                var cmd = new SqlCommand(query, conn);
+
+                foreach (var param in parameters)
                 {
-                    return BadRequest(new ApiResponse<string>
-                    {
-                        Success = false,
-                        Message = "No image file provided"
-                    });
+                    cmd.Parameters.AddWithValue(param.Key, param.Value);
                 }
 
-                // Validate file type and size
-                var allowedTypes = new[] { "image/jpeg", "image/jpg", "image/png" };
-                if (!allowedTypes.Contains(request.Image.ContentType.ToLower()))
-                {
-                    return BadRequest(new ApiResponse<string>
-                    {
-                        Success = false,
-                        Message = "Only JPEG, JPG, and PNG files are allowed"
-                    });
-                }
-
-                if (request.Image.Length > 3 * 1024 * 1024) // 3MB limit
-                {
-                    return BadRequest(new ApiResponse<string>
-                    {
-                        Success = false,
-                        Message = "File size cannot exceed 3MB"
-                    });
-                }
-
-                // Generate unique filename
-                string fileName = $"{request.DocumentNo}_{request.ImageSequence}_{Guid.NewGuid()}{Path.GetExtension(request.Image.FileName)}";
-                string uploadPath = Path.Combine("uploads", "images");
-
-                // Ensure directory exists
-                if (!Directory.Exists(uploadPath))
-                {
-                    Directory.CreateDirectory(uploadPath);
-                }
-
-                string filePath = Path.Combine(uploadPath, fileName);
-
-                // Save file
-                using (var stream = new FileStream(filePath, FileMode.Create))
-                {
-                    await request.Image.CopyToAsync(stream);
-                }
-
-                // TODO: Save file information to database (imagedata.dbo.cotDocAttch equivalent)
-
-                _logger.LogInformation("Image uploaded successfully: {FileName}", fileName);
-
-                return Ok(new ApiResponse<string>
-                {
-                    Success = true,
-                    Data = $"/uploads/images/{fileName}",
-                    Message = "Image uploaded successfully"
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error uploading image");
-                return StatusCode(500, new ApiResponse<string>
-                {
-                    Success = false,
-                    Message = "Error uploading image"
-                });
+                conn.Open();
+                return cmd.ExecuteNonQuery();
             }
         }
 
-        [HttpGet("validate-budget")]
-        public async Task<ActionResult<ApiResponse<BudgetValidationResponse>>> ValidateBudget([FromQuery] string activityNo, [FromQuery] decimal totalAmount)
+        public int WebExecute(string query, Dictionary<string, object> parameters)
         {
-            try
-            {
-                // Get max budget from activity
-                string sql = @"SELECT ISNULL(mxBdgtAl, 0) as maxBudget
-                              FROM catActPreSl WITH (NOLOCK)
-                              WHERE docuNumb = @activityNo";
-
-                var result = await _dbHelper.ExecuteScalarAsync(sql, new { activityNo });
-                decimal maxBudget = Convert.ToDecimal(result ?? 0);
-
-                var response = new BudgetValidationResponse
-                {
-                    IsValid = totalAmount <= maxBudget,
-                    MaxBudget = maxBudget,
-                    RequestedAmount = totalAmount,
-                    RemainingBudget = maxBudget - totalAmount
-                };
-
-                return Ok(new ApiResponse<BudgetValidationResponse>
-                {
-                    Success = true,
-                    Data = response,
-                    Message = response.IsValid ? "Budget is valid" : "Requested amount exceeds maximum budget"
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error validating budget");
-                return StatusCode(500, new ApiResponse<BudgetValidationResponse>
-                {
-                    Success = false,
-                    Message = "Error validating budget"
-                });
-            }
+            return ExecuteCommandInternal(_bwliveConnectionString, query, parameters);
         }
 
-        // Helper methods matching Java backend logic
-        private async Task<string> GenerateDocumentNumber(string docuType, string areaCode)
+
+        // Function to handle queries for bwlive database (WebSessBean)
+        public List<Dictionary<string, object>> WebSessBean(string query, Dictionary<string, object> parameters)
         {
-            // Generate document number similar to WebSessBean.getDocumentNo logic
-            // You may need to adjust this based on your actual document number generation logic
-            string sql = @"SELECT ISNULL(MAX(CAST(RIGHT(docuNumb, 4) AS INT)), 0) + 1 as nextNum
-                          FROM catExcpnsEp WITH (NOLOCK)
-                          WHERE LEFT(docuNumb, 3) = @docuType
-                          AND SUBSTRING(docuNumb, 4, 6) = @yearMonth
-                          AND SUBSTRING(docuNumb, 10, LEN(@areaCode)) = @areaCode";
-
-            string yearMonth = DateTime.Now.ToString("yyyyMM");
-            var result = await _dbHelper.ExecuteScalarAsync(sql, new { docuType, yearMonth, areaCode });
-            int nextNum = Convert.ToInt32(result ?? 1);
-
-            return $"{docuType}{yearMonth}{areaCode}{nextNum:D4}";
+            return ExecuteSelectQuery(_bwliveConnectionString, query, parameters);
         }
 
-        private List<ProcessTypeOption> GetProcessTypeOptions(string selectedValue)
+        // Retrieve SecretKey for a given PartnerID from the RegisteredUsers table (itKharia)
+        public string GetSecretKey(string userID)
         {
-            return new List<ProcessTypeOption>
+            var query = "SELECT appRegId FROM wcmUserCred WHERE loginIdM = @loginIdm and isActive = 'Y'";
+            var parameters = new Dictionary<string, object>
             {
-                new ProcessTypeOption { Value = "A", Label = "Add", Selected = selectedValue == "A" },
-                new ProcessTypeOption { Value = "U", Label = "Update", Selected = selectedValue == "U" },
-                new ProcessTypeOption { Value = "D", Label = "Delete", Selected = selectedValue == "D" }
+                { "@loginIdm", userID } // ✅ Matches query
             };
-        }
 
-        private async Task<List<DocumentOption>> GetDocumentOptions(string loginIdM)
-        {
-            string sql = @"SELECT docuNumb, docuNumb
-                          FROM catExcpnsEp WITH (NOLOCK)
-                          WHERE statFlag = 'T' AND createId = @loginIdM
-                          ORDER BY createDt DESC";
-
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { loginIdM });
-            var options = new List<DocumentOption>();
-
-            foreach (DataRow row in result.Rows)
+            var result = WebSessBean(query, parameters);
+            if (result.Count > 0)
             {
-                options.Add(new DocumentOption
-                {
-                    Value = row[0].ToString(),
-                    Label = row[1].ToString()
-                });
+                return result[0]["appRegId"]?.ToString();
             }
 
-            return options;
+            throw new Exception("appRegId not found for the given UserID.");
         }
-
-        private async Task<List<ActivityOption>> GetActivityOptions(string loginIdM)
-        {
-            string sql = @"SELECT a.docuNumb, a.docuNumb + ' ' + a.custCode + ' (' + b.custName + ')'
-                          FROM catActPreSl a WITH (NOLOCK), dpvConcEmpl b WITH (NOLOCK)
-                          WHERE a.cusRtlCd = b.custCode
-                          AND a.statFlag IN ('N')
-                          AND a.createId = @loginIdM
-                          AND ISNULL(a.refDocNo, '') NOT IN (
-                              SELECT docuNumb FROM catExcpnsEp a WITH (NOLOCK)
-                              WHERE statFlag NOT IN ('T') AND a.createId = @loginIdM
-                          )
-                          AND a.createDt > GETDATE() - 365
-                          ORDER BY a.createDt DESC";
-
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { loginIdM });
-            var options = new List<ActivityOption>();
-
-            foreach (DataRow row in result.Rows)
-            {
-                options.Add(new ActivityOption
-                {
-                    Value = row[0].ToString(),
-                    Label = row[1].ToString()
-                });
-            }
-
-            return options;
-        }
-
-        private async Task LoadExistingClaimData(ExpertMeetClaimFormData formData, string docuNumb, string loginIdM)
-        {
-            string sql = @"SELECT docuNumb, catActNo, noOfTtPr
-                          FROM catExcpnsEp WITH (NOLOCK)
-                          WHERE statFlag = 'T' AND docuNumb = @docuNumb AND createId = @loginIdM";
-
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { docuNumb, loginIdM });
-
-            if (result.Rows.Count > 0)
-            {
-                var row = result.Rows[0];
-                formData.DocuNumb = row[0].ToString();
-                formData.CatActNo = row[1].ToString();
-            }
-        }
-
-        private async Task LoadActivityDetails(ExpertMeetClaimFormData formData, string catActNo)
-        {
-            // Load activity details
-            string sql = @"SELECT a.docuNumb, CONVERT(varchar(11), a.actvDate, 113), a.docuMnth, a.actvName, a.caaActTy, a.caaObjTy,
-                          CONVERT(VARCHAR(10), a.meetDate, 103), a.meetVenu, a.actvCity, a.district, a.pinCodeN, a.noOfPart,
-                          a.noOfEnqu, a.noOfVist, a.prodCtLs, a.empPrsLs, a.actvRmrk, a.caaPrjTy, a.mobileNo, a.emailAdd,
-                          a.contPers, a.potnInMT, a.maturtMn, a.rejcRmrk, b.areaCode, ISNULL(a.cusRtlCd, ''),
-                          ISNULL(a.atchNmId, ''), a.statFlag, ISNULL(mxBdgtAl, 0), ISNULL(refDocNo, '')
-                          FROM catActPreSl a WITH (NOLOCK), bkmareaStZn b WITH (NOLOCK)
-                          WHERE docuNumb = @catActNo
-                          AND dbo.cofDocNoVal(a.docuNumb, 'O') = b.areaCode";
-
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { catActNo });
-
-            if (result.Rows.Count > 0)
-            {
-                var row = result.Rows[0];
-                formData.ActivityDetails = new ActivityDetails
-                {
-                    ActivityNo = row[0].ToString(),
-                    ActivityDate = row[1].ToString(),
-                    ActivityName = row[3].ToString(),
-                    MeetDate = row[6].ToString(),
-                    MeetVenue = row[7].ToString(),
-                    ActivityCity = row[8].ToString(),
-                    District = row[9].ToString(),
-                    MaxBudget = Convert.ToDecimal(row[28]),
-                    AreaCode = row[24].ToString(),
-                    RetailerCode = row[25].ToString()
-                };
-
-                // Load retailer details if retailer code exists
-                if (!string.IsNullOrEmpty(formData.ActivityDetails.RetailerCode))
-                {
-                    await LoadRetailerDetails(formData, formData.ActivityDetails.RetailerCode);
-                }
-
-                // Load painter details
-                await LoadPainterDetails(formData, catActNo);
-            }
-        }
-
-        private async Task LoadRetailerDetails(ExpertMeetClaimFormData formData, string retlSpCd)
-        {
-            string sql = @"SELECT a.retlCode, a.retlName, a.mobileNo, b.custName, a.sapRtlCd, ISNULL(a.cityName, location),
-                          a.district, a.retlPinC, CASE WHEN ISNULL(a.kycVerFl, 'N') = 'Y' THEN 'Yes' ELSE 'No' END as kycVerFl,
-                          ISNULL(a.mrktName, ''), CASE WHEN a.retlCatg = '' THEN 'U' ELSE 'R' END, c.zoneCode
-                          FROM rtmRetailer a WITH (NOLOCK), dpmCustomer b WITH (NOLOCK), bkmAreaStZn c WITH (NOLOCK)
-                          WHERE a.isActive = 'Y' AND a.custCode = b.custCode AND a.areaCode = c.areaCode
-                          AND retlCode = @retlSpCd
-                          UNION ALL
-                          SELECT custCode, b.custName, b.mobileNo, b.custName, b.sapCusCd, ISNULL(custCity, ''),
-                          district, b.custPinC, 'Yes' as kycVerFl, ISNULL(b.mrktName, ''), 'U', c.zoneCode
-                          FROM dpmCustomer b WITH (NOLOCK), bkmAreaStZn c WITH (NOLOCK)
-                          WHERE b.isActive = 'Y' AND b.areaCode = c.areaCode
-                          AND custCode = @retlSpCd";
-
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { retlSpCd });
-
-            if (result.Rows.Count > 0)
-            {
-                var row = result.Rows[0];
-                formData.RetailerDetails = new RetailerDetails
-                {
-                    Name = row[1].ToString(),
-                    SapCode = row[4].ToString(),
-                    MobileNo = row[2].ToString(),
-                    StockistName = row[3].ToString(),
-                    District = row[6].ToString(),
-                    City = row[5].ToString(),
-                    PinCode = row[7].ToString(),
-                    KycStatus = row[8].ToString()
-                };
-            }
-        }
-
-        private async Task LoadPainterDetails(ExpertMeetClaimFormData formData, string catActNo)
-        {
-            string sql = @"SELECT b.mobileNo, c.paramDes, b.inflName, ISNULL(a.dsrRem08, ''), ISNULL(a.nwPntFlg, ''),
-                          ISNULL(a.tlKitFlg, ''), b.inflCode, ISNULL(oldKycFl, '')
-                          FROM catActPreSlDtl a WITH (NOLOCK), ctvInfluncr b WITH (NOLOCK), wcmParametr c WITH (NOLOCK)
-                          WHERE a.attnCode = b.inflCode AND a.dsrRem09 = b.mobileNo AND b.inflType = c.paramCod
-                          AND paramTyp = '04' AND docuNumb = @catActNo AND attnType = 'I'";
-
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { catActNo });
-            formData.Painters = new List<PainterDetails>();
-
-            foreach (DataRow row in result.Rows)
-            {
-                formData.Painters.Add(new PainterDetails
-                {
-                    MobileNo = row[0].ToString(),
-                    Type = row[1].ToString(),
-                    Name = row[2].ToString()
-                });
-            }
-        }
-
-        private async Task UpdateBudgetUsage(string zoneCode, string catActNo, string loginIdM, decimal totalExpenseAmount)
-        {
-            // Update budget status to 'C' (Closed)
-            string sql = @"UPDATE ettExpncBud SET statFlag = 'C', updateDt = GETDATE(), updateId = @loginIdM
-                          WHERE zoneCode = @zoneCode AND expnsTyp = '11' AND fincYear = @fincYear
-                          AND catActDc = @catActNo AND statFlag = 'N'";
-
-            await _dbHelper.ExecuteNonQueryAsync(sql, new
-            {
-                zoneCode,
-                catActNo,
-                loginIdM,
-                fincYear = GetCurrentFinancialYear()
-            });
-
-            // Insert new budget record
-            sql = @"INSERT INTO ettExpncBud(zoneCode, expnsTyp, fincYear, schBdIdn, catActDc, docuDate, nrtnRmrk, budAmtDb, budAmtCr, statFlag, createId, createDt)
-                   VALUES (@zoneCode, '11', @fincYear, 1, @catActNo, CONVERT(varchar(11), GETDATE(), 113),
-                   'Budget Use in Casc Activity Expns', @expnsAmt, 0, 'N', 'System', getdate())";
-
-            await _dbHelper.ExecuteNonQueryAsync(sql, new
-            {
-                zoneCode,
-                fincYear = GetCurrentFinancialYear(),
-                catActNo,
-                expnsAmt = totalExpenseAmount
-            });
-        }
-
-        private async Task UpdateAttachmentInfo(string docuNumb, string loginIdM)
-        {
-            string sql = @"SELECT atchNmId FROM imagedata.dbo.cotDocAttch WITH (NOLOCK) WHERE docuNumb = @docuNumb";
-            var result = await _dbHelper.ExecuteReaderAsync(sql, new { docuNumb });
-
-            string atchNmIds = "";
-            foreach (DataRow row in result.Rows)
-            {
-                if (!string.IsNullOrEmpty(atchNmIds))
-                    atchNmIds += ",";
-                atchNmIds += row[0].ToString();
-            }
-
-            if (!string.IsNullOrEmpty(atchNmIds))
-            {
-                sql = "UPDATE catExcpnsEp SET atchNmId = @atchNmIds WHERE docuNumb = @docuNumb";
-                await _dbHelper.ExecuteNonQueryAsync(sql, new { atchNmIds, docuNumb });
-            }
-        }
-
-        private string ConvertToSqlDate(string dateString)
-        {
-            if (DateTime.TryParse(dateString, out DateTime date))
-            {
-                return date.ToString("yyyy-MM-dd");
-            }
-            return DateTime.Now.ToString("yyyy-MM-dd");
-        }
-
-        private string GetCurrentFinancialYear()
-        {
-            var now = DateTime.Now;
-            var startYear = now.Month >= 4 ? now.Year : now.Year - 1;
-            return $"{startYear}-{startYear + 1}";
-        }
-    }
-
-    // DTOs and Models
-    public class ApiResponse<T>
-    {
-        public bool Success { get; set; }
-        public T? Data { get; set; }
-        public string Message { get; set; } = string.Empty;
-        public List<string> Errors { get; set; } = new List<string>();
-    }
-
-    public class ActivityOption
-    {
-        public string Value { get; set; } = string.Empty;
-        public string Label { get; set; } = string.Empty;
-    }
-
-    public class DocumentOption
-    {
-        public string Value { get; set; } = string.Empty;
-        public string Label { get; set; } = string.Empty;
-    }
-
-    public class ActivityDetails
-    {
-        public string ActivityNo { get; set; } = string.Empty;
-        public string ActivityDate { get; set; } = string.Empty;
-        public string ActivityName { get; set; } = string.Empty;
-        public string MeetDate { get; set; } = string.Empty;
-        public string MeetVenue { get; set; } = string.Empty;
-        public string ActivityCity { get; set; } = string.Empty;
-        public string District { get; set; } = string.Empty;
-        public decimal MaxBudget { get; set; }
-        public string AreaCode { get; set; } = string.Empty;
-        public string RetailerCode { get; set; } = string.Empty;
-        public RetailerDetails? RetailerDetails { get; set; }
-        public List<PainterDetails> Painters { get; set; } = new List<PainterDetails>();
-    }
-
-    public class RetailerDetails
-    {
-        public string Name { get; set; } = string.Empty;
-        public string SapCode { get; set; } = string.Empty;
-        public string MobileNo { get; set; } = string.Empty;
-        public string StockistName { get; set; } = string.Empty;
-        public string District { get; set; } = string.Empty;
-        public string City { get; set; } = string.Empty;
-        public string PinCode { get; set; } = string.Empty;
-        public string KycStatus { get; set; } = string.Empty;
-    }
-
-    public class PainterDetails
-    {
-        public string MobileNo { get; set; } = string.Empty;
-        public string Type { get; set; } = string.Empty;
-        public string Name { get; set; } = string.Empty;
-    }
-
-    public class ExpenseDetail
-    {
-        public string BillNo { get; set; } = string.Empty;
-        public decimal Amount { get; set; }
-        public string ImagePath { get; set; } = string.Empty;
-    }
-
-
-    // New DTOs matching the Java backend structure
-    public class ExpertMeetClaimFormData
-    {
-        public string ProcType { get; set; } = "A";
-        public string DocuNumb { get; set; } = string.Empty;
-        public string CatActNo { get; set; } = string.Empty;
-        public string AreaCode { get; set; } = string.Empty;
-        public string RandNmSt { get; set; } = string.Empty;
-        public List<ProcessTypeOption> ProcessTypeOptions { get; set; } = new List<ProcessTypeOption>();
-        public List<DocumentOption> DocumentOptions { get; set; } = new List<DocumentOption>();
-        public List<ActivityOption> ActivityOptions { get; set; } = new List<ActivityOption>();
-        public ActivityDetails? ActivityDetails { get; set; }
-        public RetailerDetails? RetailerDetails { get; set; }
-        public List<PainterDetails> Painters { get; set; } = new List<PainterDetails>();
-        public List<ExpenseDetailData> ExpenseDetails { get; set; } = new List<ExpenseDetailData>();
-    }
-
-    public class ProcessTypeOption
-    {
-        public string Value { get; set; } = string.Empty;
-        public string Label { get; set; } = string.Empty;
-        public bool Selected { get; set; }
-    }
-
-    public class ExpenseDetailData
-    {
-        public string ExpnsTye { get; set; } = string.Empty;
-        public string ExpnsAmt { get; set; } = string.Empty;
-        public string ExpnsBil { get; set; } = string.Empty;
-        public string ExpAmtEx { get; set; } = "0";
-    }
-
-    public class ExpertMeetClaimSubmission
-    {
-        [Required]
-        public string ProcType { get; set; } = "A"; // A=Add, U=Update, D=Delete
-
-        public string DocuNumb { get; set; } = string.Empty; // For Update/Delete
-
-        [Required]
-        public string CatActNo { get; set; } = string.Empty; // Activity Number
-
-        [Required]
-        public string AreaCode { get; set; } = string.Empty;
-
-        [Required]
-        public string LoginIdM { get; set; } = string.Empty;
-
-        public string PendWith { get; set; } = string.Empty;
-
-        public string RandNmSt { get; set; } = string.Empty;
-
-        public string ZoneCode { get; set; } = string.Empty;
-
-        public string MeetDate { get; set; } = string.Empty;
-
-        [Required]
-        public List<ExpenseSubmissionDetail> ExpenseDetails { get; set; } = new List<ExpenseSubmissionDetail>();
-    }
-
-    public class ExpenseSubmissionDetail
-    {
-        [Required]
-        public string ExpnsBil { get; set; } = string.Empty; // Bill Number
-
-        [Required]
-        [Range(0.01, 999999.99)]
-        public string ExpnsAmt { get; set; } = string.Empty; // Amount
-
-        public string ExpAmtEx { get; set; } = "0"; // Extra Amount
-    }
-
-
-    public class ImageUploadRequest
-    {
-        [Required]
-        public IFormFile Image { get; set; } = null!;
-
-        [Required]
-        public string DocumentNo { get; set; } = string.Empty;
-
-        [Required]
-        public string ImageSequence { get; set; } = string.Empty;
-    }
-
-    public class BudgetValidationResponse
-    {
-        public bool IsValid { get; set; }
-        public decimal MaxBudget { get; set; }
-        public decimal RequestedAmount { get; set; }
-        public decimal RemainingBudget { get; set; }
     }
 }
