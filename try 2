@@ -1,641 +1,244 @@
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text.RegularExpressions;
-
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class ApprovalController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-
-        public ApprovalController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
-
-        // ------------------------------------------------------------
-        // 1) PENDING LIST (paged + search + filter by type)
-        // GET: /api/Approval/pending?search=&type=All&page=1&pageSize=20
-        // ------------------------------------------------------------
-        [HttpGet("pending")]
-        public IActionResult GetPending(
-            [FromQuery] string? search = "",
-            [FromQuery] string? type = "All",
-            [FromQuery] int page = 1,
-            [FromQuery] int pageSize = 20,
-            [FromQuery] string? sort = "createDt_desc")
-        {
-            page = page <= 0 ? 1 : page;
-            pageSize = pageSize <= 0 ? 20 : pageSize;
-            var skip = (page - 1) * pageSize;
-
-            // Only PENDING rows now: isActive NOT IN ('Y','R'); also exclude blocked
-            var where = @"
-WHERE 
-    ISNULL(blkStuts,'N') <> 'Y'
-    AND ISNULL(isActive,'') NOT IN ('Y','R')
-";
-            var p = new Dictionary<string, object?>();
-
-            // Filter by type (friendly label or 2-char code)
-            if (!string.IsNullOrWhiteSpace(type) && !type.Equals("All", StringComparison.OrdinalIgnoreCase))
-            {
-                where += "  AND (contrtyp = @type OR inflType = @typeShort)\n";
-                p["@type"] = type;
-                p["@typeShort"] = (type.Length >= 2 ? type[..2] : type).ToUpperInvariant();
-            }
-
-            // Search
-            if (!string.IsNullOrWhiteSpace(search))
-            {
-                where += @"
-  AND (
-        inflName LIKE @kw 
-        OR (LTRIM(RTRIM(ISNULL(frstname,''))) + ' ' + LTRIM(RTRIM(ISNULL(middname,''))) + ' ' + LTRIM(RTRIM(ISNULL(lastname,'')))) LIKE @kw
-        OR mobileNo LIKE @kw
-        OR areaCode LIKE @kw
-        OR inflCode LIKE @kw
-        OR contrtyp LIKE @kw
-      )
-";
-                p["@kw"] = $"%{search.Trim()}%";
-            }
-
-            // Sorting
-            string orderBy = sort?.ToLowerInvariant() switch
-            {
-                "name_asc" => "ORDER BY name ASC",
-                "name_desc" => "ORDER BY name DESC",
-                "type_asc" => "ORDER BY type ASC",
-                "type_desc" => "ORDER BY type DESC",
-                "date_asc" => "ORDER BY dt ASC",
-                _ => "ORDER BY dt DESC", // default date_desc
-            };
-
-            // Single result set with COUNT() OVER()
-            var sql = $@"
-;WITH base AS
-(
-    SELECT
-        inflCode,
-        LTRIM(RTRIM(
-            NULLIF(
-                CONCAT(
-                    NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
-                    NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
-                    NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
-                ), '  ')
-        )) AS compositeName,
-        inflName,
-        ISNULL(contrtyp, '') AS contrtyp,
-        ISNULL(inflType, '') AS inflType,
-        ISNULL(isActive,'') AS isActive,
-        COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS dt
-    FROM dbo.ctmInfluncr WITH (NOLOCK)
-    {where}
-)
-, shaped AS
-(
-    SELECT
-        inflCode AS id,
-        CAST(NULLIF(LTRIM(RTRIM(CASE WHEN ISNULL(compositeName,'') <> '' THEN compositeName ELSE inflName END)), '') AS NVARCHAR(256)) AS name,
-        CAST(NULLIF(LTRIM(RTRIM(CASE WHEN ISNULL(contrtyp,'') <> '' THEN contrtyp ELSE inflType END)), '') AS NVARCHAR(255)) AS type,
-        dt,
-        CASE 
-            WHEN isActive = 'Y' THEN 'Approved'
-            WHEN isActive = 'R' THEN 'Rejected'
-            ELSE 'Pending'
-        END AS status
-    FROM base
-)
-SELECT
-    id,
-    ISNULL(name,'') AS name,
-    CASE WHEN ISNULL(type,'')='' THEN 'Contractor' ELSE type END AS type,
-    CONVERT(VARCHAR(10), dt, 120) AS [date], -- yyyy-MM-dd
-    status,
-    COUNT(1) OVER() AS total
-FROM shaped
-{orderBy}
-OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY;
-";
-
-            p["@skip"] = skip;
-            p["@take"] = pageSize;
-
-            var rows = _db.WebSessBean(sql, p ?? new Dictionary<string, object?>())
-                       ?? new List<Dictionary<string, object>>();
-
-            int total = 0;
-            if (rows.Count > 0)
-            {
-                var tStr = rows[0].GetValueOrDefault("total")?.ToString();
-                _ = int.TryParse(tStr, out total);
-            }
-
-            var items = rows.Select(r =>
-            {
-                var id = r["id"]?.ToString() ?? "";
-                var name = r["name"]?.ToString() ?? "";
-                var typeOut = r["type"]?.ToString() ?? "Contractor";
-                var date = r["date"]?.ToString() ?? "";
-                var status = r["status"]?.ToString() ?? "Pending";
-                return new
-                {
-                    id,
-                    name,
-                    type = typeOut,
-                    date,
-                    status,
-                    avatar = MakeAvatar(name, id)
-                };
-            });
-
-            return Ok(new
-            {
-                success = true,
-                page,
-                pageSize,
-                total,
-                items
-            });
-        }
-
-        // ------------------------------------------------------------
-        // 2) STATS for the 3 cards (based on isActive)
-        // GET: /api/Approval/stats
-        // ------------------------------------------------------------
-        [HttpGet("stats")]
-        public IActionResult GetStats()
-        {
-            var sql = @"
-;WITH base AS
-(
-    SELECT
-        ISNULL(isActive,'') AS ia,
-        ISNULL(contrtyp,'') AS contrtyp,
-        ISNULL(inflType,'') AS inflType
-    FROM dbo.ctmInfluncr WITH (NOLOCK)
-    WHERE ISNULL(blkStuts,'N') <> 'Y'
-)
-SELECT 
-    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R')) AS totalPending,
-    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R') AND (contrtyp LIKE '%Contractor%' OR inflType = 'CO')) AS contractors,
-    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R') AND (contrtyp LIKE '%Painter%' OR inflType = 'PA')) AS painters;
-";
-            var rows = _db.WebSessBean(sql, new Dictionary<string, object?>())
-                       ?? new List<Dictionary<string, object>>();
-            var r = rows.FirstOrDefault() ?? new Dictionary<string, object>();
-
-            int Tot(string k) => int.TryParse(r.GetValueOrDefault(k)?.ToString(), out var v) ? v : 0;
-
-            return Ok(new
-            {
-                success = true,
-                totalPending = Tot("totalPending"),
-                contractors = Tot("contractors"),
-                painters = Tot("painters"),
-                timestamp = DateTime.Now
-            });
-        }
-
-        // ------------------------------------------------------------
-        // 3) APPROVE: set isActive = 'Y'
-        // POST: /api/Approval/approve  { inflCode, actorId }
-        // ------------------------------------------------------------
-        [HttpPost("approve")]
-        public IActionResult Approve([FromBody] ApprovalActionRequest req)
-        {
-            if (string.IsNullOrWhiteSpace(req.InflCode))
-                return BadRequest(new { success = false, message = "InflCode is required" });
-
-            var p = new Dictionary<string, object?>
-            {
-                ["@code"] = req.InflCode,
-                ["@usr"] = Cut(req.ActorId ?? "API", 10)
-            };
-
-            var sql = @"
-UPDATE dbo.ctmInfluncr
-   SET isActive = 'Y',
-       updateId = @usr,
-       updateDt = GETDATE()
- WHERE inflCode = @code;
-SELECT @@ROWCOUNT AS rc;
-";
-            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-            var rc = rows.FirstOrDefault()?["rc"]?.ToString();
-            if (rc == "0") return NotFound(new { success = false, message = "Not found" });
-
-            return Ok(new { success = true, message = "Approved", influencerCode = req.InflCode });
-        }
-
-        // ------------------------------------------------------------
-        // 4) REJECT: set isActive = 'R'
-        // POST: /api/Approval/reject  { inflCode, reason, actorId }
-        // ------------------------------------------------------------
-        [HttpPost("reject")]
-        public IActionResult Reject([FromBody] RejectionActionRequest req)
-        {
-            if (string.IsNullOrWhiteSpace(req.InflCode))
-                return BadRequest(new { success = false, message = "InflCode is required" });
-
-            var p = new Dictionary<string, object?>
-            {
-                ["@code"] = req.InflCode,
-                ["@usr"] = Cut(req.ActorId ?? "API", 10),
-                ["@rem"] = Cut(req.Reason ?? "", 1000)
-            };
-
-            var sql = @"
-UPDATE dbo.ctmInfluncr
-   SET isActive = 'R',
-       rjcRemrk = @rem,
-       updateId = @usr,
-       updateDt = GETDATE()
- WHERE inflCode = @code;
-SELECT @@ROWCOUNT AS rc;
-";
-            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-            var rc = rows.FirstOrDefault()?["rc"]?.ToString();
-            if (rc == "0") return NotFound(new { success = false, message = "Not found" });
-
-            return Ok(new { success = true, message = "Rejected", influencerCode = req.InflCode });
-        }
-
-
-        // ------------------------------------------------------------
-
-        // 5) DETAILS by inflCode (for Registration Details screen)
-
-        // GET: /api/Approval/{inflCode}
-
-        // ------------------------------------------------------------
-
-        // Add inside ApprovalController
-
-        // ------------------------------------------------------------
-
-        // COMPACT DETAILS for RegistrationDetailsScreen
-
-        // GET: /api/Approval/details/{inflCode}
-
-        // ------------------------------------------------------------
-
-        [HttpGet("details/{inflCode}")]
-        public IActionResult GetCompactDetails([FromRoute] string inflCode)
-        {
-            if (string.IsNullOrWhiteSpace(inflCode))
-                return BadRequest(new { success = false, message = "inflCode is required" });
-
-            var p = new Dictionary<string, object?>
-            {
-                ["@code"] = inflCode.Trim()
-            };
-
-            var sql = @"
-  SELECT TOP 1
-      -- keys / status / typing
-      inflCode,
-      ISNULL(isActive,'')            AS isActive,
-      ISNULL(contrtyp,'')            AS contrtyp,
-      ISNULL(inflType,'')            AS inflType,
-      CONVERT(VARCHAR(10), COALESCE(createDt, sapInsDt, frstScDt, GETDATE()), 120) AS submittedDate,        
-
-      -- names
-      LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
-      LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
-      LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
-      LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
-
-      -- contact
-      ISNULL(mobileNo,'')            AS mobileNo,
-      ISNULL(emailAdd,'')            AS emailAdd,
-
-      -- reference
-      ISNULL(referenc,'')            AS referenc,
-
-      -- address (present)
-      ISNULL(inflAdd1,'')            AS inflAdd1,
-      ISNULL(inflAdd2,'')            AS inflAdd2,
-      ISNULL(inflAdd3,'')            AS inflAdd3,
-      ISNULL(inflCity,'')            AS inflCity,
-      ISNULL(district,'')            AS district,
-      ISNULL(inflPinC,'')            AS inflPinC,
-
-      -- business / VAT / license
-      ISNULL(comtrdnm,'')            AS comtrdnm,
-      ISNULL(vatfrmnm,'')            AS vatfrmnm,
-      ISNULL(comlcnno,'')            AS comlcnno,
-      ISNULL(vattxreg,'')            AS vattxreg,
-
-      -- bank
-      ISNULL(bankApNm,'')            AS bankApNm,
-      ISNULL(ibannumb,'')            AS ibannumb,
-      ISNULL(bankBnNm,'')            AS bankBnNm,
-      ISNULL(bankBnDs,'')            AS bankBnDs
-  FROM dbo.ctmInfluncr WITH (NOLOCK)
-  WHERE inflCode = @code;
-  ";
-
-            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-            var r = rows.FirstOrDefault();
-
-            if (r == null)
-                return NotFound(new { success = false, message = "Registration not found" });
-
-            string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
-
-            // Status mapping
-            static string MapStatus(string ia) => (ia ?? "").Trim().ToUpperInvariant() switch
-            {
-                "Y" => "Approved",
-                "R" => "Rejected",
-                _ => "Pending"
-            };
-
-            // Compose display name
-            var fullName = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
-            var name = string.IsNullOrWhiteSpace(fullName) ? G("inflName") : fullName;
-
-            // Type: prefer contrtyp; fallback inflType; final fallback "Contractor"
-            var typeRaw = string.IsNullOrWhiteSpace(G("contrtyp")) ? G("inflType") : G("contrtyp");
-            var type = string.IsNullOrWhiteSpace(typeRaw) ? "Contractor" : typeRaw;
-
-            // Company name: prefer trade name, else firm name
-            var companyName = string.IsNullOrWhiteSpace(G("comtrdnm")) ? G("vatfrmnm") : G("comtrdnm");
-
-            // Address line
-            string AddressLine(params string[] parts)
-            {
-                var clean = parts
-                    .Select(x => (x ?? "").Trim())
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .ToList();
-                return string.Join(", ", clean);
-            }
-
-            var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"), G("inflCity"),
-        G("district"), G("inflPinC"));
-            var status = MapStatus(G("isActive"));
-
-            return Ok(new
-            {
-                success = true,
-                id = G("inflCode"),
-                name = name,
-                type = type,
-                mobile = G("mobileNo"),
-                email = G("emailAdd"),
-                submittedDate = G("submittedDate"),
-                status = status,
-                fullName = name,
-                address = address,
-                reference = G("referenc"),
-                companyName = companyName,
-                licenseNumber = G("comlcnno"),
-                trnNumber = G("vattxreg"),
-                accountHolder = G("bankApNm"),
-                iban = G("ibannumb"),
-                bankName = G("bankBnNm"),
-                branch = G("bankBnDs"),
-                avatar = MakeAvatar(name, G("inflCode"))
-            });
-        }
-
-        // ------------------------------------------------------------
-        // FULL REGISTRATION DETAILS by inflCode (for details screen)
-        // GET: /api/Approval/{inflCode}
-        // ------------------------------------------------------------
-        [HttpGet("{inflCode}")]
-        public IActionResult GetRegistrationDetails([FromRoute] string inflCode)
-        {
-            if (string.IsNullOrWhiteSpace(inflCode))
-                return BadRequest(new { success = false, message = "inflCode is required" });
-
-            var p = new Dictionary<string, object?>
-            {
-                ["@code"] = inflCode.Trim()
-            };
-
-            var sql = @"
-SELECT TOP 1
-    -- keys / status / typing
-    inflCode,
-    ISNULL(isActive,'')            AS isActive,
-    ISNULL(contrtyp,'')            AS contrtyp,
-    ISNULL(inflType,'')            AS inflType,
-    COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS submittedDateDt,
-
-    -- names
-    LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
-    LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
-    LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
-    LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
-
-    -- contact
-    ISNULL(mobileNo,'')            AS mobileNo,
-    ISNULL(emailAdd,'')            AS emailAdd,
-
-    -- reference
-    ISNULL(referenc,'')            AS referenc,
-
-    -- address (present)
-    ISNULL(inflAdd1,'')            AS inflAdd1,
-    ISNULL(inflAdd2,'')            AS inflAdd2,
-    ISNULL(inflAdd3,'')            AS inflAdd3,
-    ISNULL(inflCity,'')            AS inflCity,
-    ISNULL(district,'')            AS district,
-    ISNULL(inflPinC,'')            AS inflPinC,
-
-    -- business / VAT / license
-    ISNULL(comtrdnm,'')            AS comtrdnm,   -- Trade Name (preferred companyName)
-    ISNULL(vatfrmnm,'')            AS vatfrmnm,   -- Firm Name (fallback companyName)
-    ISNULL(comlcnno,'')            AS comlcnno,   -- License Number
-    ISNULL(vattxreg,'')            AS vattxreg,   -- TRN Number
-
-    -- bank
-    ISNULL(bankApNm,'')            AS bankApNm,   -- Account Holder
-    ISNULL(ibannumb,'')            AS ibannumb,   -- IBAN
-    ISNULL(bankBnNm,'')            AS bankBnNm,   -- Bank Name
-    ISNULL(bankBnDs,'')            AS bankBnDs    -- Branch
-FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE inflCode = @code;
-";
-
-            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-            var r = rows.FirstOrDefault();
-            if (r == null)
-                return NotFound(new { success = false, message = "Not found" });
-
-            string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
-
-            // Compose display name
-            var fullName = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
-            var name = string.IsNullOrWhiteSpace(fullName) ? G("inflName") : fullName;
-
-            // Type: prefer contrtyp; fallback inflType; final fallback "Contractor"
-            var typeRaw = string.IsNullOrWhiteSpace(G("contrtyp")) ? G("inflType") : G("contrtyp");
-            var type = string.IsNullOrWhiteSpace(typeRaw) ? "Contractor" : typeRaw;
-
-            // Company name: prefer trade name, else firm name
-            var companyName = string.IsNullOrWhiteSpace(G("comtrdnm")) ? G("vatfrmnm") : G("comtrdnm");
-
-            // Address line
-            string AddressLine(params string[] parts)
-                => string.Join(", ", parts.Where(x => !string.IsNullOrWhiteSpace(x?.Trim()))
-                                          .Select(x => x!.Trim()));
-
-            var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"),
-                                      G("inflCity"), G("district"), G("inflPinC"));
-
-            // Status + date format
-            var status = MapStatus(G("isActive"));
-            var submittedDate = DateTime.TryParse(r.GetValueOrDefault("submittedDateDt")?.ToString(), out var dt)
-                                ? dt.ToString("yyyy-MM-dd")
-                                : DateTime.Now.ToString("yyyy-MM-dd");
-
-            return Ok(new
-            {
-                success = true,
-
-                // Header / Registration Information
-                id = G("inflCode"),
-                name = name,
-                type = type,
-                mobile = G("mobileNo"),
-                email = G("emailAdd"),
-                submittedDate = submittedDate,
-                status = status,
-
-                // Personal Details
-                fullName = name,
-                address = address,
-                reference = G("referenc"),
-
-                // Business Details
-                companyName = companyName,
-                licenseNumber = G("comlcnno"),
-                trnNumber = G("vattxreg"),
-
-                // Bank Details
-                accountHolder = G("bankApNm"),
-                iban = G("ibannumb"),
-                bankName = G("bankBnNm"),
-                branch = G("bankBnDs"),
-
-                // UI avatar
-                avatar = MakeAvatar(name, G("inflCode"))
-            });
-        }
-
-
-
-
-
-
-        // ========================= Helpers =========================
-
-        private static string MapStatus(string? ia)
-        {
-            ia = (ia ?? "").Trim().ToUpperInvariant();
-            return ia switch
-            {
-                "Y" => "Approved",
-                "R" => "Rejected",
-                _ => "Pending"
-            };
-        }
-
-        private static string MakeAvatar(string? name, string? fallbackId)
-        {
-            // build initials from name, else from inflCode
-            if (!string.IsNullOrWhiteSpace(name))
-            {
-                var parts = Regex.Split(name.Trim(), @"\s+")
-                                 .Where(s => !string.IsNullOrWhiteSpace(s))
-                                 .ToList();
-                if (parts.Count == 1)
-                {
-                    return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpperInvariant();
-                }
-                if (parts.Count >= 2)
-                {
-                    var a = parts[0][0];
-                    var b = parts[^1][0];
-                    return $"{char.ToUpperInvariant(a)}{char.ToUpperInvariant(b)}";
-                }
-            }
-            var f = (fallbackId ?? "ID");
-            return f.Length >= 2 ? f.Substring(0, 2).ToUpperInvariant() : f.ToUpperInvariant();
-        }
-
-        private static string ComposeName(string? f, string? m, string? l, string? fallback)
-        {
-            var list = new[] { f, m, l }
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .Select(x => x!.Trim());
-            var joined = string.Join(" ", list).Trim();
-            if (!string.IsNullOrWhiteSpace(joined)) return joined;
-            return (fallback ?? "").Trim();
-        }
-
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
-        private static string TryDate(string? sqlDate)
-        {
-            // Expecting yyyy-MM-ddTHH:mm:ss or SQL smalldatetime string; we output yyyy-MM-dd for Flutter
-            if (DateTime.TryParse(sqlDate, out var dt))
-                return dt.ToString("yyyy-MM-dd");
-            return DateTime.Now.ToString("yyyy-MM-dd");
-        }
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import '../models/approval_models.dart';
+
+class ApprovalService {
+  static const String baseUrl = 'http://10.4.64.23:8521';
+
+  Future<ApprovalResponse> getPendingApprovals({
+    String? search,
+    String? type,
+    int page = 1,
+    int pageSize = 20,
+    String? sort,
+  }) async {
+    try {
+      final queryParams = <String, String>{
+        'page': page.toString(),
+        'pageSize': pageSize.toString(),
+      };
+
+      if (search != null && search.isNotEmpty) {
+        queryParams['search'] = search;
+      }
+      if (type != null && type.isNotEmpty) {
+        queryParams['type'] = type;
+      }
+      if (sort != null && sort.isNotEmpty) {
+        queryParams['sort'] = sort;
+      }
+
+      final uri = Uri.parse(
+        '$baseUrl/api/Approval/pending',
+      ).replace(queryParameters: queryParams);
+
+      final response = await http
+          .get(
+            uri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return ApprovalResponse.fromJson(data);
+      } else {
+        throw Exception(
+          'Failed to load pending approvals: ${response.statusCode}',
+        );
+      }
+    } catch (e) {
+      throw Exception('Error fetching pending approvals: $e');
     }
+  }
 
-    // ========================= Request Models =========================
+  Future<ApprovalStats> getApprovalStats() async {
+    try {
+      final uri = Uri.parse('$baseUrl/api/Approval/stats');
 
-    public class ApprovalActionRequest
-    {
-        public string? InflCode { get; set; }
-        public string? ActorId { get; set; }   // loginId to set updateId
+      final response = await http
+          .get(
+            uri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return ApprovalStats.fromJson(data);
+      } else {
+        throw Exception(
+          'Failed to load approval stats: ${response.statusCode}',
+        );
+      }
+    } catch (e) {
+      throw Exception('Error fetching approval stats: $e');
     }
+  }
 
-    public class RejectionActionRequest : ApprovalActionRequest
-    {
-        public string? Reason { get; set; }    // goes to rjcRemrk
+  Future<ApprovalActionResponse> approveItem(
+    String inflCode, {
+    String? actorId,
+  }) async {
+    try {
+      final request = ApprovalActionRequest(
+        inflCode: inflCode,
+        actorId: actorId,
+      );
+
+      final uri = Uri.parse('$baseUrl/api/Approval/approve');
+
+      final response = await http
+          .post(
+            uri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: json.encode(request.toJson()),
+          )
+          .timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return ApprovalActionResponse.fromJson(data);
+      } else {
+        throw Exception('Failed to approve item: ${response.statusCode}');
+      }
+    } catch (e) {
+      throw Exception('Error approving item: $e');
     }
+  }
+
+  Future<ApprovalActionResponse> rejectItem(
+    String inflCode, {
+    String? reason,
+    String? actorId,
+  }) async {
+    try {
+      final request = RejectionActionRequest(
+        inflCode: inflCode,
+        reason: reason,
+        actorId: actorId,
+      );
+
+      final uri = Uri.parse('$baseUrl/api/Approval/reject');
+
+      final response = await http
+          .post(
+            uri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: json.encode(request.toJson()),
+          )
+          .timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return ApprovalActionResponse.fromJson(data);
+      } else {
+        throw Exception('Failed to reject item: ${response.statusCode}');
+      }
+    } catch (e) {
+      throw Exception('Error rejecting item: $e');
+    }
+  }
+
+  Future<String> lookupInflCode(String identifier) async {
+    try {
+      final uri = Uri.parse('$baseUrl/api/Approval/lookup/$identifier');
+      print('DEBUG API: Looking up inflCode for identifier: $identifier');
+      print('DEBUG API: Lookup URL: $uri');
+
+      final response = await http
+          .get(
+            uri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 30));
+
+      print('DEBUG API: Lookup response status: ${response.statusCode}');
+      print('DEBUG API: Lookup response body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final inflCode = data['inflCode'] ?? '';
+        print('DEBUG API: Found inflCode: $inflCode');
+        return inflCode;
+      } else if (response.statusCode == 404) {
+        throw Exception('Person not found for identifier: $identifier');
+      } else {
+        throw Exception(
+          'Failed to lookup inflCode: ${response.statusCode} - ${response.body}',
+        );
+      }
+    } catch (e) {
+      print('DEBUG API: Lookup exception: $e');
+      throw Exception('Error looking up inflCode: $e');
+    }
+  }
+
+  Future<RegistrationDetails> getRegistrationDetails(String inflCode) async {
+    try {
+      final uri = Uri.parse('$baseUrl/api/Approval/details/$inflCode');
+      print('DEBUG API: Requesting URL: $uri');
+
+      final response = await http
+          .get(
+            uri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 30));
+
+      print('DEBUG API: Response status: ${response.statusCode}');
+      print('DEBUG API: Response body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        print('DEBUG API: Parsed data: $data');
+        return RegistrationDetails.fromJson(data);
+      } else if (response.statusCode == 404) {
+        throw Exception('Registration details not found for inflCode: $inflCode');
+      } else {
+        throw Exception(
+          'Failed to load registration details: ${response.statusCode} - ${response.body}',
+        );
+      }
+    } catch (e) {
+      print('DEBUG API: Exception occurred: $e');
+      throw Exception('Error fetching registration details: $e');
+    }
+  }
+
+  Future<RegistrationDetails> getRegistrationDetailsByIdentifier(String identifier) async {
+    try {
+      print('DEBUG: Getting details for identifier: $identifier');
+
+      // First lookup the inflCode
+      final inflCode = await lookupInflCode(identifier);
+
+      // Then get the full details
+      return await getRegistrationDetails(inflCode);
+    } catch (e) {
+      print('DEBUG: Error in getRegistrationDetailsByIdentifier: $e');
+      rethrow;
+    }
+  }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1615,25 +1218,6 @@ class _ApprovalDashboardScreenState extends State<ApprovalDashboardScreen>
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../../core/theme/theme.dart';
@@ -1729,7 +1313,12 @@ class _RegistrationDetailsScreenState extends State<RegistrationDetailsScreen>
   void didChangeDependencies() {
     super.didChangeDependencies();
     if (_registrationData == null && !_isLoading && _errorMessage == null) {
-      _loadRegistrationDetails();
+      // Add a small delay to ensure route is fully established
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (mounted) {
+          _loadRegistrationDetails();
+        }
+      });
     }
   }
 
@@ -1760,26 +1349,29 @@ class _RegistrationDetailsScreenState extends State<RegistrationDetailsScreen>
     });
 
     try {
-      String inflCode;
+      String identifier;
       if (args is String) {
-        inflCode = args;
-        print('DEBUG: Using String as inflCode: $inflCode');
+        identifier = args;
+        print('DEBUG: Using String as identifier: $identifier');
       } else if (args is Map<String, dynamic>) {
-        inflCode = args['id'] ?? '';
-        print('DEBUG: Extracted inflCode from Map: $inflCode');
+        identifier = args['id'] ?? '';
+        print('DEBUG: Extracted identifier from Map: $identifier');
       } else {
         print('DEBUG: Invalid arguments type: ${args.runtimeType}');
         throw Exception('Invalid arguments format: ${args.runtimeType}');
       }
 
-      if (inflCode.isEmpty) {
-        throw Exception('No registration ID provided');
+      if (identifier.isEmpty) {
+        throw Exception('No identifier provided');
       }
 
-      _inflCode = inflCode;
-      print('DEBUG: Fetching details for inflCode: $inflCode');
-      final details = await _approvalService.getRegistrationDetails(inflCode);
-      print('DEBUG: Received details: ${details.name}');
+      print('DEBUG: Looking up registration details for identifier: $identifier');
+
+      // Use the new dynamic lookup method
+      final details = await _approvalService.getRegistrationDetailsByIdentifier(identifier);
+      _inflCode = details.id; // Store the actual inflCode for approve/reject actions
+
+      print('DEBUG: Successfully received details for: ${details.name} (inflCode: ${details.id})');
 
       setState(() {
         _registrationData = details;
@@ -1795,20 +1387,20 @@ class _RegistrationDetailsScreenState extends State<RegistrationDetailsScreen>
   }
 
   void _testApiWithSampleId() async {
-    print('DEBUG: Testing API with sample ID');
+    print('DEBUG: Testing API with sample identifier');
     setState(() {
       _isLoading = true;
       _errorMessage = null;
     });
 
     try {
-      // Test with a sample inflCode - you can change this to any valid inflCode from your database
-      const testInflCode = 'TEST001'; // Change this to a real inflCode from your DB
-      _inflCode = testInflCode;
-      print('DEBUG: Testing with inflCode: $testInflCode');
+      // Test with any identifier - could be name, mobile, email, or inflCode
+      const testIdentifier = 'John'; // Change this to any name, mobile, email, or inflCode from your DB
+      print('DEBUG: Testing with identifier: $testIdentifier');
 
-      final details = await _approvalService.getRegistrationDetails(testInflCode);
-      print('DEBUG: Test successful! Received details: ${details.name}');
+      final details = await _approvalService.getRegistrationDetailsByIdentifier(testIdentifier);
+      _inflCode = details.id;
+      print('DEBUG: Test successful! Received details: ${details.name} (inflCode: ${details.id})');
 
       setState(() {
         _registrationData = details;
@@ -1825,6 +1417,10 @@ class _RegistrationDetailsScreenState extends State<RegistrationDetailsScreen>
 
   @override
   Widget build(BuildContext context) {
+    // Debug: Check arguments every time build is called
+    final currentArgs = ModalRoute.of(context)?.settings.arguments;
+    print('DEBUG BUILD: Current arguments: $currentArgs, hasData: ${_registrationData != null}, isLoading: $_isLoading, error: $_errorMessage');
+
     // Set system UI overlay style
     SystemChrome.setSystemUIOverlayStyle(
       const SystemUiOverlayStyle(
@@ -1991,6 +1587,15 @@ class _RegistrationDetailsScreenState extends State<RegistrationDetailsScreen>
         'Registration Details',
         style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
       ),
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.refresh),
+          onPressed: () {
+            print('DEBUG: Manual refresh triggered');
+            _loadRegistrationDetails();
+          },
+        ),
+      ],
     );
   }
 
@@ -2745,3 +2350,720 @@ class _RegistrationDetailsScreenState extends State<RegistrationDetailsScreen>
   }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+namespace RAKControllers.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class ApprovalController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public ApprovalController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        // ------------------------------------------------------------
+        // 1) PENDING LIST (paged + search + filter by type)
+        // GET: /api/Approval/pending?search=&type=All&page=1&pageSize=20
+        // ------------------------------------------------------------
+        [HttpGet("pending")]
+        public IActionResult GetPending(
+            [FromQuery] string? search = "",
+            [FromQuery] string? type = "All",
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 20,
+            [FromQuery] string? sort = "createDt_desc")
+        {
+            page = page <= 0 ? 1 : page;
+            pageSize = pageSize <= 0 ? 20 : pageSize;
+            var skip = (page - 1) * pageSize;
+
+            // Only PENDING rows now: isActive NOT IN ('Y','R'); also exclude blocked
+            var where = @"
+WHERE 
+    ISNULL(blkStuts,'N') <> 'Y'
+    AND ISNULL(isActive,'') NOT IN ('Y','R')
+";
+            var p = new Dictionary<string, object?>();
+
+            // Filter by type (friendly label or 2-char code)
+            if (!string.IsNullOrWhiteSpace(type) && !type.Equals("All", StringComparison.OrdinalIgnoreCase))
+            {
+                where += "  AND (contrtyp = @type OR inflType = @typeShort)\n";
+                p["@type"] = type;
+                p["@typeShort"] = (type.Length >= 2 ? type[..2] : type).ToUpperInvariant();
+            }
+
+            // Search
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                where += @"
+  AND (
+        inflName LIKE @kw 
+        OR (LTRIM(RTRIM(ISNULL(frstname,''))) + ' ' + LTRIM(RTRIM(ISNULL(middname,''))) + ' ' + LTRIM(RTRIM(ISNULL(lastname,'')))) LIKE @kw
+        OR mobileNo LIKE @kw
+        OR areaCode LIKE @kw
+        OR inflCode LIKE @kw
+        OR contrtyp LIKE @kw
+      )
+";
+                p["@kw"] = $"%{search.Trim()}%";
+            }
+
+            // Sorting
+            string orderBy = sort?.ToLowerInvariant() switch
+            {
+                "name_asc" => "ORDER BY name ASC",
+                "name_desc" => "ORDER BY name DESC",
+                "type_asc" => "ORDER BY type ASC",
+                "type_desc" => "ORDER BY type DESC",
+                "date_asc" => "ORDER BY dt ASC",
+                _ => "ORDER BY dt DESC", // default date_desc
+            };
+
+            // Single result set with COUNT() OVER()
+            var sql = $@"
+;WITH base AS
+(
+    SELECT
+        inflCode,
+        LTRIM(RTRIM(
+            NULLIF(
+                CONCAT(
+                    NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+                ), '  ')
+        )) AS compositeName,
+        inflName,
+        ISNULL(contrtyp, '') AS contrtyp,
+        ISNULL(inflType, '') AS inflType,
+        ISNULL(isActive,'') AS isActive,
+        COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS dt
+    FROM dbo.ctmInfluncr WITH (NOLOCK)
+    {where}
+)
+, shaped AS
+(
+    SELECT
+        inflCode AS id,
+        CAST(NULLIF(LTRIM(RTRIM(CASE WHEN ISNULL(compositeName,'') <> '' THEN compositeName ELSE inflName END)), '') AS NVARCHAR(256)) AS name,
+        CAST(NULLIF(LTRIM(RTRIM(CASE WHEN ISNULL(contrtyp,'') <> '' THEN contrtyp ELSE inflType END)), '') AS NVARCHAR(255)) AS type,
+        dt,
+        CASE 
+            WHEN isActive = 'Y' THEN 'Approved'
+            WHEN isActive = 'R' THEN 'Rejected'
+            ELSE 'Pending'
+        END AS status
+    FROM base
+)
+SELECT
+    id,
+    ISNULL(name,'') AS name,
+    CASE WHEN ISNULL(type,'')='' THEN 'Contractor' ELSE type END AS type,
+    CONVERT(VARCHAR(10), dt, 120) AS [date], -- yyyy-MM-dd
+    status,
+    COUNT(1) OVER() AS total
+FROM shaped
+{orderBy}
+OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY;
+";
+
+            p["@skip"] = skip;
+            p["@take"] = pageSize;
+
+            var rows = _db.WebSessBean(sql, p ?? new Dictionary<string, object?>())
+                       ?? new List<Dictionary<string, object>>();
+
+            int total = 0;
+            if (rows.Count > 0)
+            {
+                var tStr = rows[0].GetValueOrDefault("total")?.ToString();
+                _ = int.TryParse(tStr, out total);
+            }
+
+            var items = rows.Select(r =>
+            {
+                var id = r["id"]?.ToString() ?? "";
+                var name = r["name"]?.ToString() ?? "";
+                var typeOut = r["type"]?.ToString() ?? "Contractor";
+                var date = r["date"]?.ToString() ?? "";
+                var status = r["status"]?.ToString() ?? "Pending";
+                return new
+                {
+                    id,
+                    name,
+                    type = typeOut,
+                    date,
+                    status,
+                    avatar = MakeAvatar(name, id)
+                };
+            });
+
+            return Ok(new
+            {
+                success = true,
+                page,
+                pageSize,
+                total,
+                items
+            });
+        }
+
+        // ------------------------------------------------------------
+        // 2) STATS for the 3 cards (based on isActive)
+        // GET: /api/Approval/stats
+        // ------------------------------------------------------------
+        [HttpGet("stats")]
+        public IActionResult GetStats()
+        {
+            var sql = @"
+;WITH base AS
+(
+    SELECT
+        ISNULL(isActive,'') AS ia,
+        ISNULL(contrtyp,'') AS contrtyp,
+        ISNULL(inflType,'') AS inflType
+    FROM dbo.ctmInfluncr WITH (NOLOCK)
+    WHERE ISNULL(blkStuts,'N') <> 'Y'
+)
+SELECT 
+    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R')) AS totalPending,
+    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R') AND (contrtyp LIKE '%Contractor%' OR inflType = 'CO')) AS contractors,
+    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R') AND (contrtyp LIKE '%Painter%' OR inflType = 'PA')) AS painters;
+";
+            var rows = _db.WebSessBean(sql, new Dictionary<string, object?>())
+                       ?? new List<Dictionary<string, object>>();
+            var r = rows.FirstOrDefault() ?? new Dictionary<string, object>();
+
+            int Tot(string k) => int.TryParse(r.GetValueOrDefault(k)?.ToString(), out var v) ? v : 0;
+
+            return Ok(new
+            {
+                success = true,
+                totalPending = Tot("totalPending"),
+                contractors = Tot("contractors"),
+                painters = Tot("painters"),
+                timestamp = DateTime.Now
+            });
+        }
+
+        // ------------------------------------------------------------
+        // 3) APPROVE: set isActive = 'Y'
+        // POST: /api/Approval/approve  { inflCode, actorId }
+        // ------------------------------------------------------------
+        [HttpPost("approve")]
+        public IActionResult Approve([FromBody] ApprovalActionRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(req.InflCode))
+                return BadRequest(new { success = false, message = "InflCode is required" });
+
+            var p = new Dictionary<string, object?>
+            {
+                ["@code"] = req.InflCode,
+                ["@usr"] = Cut(req.ActorId ?? "API", 10)
+            };
+
+            var sql = @"
+UPDATE dbo.ctmInfluncr
+   SET isActive = 'Y',
+       updateId = @usr,
+       updateDt = GETDATE()
+ WHERE inflCode = @code;
+SELECT @@ROWCOUNT AS rc;
+";
+            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+            var rc = rows.FirstOrDefault()?["rc"]?.ToString();
+            if (rc == "0") return NotFound(new { success = false, message = "Not found" });
+
+            return Ok(new { success = true, message = "Approved", influencerCode = req.InflCode });
+        }
+
+        // ------------------------------------------------------------
+        // 4) REJECT: set isActive = 'R'
+        // POST: /api/Approval/reject  { inflCode, reason, actorId }
+        // ------------------------------------------------------------
+        [HttpPost("reject")]
+        public IActionResult Reject([FromBody] RejectionActionRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(req.InflCode))
+                return BadRequest(new { success = false, message = "InflCode is required" });
+
+            var p = new Dictionary<string, object?>
+            {
+                ["@code"] = req.InflCode,
+                ["@usr"] = Cut(req.ActorId ?? "API", 10),
+                ["@rem"] = Cut(req.Reason ?? "", 1000)
+            };
+
+            var sql = @"
+UPDATE dbo.ctmInfluncr
+   SET isActive = 'R',
+       rjcRemrk = @rem,
+       updateId = @usr,
+       updateDt = GETDATE()
+ WHERE inflCode = @code;
+SELECT @@ROWCOUNT AS rc;
+";
+            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+            var rc = rows.FirstOrDefault()?["rc"]?.ToString();
+            if (rc == "0") return NotFound(new { success = false, message = "Not found" });
+
+            return Ok(new { success = true, message = "Rejected", influencerCode = req.InflCode });
+        }
+
+
+        // ------------------------------------------------------------
+
+        // 5) DETAILS by inflCode (for Registration Details screen)
+
+        // GET: /api/Approval/{inflCode}
+
+        // ------------------------------------------------------------
+
+        // Add inside ApprovalController
+
+        // ------------------------------------------------------------
+
+        // COMPACT DETAILS for RegistrationDetailsScreen
+
+        // GET: /api/Approval/details/{inflCode}
+
+        // ------------------------------------------------------------
+
+        [HttpGet("details/{inflCode}")]
+        public IActionResult GetCompactDetails([FromRoute] string inflCode)
+        {
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required" });
+
+            var p = new Dictionary<string, object?>
+            {
+                ["@code"] = inflCode.Trim()
+            };
+
+            var sql = @"
+  SELECT TOP 1
+      -- keys / status / typing
+      inflCode,
+      ISNULL(isActive,'')            AS isActive,
+      ISNULL(contrtyp,'')            AS contrtyp,
+      ISNULL(inflType,'')            AS inflType,
+      CONVERT(VARCHAR(10), COALESCE(createDt, sapInsDt, frstScDt, GETDATE()), 120) AS submittedDate,        
+
+      -- names
+      LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
+      LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
+      LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
+      LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
+
+      -- contact
+      ISNULL(mobileNo,'')            AS mobileNo,
+      ISNULL(emailAdd,'')            AS emailAdd,
+
+      -- reference
+      ISNULL(referenc,'')            AS referenc,
+
+      -- address (present)
+      ISNULL(inflAdd1,'')            AS inflAdd1,
+      ISNULL(inflAdd2,'')            AS inflAdd2,
+      ISNULL(inflAdd3,'')            AS inflAdd3,
+      ISNULL(inflCity,'')            AS inflCity,
+      ISNULL(district,'')            AS district,
+      ISNULL(inflPinC,'')            AS inflPinC,
+
+      -- business / VAT / license
+      ISNULL(comtrdnm,'')            AS comtrdnm,
+      ISNULL(vatfrmnm,'')            AS vatfrmnm,
+      ISNULL(comlcnno,'')            AS comlcnno,
+      ISNULL(vattxreg,'')            AS vattxreg,
+
+      -- bank
+      ISNULL(bankApNm,'')            AS bankApNm,
+      ISNULL(ibannumb,'')            AS ibannumb,
+      ISNULL(bankBnNm,'')            AS bankBnNm,
+      ISNULL(bankBnDs,'')            AS bankBnDs
+  FROM dbo.ctmInfluncr WITH (NOLOCK)
+  WHERE inflCode = @code;
+  ";
+
+            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+            var r = rows.FirstOrDefault();
+
+            if (r == null)
+                return NotFound(new { success = false, message = "Registration not found" });
+
+            string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+
+            // Status mapping
+            static string MapStatus(string ia) => (ia ?? "").Trim().ToUpperInvariant() switch
+            {
+                "Y" => "Approved",
+                "R" => "Rejected",
+                _ => "Pending"
+            };
+
+            // Compose display name
+            var fullName = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
+            var name = string.IsNullOrWhiteSpace(fullName) ? G("inflName") : fullName;
+
+            // Type: prefer contrtyp; fallback inflType; final fallback "Contractor"
+            var typeRaw = string.IsNullOrWhiteSpace(G("contrtyp")) ? G("inflType") : G("contrtyp");
+            var type = string.IsNullOrWhiteSpace(typeRaw) ? "Contractor" : typeRaw;
+
+            // Company name: prefer trade name, else firm name
+            var companyName = string.IsNullOrWhiteSpace(G("comtrdnm")) ? G("vatfrmnm") : G("comtrdnm");
+
+            // Address line
+            string AddressLine(params string[] parts)
+            {
+                var clean = parts
+                    .Select(x => (x ?? "").Trim())
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .ToList();
+                return string.Join(", ", clean);
+            }
+
+            var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"), G("inflCity"),
+        G("district"), G("inflPinC"));
+            var status = MapStatus(G("isActive"));
+
+            return Ok(new
+            {
+                success = true,
+                id = G("inflCode"),
+                name = name,
+                type = type,
+                mobile = G("mobileNo"),
+                email = G("emailAdd"),
+                submittedDate = G("submittedDate"),
+                status = status,
+                fullName = name,
+                address = address,
+                reference = G("referenc"),
+                companyName = companyName,
+                licenseNumber = G("comlcnno"),
+                trnNumber = G("vattxreg"),
+                accountHolder = G("bankApNm"),
+                iban = G("ibannumb"),
+                bankName = G("bankBnNm"),
+                branch = G("bankBnDs"),
+                avatar = MakeAvatar(name, G("inflCode"))
+            });
+        }
+
+        // ------------------------------------------------------------
+        // FULL REGISTRATION DETAILS by inflCode (for details screen)
+        // GET: /api/Approval/{inflCode}
+        // ------------------------------------------------------------
+        [HttpGet("{inflCode}")]
+        public IActionResult GetRegistrationDetails([FromRoute] string inflCode)
+        {
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required" });
+
+            var p = new Dictionary<string, object?>
+            {
+                ["@code"] = inflCode.Trim()
+            };
+
+            var sql = @"
+SELECT TOP 1
+    -- keys / status / typing
+    inflCode,
+    ISNULL(isActive,'')            AS isActive,
+    ISNULL(contrtyp,'')            AS contrtyp,
+    ISNULL(inflType,'')            AS inflType,
+    COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS submittedDateDt,
+
+    -- names
+    LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
+    LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
+    LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
+    LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
+
+    -- contact
+    ISNULL(mobileNo,'')            AS mobileNo,
+    ISNULL(emailAdd,'')            AS emailAdd,
+
+    -- reference
+    ISNULL(referenc,'')            AS referenc,
+
+    -- address (present)
+    ISNULL(inflAdd1,'')            AS inflAdd1,
+    ISNULL(inflAdd2,'')            AS inflAdd2,
+    ISNULL(inflAdd3,'')            AS inflAdd3,
+    ISNULL(inflCity,'')            AS inflCity,
+    ISNULL(district,'')            AS district,
+    ISNULL(inflPinC,'')            AS inflPinC,
+
+    -- business / VAT / license
+    ISNULL(comtrdnm,'')            AS comtrdnm,   -- Trade Name (preferred companyName)
+    ISNULL(vatfrmnm,'')            AS vatfrmnm,   -- Firm Name (fallback companyName)
+    ISNULL(comlcnno,'')            AS comlcnno,   -- License Number
+    ISNULL(vattxreg,'')            AS vattxreg,   -- TRN Number
+
+    -- bank
+    ISNULL(bankApNm,'')            AS bankApNm,   -- Account Holder
+    ISNULL(ibannumb,'')            AS ibannumb,   -- IBAN
+    ISNULL(bankBnNm,'')            AS bankBnNm,   -- Bank Name
+    ISNULL(bankBnDs,'')            AS bankBnDs    -- Branch
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE inflCode = @code;
+";
+
+            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+            var r = rows.FirstOrDefault();
+            if (r == null)
+                return NotFound(new { success = false, message = "Not found" });
+
+            string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+
+            // Compose display name
+            var fullName = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
+            var name = string.IsNullOrWhiteSpace(fullName) ? G("inflName") : fullName;
+
+            // Type: prefer contrtyp; fallback inflType; final fallback "Contractor"
+            var typeRaw = string.IsNullOrWhiteSpace(G("contrtyp")) ? G("inflType") : G("contrtyp");
+            var type = string.IsNullOrWhiteSpace(typeRaw) ? "Contractor" : typeRaw;
+
+            // Company name: prefer trade name, else firm name
+            var companyName = string.IsNullOrWhiteSpace(G("comtrdnm")) ? G("vatfrmnm") : G("comtrdnm");
+
+            // Address line
+            string AddressLine(params string[] parts)
+                => string.Join(", ", parts.Where(x => !string.IsNullOrWhiteSpace(x?.Trim()))
+                                          .Select(x => x!.Trim()));
+
+            var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"),
+                                      G("inflCity"), G("district"), G("inflPinC"));
+
+            // Status + date format
+            var status = MapStatus(G("isActive"));
+            var submittedDate = DateTime.TryParse(r.GetValueOrDefault("submittedDateDt")?.ToString(), out var dt)
+                                ? dt.ToString("yyyy-MM-dd")
+                                : DateTime.Now.ToString("yyyy-MM-dd");
+
+            return Ok(new
+            {
+                success = true,
+
+                // Header / Registration Information
+                id = G("inflCode"),
+                name = name,
+                type = type,
+                mobile = G("mobileNo"),
+                email = G("emailAdd"),
+                submittedDate = submittedDate,
+                status = status,
+
+                // Personal Details
+                fullName = name,
+                address = address,
+                reference = G("referenc"),
+
+                // Business Details
+                companyName = companyName,
+                licenseNumber = G("comlcnno"),
+                trnNumber = G("vattxreg"),
+
+                // Bank Details
+                accountHolder = G("bankApNm"),
+                iban = G("ibannumb"),
+                bankName = G("bankBnNm"),
+                branch = G("bankBnDs"),
+
+                // UI avatar
+                avatar = MakeAvatar(name, G("inflCode"))
+            });
+        }
+
+
+        [HttpGet("lookup/{identifier}")]
+        public IActionResult GetInflCodeByIdentifier([FromRoute] string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+                return BadRequest(new { success = false, message = "identifier is required" });
+
+            var p = new Dictionary<string, object?>
+            {
+                ["@identifier"] = identifier.Trim()
+            };
+
+            // Search by multiple criteria to find the inflCode
+            var sql = @"
+  SELECT TOP 1
+      inflCode,
+      LTRIM(RTRIM(
+          NULLIF(
+              CONCAT(
+                  NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                  NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                  NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+              ), '  ')
+      )) AS compositeName,
+      inflName,
+      mobileNo,
+      emailAdd
+  FROM dbo.ctmInfluncr WITH (NOLOCK)
+  WHERE
+      ISNULL(blkStuts,'N') <> 'Y'
+      AND (
+          inflCode = @identifier
+          OR LTRIM(RTRIM(
+              NULLIF(
+                  CONCAT(
+                      NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                      NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                      NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+                  ), '  ')
+          )) = @identifier
+          OR inflName = @identifier
+          OR mobileNo = @identifier
+          OR emailAdd = @identifier
+      );
+  ";
+
+            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+            var r = rows.FirstOrDefault();
+
+            if (r == null)
+                return NotFound(new { success = false, message = "Person not found" });
+
+            string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+
+            return Ok(new
+            {
+                success = true,
+                inflCode = G("inflCode"),
+                name = string.IsNullOrWhiteSpace(G("compositeName")) ? G("inflName") :
+G("compositeName"),
+                mobile = G("mobileNo"),
+                email = G("emailAdd")
+            });
+        }
+
+
+
+
+
+
+        // ========================= Helpers =========================
+
+        private static string MapStatus(string? ia)
+        {
+            ia = (ia ?? "").Trim().ToUpperInvariant();
+            return ia switch
+            {
+                "Y" => "Approved",
+                "R" => "Rejected",
+                _ => "Pending"
+            };
+        }
+
+        private static string MakeAvatar(string? name, string? fallbackId)
+        {
+            // build initials from name, else from inflCode
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                var parts = Regex.Split(name.Trim(), @"\s+")
+                                 .Where(s => !string.IsNullOrWhiteSpace(s))
+                                 .ToList();
+                if (parts.Count == 1)
+                {
+                    return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpperInvariant();
+                }
+                if (parts.Count >= 2)
+                {
+                    var a = parts[0][0];
+                    var b = parts[^1][0];
+                    return $"{char.ToUpperInvariant(a)}{char.ToUpperInvariant(b)}";
+                }
+            }
+            var f = (fallbackId ?? "ID");
+            return f.Length >= 2 ? f.Substring(0, 2).ToUpperInvariant() : f.ToUpperInvariant();
+        }
+
+        private static string ComposeName(string? f, string? m, string? l, string? fallback)
+        {
+            var list = new[] { f, m, l }
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!.Trim());
+            var joined = string.Join(" ", list).Trim();
+            if (!string.IsNullOrWhiteSpace(joined)) return joined;
+            return (fallback ?? "").Trim();
+        }
+
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string TryDate(string? sqlDate)
+        {
+            // Expecting yyyy-MM-ddTHH:mm:ss or SQL smalldatetime string; we output yyyy-MM-dd for Flutter
+            if (DateTime.TryParse(sqlDate, out var dt))
+                return dt.ToString("yyyy-MM-dd");
+            return DateTime.Now.ToString("yyyy-MM-dd");
+        }
+    }
+
+    // ========================= Request Models =========================
+
+    public class ApprovalActionRequest
+    {
+        public string? InflCode { get; set; }
+        public string? ActorId { get; set; }   // loginId to set updateId
+    }
+
+    public class RejectionActionRequest : ApprovalActionRequest
+    {
+        public string? Reason { get; set; }    // goes to rjcRemrk
+    }
+}
