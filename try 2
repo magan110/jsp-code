@@ -1,12 +1,12 @@
 class LoginRequest {
   final String userID;
   final String password;
-  final String? appRegId;
+  final String appRegId;
 
   const LoginRequest({
     required this.userID,
     required this.password,
-    this.appRegId,
+    required this.appRegId,
   });
 
   Map<String, dynamic> toJson() => {
@@ -18,7 +18,7 @@ class LoginRequest {
   factory LoginRequest.fromJson(Map<String, dynamic> json) => LoginRequest(
         userID: json['userID'] as String,
         password: json['password'] as String,
-        appRegId: json['appRegId'] as String?,
+        appRegId: json['appRegId'] as String,
       );
 }
 
@@ -88,6 +88,11 @@ class UserData {
 
 
 
+
+
+
+
+
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../models/auth_models.dart';
@@ -111,7 +116,7 @@ class AuthService {
       final loginRequest = LoginRequest(
         userID: userID,
         password: password,
-        appRegId: appRegId,
+        appRegId: appRegId ?? 'mobile_app_${DateTime.now().millisecondsSinceEpoch}',
       );
 
       final uri = Uri.parse('$baseUrl$authEndpoint');
@@ -120,17 +125,22 @@ class AuthService {
         'Accept': 'application/json',
       };
 
+      final requestBody = jsonEncode(loginRequest.toJson());
+
       _logger.debug('Making POST request to: $uri');
+      _logger.debug('Request headers: $requestHeaders');
+      _logger.debug('Request body: $requestBody');
 
       final response = await http
           .post(
             uri,
             headers: requestHeaders,
-            body: jsonEncode(loginRequest.toJson()),
+            body: requestBody,
           )
           .timeout(_defaultTimeout);
 
       _logger.debug('Response status: ${response.statusCode}');
+      _logger.debug('Response headers: ${response.headers}');
       _logger.debug('Response body: ${response.body}');
 
       if (response.statusCode == 200) {
@@ -166,14 +176,16 @@ class AuthService {
         };
       } else if (response.statusCode == 400) {
         final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? 'Invalid request parameters';
+        final errorMessage = errorData['error'] ?? response.body.isNotEmpty ? response.body : 'Invalid request parameters';
 
         _logger.warning('Bad request for user: $userID - $errorMessage');
+        _logger.warning('Request was: $requestBody');
 
         return {
           'success': false,
-          'error': errorMessage,
+          'error': 'Bad Request: $errorMessage',
           'statusCode': response.statusCode,
+          'raw_response': response.body,
         };
       } else {
         final errorData = _safeJsonDecode(response.body);
@@ -330,299 +342,6 @@ class AuthManager {
   }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import 'package:flutter/material.dart';
-import '../services/auth_service.dart';
-
-class NavigationUtils {
-  static const Map<String, String> _pageRoutes = {
-    'DASHBOARD': '/dashboard',
-    'QUALITY_CONTROL': '/quality-dashboard',
-    'PRODUCTS': '/products',
-    'REGISTRATION': '/registration',
-    'PROFILE': '/profile',
-    'SETTINGS': '/settings',
-    'REPORTS': '/reports',
-    'ANALYTICS': '/analytics',
-    'USER_MANAGEMENT': '/user-management',
-    'CONTRACTOR_REG': '/contractor-registration',
-    'PAINTER_REG': '/painter-registration',
-    'RETAILER_REG': '/retailer-registration',
-    'QR_SCANNER': '/qr-scanner',
-    'DOCUMENT_UPLOAD': '/document-upload',
-    'APPROVAL_WORKFLOW': '/approval-workflow',
-    'EXPERT_MEET': '/expert-meet',
-    'SAMPLE_DISTRIBUTION': '/sample-distribution',
-    'INCENTIVE_SCHEME': '/incentive-scheme',
-    'NEW_PRODUCT_ENTRY': '/new-product-entry',
-    'SAMPLING_DRIVE': '/sampling-drive',
-  };
-
-  static const Map<String, String> _roleRoutes = {
-    'ADMIN': '/dashboard',
-    'QC_MANAGER': '/quality-dashboard',
-    'PRODUCT_MANAGER': '/products',
-    'REGISTRAR': '/registration',
-    'USER': '/home',
-    'CONTRACTOR': '/contractor-dashboard',
-    'PAINTER': '/painter-dashboard',
-    'RETAILER': '/retailer-dashboard',
-  };
-
-  static String getRouteForUserAccess() {
-    if (!AuthManager.isLoggedIn) {
-      return '/login-password';
-    }
-
-    final userPages = AuthManager.getUserPages();
-    final userRoles = AuthManager.getUserRoles();
-
-    // Check pages first (more specific access)
-    for (final page in userPages) {
-      if (_pageRoutes.containsKey(page)) {
-        return _pageRoutes[page]!;
-      }
-    }
-
-    // Check roles if no specific page matches
-    for (final role in userRoles) {
-      if (_roleRoutes.containsKey(role)) {
-        return _roleRoutes[role]!;
-      }
-    }
-
-    // Default fallback
-    return '/home';
-  }
-
-  static void navigateToUserHomePage(BuildContext context) {
-    final route = getRouteForUserAccess();
-    Navigator.pushReplacementNamed(context, route);
-  }
-
-  static bool canAccessPage(String pageName) {
-    return AuthManager.hasPage(pageName) ||
-           AuthManager.hasRole('ADMIN') ||
-           AuthManager.hasRole('SUPER_USER');
-  }
-
-  static bool canAccessRoute(String routeName) {
-    // Remove leading slash for comparison
-    final cleanRoute = routeName.startsWith('/') ? routeName.substring(1) : routeName;
-
-    // Check if user has direct page access
-    final pageKey = _pageRoutes.entries
-        .where((entry) => entry.value == '/$cleanRoute')
-        .map((entry) => entry.key)
-        .firstOrNull;
-
-    if (pageKey != null) {
-      return canAccessPage(pageKey);
-    }
-
-    // Check role-based access
-    final roleKey = _roleRoutes.entries
-        .where((entry) => entry.value == '/$cleanRoute')
-        .map((entry) => entry.key)
-        .firstOrNull;
-
-    if (roleKey != null) {
-      return AuthManager.hasRole(roleKey);
-    }
-
-    // Default to deny access for unknown routes
-    return false;
-  }
-
-  static List<String> getAccessibleRoutes() {
-    final userPages = AuthManager.getUserPages();
-    final userRoles = AuthManager.getUserRoles();
-    final accessibleRoutes = <String>[];
-
-    // Add page-based routes
-    for (final page in userPages) {
-      if (_pageRoutes.containsKey(page)) {
-        accessibleRoutes.add(_pageRoutes[page]!);
-      }
-    }
-
-    // Add role-based routes
-    for (final role in userRoles) {
-      if (_roleRoutes.containsKey(role)) {
-        final route = _roleRoutes[role]!;
-        if (!accessibleRoutes.contains(route)) {
-          accessibleRoutes.add(route);
-        }
-      }
-    }
-
-    return accessibleRoutes;
-  }
-
-  static bool isUserInRole(String role) {
-    return AuthManager.hasRole(role);
-  }
-
-  static bool isUserInAnyRole(List<String> roles) {
-    return AuthManager.hasAnyRole(roles);
-  }
-
-  static String getUserDisplayInfo() {
-    final userName = AuthManager.getUserName();
-    final areaCode = AuthManager.getUserAreaCode();
-
-    if (userName.isNotEmpty && areaCode.isNotEmpty) {
-      return '$userName ($areaCode)';
-    } else if (userName.isNotEmpty) {
-      return userName;
-    } else if (areaCode.isNotEmpty) {
-      return 'User ($areaCode)';
-    }
-
-    return 'User';
-  }
-
-  static Map<String, dynamic> getUserInfo() {
-    return {
-      'name': AuthManager.getUserName(),
-      'areaCode': AuthManager.getUserAreaCode(),
-      'roles': AuthManager.getUserRoles(),
-      'pages': AuthManager.getUserPages(),
-      'isLoggedIn': AuthManager.isLoggedIn,
-    };
-  }
-}
-
-// Route Guard Widget
-class RouteGuard extends StatelessWidget {
-  final Widget child;
-  final String? requiredPage;
-  final String? requiredRole;
-  final List<String>? anyOfPages;
-  final List<String>? anyOfRoles;
-  final Widget? fallback;
-
-  const RouteGuard({
-    super.key,
-    required this.child,
-    this.requiredPage,
-    this.requiredRole,
-    this.anyOfPages,
-    this.anyOfRoles,
-    this.fallback,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    // Check if user is logged in
-    if (!AuthManager.isLoggedIn) {
-      return _buildAccessDenied(context, 'Please login to access this page');
-    }
-
-    bool hasAccess = false;
-
-    // Check specific page access
-    if (requiredPage != null) {
-      hasAccess = NavigationUtils.canAccessPage(requiredPage!);
-    }
-
-    // Check specific role access
-    if (requiredRole != null) {
-      hasAccess = hasAccess || NavigationUtils.isUserInRole(requiredRole!);
-    }
-
-    // Check if user has any of the specified pages
-    if (anyOfPages != null) {
-      hasAccess = hasAccess || anyOfPages!.any((page) => NavigationUtils.canAccessPage(page));
-    }
-
-    // Check if user has any of the specified roles
-    if (anyOfRoles != null) {
-      hasAccess = hasAccess || NavigationUtils.isUserInAnyRole(anyOfRoles!);
-    }
-
-    // If no specific requirements, allow access for logged-in users
-    if (requiredPage == null && requiredRole == null &&
-        anyOfPages == null && anyOfRoles == null) {
-      hasAccess = true;
-    }
-
-    if (hasAccess) {
-      return child;
-    } else {
-      return fallback ?? _buildAccessDenied(context, 'You don\'t have permission to access this page');
-    }
-  }
-
-  Widget _buildAccessDenied(BuildContext context, String message) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Access Denied'),
-        backgroundColor: Colors.red,
-        foregroundColor: Colors.white,
-      ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.lock_outline,
-                size: 64,
-                color: Colors.red.shade300,
-              ),
-              const SizedBox(height: 24),
-              Text(
-                'Access Denied',
-                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                  color: Colors.red,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: Colors.grey.shade600,
-                ),
-              ),
-              const SizedBox(height: 32),
-              ElevatedButton(
-                onPressed: () {
-                  NavigationUtils.navigateToUserHomePage(context);
-                },
-                child: const Text('Go to Home'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
 
 
 
