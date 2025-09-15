@@ -1,141 +1,951 @@
-class DashboardStats {
-  final bool success;
-  final String start;
-  final String end;
-  final int totalRegistrations;
-  final int contractors;
-  final int painters;
-  final int pending;
-  final DateTime timestamp;
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io' show File;
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import 'package:web/web.dart' as web;
+import '../utils/app_logger.dart';
 
-  DashboardStats({
-    required this.success,
-    required this.start,
-    required this.end,
-    required this.totalRegistrations,
-    required this.contractors,
-    required this.painters,
-    required this.pending,
-    required this.timestamp,
-  });
+class ApiService {
+  static final AppLogger _logger = AppLogger();
+  static const Duration _defaultTimeout = Duration(seconds: 30);
 
-  factory DashboardStats.fromJson(Map<String, dynamic> json) {
-    return DashboardStats(
-      success: json['success'] ?? false,
-      start: json['start'] ?? '',
-      end: json['end'] ?? '',
-      totalRegistrations: json['totalRegistrations'] ?? 0,
-      contractors: json['contractors'] ?? 0,
-      painters: json['painters'] ?? 0,
-      pending: json['pending'] ?? 0,
-      timestamp: DateTime.tryParse(json['timestamp']?.toString() ?? '') ?? DateTime.now(),
-    );
+  // Base URL configuration with fallback options
+  static String get baseUrl {
+    return 'http://10.4.64.23:8521';
+  }
+
+  static List<String> get fallbackUrls => [
+    'http://10.166.220.122',
+    'http://[::1]',
+    'http://localhost',
+    'http://127.0.0.1',
+  ];
+
+  static bool get _isInAppWebView {
+    if (kIsWeb) {
+      try {
+        final ua = web.window.navigator.userAgent.toLowerCase();
+        final vendor = web.window.navigator.vendor.toLowerCase();
+        final loc = web.window.location;
+
+        return ua.contains('inapp') ||
+            ua.contains('webview') ||
+            ua.contains('inappbrowser') ||
+            ua.contains('capacitor') ||
+            ua.contains('cordova') ||
+            ua.contains('phonegap') ||
+            vendor.contains('inapp') ||
+            loc.protocol == 'file:' ||
+            loc.protocol == 'capacitor:' ||
+            loc.protocol == 'ionic:' ||
+            (loc.hostname == 'localhost' && loc.port.isEmpty) ||
+            (ua.contains('mobile') && !ua.contains('chrome'));
+      } catch (_) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Remove duplicate - using the new fallbackUrls getter above
+
+  // Generic HTTP methods
+  static Future<Map<String, dynamic>> makeRequest({
+  required String method,
+  required String endpoint,
+  Map<String, dynamic>? body,
+  Map<String, String>? headers,
+  Duration? timeout,
+}) async {
+  try {
+    _logger.info('Making $method request to $endpoint');
+
+    final uri = Uri.parse('$baseUrl$endpoint');
+    final requestHeaders = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      ...?headers,
+    };
+
+    http.Response response;
+    final timeoutDuration = timeout ?? _defaultTimeout;
+
+    switch (method.toUpperCase()) {
+      case 'GET':
+        response = await http.get(uri, headers: requestHeaders).timeout(timeoutDuration);
+        break;
+      case 'POST':
+        response = await http
+            .post(uri, headers: requestHeaders, body: jsonEncode(body ?? <String, dynamic>{}))
+            .timeout(timeoutDuration);
+        break;
+      case 'PUT':
+        response = await http
+            .put(uri, headers: requestHeaders, body: jsonEncode(body ?? <String, dynamic>{}))
+            .timeout(timeoutDuration);
+        break;
+      case 'DELETE':
+        response = await http.delete(uri, headers: requestHeaders).timeout(timeoutDuration);
+        break;
+      default:
+        throw Exception('Unsupported HTTP method: $method');
+    }
+
+    _logger.debug('Response ${response.statusCode} for $method $endpoint');
+    _logger.debug('Response body: ${response.body}');
+
+    final parsed = _safeJson(response.body);
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return {
+        'success': true,
+        'data': parsed,
+        'statusCode': response.statusCode,
+      };
+    } else {
+      final msg = _extractProblemMessage(parsed, fallback: response.reasonPhrase ?? 'Request failed');
+      return {
+        'success': false,
+        'error': msg,
+        'statusCode': response.statusCode,
+        'data': parsed, // keep full payload for debugging if needed
+      };
+    }
+  } catch (e) {
+    _logger.error('Request failed', e);
+    return {'success': false, 'error': 'Network error: $e', 'statusCode': 0};
   }
 }
 
-class TrendData {
-  final String date;
-  final int total;
-  final int contractors;
-  final int painters;
-  final int approved;
-  final int pending;
-  final int rejected;
-
-  TrendData({
-    required this.date,
-    required this.total,
-    required this.contractors,
-    required this.painters,
-    required this.approved,
-    required this.pending,
-    required this.rejected,
-  });
-
-  factory TrendData.fromJson(Map<String, dynamic> json) {
-    return TrendData(
-      date: json['date'] ?? '',
-      total: json['total'] ?? 0,
-      contractors: json['contractors'] ?? 0,
-      painters: json['painters'] ?? 0,
-      approved: json['approved'] ?? 0,
-      pending: json['pending'] ?? 0,
-      rejected: json['rejected'] ?? 0,
-    );
+/// Turns ASP.NET ProblemDetails (title/detail/errors) into a readable string.
+static String _extractProblemMessage(Map<String, dynamic> j, {String fallback = 'Request failed'}) {
+  // Prefer ProblemDetails shape
+  final title = j['title']?.toString();
+  final detail = j['detail']?.toString();
+  String combined = (title ?? '').trim();
+  if (detail != null && detail.isNotEmpty) {
+    combined = combined.isEmpty ? detail : '$combined — $detail';
   }
-}
 
-class DashboardTrends {
-  final bool success;
-  final String start;
-  final String end;
-  final List<TrendData> data;
-
-  DashboardTrends({
-    required this.success,
-    required this.start,
-    required this.end,
-    required this.data,
-  });
-
-  factory DashboardTrends.fromJson(Map<String, dynamic> json) {
-    return DashboardTrends(
-      success: json['success'] ?? false,
-      start: json['start'] ?? '',
-      end: json['end'] ?? '',
-      data: (json['data'] as List? ?? [])
-          .map((item) => TrendData.fromJson(item))
-          .toList(),
-    );
+  // Flatten validation "errors"
+  if (j['errors'] is Map) {
+    final errs = j['errors'] as Map;
+    final parts = <String>[];
+    errs.forEach((k, v) {
+      if (v is List && v.isNotEmpty) {
+        parts.add('$k: ${v.join("; ")}');
+      } else if (v != null) {
+        parts.add('$k: $v');
+      }
+    });
+    if (parts.isNotEmpty) {
+      final flat = parts.join(' | ');
+      combined = combined.isEmpty ? flat : '$combined | $flat';
+    }
   }
-}
 
-class RecentRegistration {
-  final String name;
-  final String type;
-  final String status;
-  final String date;
-  final String avatar;
+  if (combined.isNotEmpty) return combined;
 
-  RecentRegistration({
-    required this.name,
-    required this.type,
-    required this.status,
-    required this.date,
-    required this.avatar,
-  });
-
-  factory RecentRegistration.fromJson(Map<String, dynamic> json) {
-    return RecentRegistration(
-      name: json['name'] ?? '',
-      type: json['type'] ?? '',
-      status: json['status'] ?? '',
-      date: json['date'] ?? '',
-      avatar: json['avatar'] ?? '',
-    );
-  }
-}
-
-class DashboardRecent {
-  final bool success;
-  final List<RecentRegistration> items;
-
-  DashboardRecent({
-    required this.success,
-    required this.items,
-  });
-
-  factory DashboardRecent.fromJson(Map<String, dynamic> json) {
-    return DashboardRecent(
-      success: json['success'] ?? false,
-      items: (json['items'] as List? ?? [])
-          .map((item) => RecentRegistration.fromJson(item))
-          .toList(),
-    );
-  }
+  // Fallbacks
+  if (j['message'] != null) return j['message'].toString();
+  if (j['error'] != null) return j['error'].toString();
+  if (j['raw'] is String && (j['raw'] as String).isNotEmpty) return j['raw'] as String;
+  return fallback;
 }
 
 
+  // Authentication APIs
+  static Future<Map<String, dynamic>> login(
+    String userId,
+    String password,
+  ) async {
+    await Future.delayed(const Duration(seconds: 1)); // Simulate delay
+
+    if (userId.isNotEmpty && password.isNotEmpty) {
+      return {
+        'success': true,
+        'data': {
+          'token': 'mock_jwt_token_${DateTime.now().millisecondsSinceEpoch}',
+          'user': {
+            'id': userId,
+            'name': 'User Name',
+            'email': '$userId@example.com',
+          },
+        },
+      };
+    }
+
+    return {'success': false, 'error': 'Invalid credentials'};
+  }
+
+  static Future<Map<String, dynamic>> loginWithOtp(
+    String mobile,
+    String otp,
+  ) async {
+    await Future.delayed(const Duration(seconds: 1));
+
+    if (mobile.isNotEmpty && otp.isNotEmpty) {
+      return {
+        'success': true,
+        'data': {
+          'token': 'mock_jwt_token_${DateTime.now().millisecondsSinceEpoch}',
+          'user': {'id': mobile, 'name': 'Mobile User', 'phone': mobile},
+        },
+      };
+    }
+
+    return {'success': false, 'error': 'Invalid OTP'};
+  }
+
+  static Future<Map<String, dynamic>> sendOtp(String mobile) async {
+    await Future.delayed(const Duration(seconds: 1));
+
+    if (mobile.isNotEmpty) {
+      return {
+        'success': true,
+        'data': {
+          'message': 'OTP sent successfully',
+          'otpId': 'otp_${DateTime.now().millisecondsSinceEpoch}',
+        },
+      };
+    }
+
+    return {'success': false, 'error': 'Invalid mobile number'};
+  }
+
+  static Future<Map<String, dynamic>> logout() async {
+    await Future.delayed(const Duration(milliseconds: 500));
+    return {
+      'success': true,
+      'data': {'message': 'Logged out successfully'},
+    };
+  }
+
+  // File Upload APIs
+  static Future<Map<String, dynamic>> uploadFile(
+    String filePath, {
+    String? originalName,
+  }) async {
+    return await _uploadWithFallback(filePath, originalName: originalName);
+  }
+
+  static Future<Map<String, dynamic>> _uploadWithFallback(
+    String filePath, {
+    String? originalName,
+  }) async {
+    var result = await _uploadToUrl(
+      baseUrl,
+      filePath,
+      originalName: originalName,
+    );
+    if (result['success'] == true) return result;
+
+    for (final url in fallbackUrls) {
+      result = await _uploadToUrl(url, filePath, originalName: originalName);
+      if (result['success'] == true) return result;
+    }
+
+    return result;
+  }
+
+  static Future<Map<String, dynamic>> _uploadToUrl(
+    String baseUrl,
+    String filePath, {
+    String? originalName,
+  }) async {
+    try {
+      final uri = Uri.parse('$baseUrl/upload');
+      final request = http.MultipartRequest('POST', uri);
+
+      request.headers['Accept'] = 'application/json';
+
+      if (kIsWeb) {
+        if (filePath.startsWith('data:')) {
+          final parts = filePath.split(',');
+          if (parts.length != 2) {
+            throw Exception('Invalid data URL format');
+          }
+          final header = parts[0];
+          final mimeType = header.split(':')[1].split(';')[0];
+          final bytes = base64Decode(parts[1]);
+
+          request.files.add(
+            http.MultipartFile.fromBytes(
+              'file',
+              bytes,
+              filename: originalName ?? 'upload.${_extFromMime(mimeType)}',
+            ),
+          );
+        } else {
+          throw Exception(
+            'Unsupported web file path format (expected data: URL)',
+          );
+        }
+      } else {
+        final file = File(filePath);
+        if (!await file.exists()) {
+          throw Exception('File does not exist: $filePath');
+        }
+        request.files.add(
+          await http.MultipartFile.fromPath(
+            'file',
+            filePath,
+            filename: originalName ?? file.path.split('/').last,
+          ),
+        );
+      }
+
+      final timeout = _isInAppWebView
+          ? const Duration(seconds: 20)
+          : const Duration(seconds: 30);
+
+      final streamed = await request.send().timeout(
+        timeout,
+        onTimeout: () {
+          throw Exception('Upload timed out after ${timeout.inSeconds}s');
+        },
+      );
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode == 200) {
+        final data = _safeJson(response.body);
+        return {'success': true, 'data': data};
+      } else {
+        final err = _safeJson(response.body);
+        final msg = (err['error'] ?? 'Upload failed').toString();
+        return {
+          'success': false,
+          'error': _isInAppWebView ? 'InAppWebView upload error: $msg' : msg,
+        };
+      }
+    } catch (e) {
+      String msg = 'Upload failed: $e';
+      if (_isInAppWebView) {
+        if (e.toString().contains('timed out')) {
+          msg =
+              'Upload timed out in InAppWebView. Please check your connection and try again.';
+        } else if (e.toString().contains('SocketException') ||
+            e.toString().contains('Connection')) {
+          msg =
+              'Network connection failed in InAppWebView. Ensure the server is reachable.';
+        } else {
+          msg = 'InAppWebView upload error: $e';
+        }
+      }
+      return {'success': false, 'error': msg};
+    }
+  }
+
+  // OCR Processing APIs
+  static Future<Map<String, dynamic>> processUAEId(String imagePath) async {
+    try {
+      _logger.info('Processing UAE ID via API');
+
+      // For now, return mock data - in real implementation, this would call OCR service
+      await Future.delayed(const Duration(seconds: 2));
+
+      return {
+        'success': true,
+        'data': {
+          'name': 'Sample Name',
+          'idNumber': '784-1234-1234567-1',
+          'dateOfBirth': '01/01/1990',
+          'nationality': 'UAE',
+          'issuingDate': '01/01/2020',
+          'expiryDate': '01/01/2030',
+          'sex': 'M',
+          'isValid': true,
+        },
+      };
+    } catch (e) {
+      _logger.error('UAE ID processing failed', e);
+      return {'success': false, 'error': 'Failed to process UAE ID: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> processBankDetails(
+    String imagePath,
+  ) async {
+    try {
+      _logger.info('Processing bank details via API');
+
+      // For now, return mock data - in real implementation, this would call OCR service
+      await Future.delayed(const Duration(seconds: 2));
+
+      return {
+        'success': true,
+        'data': {
+          'accountHolderName': 'Sample Account Holder',
+          'accountNumber': '1234567890',
+          'ibanNumber': 'AE12345678901234567890123',
+          'bankName': 'Emirates NBD',
+          'branchName': 'Dubai Main Branch',
+          'swiftCode': 'EBILAEAD',
+          'isValid': true,
+        },
+      };
+    } catch (e) {
+      _logger.error('Bank details processing failed', e);
+      return {'success': false, 'error': 'Failed to process bank details: $e'};
+    }
+  }
+
+  // QR Code APIs
+  static Future<Map<String, dynamic>> processQRCode(String qrData) async {
+    try {
+      _logger.info('Processing QR code via API');
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      return {
+        'success': true,
+        'data': {
+          'qrData': qrData,
+          'productInfo': {
+            'name': 'Sample Product',
+            'code': qrData,
+            'points': 50,
+            'category': 'Construction Material',
+          },
+          'points': 50,
+        },
+      };
+    } catch (e) {
+      _logger.error('QR code processing failed', e);
+      return {'success': false, 'error': 'Failed to process QR code: $e'};
+    }
+  }
+
+  // Analytics APIs
+  static Future<Map<String, dynamic>> getBusinessMetrics() async {
+    try {
+      _logger.info('Fetching business metrics via API');
+
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      return {
+        'success': true,
+        'data': {
+          'totalScans': 1234,
+          'redeemedPoints': 856,
+          'activeCampaigns': 5,
+          'monthlyTargetProgress': 78.0,
+          'totalPoints': 2450,
+          'monthlyScans': 124,
+          'rewardsEarned': 18,
+        },
+      };
+    } catch (e) {
+      _logger.error('Failed to fetch business metrics', e);
+      return {
+        'success': false,
+        'error': 'Failed to fetch business metrics: $e',
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> getRecentActivities({
+    int limit = 10,
+  }) async {
+    try {
+      _logger.info('Fetching recent activities via API');
+
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      return {
+        'success': true,
+        'data': {
+          'activities': [
+            {
+              'id': '1',
+              'title': 'QR Code Scanned',
+              'subtitle': 'Birla White Primacoat Primer - +70 points',
+              'timestamp': DateTime.now()
+                  .subtract(const Duration(hours: 2))
+                  .toIso8601String(),
+              'iconName': 'qr_code_scanner',
+              'colorName': 'successGreen',
+              'points': 70,
+            },
+            {
+              'id': '2',
+              'title': 'Reward Redeemed',
+              'subtitle': 'Amazon Gift Card - 500 points',
+              'timestamp': DateTime.now()
+                  .subtract(const Duration(days: 1))
+                  .toIso8601String(),
+              'iconName': 'card_giftcard',
+              'colorName': 'warningAmber',
+              'points': -500,
+            },
+            {
+              'id': '3',
+              'title': 'Level Up',
+              'subtitle': 'Reached Gold Member Status',
+              'timestamp': DateTime.now()
+                  .subtract(const Duration(days: 3))
+                  .toIso8601String(),
+              'iconName': 'emoji_events',
+              'colorName': 'accentBlue',
+              'points': 100,
+            },
+          ],
+        },
+      };
+    } catch (e) {
+      _logger.error('Failed to fetch recent activities', e);
+      return {
+        'success': false,
+        'error': 'Failed to fetch recent activities: $e',
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> trackQRScan(
+    String qrCode, {
+    int pointsEarned = 0,
+  }) async {
+    try {
+      _logger.info('Tracking QR scan via API');
+
+      final body = {
+        'qrCode': qrCode,
+        'pointsEarned': pointsEarned,
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/analytics/track/qr-scan',
+        body: body,
+      );
+    } catch (e) {
+      _logger.error('Failed to track QR scan', e);
+      return {'success': false, 'error': 'Failed to track QR scan: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> trackRewardRedemption(
+    String rewardName,
+    int pointsSpent,
+  ) async {
+    try {
+      _logger.info('Tracking reward redemption via API');
+
+      final body = {
+        'rewardName': rewardName,
+        'pointsSpent': pointsSpent,
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/analytics/track/reward-redemption',
+        body: body,
+      );
+    } catch (e) {
+      _logger.error('Failed to track reward redemption', e);
+      return {
+        'success': false,
+        'error': 'Failed to track reward redemption: $e',
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> trackUserInteraction(
+    String action, {
+    Map<String, dynamic>? metadata,
+  }) async {
+    try {
+      _logger.info('Tracking user interaction via API');
+
+      final body = {
+        'action': action,
+        'metadata': metadata,
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/analytics/track/user-interaction',
+        body: body,
+      );
+    } catch (e) {
+      _logger.error('Failed to track user interaction', e);
+      return {
+        'success': false,
+        'error': 'Failed to track user interaction: $e',
+      };
+    }
+  }
+
+  // Product APIs
+  static Future<Map<String, dynamic>> createProduct(
+    Map<String, dynamic> productData,
+  ) async {
+    try {
+      _logger.info('Creating product via API');
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/products',
+        body: productData,
+      );
+    } catch (e) {
+      _logger.error('Failed to create product', e);
+      return {'success': false, 'error': 'Failed to create product: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> updateProduct(
+    String productId,
+    Map<String, dynamic> productData,
+  ) async {
+    try {
+      _logger.info('Updating product via API');
+
+      return await makeRequest(
+        method: 'PUT',
+        endpoint: '/products/$productId',
+        body: productData,
+      );
+    } catch (e) {
+      _logger.error('Failed to update product', e);
+      return {'success': false, 'error': 'Failed to update product: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getProducts({
+    int? limit,
+    int? offset,
+  }) async {
+    try {
+      _logger.info('Fetching products via API');
+
+      var endpoint = '/products';
+      if (limit != null || offset != null) {
+        endpoint += '?';
+        if (limit != null) endpoint += 'limit=$limit&';
+        if (offset != null) endpoint += 'offset=$offset&';
+        endpoint = endpoint.substring(0, endpoint.length - 1);
+      }
+
+      return await makeRequest(method: 'GET', endpoint: endpoint);
+    } catch (e) {
+      _logger.error('Failed to fetch products', e);
+      return {'success': false, 'error': 'Failed to fetch products: $e'};
+    }
+  }
+
+  // Registration APIs
+  static Future<Map<String, dynamic>> registerUser(
+    Map<String, dynamic> userData,
+  ) async {
+    try {
+      _logger.info('Registering user via API');
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/auth/register',
+        body: userData,
+      );
+    } catch (e) {
+      _logger.error('Failed to register user', e);
+      return {'success': false, 'error': 'Failed to register user: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> updateUserProfile(
+    String userId,
+    Map<String, dynamic> profileData,
+  ) async {
+    try {
+      _logger.info('Updating user profile via API');
+
+      return await makeRequest(
+        method: 'PUT',
+        endpoint: '/users/$userId/profile',
+        body: profileData,
+      );
+    } catch (e) {
+      _logger.error('Failed to update user profile', e);
+      return {'success': false, 'error': 'Failed to update user profile: $e'};
+    }
+  }
+
+  // Quality Control APIs
+  static Future<Map<String, dynamic>> submitQualityReport(
+    Map<String, dynamic> reportData,
+  ) async {
+    try {
+      _logger.info('Submitting quality report via API');
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/quality-control/reports',
+        body: reportData,
+      );
+    } catch (e) {
+      _logger.error('Failed to submit quality report', e);
+      return {'success': false, 'error': 'Failed to submit quality report: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getQualityReports({
+    String? status,
+    int? limit,
+  }) async {
+    try {
+      _logger.info('Fetching quality reports via API');
+
+      var endpoint = '/quality-control/reports';
+      if (status != null || limit != null) {
+        endpoint += '?';
+        if (status != null) endpoint += 'status=$status&';
+        if (limit != null) endpoint += 'limit=$limit&';
+        endpoint = endpoint.substring(0, endpoint.length - 1);
+      }
+
+      return await makeRequest(method: 'GET', endpoint: endpoint);
+    } catch (e) {
+      _logger.error('Failed to fetch quality reports', e);
+      return {'success': false, 'error': 'Failed to fetch quality reports: $e'};
+    }
+  }
+
+  // Retail APIs
+  static Future<Map<String, dynamic>> registerRetailer(
+    Map<String, dynamic> retailerData,
+  ) async {
+    try {
+      _logger.info('Registering retailer via API');
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/retail/register',
+        body: retailerData,
+      );
+    } catch (e) {
+      _logger.error('Failed to register retailer', e);
+      return {'success': false, 'error': 'Failed to register retailer: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> submitRetailEntry(
+    Map<String, dynamic> entryData,
+  ) async {
+    try {
+      _logger.info('Submitting retail entry via API');
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/retail/entries',
+        body: entryData,
+      );
+    } catch (e) {
+      _logger.error('Failed to submit retail entry', e);
+      return {'success': false, 'error': 'Failed to submit retail entry: $e'};
+    }
+  }
+
+  // Contractor Registration APIs
+  static Future<Map<String, dynamic>> registerContractor(
+    Map<String, dynamic> contractorData,
+  ) async {
+    try {
+      _logger.info('Registering contractor via API');
+
+      return await makeRequest(
+        method: 'POST',
+        endpoint: '/api/Contractor/register',
+        body: contractorData,
+      );
+    } catch (e) {
+      _logger.error('Failed to register contractor', e);
+      return {'success': false, 'error': 'Failed to register contractor: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> uploadContractorDocument({
+    required String filePath,
+    required String documentType,
+    String? originalName,
+  }) async {
+    try {
+      _logger.info('Uploading contractor document via API');
+
+      final uri = Uri.parse('$baseUrl/api/Contractor/upload-document');
+      final request = http.MultipartRequest('POST', uri);
+
+      request.headers['Accept'] = 'application/json';
+      request.fields['documentType'] = documentType;
+
+      if (kIsWeb) {
+        if (filePath.startsWith('data:')) {
+          final parts = filePath.split(',');
+          if (parts.length != 2) {
+            throw Exception('Invalid data URL format');
+          }
+          final header = parts[0];
+          final mimeType = header.split(':')[1].split(';')[0];
+          final bytes = base64Decode(parts[1]);
+
+          request.files.add(
+            http.MultipartFile.fromBytes(
+              'file',
+              bytes,
+              filename: originalName ?? 'document.${_extFromMime(mimeType)}',
+            ),
+          );
+        } else {
+          throw Exception(
+            'Unsupported web file path format (expected data: URL)',
+          );
+        }
+      } else {
+        final file = File(filePath);
+        if (!await file.exists()) {
+          throw Exception('File does not exist: $filePath');
+        }
+        request.files.add(
+          await http.MultipartFile.fromPath(
+            'file',
+            filePath,
+            filename: originalName ?? file.path.split('/').last,
+          ),
+        );
+      }
+
+      final timeout = _isInAppWebView
+          ? const Duration(seconds: 20)
+          : const Duration(seconds: 30);
+
+      final streamed = await request.send().timeout(
+        timeout,
+        onTimeout: () {
+          throw Exception('Upload timed out after ${timeout.inSeconds}s');
+        },
+      );
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode == 200) {
+        final data = _safeJson(response.body);
+        return {'success': true, 'data': data};
+      } else {
+        final err = _safeJson(response.body);
+        final msg = (err['error'] ?? 'Upload failed').toString();
+        return {
+          'success': false,
+          'error': _isInAppWebView ? 'InAppWebView upload error: $msg' : msg,
+        };
+      }
+    } catch (e) {
+      _logger.error('Failed to upload contractor document', e);
+      String msg = 'Upload failed: $e';
+      if (_isInAppWebView) {
+        if (e.toString().contains('timed out')) {
+          msg =
+              'Upload timed out in InAppWebView. Please check your connection and try again.';
+        } else if (e.toString().contains('SocketException') ||
+            e.toString().contains('Connection')) {
+          msg =
+              'Network connection failed in InAppWebView. Ensure the server is reachable.';
+        } else {
+          msg = 'InAppWebView upload error: $e';
+        }
+      }
+      return {'success': false, 'error': msg};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getContractorTypes() async {
+    try {
+      _logger.info('Fetching contractor types via API');
+
+      return await makeRequest(
+        method: 'GET',
+        endpoint: '/api/Contractor/contractor-types',
+      );
+    } catch (e) {
+      _logger.error('Failed to fetch contractor types', e);
+      return {
+        'success': false,
+        'error': 'Failed to fetch contractor types: $e',
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> getEmiratesList() async {
+    try {
+      _logger.info('Fetching emirates list via API');
+
+      return await makeRequest(
+        method: 'GET',
+        endpoint: '/api/Contractor/emirates-list',
+      );
+    } catch (e) {
+      _logger.error('Failed to fetch emirates list', e);
+      return {'success': false, 'error': 'Failed to fetch emirates list: $e'};
+    }
+  }
+
+  // Health Check
+  static Future<Map<String, dynamic>> testConnectivity() async {
+    try {
+      final resp = await http
+          .get(
+            Uri.parse('$baseUrl/health'),
+            headers: {'Accept': 'application/json'},
+          )
+          .timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => throw Exception('Timeout'),
+          );
+
+      return {
+        'success': resp.statusCode == 200,
+        'statusCode': resp.statusCode,
+        'data': _safeJson(resp.body),
+      };
+    } catch (e) {
+      _logger.error('Connectivity test failed', e);
+      return {'success': false, 'error': 'Connectivity test failed: $e'};
+    }
+  }
+
+  // Utility methods
+  static String _extFromMime(String mime) {
+    switch (mime) {
+      case 'image/jpeg':
+        return 'jpg';
+      case 'image/png':
+        return 'png';
+      case 'image/gif':
+        return 'gif';
+      case 'image/webp':
+        return 'webp';
+      case 'application/pdf':
+        return 'pdf';
+      case 'text/plain':
+        return 'txt';
+      default:
+        return 'bin';
+    }
+  }
+
+  static Map<String, dynamic> _safeJson(String body) {
+    try {
+      final parsed = json.decode(body);
+      return parsed is Map<String, dynamic>
+          ? parsed
+          : <String, dynamic>{'raw': parsed};
+    } catch (_) {
+      return <String, dynamic>{'raw': body};
+    }
+  }
+}
 
 
 
@@ -151,6 +961,8 @@ class DashboardRecent {
 
 
 
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import '../models/dashboard_models.dart';
 import 'api_service.dart';
 
@@ -168,13 +980,18 @@ class DashboardService {
         endpoint = endpoint.substring(0, endpoint.length - 1);
       }
 
-      final response = await ApiService.makeRequest(
-        method: 'GET',
-        endpoint: endpoint,
-      );
+      final uri = Uri.parse('${ApiService.baseUrl}$endpoint');
+      final response = await http.get(
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+      ).timeout(const Duration(seconds: 30));
 
-      if (response['success'] == true && response['data'] != null) {
-        return DashboardStats.fromJson(response['data']);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return DashboardStats.fromJson(data);
       }
 
       return null;
@@ -196,13 +1013,18 @@ class DashboardService {
         endpoint = endpoint.substring(0, endpoint.length - 1);
       }
 
-      final response = await ApiService.makeRequest(
-        method: 'GET',
-        endpoint: endpoint,
-      );
+      final uri = Uri.parse('${ApiService.baseUrl}$endpoint');
+      final response = await http.get(
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+      ).timeout(const Duration(seconds: 30));
 
-      if (response['success'] == true && response['data'] != null) {
-        return DashboardTrends.fromJson(response['data']);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return DashboardTrends.fromJson(data);
       }
 
       return null;
@@ -217,890 +1039,23 @@ class DashboardService {
     try {
       final endpoint = '/api/Dashboard/recent?limit=$limit';
 
-      final response = await ApiService.makeRequest(
-        method: 'GET',
-        endpoint: endpoint,
-      );
+      final uri = Uri.parse('${ApiService.baseUrl}$endpoint');
+      final response = await http.get(
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+      ).timeout(const Duration(seconds: 30));
 
-      if (response['success'] == true && response['data'] != null) {
-        return DashboardRecent.fromJson(response['data']);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return DashboardRecent.fromJson(data);
       }
 
       return null;
     } catch (e) {
       return null;
     }
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import '../../../core/theme/theme.dart';
-import '../../../core/widgets/custom_back_button.dart';
-import '../../../core/models/dashboard_models.dart';
-import '../../../core/services/dashboard_service.dart';
-
-class DashboardScreen extends StatefulWidget {
-  const DashboardScreen({super.key});
-
-  @override
-  State<DashboardScreen> createState() => _DashboardScreenState();
-}
-
-class _DashboardScreenState extends State<DashboardScreen>
-    with TickerProviderStateMixin {
-  DateTime _startDate = DateTime.now().subtract(const Duration(days: 30));
-  DateTime _endDate = DateTime.now();
-
-  DashboardStats? _dashboardStats;
-  DashboardTrends? _dashboardTrends;
-  DashboardRecent? _recentRegistrations;
-  bool _isLoading = true;
-
-  late AnimationController _mainController;
-  late AnimationController _fabController;
-  late Animation<double> _fadeAnimation;
-  late Animation<Offset> _slideAnimation;
-  late Animation<double> _scaleAnimation;
-  final List<AnimationController> _cardControllers = [];
-  final List<Animation<double>> _cardAnimations = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _mainController = AnimationController(
-      duration: const Duration(milliseconds: 1000),
-      vsync: this,
-    );
-    _fabController = AnimationController(
-      duration: const Duration(milliseconds: 400),
-      vsync: this,
-    );
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController,
-        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
-      ),
-    );
-    _slideAnimation =
-        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-          CurvedAnimation(
-            parent: _mainController,
-            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-          ),
-        );
-    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController,
-        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
-      ),
-    );
-    // Initialize card animations
-    for (int i = 0; i < 4; i++) {
-      final controller = AnimationController(
-        duration: const Duration(milliseconds: 400),
-        vsync: this,
-      );
-      final animation = CurvedAnimation(
-        parent: controller,
-        curve: Curves.easeOutCubic,
-      );
-      _cardControllers.add(controller);
-      _cardAnimations.add(animation);
-      // Stagger the card animations
-      Future.delayed(Duration(milliseconds: 200 + (i * 100)), () {
-        if (mounted) controller.forward();
-      });
-    }
-    _mainController.forward();
-    _fabController.forward();
-    _loadDashboardData();
-  }
-
-  Future<void> _loadDashboardData() async {
-    setState(() {
-      _isLoading = true;
-    });
-
-    final startDateStr = _startDate.toString().split(' ')[0];
-    final endDateStr = _endDate.toString().split(' ')[0];
-
-    try {
-      final futures = await Future.wait([
-        DashboardService.getStats(start: startDateStr, end: endDateStr),
-        DashboardService.getTrends(start: startDateStr, end: endDateStr),
-        DashboardService.getRecent(limit: 5),
-      ]);
-
-      setState(() {
-        _dashboardStats = futures[0] as DashboardStats?;
-        _dashboardTrends = futures[1] as DashboardTrends?;
-        _recentRegistrations = futures[2] as DashboardRecent?;
-        _isLoading = false;
-      });
-    } catch (e) {
-      setState(() {
-        _isLoading = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to load dashboard data: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    _mainController.dispose();
-    _fabController.dispose();
-    for (var controller in _cardControllers) {
-      controller.dispose();
-    }
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // Set system UI overlay style
-    SystemChrome.setSystemUIOverlayStyle(
-      const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-        statusBarBrightness: Brightness.light,
-      ),
-    );
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF8FAFC),
-      appBar: _buildModernAppBar(),
-      body: FadeTransition(
-        opacity: _fadeAnimation,
-        child: SlideTransition(
-          position: _slideAnimation,
-          child: Container(
-            decoration: const BoxDecoration(color: Color(0xFFF8FAFC)),
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final isMobile = constraints.maxWidth < 600;
-                final isTablet =
-                    constraints.maxWidth >= 600 && constraints.maxWidth < 1200;
-                final isDesktop = constraints.maxWidth >= 1200;
-
-                return SingleChildScrollView(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
-                    vertical: 24,
-                  ),
-                  child: ScaleTransition(
-                    scale: _scaleAnimation,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        // Header with animation
-                        _buildAnimatedHeader(),
-                        const SizedBox(height: 32),
-                        // Stats Cards
-                        _isLoading
-                            ? _buildLoadingStats(isMobile, isTablet, isDesktop)
-                            : _buildStatsCards(isMobile, isTablet, isDesktop),
-                        const SizedBox(height: 32),
-                        // Registration Trends Chart
-                        _buildRegistrationTrends(isMobile),
-                        const SizedBox(height: 32),
-                        // Recent Registrations
-                        _buildRecentRegistrations(isMobile),
-                        const SizedBox(height: 32),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  PreferredSizeWidget _buildModernAppBar() {
-    return AppBar(
-      elevation: 0,
-      backgroundColor: Colors.white,
-      foregroundColor: const Color(0xFF1E3A8A),
-      systemOverlayStyle: const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-      ),
-      leading: Navigator.of(context).canPop()
-          ? Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: CustomBackButton(animated: false, size: 36),
-            )
-          : null,
-      title: Text(
-        'Dashboard',
-        style: TextStyle(
-          fontWeight: FontWeight.w600,
-          fontSize: 20,
-          color: const Color(0xFF1E3A8A),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildAnimatedHeader() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(32),
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.blue.withOpacity(0.15),
-            blurRadius: 20,
-            offset: const Offset(0, 8),
-          ),
-        ],
-      ),
-      child: const Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Dashboard',
-            style: TextStyle(
-              fontSize: 32,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
-          SizedBox(height: 12),
-          Text(
-            'Welcome to your registration dashboard',
-            style: TextStyle(fontSize: 18, color: Colors.white70),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildLoadingStats(bool isMobile, bool isTablet, bool isDesktop) {
-    final stats = List.generate(4, (index) => {
-      'title': ['Total Registrations', 'Contractors', 'Painters', 'Pending'][index],
-      'icon': [Icons.group_rounded, Icons.business_rounded, Icons.format_paint_rounded, Icons.pending_actions_rounded][index],
-      'color': [Colors.blue, Colors.blue, Colors.blue, Colors.red][index],
-    });
-
-    if (isMobile) {
-      return Column(
-        children: List.generate(stats.length, (index) {
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 16),
-            child: _buildLoadingStatCard(
-              stats[index]['title'] as String,
-              stats[index]['icon'] as IconData,
-              stats[index]['color'] as Color,
-            ),
-          );
-        }),
-      );
-    } else if (isTablet) {
-      return GridView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          childAspectRatio: 1.2,
-          crossAxisSpacing: 16,
-          mainAxisSpacing: 16,
-        ),
-        itemCount: stats.length,
-        itemBuilder: (context, index) {
-          return _buildLoadingStatCard(
-            stats[index]['title'] as String,
-            stats[index]['icon'] as IconData,
-            stats[index]['color'] as Color,
-          );
-        },
-      );
-    } else {
-      return Row(
-        children: List.generate(stats.length, (index) {
-          return Expanded(
-            child: Padding(
-              padding: EdgeInsets.only(
-                right: index < stats.length - 1 ? 16 : 0,
-              ),
-              child: _buildLoadingStatCard(
-                stats[index]['title'] as String,
-                stats[index]['icon'] as IconData,
-                stats[index]['color'] as Color,
-              ),
-            ),
-          );
-        }),
-      );
-    }
-  }
-
-  Widget _buildLoadingStatCard(String title, IconData icon, Color color) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.04),
-            blurRadius: 16,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: color.withOpacity(0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(icon, color: color, size: 24),
-              ),
-              Container(
-                width: 40,
-                height: 20,
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade200,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Text(
-            title,
-            style: TextStyle(fontSize: 16, color: Colors.grey.shade600),
-          ),
-          const SizedBox(height: 8),
-          Container(
-            width: 60,
-            height: 28,
-            decoration: BoxDecoration(
-              color: Colors.grey.shade200,
-              borderRadius: BorderRadius.circular(8),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildStatsCards(bool isMobile, bool isTablet, bool isDesktop) {
-    final stats = [
-      {
-        'title': 'Total Registrations',
-        'value': _dashboardStats?.totalRegistrations.toString() ?? '0',
-        'icon': Icons.group_rounded,
-        'color': Colors.blue,
-        'change': '+12%',
-        'isPositive': true,
-      },
-      {
-        'title': 'Contractors',
-        'value': _dashboardStats?.contractors.toString() ?? '0',
-        'icon': Icons.business_rounded,
-        'color': Colors.blue,
-        'change': '+8%',
-        'isPositive': true,
-      },
-      {
-        'title': 'Painters',
-        'value': _dashboardStats?.painters.toString() ?? '0',
-        'icon': Icons.format_paint_rounded,
-        'color': Colors.blue,
-        'change': '+15%',
-        'isPositive': true,
-      },
-      {
-        'title': 'Pending',
-        'value': _dashboardStats?.pending.toString() ?? '0',
-        'icon': Icons.pending_actions_rounded,
-        'color': Colors.red,
-        'change': '-3%',
-        'isPositive': false,
-      },
-    ];
-
-    if (isMobile) {
-      // Mobile layout - single column
-      return Column(
-        children: List.generate(stats.length, (index) {
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 16),
-            child: _buildStatCard(
-              stats[index]['title'] as String,
-              stats[index]['value'] as String,
-              stats[index]['icon'] as IconData,
-              stats[index]['color'] as Color,
-              stats[index]['change'] as String,
-              stats[index]['isPositive'] as bool,
-              _cardAnimations[index],
-            ),
-          );
-        }),
-      );
-    } else if (isTablet) {
-      // Tablet layout - 2x2 grid
-      return GridView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          childAspectRatio: 1.2,
-          crossAxisSpacing: 16,
-          mainAxisSpacing: 16,
-        ),
-        itemCount: stats.length,
-        itemBuilder: (context, index) {
-          return _buildStatCard(
-            stats[index]['title'] as String,
-            stats[index]['value'] as String,
-            stats[index]['icon'] as IconData,
-            stats[index]['color'] as Color,
-            stats[index]['change'] as String,
-            stats[index]['isPositive'] as bool,
-            _cardAnimations[index],
-          );
-        },
-      );
-    } else {
-      // Desktop layout - single row
-      return Row(
-        children: List.generate(stats.length, (index) {
-          return Expanded(
-            child: Padding(
-              padding: EdgeInsets.only(
-                right: index < stats.length - 1 ? 16 : 0,
-              ),
-              child: _buildStatCard(
-                stats[index]['title'] as String,
-                stats[index]['value'] as String,
-                stats[index]['icon'] as IconData,
-                stats[index]['color'] as Color,
-                stats[index]['change'] as String,
-                stats[index]['isPositive'] as bool,
-                _cardAnimations[index],
-              ),
-            ),
-          );
-        }),
-      );
-    }
-  }
-
-  Widget _buildStatCard(
-    String title,
-    String value,
-    IconData icon,
-    Color color,
-    String change,
-    bool isPositive,
-    Animation<double> animation,
-  ) {
-    return ScaleTransition(
-      scale: animation,
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.04),
-              blurRadius: 16,
-              offset: const Offset(0, 4),
-            ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: color.withOpacity(0.1),
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(icon, color: color, size: 24),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  decoration: BoxDecoration(
-                    color: isPositive
-                        ? Colors.green.withOpacity(0.1)
-                        : Colors.red.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        isPositive
-                            ? Icons.trending_up_rounded
-                            : Icons.trending_down_rounded,
-                        color: isPositive ? Colors.green : Colors.red,
-                        size: 14,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        change,
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: isPositive ? Colors.green : Colors.red,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Text(
-              title,
-              style: TextStyle(fontSize: 16, color: Colors.grey.shade600),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              value,
-              style: TextStyle(
-                fontSize: 28,
-                fontWeight: FontWeight.bold,
-                color: color,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildRegistrationTrends(bool isMobile) {
-    return _buildModernSection(
-      title: 'Registration Trends',
-      icon: Icons.bar_chart_rounded,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: _selectDateRange,
-                icon: const Icon(Icons.date_range_rounded),
-                label: Text(
-                  '${_startDate.toString().split(' ')[0]} - ${_endDate.toString().split(' ')[0]}',
-                ),
-              ),
-            ),
-            if (!isMobile) const SizedBox(width: 16),
-            if (!isMobile)
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _exportReport,
-                  icon: const Icon(Icons.download_rounded),
-                  label: const Text('Export Report'),
-                ),
-              ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        Container(
-          height: isMobile ? 250 : 300,
-          decoration: BoxDecoration(
-            color: const Color(0xFFF8FAFC),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.grey.shade200),
-          ),
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(
-                  Icons.bar_chart_rounded,
-                  size: 64,
-                  color: Colors.grey,
-                ),
-                const SizedBox(height: 16),
-                const Text(
-                  'Registration Chart',
-                  style: TextStyle(color: Colors.grey, fontSize: 16),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Visual representation of registration trends',
-                  style: TextStyle(color: Colors.grey[500], fontSize: 14),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildRecentRegistrations(bool isMobile) {
-    final registrations = _recentRegistrations?.items ?? [];
-
-    return _buildModernSection(
-      title: 'Recent Registrations',
-      icon: Icons.recent_actors_rounded,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              'Latest registration activities',
-              style: TextStyle(fontSize: 16, color: Colors.grey),
-            ),
-            TextButton(
-              onPressed: () =>
-                  Navigator.pushNamed(context, '/approval-dashboard'),
-              child: Text(
-                'View All',
-                style: TextStyle(
-                  color: const Color(0xFF1E3A8A),
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-        ListView.separated(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: registrations.length,
-          separatorBuilder: (context, index) => const Divider(),
-          itemBuilder: (context, index) {
-            final registration = registrations[index];
-            final statusColor = registration.status == 'Approved'
-                ? Colors.green
-                : registration.status == 'Pending'
-                ? Colors.orange
-                : Colors.red;
-
-            return ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: CircleAvatar(
-                backgroundColor: const Color(0xFF1E3A8A).withOpacity(0.1),
-                child: Text(
-                  registration.avatar,
-                  style: TextStyle(
-                    color: const Color(0xFF1E3A8A),
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-              title: Text(
-                registration.name,
-                style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              subtitle: Text(
-                '${registration.type} • ${registration.status}',
-                style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
-              ),
-              trailing: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  const SizedBox(height: 4),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: statusColor.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Text(
-                      registration.status,
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                        color: statusColor,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              onTap: () {
-                // Navigate to registration details
-              },
-            );
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildModernSection({
-    required String title,
-    required IconData icon,
-    required List<Widget> children,
-  }) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.04),
-            blurRadius: 16,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Section Header
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF8FAFC),
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(16),
-              ),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E3A8A).withOpacity(0.1),
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(icon, color: const Color(0xFF1E3A8A), size: 24),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF1F2937),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          // Section Content
-          Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: children,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _selectDateRange() async {
-    final picked = await showDateRangePicker(
-      context: context,
-      firstDate: DateTime(2020),
-      lastDate: DateTime.now(),
-      initialDateRange: DateTimeRange(start: _startDate, end: _endDate),
-      builder: (context, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.light(primary: Color(0xFF1E3A8A)),
-          ),
-          child: child!,
-        );
-      },
-    );
-    if (picked != null) {
-      setState(() {
-        _startDate = picked.start;
-        _endDate = picked.end;
-      });
-      _loadDashboardData();
-    }
-  }
-
-  void _exportReport() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          'Report exported successfully',
-          style: AppTheme.body.copyWith(color: Colors.white),
-        ),
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        backgroundColor: const Color(0xFF1E3A8A),
-      ),
-    );
   }
 }
