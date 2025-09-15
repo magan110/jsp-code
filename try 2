@@ -1,306 +1,1106 @@
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text.RegularExpressions;
+class DashboardStats {
+  final bool success;
+  final String start;
+  final String end;
+  final int totalRegistrations;
+  final int contractors;
+  final int painters;
+  final int pending;
+  final DateTime timestamp;
 
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class DashboardController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
+  DashboardStats({
+    required this.success,
+    required this.start,
+    required this.end,
+    required this.totalRegistrations,
+    required this.contractors,
+    required this.painters,
+    required this.pending,
+    required this.timestamp,
+  });
 
-        public DashboardController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
+  factory DashboardStats.fromJson(Map<String, dynamic> json) {
+    return DashboardStats(
+      success: json['success'] ?? false,
+      start: json['start'] ?? '',
+      end: json['end'] ?? '',
+      totalRegistrations: json['totalRegistrations'] ?? 0,
+      contractors: json['contractors'] ?? 0,
+      painters: json['painters'] ?? 0,
+      pending: json['pending'] ?? 0,
+      timestamp: DateTime.tryParse(json['timestamp']?.toString() ?? '') ?? DateTime.now(),
+    );
+  }
+}
 
-        // =====================================================================
-        // 1) STATS for the 4 cards
-        // GET: /api/Dashboard/stats?start=2025-08-16&end=2025-09-15
-        // If dates omitted, uses last 30 days.
-        // =====================================================================
-        [HttpGet("stats")]
-        public IActionResult GetStats([FromQuery] string? start = null, [FromQuery] string? end = null)
-        {
-            var (d1, d2) = NormalizeDateRange(start, end, defaultDays: 30);
+class TrendData {
+  final String date;
+  final int total;
+  final int contractors;
+  final int painters;
+  final int approved;
+  final int pending;
+  final int rejected;
 
-            var p = new Dictionary<string, object?>
-            {
-                ["@d1"] = d1,
-                ["@d2"] = d2
-            };
+  TrendData({
+    required this.date,
+    required this.total,
+    required this.contractors,
+    required this.painters,
+    required this.approved,
+    required this.pending,
+    required this.rejected,
+  });
 
-            // date column priority: createDt -> sapInsDt -> frstScDt
-            var sql = @"
-;WITH base AS
-(
-    SELECT
-        ISNULL(isActive,'') AS ia,
-        ISNULL(contrtyp,'') AS contrtyp,
-        ISNULL(inflType,'') AS inflType,
-        CAST(CONVERT(date, COALESCE(createDt, sapInsDt, frstScDt, GETDATE())) AS date) AS d
-    FROM dbo.ctmInfluncr WITH (NOLOCK)
-    WHERE ISNULL(blkStuts,'N') <> 'Y'
-      AND COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) >= @d1
-      AND COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) < DATEADD(day, 1, @d2)
-)
-SELECT
-    (SELECT COUNT(1) FROM base) AS total,
-    (SELECT COUNT(1) FROM base WHERE contrtyp LIKE '%Contractor%' OR UPPER(inflType) IN ('CT','CO')) AS contractors,
-    (SELECT COUNT(1) FROM base WHERE contrtyp LIKE '%Painter%'    OR UPPER(inflType) IN ('PN','PA')) AS painters,
-    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R')) AS pending;
-";
-            var row = (_db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>()).FirstOrDefault()
-                      ?? new Dictionary<string, object>();
+  factory TrendData.fromJson(Map<String, dynamic> json) {
+    return TrendData(
+      date: json['date'] ?? '',
+      total: json['total'] ?? 0,
+      contractors: json['contractors'] ?? 0,
+      painters: json['painters'] ?? 0,
+      approved: json['approved'] ?? 0,
+      pending: json['pending'] ?? 0,
+      rejected: json['rejected'] ?? 0,
+    );
+  }
+}
 
-            int N(string k) => int.TryParse(row.GetValueOrDefault(k)?.ToString(), out var v) ? v : 0;
+class DashboardTrends {
+  final bool success;
+  final String start;
+  final String end;
+  final List<TrendData> data;
 
-            return Ok(new
-            {
-                success = true,
-                start = d1.ToString("yyyy-MM-dd"),
-                end = d2.ToString("yyyy-MM-dd"),
-                totalRegistrations = N("total"),
-                contractors = N("contractors"),
-                painters = N("painters"),
-                pending = N("pending"),
-                timestamp = DateTime.Now
-            });
-        }
+  DashboardTrends({
+    required this.success,
+    required this.start,
+    required this.end,
+    required this.data,
+  });
 
-        // =====================================================================
-        // 2) REGISTRATION TRENDS (daily buckets)
-        // GET: /api/Dashboard/trends?start=YYYY-MM-DD&end=YYYY-MM-DD
-        // =====================================================================
-        [HttpGet("trends")]
-        public IActionResult GetTrends([FromQuery] string? start = null, [FromQuery] string? end = null)
-        {
-            var (d1, d2) = NormalizeDateRange(start, end, defaultDays: 30);
+  factory DashboardTrends.fromJson(Map<String, dynamic> json) {
+    return DashboardTrends(
+      success: json['success'] ?? false,
+      start: json['start'] ?? '',
+      end: json['end'] ?? '',
+      data: (json['data'] as List? ?? [])
+          .map((item) => TrendData.fromJson(item))
+          .toList(),
+    );
+  }
+}
 
-            var p = new Dictionary<string, object?>
-            {
-                ["@d1"] = d1,
-                ["@d2"] = d2
-            };
+class RecentRegistration {
+  final String name;
+  final String type;
+  final String status;
+  final String date;
+  final String avatar;
 
-            var sql = @"
-;WITH base AS
-(
-    SELECT
-        ISNULL(isActive,'') AS ia,
-        ISNULL(contrtyp,'') AS contrtyp,
-        ISNULL(inflType,'') AS inflType,
-        CAST(CONVERT(date, COALESCE(createDt, sapInsDt, frstScDt, GETDATE())) AS date) AS d
-    FROM dbo.ctmInfluncr WITH (NOLOCK)
-    WHERE ISNULL(blkStuts,'N') <> 'Y'
-      AND COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) >= @d1
-      AND COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) < DATEADD(day, 1, @d2)
-),
-agg AS
-(
-    SELECT
-        d,
-        COUNT(1) AS total,
-        SUM(CASE WHEN contrtyp LIKE '%Contractor%' OR UPPER(inflType) IN ('CT','CO') THEN 1 ELSE 0 END) AS contractors,
-        SUM(CASE WHEN contrtyp LIKE '%Painter%'    OR UPPER(inflType) IN ('PN','PA') THEN 1 ELSE 0 END) AS painters,
-        SUM(CASE WHEN ia = 'Y' THEN 1 ELSE 0 END) AS approved,
-        SUM(CASE WHEN ia = 'R' THEN 1 ELSE 0 END) AS rejected,
-        SUM(CASE WHEN ia NOT IN ('Y','R') THEN 1 ELSE 0 END) AS pending
-    FROM base
-    GROUP BY d
-)
-SELECT
-    CONVERT(varchar(10), d, 120) AS [date],
-    total,
-    contractors,
-    painters,
-    approved,
-    pending,
-    rejected
-FROM agg
-ORDER BY d ASC;
-";
+  RecentRegistration({
+    required this.name,
+    required this.type,
+    required this.status,
+    required this.date,
+    required this.avatar,
+  });
 
-            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-            var series = rows.Select(r => new
-            {
-                date = r.GetValueOrDefault("date")?.ToString() ?? "",
-                total = ToInt(r, "total"),
-                contractors = ToInt(r, "contractors"),
-                painters = ToInt(r, "painters"),
-                approved = ToInt(r, "approved"),
-                pending = ToInt(r, "pending"),
-                rejected = ToInt(r, "rejected")
-            });
+  factory RecentRegistration.fromJson(Map<String, dynamic> json) {
+    return RecentRegistration(
+      name: json['name'] ?? '',
+      type: json['type'] ?? '',
+      status: json['status'] ?? '',
+      date: json['date'] ?? '',
+      avatar: json['avatar'] ?? '',
+    );
+  }
+}
 
-            return Ok(new
-            {
-                success = true,
-                start = d1.ToString("yyyy-MM-dd"),
-                end = d2.ToString("yyyy-MM-dd"),
-                data = series
-            });
-        }
+class DashboardRecent {
+  final bool success;
+  final List<RecentRegistration> items;
 
-        // =====================================================================
-        // 3) RECENT REGISTRATIONS
-        // GET: /api/Dashboard/recent?limit=5
-        // =====================================================================
-        [HttpGet("recent")]
-        public IActionResult GetRecent([FromQuery] int limit = 5)
-        {
-            limit = limit <= 0 ? 5 : Math.Min(limit, 50);
+  DashboardRecent({
+    required this.success,
+    required this.items,
+  });
 
-            var p = new Dictionary<string, object?>
-            {
-                ["@top"] = limit
-            };
+  factory DashboardRecent.fromJson(Map<String, dynamic> json) {
+    return DashboardRecent(
+      success: json['success'] ?? false,
+      items: (json['items'] as List? ?? [])
+          .map((item) => RecentRegistration.fromJson(item))
+          .toList(),
+    );
+  }
+}
 
-            var sql = @"
-;WITH base AS
-(
-    SELECT TOP (@top)
-        inflCode,
-        ISNULL(isActive,'') AS ia,
-        ISNULL(contrtyp,'') AS contrtyp,
-        ISNULL(inflType,'') AS inflType,
-        LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
-        LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
-        LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
-        LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
-        COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS dt
-    FROM dbo.ctmInfluncr WITH (NOLOCK)
-    WHERE ISNULL(blkStuts,'N') <> 'Y'
-    ORDER BY COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) DESC, inflCode DESC
-)
-SELECT
-    inflCode,
-    ia,
-    contrtyp,
-    inflType,
-    frstname, middname, lastname, inflName,
-    CONVERT(varchar(10), dt, 120) AS [date]
-FROM base
-ORDER BY [date] DESC, inflCode DESC;
-";
 
-            var rows = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-            var items = rows.Select(r =>
-            {
-                string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
-                var name = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
-                var type = NormalizeType(G("contrtyp"), G("inflType"));
-                var status = MapStatus(G("ia"));
-                return new
-                {
-                    name,
-                    type,
-                    status,
-                    date = G("date"),
-                    avatar = MakeAvatar(name, G("inflCode"))
-                };
-            });
 
-            return Ok(new
-            {
-                success = true,
-                items
-            });
-        }
 
-        // ============================= Helpers =============================
-        private static (DateTime d1, DateTime d2) NormalizeDateRange(string? s1, string? s2, int defaultDays)
-        {
-            // Interpret as local server time; return inclusive end (date only)
-            bool ok1 = DateTime.TryParse(s1, out var d1);
-            bool ok2 = DateTime.TryParse(s2, out var d2);
-            if (!ok1 && !ok2)
-            {
-                d2 = DateTime.Today;
-                d1 = d2.AddDays(-defaultDays);
-            }
-            else if (!ok1)
-            {
-                d1 = d2.AddDays(-defaultDays);
-            }
-            else if (!ok2)
-            {
-                d2 = d1.AddDays(defaultDays);
-            }
 
-            // Use dates with time zero, keep end as the provided date (inclusive)
-            d1 = d1.Date;
-            d2 = d2.Date;
-            return (d1, d2);
-        }
 
-        private static int ToInt(Dictionary<string, object> r, string key)
-        {
-            return int.TryParse(r.GetValueOrDefault(key)?.ToString(), out var v) ? v : 0;
-        }
 
-        private static string MapStatus(string? ia)
-        {
-            ia = (ia ?? "").Trim().ToUpperInvariant();
-            return ia switch
-            {
-                "Y" => "Approved",
-                "R" => "Rejected",
-                _ => "Pending"
-            };
-        }
 
-        private static string NormalizeType(string contrtyp, string inflType)
-        {
-            if (!string.IsNullOrWhiteSpace(contrtyp))
-            {
-                if (contrtyp.Contains("paint", StringComparison.OrdinalIgnoreCase)) return "Painter";
-                if (contrtyp.Contains("contract", StringComparison.OrdinalIgnoreCase)) return "Contractor";
-                return contrtyp.Trim();
-            }
-            inflType = (inflType ?? "").Trim().ToUpperInvariant();
-            return inflType switch
-            {
-                "PN" or "PA" => "Painter",
-                "CT" or "CO" => "Contractor",
-                _ => "Contractor"
-            };
-        }
 
-        private static string ComposeName(string? f, string? m, string? l, string? fallback)
-        {
-            var parts = new[] { f, m, l }
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .Select(x => x!.Trim());
-            var n = string.Join(" ", parts);
-            if (!string.IsNullOrWhiteSpace(n)) return n;
-            return (fallback ?? "").Trim();
-        }
 
-        private static string MakeAvatar(string? name, string? fallbackId)
-        {
-            if (!string.IsNullOrWhiteSpace(name))
-            {
-                var tokens = Regex.Split(name.Trim(), @"\s+")
-                                  .Where(t => !string.IsNullOrWhiteSpace(t))
-                                  .ToArray();
-                if (tokens.Length == 1)
-                {
-                    var t = tokens[0];
-                    return t.Substring(0, Math.Min(2, t.Length)).ToUpperInvariant();
-                }
-                if (tokens.Length >= 2)
-                {
-                    return $"{char.ToUpperInvariant(tokens[0][0])}{char.ToUpperInvariant(tokens[^1][0])}";
-                }
-            }
-            var f = (fallbackId ?? "ID").Trim();
-            return f.Length >= 2 ? f.Substring(0, 2).ToUpperInvariant() : f.ToUpperInvariant();
-        }
+
+
+
+
+
+
+
+import '../models/dashboard_models.dart';
+import 'api_service.dart';
+
+class DashboardService {
+  static Future<DashboardStats?> getStats({
+    String? start,
+    String? end,
+  }) async {
+    try {
+      var endpoint = '/api/Dashboard/stats';
+      if (start != null || end != null) {
+        endpoint += '?';
+        if (start != null) endpoint += 'start=$start&';
+        if (end != null) endpoint += 'end=$end&';
+        endpoint = endpoint.substring(0, endpoint.length - 1);
+      }
+
+      final response = await ApiService.makeRequest(
+        method: 'GET',
+        endpoint: endpoint,
+      );
+
+      if (response['success'] == true && response['data'] != null) {
+        return DashboardStats.fromJson(response['data']);
+      }
+
+      return null;
+    } catch (e) {
+      return null;
     }
+  }
+
+  static Future<DashboardTrends?> getTrends({
+    String? start,
+    String? end,
+  }) async {
+    try {
+      var endpoint = '/api/Dashboard/trends';
+      if (start != null || end != null) {
+        endpoint += '?';
+        if (start != null) endpoint += 'start=$start&';
+        if (end != null) endpoint += 'end=$end&';
+        endpoint = endpoint.substring(0, endpoint.length - 1);
+      }
+
+      final response = await ApiService.makeRequest(
+        method: 'GET',
+        endpoint: endpoint,
+      );
+
+      if (response['success'] == true && response['data'] != null) {
+        return DashboardTrends.fromJson(response['data']);
+      }
+
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static Future<DashboardRecent?> getRecent({
+    int limit = 5,
+  }) async {
+    try {
+      final endpoint = '/api/Dashboard/recent?limit=$limit';
+
+      final response = await ApiService.makeRequest(
+        method: 'GET',
+        endpoint: endpoint,
+      );
+
+      if (response['success'] == true && response['data'] != null) {
+        return DashboardRecent.fromJson(response['data']);
+      }
+
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../../../core/theme/theme.dart';
+import '../../../core/widgets/custom_back_button.dart';
+import '../../../core/models/dashboard_models.dart';
+import '../../../core/services/dashboard_service.dart';
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen>
+    with TickerProviderStateMixin {
+  DateTime _startDate = DateTime.now().subtract(const Duration(days: 30));
+  DateTime _endDate = DateTime.now();
+
+  DashboardStats? _dashboardStats;
+  DashboardTrends? _dashboardTrends;
+  DashboardRecent? _recentRegistrations;
+  bool _isLoading = true;
+
+  late AnimationController _mainController;
+  late AnimationController _fabController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+  final List<AnimationController> _cardControllers = [];
+  final List<Animation<double>> _cardAnimations = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _mainController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
+      vsync: this,
+    );
+    _fabController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _mainController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+    // Initialize card animations
+    for (int i = 0; i < 4; i++) {
+      final controller = AnimationController(
+        duration: const Duration(milliseconds: 400),
+        vsync: this,
+      );
+      final animation = CurvedAnimation(
+        parent: controller,
+        curve: Curves.easeOutCubic,
+      );
+      _cardControllers.add(controller);
+      _cardAnimations.add(animation);
+      // Stagger the card animations
+      Future.delayed(Duration(milliseconds: 200 + (i * 100)), () {
+        if (mounted) controller.forward();
+      });
+    }
+    _mainController.forward();
+    _fabController.forward();
+    _loadDashboardData();
+  }
+
+  Future<void> _loadDashboardData() async {
+    setState(() {
+      _isLoading = true;
+    });
+
+    final startDateStr = _startDate.toString().split(' ')[0];
+    final endDateStr = _endDate.toString().split(' ')[0];
+
+    try {
+      final futures = await Future.wait([
+        DashboardService.getStats(start: startDateStr, end: endDateStr),
+        DashboardService.getTrends(start: startDateStr, end: endDateStr),
+        DashboardService.getRecent(limit: 5),
+      ]);
+
+      setState(() {
+        _dashboardStats = futures[0] as DashboardStats?;
+        _dashboardTrends = futures[1] as DashboardTrends?;
+        _recentRegistrations = futures[2] as DashboardRecent?;
+        _isLoading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to load dashboard data: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _mainController.dispose();
+    _fabController.dispose();
+    for (var controller in _cardControllers) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Set system UI overlay style
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+        statusBarBrightness: Brightness.light,
+      ),
+    );
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8FAFC),
+      appBar: _buildModernAppBar(),
+      body: FadeTransition(
+        opacity: _fadeAnimation,
+        child: SlideTransition(
+          position: _slideAnimation,
+          child: Container(
+            decoration: const BoxDecoration(color: Color(0xFFF8FAFC)),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final isMobile = constraints.maxWidth < 600;
+                final isTablet =
+                    constraints.maxWidth >= 600 && constraints.maxWidth < 1200;
+                final isDesktop = constraints.maxWidth >= 1200;
+
+                return SingleChildScrollView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
+                    vertical: 24,
+                  ),
+                  child: ScaleTransition(
+                    scale: _scaleAnimation,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // Header with animation
+                        _buildAnimatedHeader(),
+                        const SizedBox(height: 32),
+                        // Stats Cards
+                        _isLoading
+                            ? _buildLoadingStats(isMobile, isTablet, isDesktop)
+                            : _buildStatsCards(isMobile, isTablet, isDesktop),
+                        const SizedBox(height: 32),
+                        // Registration Trends Chart
+                        _buildRegistrationTrends(isMobile),
+                        const SizedBox(height: 32),
+                        // Recent Registrations
+                        _buildRecentRegistrations(isMobile),
+                        const SizedBox(height: 32),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  PreferredSizeWidget _buildModernAppBar() {
+    return AppBar(
+      elevation: 0,
+      backgroundColor: Colors.white,
+      foregroundColor: const Color(0xFF1E3A8A),
+      systemOverlayStyle: const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+      ),
+      leading: Navigator.of(context).canPop()
+          ? Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: CustomBackButton(animated: false, size: 36),
+            )
+          : null,
+      title: Text(
+        'Dashboard',
+        style: TextStyle(
+          fontWeight: FontWeight.w600,
+          fontSize: 20,
+          color: const Color(0xFF1E3A8A),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAnimatedHeader() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(32),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.blue.withOpacity(0.15),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: const Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Dashboard',
+            style: TextStyle(
+              fontSize: 32,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          SizedBox(height: 12),
+          Text(
+            'Welcome to your registration dashboard',
+            style: TextStyle(fontSize: 18, color: Colors.white70),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLoadingStats(bool isMobile, bool isTablet, bool isDesktop) {
+    final stats = List.generate(4, (index) => {
+      'title': ['Total Registrations', 'Contractors', 'Painters', 'Pending'][index],
+      'icon': [Icons.group_rounded, Icons.business_rounded, Icons.format_paint_rounded, Icons.pending_actions_rounded][index],
+      'color': [Colors.blue, Colors.blue, Colors.blue, Colors.red][index],
+    });
+
+    if (isMobile) {
+      return Column(
+        children: List.generate(stats.length, (index) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: _buildLoadingStatCard(
+              stats[index]['title'] as String,
+              stats[index]['icon'] as IconData,
+              stats[index]['color'] as Color,
+            ),
+          );
+        }),
+      );
+    } else if (isTablet) {
+      return GridView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          childAspectRatio: 1.2,
+          crossAxisSpacing: 16,
+          mainAxisSpacing: 16,
+        ),
+        itemCount: stats.length,
+        itemBuilder: (context, index) {
+          return _buildLoadingStatCard(
+            stats[index]['title'] as String,
+            stats[index]['icon'] as IconData,
+            stats[index]['color'] as Color,
+          );
+        },
+      );
+    } else {
+      return Row(
+        children: List.generate(stats.length, (index) {
+          return Expanded(
+            child: Padding(
+              padding: EdgeInsets.only(
+                right: index < stats.length - 1 ? 16 : 0,
+              ),
+              child: _buildLoadingStatCard(
+                stats[index]['title'] as String,
+                stats[index]['icon'] as IconData,
+                stats[index]['color'] as Color,
+              ),
+            ),
+          );
+        }),
+      );
+    }
+  }
+
+  Widget _buildLoadingStatCard(String title, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 16,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: color, size: 24),
+              ),
+              Container(
+                width: 40,
+                height: 20,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade200,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text(
+            title,
+            style: TextStyle(fontSize: 16, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            width: 60,
+            height: 28,
+            decoration: BoxDecoration(
+              color: Colors.grey.shade200,
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatsCards(bool isMobile, bool isTablet, bool isDesktop) {
+    final stats = [
+      {
+        'title': 'Total Registrations',
+        'value': _dashboardStats?.totalRegistrations.toString() ?? '0',
+        'icon': Icons.group_rounded,
+        'color': Colors.blue,
+        'change': '+12%',
+        'isPositive': true,
+      },
+      {
+        'title': 'Contractors',
+        'value': _dashboardStats?.contractors.toString() ?? '0',
+        'icon': Icons.business_rounded,
+        'color': Colors.blue,
+        'change': '+8%',
+        'isPositive': true,
+      },
+      {
+        'title': 'Painters',
+        'value': _dashboardStats?.painters.toString() ?? '0',
+        'icon': Icons.format_paint_rounded,
+        'color': Colors.blue,
+        'change': '+15%',
+        'isPositive': true,
+      },
+      {
+        'title': 'Pending',
+        'value': _dashboardStats?.pending.toString() ?? '0',
+        'icon': Icons.pending_actions_rounded,
+        'color': Colors.red,
+        'change': '-3%',
+        'isPositive': false,
+      },
+    ];
+
+    if (isMobile) {
+      // Mobile layout - single column
+      return Column(
+        children: List.generate(stats.length, (index) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: _buildStatCard(
+              stats[index]['title'] as String,
+              stats[index]['value'] as String,
+              stats[index]['icon'] as IconData,
+              stats[index]['color'] as Color,
+              stats[index]['change'] as String,
+              stats[index]['isPositive'] as bool,
+              _cardAnimations[index],
+            ),
+          );
+        }),
+      );
+    } else if (isTablet) {
+      // Tablet layout - 2x2 grid
+      return GridView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          childAspectRatio: 1.2,
+          crossAxisSpacing: 16,
+          mainAxisSpacing: 16,
+        ),
+        itemCount: stats.length,
+        itemBuilder: (context, index) {
+          return _buildStatCard(
+            stats[index]['title'] as String,
+            stats[index]['value'] as String,
+            stats[index]['icon'] as IconData,
+            stats[index]['color'] as Color,
+            stats[index]['change'] as String,
+            stats[index]['isPositive'] as bool,
+            _cardAnimations[index],
+          );
+        },
+      );
+    } else {
+      // Desktop layout - single row
+      return Row(
+        children: List.generate(stats.length, (index) {
+          return Expanded(
+            child: Padding(
+              padding: EdgeInsets.only(
+                right: index < stats.length - 1 ? 16 : 0,
+              ),
+              child: _buildStatCard(
+                stats[index]['title'] as String,
+                stats[index]['value'] as String,
+                stats[index]['icon'] as IconData,
+                stats[index]['color'] as Color,
+                stats[index]['change'] as String,
+                stats[index]['isPositive'] as bool,
+                _cardAnimations[index],
+              ),
+            ),
+          );
+        }),
+      );
+    }
+  }
+
+  Widget _buildStatCard(
+    String title,
+    String value,
+    IconData icon,
+    Color color,
+    String change,
+    bool isPositive,
+    Animation<double> animation,
+  ) {
+    return ScaleTransition(
+      scale: animation,
+      child: Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.04),
+              blurRadius: 16,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: color.withOpacity(0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: color, size: 24),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: isPositive
+                        ? Colors.green.withOpacity(0.1)
+                        : Colors.red.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isPositive
+                            ? Icons.trending_up_rounded
+                            : Icons.trending_down_rounded,
+                        color: isPositive ? Colors.green : Colors.red,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        change,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: isPositive ? Colors.green : Colors.red,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Text(
+              title,
+              style: TextStyle(fontSize: 16, color: Colors.grey.shade600),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              value,
+              style: TextStyle(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRegistrationTrends(bool isMobile) {
+    return _buildModernSection(
+      title: 'Registration Trends',
+      icon: Icons.bar_chart_rounded,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _selectDateRange,
+                icon: const Icon(Icons.date_range_rounded),
+                label: Text(
+                  '${_startDate.toString().split(' ')[0]} - ${_endDate.toString().split(' ')[0]}',
+                ),
+              ),
+            ),
+            if (!isMobile) const SizedBox(width: 16),
+            if (!isMobile)
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _exportReport,
+                  icon: const Icon(Icons.download_rounded),
+                  label: const Text('Export Report'),
+                ),
+              ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        Container(
+          height: isMobile ? 250 : 300,
+          decoration: BoxDecoration(
+            color: const Color(0xFFF8FAFC),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.grey.shade200),
+          ),
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.bar_chart_rounded,
+                  size: 64,
+                  color: Colors.grey,
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Registration Chart',
+                  style: TextStyle(color: Colors.grey, fontSize: 16),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Visual representation of registration trends',
+                  style: TextStyle(color: Colors.grey[500], fontSize: 14),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRecentRegistrations(bool isMobile) {
+    final registrations = _recentRegistrations?.items ?? [];
+
+    return _buildModernSection(
+      title: 'Recent Registrations',
+      icon: Icons.recent_actors_rounded,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'Latest registration activities',
+              style: TextStyle(fontSize: 16, color: Colors.grey),
+            ),
+            TextButton(
+              onPressed: () =>
+                  Navigator.pushNamed(context, '/approval-dashboard'),
+              child: Text(
+                'View All',
+                style: TextStyle(
+                  color: const Color(0xFF1E3A8A),
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        ListView.separated(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: registrations.length,
+          separatorBuilder: (context, index) => const Divider(),
+          itemBuilder: (context, index) {
+            final registration = registrations[index];
+            final statusColor = registration.status == 'Approved'
+                ? Colors.green
+                : registration.status == 'Pending'
+                ? Colors.orange
+                : Colors.red;
+
+            return ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: CircleAvatar(
+                backgroundColor: const Color(0xFF1E3A8A).withOpacity(0.1),
+                child: Text(
+                  registration.avatar,
+                  style: TextStyle(
+                    color: const Color(0xFF1E3A8A),
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              title: Text(
+                registration.name,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              subtitle: Text(
+                '${registration.type} • ${registration.status}',
+                style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
+              ),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: statusColor.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      registration.status,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: statusColor,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              onTap: () {
+                // Navigate to registration details
+              },
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildModernSection({
+    required String title,
+    required IconData icon,
+    required List<Widget> children,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 16,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Section Header
+          Container(
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(16),
+              ),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E3A8A).withOpacity(0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: const Color(0xFF1E3A8A), size: 24),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF1F2937),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Section Content
+          Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: children,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _selectDateRange() async {
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now(),
+      initialDateRange: DateTimeRange(start: _startDate, end: _endDate),
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.light(primary: Color(0xFF1E3A8A)),
+          ),
+          child: child!,
+        );
+      },
+    );
+    if (picked != null) {
+      setState(() {
+        _startDate = picked.start;
+        _endDate = picked.end;
+      });
+      _loadDashboardData();
+    }
+  }
+
+  void _exportReport() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Report exported successfully',
+          style: AppTheme.body.copyWith(color: Colors.white),
+        ),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        backgroundColor: const Color(0xFF1E3A8A),
+      ),
+    );
+  }
 }
