@@ -1,605 +1,2024 @@
-class ImageUploadRequest {
-  final String fileName;
-  final List<int> fileBytes;
-  final String fileExtension;
-  final int fileSize;
-  final String attFilTy;
-  final String createId;
-
-  ImageUploadRequest({
-    required this.fileName,
-    required this.fileBytes,
-    required this.fileExtension,
-    required this.fileSize,
-    this.attFilTy = "01",
-    this.createId = "SYSTEM",
-  });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'fileName': fileName,
-      'fileBytes': fileBytes,
-      'fileExtension': fileExtension,
-      'fileSize': fileSize,
-      'attFilTy': attFilTy,
-      'createId': createId,
-    };
-  }
-}
-
-class ImageUploadResponse {
-  final String msg;
-  final ImageUploadData? data;
-  final bool success;
-
-  ImageUploadResponse({
-    required this.msg,
-    this.data,
-    required this.success,
-  });
-
-  factory ImageUploadResponse.fromJson(Map<String, dynamic> json) {
-    return ImageUploadResponse(
-      msg: json['msg'] ?? json['message'] ?? '',
-      data: json['data'] != null ? ImageUploadData.fromJson(json['data']) : null,
-      success: json['success'] == true || json['msg']?.toString().toLowerCase().contains('success') == true,
-    );
-  }
-}
-
-class ImageUploadData {
-  final String attFilKy;
-  final String fileName;
-  final int fileSize;
-  final String? filePath;
-  final String? fileUrl;
-
-  ImageUploadData({
-    required this.attFilKy,
-    required this.fileName,
-    required this.fileSize,
-    this.filePath,
-    this.fileUrl,
-  });
-
-  factory ImageUploadData.fromJson(Map<String, dynamic> json) {
-    return ImageUploadData(
-      attFilKy: json['attFilKy'] ?? json['fileId'] ?? '',
-      fileName: json['fileName'] ?? json['name'] ?? '',
-      fileSize: (json['fileSize'] ?? json['size'] ?? 0) is int
-          ? (json['fileSize'] ?? json['size'] ?? 0)
-          : int.tryParse((json['fileSize'] ?? json['size'] ?? 0).toString()) ?? 0,
-      filePath: json['filePath'] ?? json['path'],
-      fileUrl: json['fileUrl'] ?? json['url'],
-    );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'attFilKy': attFilKy,
-      'fileName': fileName,
-      'fileSize': fileSize,
-      if (filePath != null) 'filePath': filePath,
-      if (fileUrl != null) 'fileUrl': fileUrl,
-    };
-  }
-}
-
-class DeleteImageRequest {
-  final String updateId;
-
-  DeleteImageRequest({
-    required this.updateId,
-  });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'updateId': updateId,
-    };
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import 'dart:convert';
-import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart';
-import '../models/image_upload_models.dart';
-import 'upload_service.dart';
-
-class ImageUploadService {
-  static final Map<String, PendingImageUpload> _pendingUploads = {};
-
-  static Future<PendingImageUpload?> selectImage({
-    String attFilTy = "01",
-    String createId = "SYSTEM",
-  }) async {
-    try {
-      final file = await pickImage();
-      if (file == null) return null;
-
-      if (!isValidImageFile(file)) {
-        throw Exception('Invalid file type. Only image files are allowed.');
-      }
-
-      final id = DateTime.now().millisecondsSinceEpoch.toString();
-      String filePath;
-
-      if (kIsWeb) {
-        if (file.bytes != null) {
-          final bytes = file.bytes!;
-          final base64String = base64Encode(bytes);
-          final mimeType = _getMimeType(file.extension);
-          filePath = 'data:$mimeType;base64,$base64String';
-        } else {
-          throw Exception('File bytes are null');
-        }
-      } else {
-        filePath = file.path ?? '';
-      }
-
-      final pendingUpload = PendingImageUpload(
-        id: id,
-        fileName: file.name,
-        filePath: filePath,
-        fileBytes: file.bytes,
-        fileExtension: file.extension ?? '',
-        fileSize: file.size,
-        attFilTy: attFilTy,
-        createId: createId,
-      );
-
-      _pendingUploads[id] = pendingUpload;
-      return pendingUpload;
-    } catch (e) {
-      throw Exception('Failed to select image: ${e.toString()}');
-    }
-  }
-
-  static void removePendingUpload(String id) {
-    _pendingUploads.remove(id);
-  }
-
-  static List<PendingImageUpload> getPendingUploads() {
-    return _pendingUploads.values.toList();
-  }
-
-  static PendingImageUpload? getPendingUpload(String id) {
-    return _pendingUploads[id];
-  }
-
-  static void clearPendingUploads() {
-    _pendingUploads.clear();
-  }
-
-  static Future<List<ImageUploadResponse>> uploadPendingImages() async {
-    final results = <ImageUploadResponse>[];
-    final uploads = List<PendingImageUpload>.from(_pendingUploads.values);
-
-    for (final upload in uploads) {
-      try {
-        final result = await UploadService.uploadFile(
-          upload.filePath,
-          originalName: upload.fileName,
-        );
-
-        if (result['success'] == true) {
-          final data = result['data'] as Map<String, dynamic>?;
-          results.add(ImageUploadResponse(
-            msg: 'Image uploaded successfully',
-            success: true,
-            data: data != null ? ImageUploadData.fromJson(data) : null,
-          ));
-          _pendingUploads.remove(upload.id);
-        } else {
-          results.add(ImageUploadResponse(
-            msg: result['error']?.toString() ?? 'Upload failed for ${upload.fileName}',
-            success: false,
-          ));
-        }
-      } catch (e) {
-        results.add(ImageUploadResponse(
-          msg: 'Network error for ${upload.fileName}: ${e.toString()}',
-          success: false,
-        ));
-      }
-    }
-
-    return results;
-  }
-
-  static Future<ImageUploadResponse> uploadSinglePendingImage(String id) async {
-    final upload = _pendingUploads[id];
-    if (upload == null) {
-      return ImageUploadResponse(
-        msg: 'Pending upload not found',
-        success: false,
-      );
-    }
-
-    try {
-      final result = await UploadService.uploadFile(
-        upload.filePath,
-        originalName: upload.fileName,
-      );
-
-      if (result['success'] == true) {
-        final data = result['data'] as Map<String, dynamic>?;
-        _pendingUploads.remove(id);
-        return ImageUploadResponse(
-          msg: 'Image uploaded successfully',
-          success: true,
-          data: data != null ? ImageUploadData.fromJson(data) : null,
-        );
-      } else {
-        return ImageUploadResponse(
-          msg: result['error']?.toString() ?? 'Upload failed',
-          success: false,
-        );
-      }
-    } catch (e) {
-      return ImageUploadResponse(
-        msg: 'Network error: ${e.toString()}',
-        success: false,
-      );
-    }
-  }
-
-  static Future<PlatformFile?> pickImage() async {
-    try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.image,
-        allowMultiple: false,
-        withData: true, // This ensures bytes are loaded
-      );
-
-      if (result != null && result.files.isNotEmpty) {
-        return result.files.first;
-      }
-      return null;
-    } catch (e) {
-      throw Exception('Failed to pick image: ${e.toString()}');
-    }
-  }
-
-  static bool isValidImageFile(PlatformFile file) {
-    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
-    final fileExtension = file.extension?.toLowerCase();
-
-    if (fileExtension == null) return false;
-
-    return allowedExtensions.contains('.$fileExtension');
-  }
-
-  static String formatFileSize(int bytes) {
-    if (bytes <= 0) return "0 B";
-    const suffixes = ["B", "KB", "MB", "GB"];
-    int i = 0;
-    double size = bytes.toDouble();
-
-    while (size >= 1024 && i < suffixes.length - 1) {
-      size /= 1024;
-      i++;
-    }
-
-    return "${size.toStringAsFixed(1)} ${suffixes[i]}";
-  }
-
-  static String _getMimeType(String? extension) {
-    if (extension == null) return 'application/octet-stream';
-
-    switch (extension.toLowerCase()) {
-      case 'jpg':
-      case 'jpeg':
-        return 'image/jpeg';
-      case 'png':
-        return 'image/png';
-      case 'gif':
-        return 'image/gif';
-      case 'bmp':
-        return 'image/bmp';
-      case 'webp':
-        return 'image/webp';
-      default:
-        return 'application/octet-stream';
-    }
-  }
-
-  static Future<bool> testConnectivity() async {
-    return await UploadService.testConnectivity();
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// upload_service.dart
-import 'dart:convert';
-import 'dart:io' show File; // used only on mobile paths
-import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-// Web-only
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web/web.dart' as web;
+import 'dart:js_interop';
+import '../../../core/widgets/file_upload_widget.dart';
+import '../../../core/widgets/modern_dropdown.dart';
 
-class UploadService {
-  // Detect webview-ish contexts (wider net than widget side)
-  static bool get _isInAppWebView {
-    if (kIsWeb) {
-      try {
-        final ua = web.window.navigator.userAgent.toLowerCase();
-        final vendor = web.window.navigator.vendor.toLowerCase();
-        final loc = web.window.location;
+@JS()
+@staticInterop
+class WindowWithGeoLocation {}
 
-        final isInAppWebView =
-            ua.contains('inapp') ||
-            ua.contains('webview') ||
-            ua.contains('inappbrowser') ||
-            ua.contains('capacitor') ||
-            ua.contains('cordova') ||
-            ua.contains('phonegap') ||
-            vendor.contains('inapp') ||
-            loc.protocol == 'file:' ||
-            loc.protocol == 'capacitor:' ||
-            loc.protocol == 'ionic:' ||
-            (loc.hostname == 'localhost' && loc.port.isEmpty) ||
-            (ua.contains('mobile') && !ua.contains('chrome'));
+extension WindowGeoLocationExtension on WindowWithGeoLocation {
+  external JSPromise<JSAny?> requestGeoPosition();
+}
 
-        return isInAppWebView;
-      } catch (_) {
-        return true;
-      }
-    }
-    return false;
+class ActivityEntryScreen extends StatefulWidget {
+  @override
+  _ActivityEntryScreenState createState() => _ActivityEntryScreenState();
+}
+
+class _ActivityEntryScreenState extends State<ActivityEntryScreen>
+    with TickerProviderStateMixin {
+  // Controllers
+  final processTypeController = TextEditingController();
+  final activityController = TextEditingController();
+  final descriptionController = TextEditingController();
+  final objectiveController = TextEditingController();
+  final activityDateController = TextEditingController();
+  final meetingVenueController = TextEditingController();
+  final areaController = TextEditingController();
+  final cityNameController = TextEditingController();
+  final districtController = TextEditingController();
+  final pinCodeController = TextEditingController();
+  final productController = TextEditingController();
+  final employeesCountController = TextEditingController();
+  final channelPartnerCountController = TextEditingController();
+  final influencersCountController = TextEditingController();
+  final totalParticipantsController = TextEditingController();
+  final ruralUrbanController = TextEditingController();
+  final latitudeController = TextEditingController();
+  final longitudeController = TextEditingController();
+  
+  // Animation controllers
+  late AnimationController _mainController;
+  late AnimationController _fabController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+  // Add to your state class
+List<Map<String, String>> painterList = [];
+void _addPainterRow() {
+  setState(() {
+    painterList.add({
+      'type': '',
+      'mobile': '',
+      'name': '',
+      'pastData': '',
+      'kyc': '',
+      'appDownloaded': '',
+    });
+  });
+}
+void _deletePainterRow() {
+  if (painterList.isNotEmpty) {
+    setState(() {
+      painterList.removeLast();
+    });
   }
+}
+void _deletePainterAt(int index) {
+  setState(() {
+    painterList.removeAt(index);
+  });
+}
 
-  static List<String> get _fallbackUrls => <String>[
-    'https://10.166.220.182:8521/api', // Direct IP (HTTPS)
-    'http://10.166.220.182:8520/api', // HTTP variant
-    'http://localhost:8520/api',
-    'http://localhost:8080/api',
-  ];
 
-  static String get baseUrl {
-    if (kIsWeb) {
-      if (_isInAppWebView) {
-        try {
-          final host = web.window.location.hostname;
-          final port = web.window.location.port;
-          final protocol = web
-              .window
-              .location
-              .protocol; // keep same scheme to avoid mixed content
-          if (host.isNotEmpty && host != 'localhost') {
-            final portPart = (port.isNotEmpty && port != '80' && port != '443')
-                ? ':$port'
-                : '';
-            return '$protocol//$host$portPart/api';
-          }
-        } catch (_) {}
-        // Fallback for in-app
-        return 'https://10.166.220.182:8521/api';
-      } else {
-        // Browser dev default; change to your served origin if needed
-        return 'http://localhost:8080/api';
-      }
-    } else {
-      // Mobile builds – hit your server
-      return 'https://10.166.220.182:8520/api';
-    }
-  }
+  bool _isSubmitting = false;
+  bool _isGettingLocation = false;
+  String? _uploadedFileName;
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
 
-  /// Upload file to server only - no local storage fallback
-  static Future<Map<String, dynamic>> uploadFile(
-    String filePath, {
-    String? originalName,
-  }) async {
-    return await _uploadWithFallback(filePath, originalName: originalName);
-  }
+  // Lists for tables
+  List<Map<String, String>> employeesList = [];
+  List<Map<String, String>> imagesList = [];
 
-  static Future<Map<String, dynamic>> _uploadWithFallback(
-    String filePath, {
-    String? originalName,
-  }) async {
-    // Try primary URL first
-    var result = await _uploadToUrl(
-      baseUrl,
-      filePath,
-      originalName: originalName,
+  @override
+  void initState() {
+    super.initState();
+    // Initialize animations
+    _mainController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
+      vsync: this,
     );
-    if (result['success'] == true) return result;
-
-    // Try fallbacks
-    for (final url in _fallbackUrls) {
-      result = await _uploadToUrl(url, filePath, originalName: originalName);
-      if (result['success'] == true) return result;
-    }
-
-    // Give up; caller may choose local fallback
-    return result;
+    _fabController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+      ),
+    );
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+    _mainController.forward();
+    _fabController.forward();
+    
+    // Auto-fill location on load
+    _initLocation();
   }
 
-  static Future<Map<String, dynamic>> _uploadToUrl(
-    String baseUrl,
-    String filePath, {
-    String? originalName,
-  }) async {
-    try {
-      final uri = Uri.parse('$baseUrl/upload');
-      final request = http.MultipartRequest('POST', uri);
+  @override
+  void dispose() {
+    _mainController.dispose();
+    _fabController.dispose();
+    processTypeController.dispose();
+    activityController.dispose();
+    descriptionController.dispose();
+    objectiveController.dispose();
+    activityDateController.dispose();
+    meetingVenueController.dispose();
+    areaController.dispose();
+    cityNameController.dispose();
+    districtController.dispose();
+    pinCodeController.dispose();
+    productController.dispose();
+    employeesCountController.dispose();
+    channelPartnerCountController.dispose();
+    influencersCountController.dispose();
+    totalParticipantsController.dispose();
+    ruralUrbanController.dispose();
+    latitudeController.dispose();
+    longitudeController.dispose();
+    super.dispose();
+  }
 
-      // Helpful (but CORS must be on server)
-      request.headers['Accept'] = 'application/json';
-
-      if (kIsWeb) {
-        if (filePath.startsWith('data:')) {
-          final parts = filePath.split(',');
-          if (parts.length != 2) {
-            throw Exception('Invalid data URL format');
-          }
-          final header = parts[0]; // data:<mime>;base64
-          final mimeType = header.split(':')[1].split(';')[0];
-          final bytes = base64Decode(parts[1]);
-
-          request.files.add(
-            http.MultipartFile.fromBytes(
-              'file',
-              bytes,
-              filename: originalName ?? 'upload.${_extFromMime(mimeType)}',
+  void _submitForm() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() {
+        _isSubmitting = true;
+      });
+      try {
+        // Here you would create and submit the activity entry
+        // For now, we'll just show a success message
+        
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.check_circle, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Activity entry submitted successfully'),
+                  ),
+                ],
+              ),
+              backgroundColor: Colors.green,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 5),
             ),
           );
-        } else {
-          // If you support blob: or object URLs, you’d need to fetch them first in JS and pass data:
-          throw Exception(
-            'Unsupported web file path format (expected data: URL)',
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.warning, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(child: Text('Unexpected error: ${e.toString()}')),
+                ],
+              ),
+              backgroundColor: Colors.orange,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 4),
+            ),
           );
         }
-      } else {
-        final file = File(filePath);
-        if (!await file.exists()) {
-          throw Exception('File does not exist: $filePath');
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSubmitting = false;
+          });
         }
-        request.files.add(
-          await http.MultipartFile.fromPath(
-            'file',
-            filePath,
-            filename: originalName ?? file.path.split('/').last,
-          ),
-        );
       }
+    }
+  }
 
-      // Reasonable timeouts
-      final timeout = _isInAppWebView
-          ? const Duration(seconds: 20)
-          : const Duration(seconds: 30);
+  void _saveAsDraft() {
+    // Save form data to SharedPreferences
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(Icons.save, color: Colors.white, size: 20),
+            SizedBox(width: 8),
+            Expanded(child: Text('Draft saved successfully')),
+          ],
+        ),
+        backgroundColor: Colors.blue,
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 4),
+      ),
+    );
+  }
 
-      final streamed = await request.send().timeout(
-        timeout,
-        onTimeout: () {
-          throw Exception('Upload timed out after ${timeout.inSeconds}s');
-        },
-      );
-      final response = await http.Response.fromStream(streamed);
+  // --- GEOLOCATION (using web JavaScript helper from index.html) ---
+  Future<void> _initLocation() async {
+    setState(() => _isGettingLocation = true);
+    try {
+      await _getWebLocation();
+    } catch (e) {
+      _toast('Could not fetch location: $e');
+    } finally {
+      if (mounted) setState(() => _isGettingLocation = false);
+    }
+  }
 
-      if (response.statusCode == 200) {
-        final data = _safeJson(response.body);
-        return {'success': true, 'data': data};
-      } else {
-        final err = _safeJson(response.body);
-        final msg = (err['error'] ?? 'Upload failed').toString();
-        return {
-          'success': false,
-          'error': _isInAppWebView ? 'InAppWebView upload error: $msg' : msg,
-        };
+  Future<void> _getWebLocation() async {
+    try {
+      // First try to get from localStorage (cached values from index.html)
+      final lastLat = web.window.localStorage.getItem('lastLat');
+      final lastLng = web.window.localStorage.getItem('lastLng');
+      if (lastLat != null && lastLng != null && mounted) {
+        latitudeController.text = double.parse(lastLat).toStringAsFixed(6);
+        longitudeController.text = double.parse(lastLng).toStringAsFixed(6);
+      }
+      
+      // Use the JavaScript geolocation helper from index.html
+      final jsWindow = web.window as WindowWithGeoLocation;
+      final result = await jsWindow.requestGeoPosition().toDart;
+      if (result != null) {
+        // Convert JSAny to proper Dart object
+        final resultDart = result.dartify();
+        if (resultDart is Map<String, dynamic>) {
+          if (resultDart['ok'] == true) {
+            if (mounted) {
+              final lat = resultDart['lat'] as num?;
+              final lng = resultDart['lng'] as num?;
+              if (lat != null && lng != null) {
+                latitudeController.text = lat.toStringAsFixed(6);
+                longitudeController.text = lng.toStringAsFixed(6);
+              }
+            }
+          } else {
+            final error = resultDart['error']?.toString() ?? 'Unknown error';
+            _toast('Web geolocation failed: $error');
+          }
+        }
       }
     } catch (e) {
-      String msg = 'Upload failed: $e';
-      if (_isInAppWebView) {
-        if (e.toString().contains('timed out')) {
-          msg =
-              'Upload timed out in InAppWebView. Please check your connection and try again.';
-        } else if (e.toString().contains('SocketException') ||
-            e.toString().contains('Connection')) {
-          msg =
-              'Network connection failed in InAppWebView. Ensure the server is reachable.';
-        } else {
-          msg = 'InAppWebView upload error: $e';
-        }
+      _toast('Web geolocation error: $e');
+    }
+  }
+
+  void _captureLocation() {
+    // Location capture logic - now calls the web location
+    _initLocation();
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  void _addEmployee() {
+    // Add a new empty employee to the list
+    setState(() {
+      employeesList.add({
+        'employeeCode': '',
+        'name': '',
+      });
+    });
+  }
+
+  void _deleteEmployee(int index) {
+    // Remove an employee from the list
+    setState(() {
+      employeesList.removeAt(index);
+    });
+  }
+
+  void _addImage() {
+    // Add a new empty image to the list
+    setState(() {
+      imagesList.add({
+        'type': 'Select',
+        'path': '',
+      });
+    });
+  }
+
+  void _deleteImage(int index) {
+    // Remove an image from the list
+    setState(() {
+      imagesList.removeAt(index);
+    });
+  }
+
+
+Widget _buildPainterMeetSection(BoxConstraints constraints) {
+  if (activityController.text != 'Painter Meet') return SizedBox.shrink();
+  final isMobile = constraints.maxWidth <= 800;
+  return _buildModernSection(
+    title: 'List of Painter/Contractor/Tile Applicator',
+    icon: Icons.format_paint,
+    children: [
+      isMobile ? _buildPainterCardsMobile() : _buildPainterMeetTableDesktop(),
+      const SizedBox(height: 16),
+      Row(
+        mainAxisAlignment: MainAxisAlignment.start,
+        children: [
+          ElevatedButton(
+            onPressed: _addPainterRow,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.grey.shade200,
+              foregroundColor: Colors.black87,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            child: const Text('Add'),
+          ),
+          const SizedBox(width: 16),
+          ElevatedButton(
+            onPressed: painterList.isEmpty ? null : _deletePainterRow,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red.shade400,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+Widget _buildPainterMeetTableDesktop() {
+  return SingleChildScrollView(
+    scrollDirection: Axis.horizontal,
+    child: Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        children: [
+          // Table Header
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                topRight: Radius.circular(8),
+              ),
+            ),
+            child: Row(
+              children: [
+                _buildTableHeaderCell('Del', flex: 1),
+                _buildTableHeaderCell('Type', flex: 2),
+                _buildTableHeaderCell('Mobile No', flex: 2),
+                _buildTableHeaderCell('Name', flex: 2),
+                _buildTableHeaderCell('Past Data', flex: 2),
+                _buildTableHeaderCell('KYC Collected', flex: 3),
+                _buildTableHeaderCell('App Downloaded', flex: 2),
+              ],
+            ),
+          ),
+          if (painterList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No painters added yet. Click "Add" to add a painter.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          else
+            ...painterList.asMap().entries.map((entry) {
+              final index = entry.key;
+              final painter = entry.value;
+              return Row(
+                children: [
+                  _buildTableCell(
+                    Checkbox(
+                      value: false,
+                      onChanged: (value) {
+                        if (value == true) _deletePainterAt(index);
+                      },
+                    ),
+                    flex: 1,
+                  ),
+                  _buildTableCell(
+                    DropdownButtonFormField<String>(
+                      value: painter['type']!.isEmpty ? null : painter['type'],
+                      items: ['Painter', 'Contractor', 'Tile Applicator']
+                          .map((t) =>
+                              DropdownMenuItem(value: t, child: Text(t)))
+                          .toList(),
+                      onChanged: (val) {
+                        setState(() => painterList[index]['type'] = val ?? '');
+                      },
+                      decoration: InputDecoration(
+                        isDense: true,
+                        border: InputBorder.none,
+                        hintText: 'Select',
+                      ),
+                    ),
+                    flex: 2,
+                  ),
+                  _buildTableCell(
+                    TextFormField(
+                      initialValue: painter['mobile'],
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Mobile',
+                      ),
+                      onChanged: (val) =>
+                          painterList[index]['mobile'] = val,
+                    ),
+                    flex: 2,
+                  ),
+                  _buildTableCell(
+                    TextFormField(
+                      initialValue: painter['name'],
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Name',
+                      ),
+                      onChanged: (val) =>
+                          painterList[index]['name'] = val,
+                    ),
+                    flex: 2,
+                  ),
+                  _buildTableCell(
+                    TextFormField(
+                      initialValue: painter['pastData'],
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Past Data',
+                      ),
+                      onChanged: (val) =>
+                          painterList[index]['pastData'] = val,
+                    ),
+                    flex: 2,
+                  ),
+                  _buildTableCell(
+                    Wrap(
+                      spacing: 4,
+                      children: ['Full KYC', 'Partial KYC', 'No', 'Already KYC']
+                          .map((kyc) => OutlinedButton(
+                                onPressed: () => setState(() =>
+                                    painterList[index]['kyc'] = kyc),
+                                style: OutlinedButton.styleFrom(
+                                  side: BorderSide(color: Colors.blue),
+                                  backgroundColor:
+                                      painter['kyc'] == kyc
+                                          ? Colors.blue.shade100
+                                          : null,
+                                ),
+                                child: Text(kyc, style: TextStyle(fontSize: 12)),
+                              ))
+                          .toList(),
+                    ),
+                    flex: 3,
+                  ),
+                  _buildTableCell(
+                    Row(
+                      children: [
+                        OutlinedButton(
+                          onPressed: () => setState(() =>
+                              painterList[index]['appDownloaded'] = 'Yes'),
+                          style: OutlinedButton.styleFrom(
+                            side: BorderSide(color: Colors.blue),
+                            backgroundColor: painter['appDownloaded'] == 'Yes'
+                                ? Colors.blue.shade100
+                                : null,
+                          ),
+                          child: Text('Yes', style: TextStyle(fontSize: 12)),
+                        ),
+                        SizedBox(width: 4),
+                        OutlinedButton(
+                          onPressed: () => setState(() =>
+                              painterList[index]['appDownloaded'] = 'No'),
+                          style: OutlinedButton.styleFrom(
+                            side: BorderSide(color: Colors.blue),
+                            backgroundColor: painter['appDownloaded'] == 'No'
+                                ? Colors.blue.shade100
+                                : null,
+                          ),
+                          child: Text('No', style: TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                    flex: 2,
+                  ),
+                ],
+              );
+            }).toList(),
+        ],
+      ),
+    ),
+  );
+}
+Widget _buildPainterCardsMobile() {
+  return Column(
+    children: painterList.isEmpty
+        ? [
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No painters added yet. Click "Add" to add a painter.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          ]
+        : painterList.asMap().entries.map((entry) {
+            final index = entry.key;
+            final painter = entry.value;
+            return Card(
+              margin: EdgeInsets.only(bottom: 12),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8)),
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            value: painter['type']!.isEmpty ? null : painter['type'],
+                            items: ['Painter', 'Contractor', 'Tile Applicator']
+                                .map((t) =>
+                                    DropdownMenuItem(value: t, child: Text(t)))
+                                .toList(),
+                            onChanged: (val) {
+                              setState(
+                                  () => painterList[index]['type'] = val ?? '');
+                            },
+                            decoration: InputDecoration(
+                              labelText: 'Type',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: Icon(Icons.delete, color: Colors.red),
+                          onPressed: () => _deletePainterAt(index),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      initialValue: painter['mobile'],
+                      decoration: InputDecoration(
+                        labelText: 'Mobile No',
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (val) => painterList[index]['mobile'] = val,
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      initialValue: painter['name'],
+                      decoration: InputDecoration(
+                        labelText: 'Name',
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (val) => painterList[index]['name'] = val,
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      initialValue: painter['pastData'],
+                      decoration: InputDecoration(
+                        labelText: 'Past Data',
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (val) =>
+                          painterList[index]['pastData'] = val,
+                    ),
+                    const SizedBox(height: 10),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text('KYC Collected:'),
+                    ),
+                    Wrap(
+                      spacing: 4,
+                      children: ['Full KYC', 'Partial KYC', 'No', 'Already KYC']
+                          .map((kyc) => OutlinedButton(
+                                onPressed: () => setState(
+                                    () => painterList[index]['kyc'] = kyc),
+                                style: OutlinedButton.styleFrom(
+                                  side: BorderSide(color: Colors.blue),
+                                  backgroundColor:
+                                      painter['kyc'] == kyc
+                                          ? Colors.blue.shade100
+                                          : null,
+                                ),
+                                child: Text(kyc, style: TextStyle(fontSize: 12)),
+                              ))
+                          .toList(),
+                    ),
+                    const SizedBox(height: 10),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text('App Downloaded:'),
+                    ),
+                    Row(
+                      children: [
+                        OutlinedButton(
+                          onPressed: () =>
+                              setState(() =>
+                                  painterList[index]['appDownloaded'] = 'Yes'),
+                          style: OutlinedButton.styleFrom(
+                            side: BorderSide(color: Colors.blue),
+                            backgroundColor: painter['appDownloaded'] == 'Yes'
+                                ? Colors.blue.shade100
+                                : null,
+                          ),
+                          child: Text('Yes', style: TextStyle(fontSize: 12)),
+                        ),
+                        SizedBox(width: 8),
+                        OutlinedButton(
+                          onPressed: () =>
+                              setState(() =>
+                                  painterList[index]['appDownloaded'] = 'No'),
+                          style: OutlinedButton.styleFrom(
+                            side: BorderSide(color: Colors.blue),
+                            backgroundColor: painter['appDownloaded'] == 'No'
+                                ? Colors.blue.shade100
+                                : null,
+                          ),
+                          child: Text('No', style: TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+  );
+}
+
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isDesktop = constraints.maxWidth > 1200;
+        final isTablet = constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
+        final isMobile = constraints.maxWidth <= 800;
+        
+        return Scaffold(
+          backgroundColor: const Color(0xFFF8FAFC),
+          appBar: _buildModernAppBar(),
+          body: FadeTransition(
+            opacity: _fadeAnimation,
+            child: SlideTransition(
+              position: _slideAnimation,
+              child: Container(
+                decoration: const BoxDecoration(
+                  color: Color(0xFFF8FAFC),
+                ),
+                child: SingleChildScrollView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
+                    vertical: 24,
+                  ),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: isDesktop ? 1400 : double.infinity,
+                      ),
+                      child: ScaleTransition(
+                        scale: _scaleAnimation,
+                        child: Form(
+                          key: _formKey,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // Header with animation
+                              _buildAnimatedHeader(),
+                              const SizedBox(height: 32),
+                              // Main Content - Two columns on desktop
+                              if (isDesktop)
+                                _buildDesktopLayout()
+                              else
+                                _buildMobileLayout(),
+                              const SizedBox(height: 48),
+                              // Submit and Save as Draft Buttons
+                              if (activityController.text == 'Painter Meet')
+                                _buildPainterMeetSection(constraints),
+                              const SizedBox(height: 24),
+                              _buildActionButtons(),
+                              const SizedBox(height: 48),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDesktopLayout() {
+    return Column(
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Left Column
+            Expanded(
+              child: _buildModernSection(
+                title: 'Activity Details',
+                icon: Icons.event_note_rounded,
+                children: [
+                  ModernDropdown(
+                    label: 'Process Type',
+                    icon: Icons.category_outlined,
+                    items: const ['Add', 'Process 2', 'Process 3'],
+                    value: processTypeController.text.isEmpty
+                        ? null
+                        : processTypeController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        processTypeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+  label: 'Activity',
+  icon: Icons.event_outlined,
+  items: ['Select', 'Painter Meet', 'Activity 2', 'Activity 3'],
+  value: activityController.text.isEmpty ? null : activityController.text,
+  onChanged: (String? newValue) {
+  setState(() {
+    activityController.text = newValue ?? '';
+    if (newValue == 'Painter Meet') {
+      if (painterList.isEmpty) _addPainterRow();
+    } else {
+      painterList.clear();
+    }
+  });
+},
+
+  isRequired: true,
+),
+
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: descriptionController,
+                    label: 'Description',
+                    icon: Icons.description_outlined,
+                    isRequired: true,
+                    isMultiline: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Objective',
+                    icon: Icons.flag_outlined,
+                    items: ['Select', 'Objective 2', 'Objective 3'],
+                    value: objectiveController.text.isEmpty
+                        ? null
+                        : objectiveController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        objectiveController.text = newValue ?? '';
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernDateField(
+                    controller: activityDateController,
+                    label: 'Activity Date',
+                    icon: Icons.calendar_today_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: meetingVenueController,
+                    label: 'Meeting Venue(Enter Address)',
+                    icon: Icons.location_on_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Area',
+                    icon: Icons.map_outlined,
+                    items: ['Select', 'Area 2', 'Area 3'],
+                    value: areaController.text.isEmpty
+                        ? null
+                        : areaController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        areaController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: cityNameController,
+                    label: 'City Name',
+                    icon: Icons.location_city_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'District',
+                    icon: Icons.location_city_outlined,
+                    items: ['Select', 'District 2', 'District 3'],
+                    value: districtController.text.isEmpty
+                        ? null
+                        : districtController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        districtController.text = newValue ?? '';
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Pin Code',
+                    icon: Icons.pin_outlined,
+                    items: ['Select', 'Pin 2', 'Pin 3'],
+                    value: pinCodeController.text.isEmpty
+                        ? null
+                        : pinCodeController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        pinCodeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Product',
+                    icon: Icons.inventory_2_outlined,
+                    items: ['0 options selected', 'Product 2', 'Product 3'],
+                    value: productController.text.isEmpty
+                        ? null
+                        : productController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        productController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: employeesCountController,
+                    label: 'No. of Employees',
+                    icon: Icons.people_outline,
+                    isRequired: false,
+                    isNumeric: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: channelPartnerCountController,
+                    label: 'No. of Channel Partner',
+                    icon: Icons.business_outlined,
+                    isRequired: false,
+                    isNumeric: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: influencersCountController,
+                    label: 'No. of Influencers',
+                    icon: Icons.people_alt_outlined,
+                    isRequired: false,
+                    isNumeric: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: totalParticipantsController,
+                    label: 'Total Participants',
+                    icon: Icons.groups_outlined,
+                    isRequired: false,
+                    isNumeric: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Rural / Urban',
+                    icon: Icons.home_work_outlined,
+                    items: ['Select', 'Rural', 'Urban'],
+                    value: ruralUrbanController.text.isEmpty
+                        ? null
+                        : ruralUrbanController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        ruralUrbanController.text = newValue ?? '';
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  Column(
+                    children: [
+                      _buildModernTextField(
+                        controller: latitudeController,
+                        label: 'Latitude',
+                        icon: Icons.my_location_outlined,
+                        isRequired: false,
+                        suffix: IconButton(
+                          tooltip: 'Refresh location',
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _isGettingLocation
+                              ? null
+                              : () async {
+                                  HapticFeedback.selectionClick();
+                                  await _initLocation();
+                                },
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      _buildModernTextField(
+                        controller: longitudeController,
+                        label: 'Longitude',
+                        icon: Icons.my_location_outlined,
+                        isRequired: false,
+                        suffix: IconButton(
+                          tooltip: 'Refresh location',
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _isGettingLocation
+                              ? null
+                              : () async {
+                                  HapticFeedback.selectionClick();
+                                  await _initLocation();
+                                },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.info_outline,
+                        size: 16,
+                        color: Colors.grey,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _isGettingLocation
+                              ? 'Fetching GPS…'
+                              : (latitudeController.text.isEmpty ||
+                                    longitudeController.text.isEmpty)
+                              ? 'Tap the GPS icon if fields are empty.'
+                              : 'Coordinates captured from your device GPS.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey.shade700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 24),
+            
+            // Right Column
+            Expanded(
+              child: Column(
+                children: [
+                  // BW Employees Present Table
+                  _buildModernSection(
+                    title: 'BW Employees Present',
+                    icon: Icons.people_outline,
+                    children: [
+                      _buildEmployeesTable(),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.start,
+                        children: [
+                          ElevatedButton(
+                            onPressed: _addEmployee,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.grey.shade200,
+                              foregroundColor: Colors.black87,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Add'),
+                          ),
+                          const SizedBox(width: 16),
+                          ElevatedButton(
+                            onPressed: employeesList.isEmpty ? null : () {
+                              if (employeesList.isNotEmpty) {
+                                _deleteEmployee(employeesList.length - 1);
+                              }
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade400,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Delete'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  
+                  // Image Upload Section
+                  _buildModernSection(
+                    title: 'Image Upload',
+                    icon: Icons.image_outlined,
+                    children: [
+                      _buildImageUploadTable(),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.start,
+                        children: [
+                          ElevatedButton(
+                            onPressed: _addImage,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.grey.shade200,
+                              foregroundColor: Colors.black87,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Add'),
+                          ),
+                          const SizedBox(width: 16),
+                          ElevatedButton(
+                            onPressed: imagesList.isEmpty ? null : () {
+                              if (imagesList.isNotEmpty) {
+                                _deleteImage(imagesList.length - 1);
+                              }
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade400,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Delete'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                 
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMobileLayout() {
+    return Column(
+      children: [
+        // Activity Details Section
+        _buildModernSection(
+          title: 'Activity Details',
+          icon: Icons.event_note_rounded,
+          children: [
+            ModernDropdown(
+              label: 'Process Type',
+              icon: Icons.category_outlined,
+              items: const ['Add', 'Process 2', 'Process 3'],
+              value: processTypeController.text.isEmpty
+                  ? null
+                  : processTypeController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  processTypeController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+  label: 'Activity',
+  icon: Icons.event_outlined,
+  items: ['Select', 'Painter Meet', 'Activity 2', 'Activity 3'],
+  value: activityController.text.isEmpty ? null : activityController.text,
+  onChanged: (String? newValue) {
+    setState(() {
+      activityController.text = newValue ?? '';
+      // Show painter row table if selecting "Painter Meet", otherwise clear
+      if (newValue == 'Painter Meet') {
+        if (painterList.isEmpty) _addPainterRow();
+      } else {
+        painterList.clear();
       }
-      return {'success': false, 'error': msg};
-    }
+    });
+  },
+  isRequired: true,
+),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: descriptionController,
+              label: 'Description',
+              icon: Icons.description_outlined,
+              isRequired: true,
+              isMultiline: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Objective',
+              icon: Icons.flag_outlined,
+              items: ['Select', 'Objective 2', 'Objective 3'],
+              value: objectiveController.text.isEmpty
+                  ? null
+                  : objectiveController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  objectiveController.text = newValue ?? '';
+                });
+              },
+            ),
+            const SizedBox(height: 16),
+            _buildModernDateField(
+              controller: activityDateController,
+              label: 'Activity Date',
+              icon: Icons.calendar_today_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: meetingVenueController,
+              label: 'Meeting Venue(Enter Address)',
+              icon: Icons.location_on_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Area',
+              icon: Icons.map_outlined,
+              items: ['Select', 'Area 2', 'Area 3'],
+              value: areaController.text.isEmpty
+                  ? null
+                  : areaController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  areaController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: cityNameController,
+              label: 'City Name',
+              icon: Icons.location_city_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'District',
+              icon: Icons.location_city_outlined,
+              items: ['Select', 'District 2', 'District 3'],
+              value: districtController.text.isEmpty
+                  ? null
+                  : districtController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  districtController.text = newValue ?? '';
+                });
+              },
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Pin Code',
+              icon: Icons.pin_outlined,
+              items: ['Select', 'Pin 2', 'Pin 3'],
+              value: pinCodeController.text.isEmpty
+                  ? null
+                  : pinCodeController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  pinCodeController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Product',
+              icon: Icons.inventory_2_outlined,
+              items: ['0 options selected', 'Product 2', 'Product 3'],
+              value: productController.text.isEmpty
+                  ? null
+                  : productController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  productController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: employeesCountController,
+              label: 'No. of Employees',
+              icon: Icons.people_outline,
+              isRequired: false,
+              isNumeric: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: channelPartnerCountController,
+              label: 'No. of Channel Partner',
+              icon: Icons.business_outlined,
+              isRequired: false,
+              isNumeric: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: influencersCountController,
+              label: 'No. of Influencers',
+              icon: Icons.people_alt_outlined,
+              isRequired: false,
+              isNumeric: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: totalParticipantsController,
+              label: 'Total Participants',
+              icon: Icons.groups_outlined,
+              isRequired: false,
+              isNumeric: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Rural / Urban',
+              icon: Icons.home_work_outlined,
+              items: ['Select', 'Rural', 'Urban'],
+              value: ruralUrbanController.text.isEmpty
+                  ? null
+                  : ruralUrbanController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  ruralUrbanController.text = newValue ?? '';
+                });
+              },
+            ),
+            const SizedBox(height: 16),
+            Column(
+              children: [
+                _buildModernTextField(
+                  controller: latitudeController,
+                  label: 'Latitude',
+                  icon: Icons.my_location_outlined,
+                  isRequired: false,
+                  suffix: IconButton(
+                    tooltip: 'Refresh location',
+                    icon: const Icon(Icons.gps_fixed),
+                    onPressed: _isGettingLocation
+                        ? null
+                        : () async {
+                            HapticFeedback.selectionClick();
+                            await _initLocation();
+                          },
+                  ),
+                ),
+                const SizedBox(height: 24),
+                _buildModernTextField(
+                  controller: longitudeController,
+                  label: 'Longitude',
+                  icon: Icons.my_location_outlined,
+                  isRequired: false,
+                  suffix: IconButton(
+                    tooltip: 'Refresh location',
+                    icon: const Icon(Icons.gps_fixed),
+                    onPressed: _isGettingLocation
+                        ? null
+                        : () async {
+                            HapticFeedback.selectionClick();
+                            await _initLocation();
+                          },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Icon(
+                  Icons.info_outline,
+                  size: 16,
+                  color: Colors.grey,
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    _isGettingLocation
+                        ? 'Fetching GPS…'
+                        : (latitudeController.text.isEmpty ||
+                              longitudeController.text.isEmpty)
+                        ? 'Tap the GPS icon if fields are empty.'
+                        : 'Coordinates captured from your device GPS.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        // BW Employees Present Table
+        _buildModernSection(
+          title: 'BW Employees Present',
+          icon: Icons.people_outline,
+          children: [
+            _buildEmployeesTable(),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.start,
+              children: [
+                ElevatedButton(
+                  onPressed: _addEmployee,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.grey.shade200,
+                    foregroundColor: Colors.black87,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Add'),
+                ),
+                const SizedBox(width: 16),
+                ElevatedButton(
+                  onPressed: employeesList.isEmpty ? null : () {
+                    if (employeesList.isNotEmpty) {
+                      _deleteEmployee(employeesList.length - 1);
+                    }
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade400,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Delete'),
+                ),
+              ],
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        // Image Upload Section
+        _buildModernSection(
+          title: 'Image Upload',
+          icon: Icons.image_outlined,
+          children: [
+            _buildImageUploadTable(),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.start,
+              children: [
+                ElevatedButton(
+                  onPressed: _addImage,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.grey.shade200,
+                    foregroundColor: Colors.black87,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Add'),
+                ),
+                const SizedBox(width: 16),
+                ElevatedButton(
+                  onPressed: imagesList.isEmpty ? null : () {
+                    if (imagesList.isNotEmpty) {
+                      _deleteImage(imagesList.length - 1);
+                    }
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade400,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Delete'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+    );
   }
 
-  static Future<bool> testConnectivity() async {
-    try {
-      final resp = await http
-          .get(
-            Uri.parse('$baseUrl/health'),
-            headers: {'Accept': 'application/json'},
-          )
-          .timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw Exception('Timeout'),
-          );
-      return resp.statusCode == 200;
-    } catch (_) {
-      return false;
-    }
+  Widget _buildEmployeesTable() {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        children: [
+          // Table Header
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                topRight: Radius.circular(8),
+              ),
+            ),
+            child: Row(
+              children: [
+                _buildTableHeaderCell('Del', flex: 1),
+                _buildTableHeaderCell('BW Employees Present', flex: 3),
+                _buildTableHeaderCell('Employee Code', flex: 3),
+                _buildTableHeaderCell('Name', flex: 5),
+              ],
+            ),
+          ),
+          // Table Rows
+          if (employeesList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No employees added yet. Click "Add" to add an employee.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          else
+            ...employeesList.asMap().entries.map((entry) {
+              final index = entry.key;
+              final employee = entry.value;
+              return Row(
+                children: [
+                  _buildTableCell(
+                    Checkbox(
+                      value: false,
+                      onChanged: (value) {
+                        if (value == true) {
+                          _deleteEmployee(index);
+                        }
+                      },
+                    ),
+                    flex: 1,
+                  ),
+                  _buildTableCell(
+                    Text('Employee ${index + 1}'),
+                    flex: 3,
+                  ),
+                  _buildTableCell(
+                    TextField(
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Enter code',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          employeesList[index]['employeeCode'] = value;
+                        });
+                      },
+                    ),
+                    flex: 3,
+                  ),
+                  _buildTableCell(
+                    TextField(
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Enter name',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          employeesList[index]['name'] = value;
+                        });
+                      },
+                    ),
+                    flex: 5,
+                  ),
+                ],
+              );
+            }).toList(),
+        ],
+      ),
+    );
   }
 
-  // -------- helpers --------
-
-  static String _extFromMime(String mime) {
-    switch (mime) {
-      case 'image/jpeg':
-        return 'jpg';
-      case 'image/png':
-        return 'png';
-      case 'image/gif':
-        return 'gif';
-      case 'image/webp':
-        return 'webp';
-      case 'application/pdf':
-        return 'pdf';
-      case 'text/plain':
-        return 'txt';
-      default:
-        return 'bin';
-    }
+  Widget _buildImageUploadTable() {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        children: [
+          // Table Header
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                topRight: Radius.circular(8),
+              ),
+            ),
+            child: Row(
+              children: [
+                _buildTableHeaderCell('Del', flex: 1),
+                _buildTableHeaderCell('Upload Supporting', flex: 5),
+                _buildTableHeaderCell('View', flex: 5),
+              ],
+            ),
+          ),
+          // Table Rows
+          if (imagesList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No images added yet. Click "Add" to add an image.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          else
+            ...imagesList.asMap().entries.map((entry) {
+              final index = entry.key;
+              final image = entry.value;
+              return Row(
+                children: [
+                  _buildTableCell(
+                    Checkbox(
+                      value: false,
+                      onChanged: (value) {
+                        if (value == true) {
+                          _deleteImage(index);
+                        }
+                      },
+                    ),
+                    flex: 1,
+                  ),
+                  _buildTableCell(
+                    ModernDropdown(
+                      label: '',
+                      icon: Icons.category_outlined,
+                      items: ['Select', 'Image', 'Document'],
+                      value: image['type'],
+                      onChanged: (String? newValue) {
+                        setState(() {
+                          imagesList[index]['type'] = newValue ?? 'Select';
+                        });
+                      },
+                      isRequired: false,
+                    ),
+                    flex: 5,
+                  ),
+                  _buildTableCell(
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ElevatedButton(
+                          onPressed: () {
+                            // Upload image logic
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue,
+                            foregroundColor: Colors.white,
+                          ),
+                          child: Text('Upload Image'),
+                        ),
+                        SizedBox(width: 8),
+                        ElevatedButton(
+                          onPressed: image['path']!.isEmpty ? null : () {
+                            // View image logic
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue,
+                            foregroundColor: Colors.white,
+                          ),
+                          child: Text('View Image'),
+                        ),
+                      ],
+                    ),
+                    flex: 5,
+                  ),
+                ],
+              );
+            }).toList(),
+        ],
+      ),
+    );
   }
 
-  static Map<String, dynamic> _safeJson(String body) {
-    try {
-      final parsed = json.decode(body);
-      return parsed is Map<String, dynamic>
-          ? parsed
-          : <String, dynamic>{'raw': parsed};
-    } catch (_) {
-      return <String, dynamic>{'raw': body};
-    }
+  Widget _buildTableHeaderCell(String text, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: Colors.grey.shade300),
+            bottom: BorderSide(color: Colors.grey.shade300),
+          ),
+        ),
+        child: Text(
+          text,
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTableCell(Widget child, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: Colors.grey.shade300),
+            bottom: BorderSide(color: Colors.grey.shade300),
+          ),
+        ),
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildActionButtons() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        SizedBox(
+          width: 200,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: _saveAsDraft,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            child: const Text(
+              'Save as Draft',
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 24),
+        SizedBox(
+          width: 200,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: _isSubmitting ? null : _submitForm,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1E3A8A),
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            child: _isSubmitting
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(width: 16),
+                      Text('Submitting...', style: TextStyle(color: Colors.white)),
+                    ],
+                  )
+                : const Text(
+                    'Submit',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  PreferredSizeWidget _buildModernAppBar() {
+    return AppBar(
+      elevation: 0,
+      backgroundColor: Colors.white,
+      foregroundColor: const Color(0xFF1E3A8A),
+      systemOverlayStyle: const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+      ),
+      leading: Navigator.of(context).canPop()
+          ? Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: IconButton(
+                icon: const Icon(Icons.arrow_back, color: Color(0xFF1E3A8A)),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            )
+          : null,
+      title: Text(
+        'Activity Entry',
+        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20, color: const Color(0xFF1E3A8A)),
+      ),
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.home, color: Color(0xFF1E3A8A)),
+          onPressed: () {
+            // Navigate to home
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAnimatedHeader() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(32),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.blue.withOpacity(0.15),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: const Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Activity Entry',
+            style: TextStyle(
+              fontSize: 32,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          SizedBox(height: 12),
+          Text(
+            'Enter activity details and capture location',
+            style: TextStyle(fontSize: 18, color: Colors.white70),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModernSection({
+    required String title,
+    required IconData icon,
+    required List<Widget> children,
+    bool isOptional = false,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 16,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Section Header
+          Container(
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(16),
+              ),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E3A8A).withOpacity(0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: const Color(0xFF1E3A8A), size: 24),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF1F2937),
+                        ),
+                      ),
+                      if (isOptional)
+                        Text(
+                          'Optional',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey.shade500,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Section Content
+          Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: children,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModernTextField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isPhone = false,
+    bool isNumeric = false,
+    bool isMultiline = false,
+    bool isRequired = true,
+    Widget? suffix,
+  }) {
+    return TextFormField(
+      controller: controller,
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: suffix,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
+      keyboardType: isPhone
+          ? TextInputType.phone
+          : isNumeric
+              ? TextInputType.number
+              : isMultiline
+                  ? TextInputType.multiline
+                  : TextInputType.text,
+      maxLines: isMultiline ? 3 : 1,
+      validator: (value) {
+        if (isRequired && (value == null || value.trim().isEmpty)) {
+          return 'Please enter $label';
+        }
+        if (isPhone && value != null && value.isNotEmpty) {
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
+          }
+        }
+        if (isNumeric && value != null && value.isNotEmpty) {
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
+          }
+        }
+        return null;
+      },
+    );
+  }
+
+  Widget _buildModernDateField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isRequired = true,
+  }) {
+    return TextFormField(
+      controller: controller,
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: const Icon(
+          Icons.calendar_today_rounded,
+          color: Colors.grey,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
+      readOnly: true,
+      onTap: () async {
+        final date = await showDatePicker(
+          context: context,
+          initialDate: DateTime.now(),
+          firstDate: DateTime(1900),
+          lastDate: DateTime(2100),
+          builder: (context, child) {
+            return Theme(
+              data: Theme.of(context).copyWith(
+                colorScheme: const ColorScheme.light(primary: Color(0xFF1E3A8A)),
+              ),
+              child: child!,
+            );
+          },
+        );
+        if (date != null) {
+          controller.text = date.toString().split(' ')[0];
+        }
+      },
+      validator: (value) {
+        if (isRequired && (value == null || value.isEmpty)) {
+          return 'Please enter $label';
+        }
+        return null;
+      },
+    );
   }
 }
