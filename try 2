@@ -1,1417 +1,605 @@
+class ImageUploadRequest {
+  final String fileName;
+  final List<int> fileBytes;
+  final String fileExtension;
+  final int fileSize;
+  final String attFilTy;
+  final String createId;
 
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:go_router/go_router.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:web/web.dart' as web;
-import 'dart:js_interop';
-import '../../../core/models/retailer_onboarding_models.dart';
-import '../../../core/services/retailer_onboarding_service.dart';
-import '../../../core/widgets/custom_back_button.dart';
+  ImageUploadRequest({
+    required this.fileName,
+    required this.fileBytes,
+    required this.fileExtension,
+    required this.fileSize,
+    this.attFilTy = "01",
+    this.createId = "SYSTEM",
+  });
 
-@JS()
-@staticInterop
-class WindowWithGeoLocation {}
-extension WindowGeoLocationExtension on WindowWithGeoLocation {
-  external JSPromise<JSAny?> requestGeoPosition();
+  Map<String, dynamic> toJson() {
+    return {
+      'fileName': fileName,
+      'fileBytes': fileBytes,
+      'fileExtension': fileExtension,
+      'fileSize': fileSize,
+      'attFilTy': attFilTy,
+      'createId': createId,
+    };
+  }
 }
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(RetailerOnboardingApp());
-}
+class ImageUploadResponse {
+  final String msg;
+  final ImageUploadData? data;
+  final bool success;
 
-class RetailerOnboardingApp extends StatelessWidget {
-  const RetailerOnboardingApp({super.key});
+  ImageUploadResponse({
+    required this.msg,
+    this.data,
+    required this.success,
+  });
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Retailer Onboarding',
-      theme: ThemeData(primarySwatch: Colors.blue, fontFamily: 'Roboto'),
-      home: RetailerFormPage(),
+  factory ImageUploadResponse.fromJson(Map<String, dynamic> json) {
+    return ImageUploadResponse(
+      msg: json['msg'] ?? json['message'] ?? '',
+      data: json['data'] != null ? ImageUploadData.fromJson(json['data']) : null,
+      success: json['success'] == true || json['msg']?.toString().toLowerCase().contains('success') == true,
     );
   }
 }
 
-class RetailerFormPage extends StatefulWidget {
-  const RetailerFormPage({super.key});
+class ImageUploadData {
+  final String attFilKy;
+  final String fileName;
+  final int fileSize;
+  final String? filePath;
+  final String? fileUrl;
 
-  @override
-  RetailerFormPageState createState() => RetailerFormPageState();
+  ImageUploadData({
+    required this.attFilKy,
+    required this.fileName,
+    required this.fileSize,
+    this.filePath,
+    this.fileUrl,
+  });
+
+  factory ImageUploadData.fromJson(Map<String, dynamic> json) {
+    return ImageUploadData(
+      attFilKy: json['attFilKy'] ?? json['fileId'] ?? '',
+      fileName: json['fileName'] ?? json['name'] ?? '',
+      fileSize: (json['fileSize'] ?? json['size'] ?? 0) is int
+          ? (json['fileSize'] ?? json['size'] ?? 0)
+          : int.tryParse((json['fileSize'] ?? json['size'] ?? 0).toString()) ?? 0,
+      filePath: json['filePath'] ?? json['path'],
+      fileUrl: json['fileUrl'] ?? json['url'],
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'attFilKy': attFilKy,
+      'fileName': fileName,
+      'fileSize': fileSize,
+      if (filePath != null) 'filePath': filePath,
+      if (fileUrl != null) 'fileUrl': fileUrl,
+    };
+  }
 }
 
-class RetailerFormPageState extends State<RetailerFormPage>
-    with TickerProviderStateMixin {
-  final _formKey = GlobalKey<FormState>();
-  final bool _isVATRequired = true;
-  bool _isSubmitting = false;
-  bool _isGettingLocation = false;
+class DeleteImageRequest {
+  final String updateId;
 
-  // File paths (reserved for future use)
-  String? _licenseImage;
-  String? _vatCertificateImage;
-  String? _addressProofImage;
+  DeleteImageRequest({
+    required this.updateId,
+  });
 
-  // Controllers
-  final firmNameController = TextEditingController();
-  final taxRegNumberController = TextEditingController();
-  final registeredAddressController = TextEditingController();
-  final effectiveDateController = TextEditingController();
-  final licenseNumberController = TextEditingController();
-  final issuingAuthorityController = TextEditingController();
-  final establishmentDateController = TextEditingController();
-  final expiryDateController = TextEditingController();
-  final tradeNameController = TextEditingController();
-  final responsiblePersonController = TextEditingController();
-  final accountNameController = TextEditingController();
-  final ibanController = TextEditingController();
-  final bankNameController = TextEditingController();
-  final branchNameController = TextEditingController();
-  final branchAddressController = TextEditingController();
-  final latitudeController = TextEditingController();
-  final longitudeController = TextEditingController();
-
-  // Animations
-  AnimationController? _mainController;
-  AnimationController? _fabController;
-  Animation<double>? _fadeAnimation;
-  Animation<Offset>? _slideAnimation;
-  Animation<double>? _scaleAnimation;
-
-  @override
-  void initState() {
-    super.initState();
-    _mainController = AnimationController(
-      duration: const Duration(milliseconds: 1000),
-      vsync: this,
-    );
-    _fabController = AnimationController(
-      duration: const Duration(milliseconds: 400),
-      vsync: this,
-    );
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController!,
-        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
-      ),
-    );
-    _slideAnimation =
-        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-          CurvedAnimation(
-            parent: _mainController!,
-            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-          ),
-        );
-    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController!,
-        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
-      ),
-    );
-    _mainController?.forward();
-    _fabController?.forward();
-    // Auto-fill on load
-    _initLocation();
+  Map<String, dynamic> toJson() {
+    return {
+      'updateId': updateId,
+    };
   }
+}
 
-  @override
-  void dispose() {
-    _mainController?.dispose();
-    _fabController?.dispose();
-    firmNameController.dispose();
-    taxRegNumberController.dispose();
-    registeredAddressController.dispose();
-    effectiveDateController.dispose();
-    licenseNumberController.dispose();
-    issuingAuthorityController.dispose();
-    establishmentDateController.dispose();
-    expiryDateController.dispose();
-    tradeNameController.dispose();
-    responsiblePersonController.dispose();
-    accountNameController.dispose();
-    ibanController.dispose();
-    bankNameController.dispose();
-    branchNameController.dispose();
-    branchAddressController.dispose();
-    latitudeController.dispose();
-    longitudeController.dispose();
-    super.dispose();
-  }
 
-  // --- GEOLOCATION (using web JavaScript helper from index.html) ---
-  Future<void> _initLocation() async {
-    setState(() => _isGettingLocation = true);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'dart:convert';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
+import '../models/image_upload_models.dart';
+import 'upload_service.dart';
+
+class ImageUploadService {
+  static final Map<String, PendingImageUpload> _pendingUploads = {};
+
+  static Future<PendingImageUpload?> selectImage({
+    String attFilTy = "01",
+    String createId = "SYSTEM",
+  }) async {
     try {
-      await _getWebLocation();
-    } catch (e) {
-      _toast('Could not fetch location: $e');
-    } finally {
-      if (mounted) setState(() => _isGettingLocation = false);
-    }
-  }
+      final file = await pickImage();
+      if (file == null) return null;
 
-  Future<void> _getWebLocation() async {
-    try {
-      // First try to get from localStorage (cached values from index.html)
-      final lastLat = web.window.localStorage.getItem('lastLat');
-      final lastLng = web.window.localStorage.getItem('lastLng');
-      if (lastLat != null && lastLng != null && mounted) {
-        latitudeController.text = double.parse(lastLat).toStringAsFixed(6);
-        longitudeController.text = double.parse(lastLng).toStringAsFixed(6);
+      if (!isValidImageFile(file)) {
+        throw Exception('Invalid file type. Only image files are allowed.');
       }
-      // Use the JavaScript geolocation helper from index.html
-      final jsWindow = web.window as WindowWithGeoLocation;
-      final result = await jsWindow.requestGeoPosition().toDart;
-      if (result != null) {
-        // Convert JSAny to proper Dart object
-        final resultDart = result.dartify();
-        if (resultDart is Map<String, dynamic>) {
-          if (resultDart['ok'] == true) {
-            if (mounted) {
-              final lat = resultDart['lat'] as num?;
-              final lng = resultDart['lng'] as num?;
-              if (lat != null && lng != null) {
-                latitudeController.text = lat.toStringAsFixed(6);
-                longitudeController.text = lng.toStringAsFixed(6);
-              }
-            }
-          } else {
-            final error = resultDart['error']?.toString() ?? 'Unknown error';
-            _toast('Web geolocation failed: $error');
-          }
-        }
-      }
-    } catch (e) {
-      _toast('Web geolocation error: $e');
-    }
-  }
 
-  void _toast(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
-    );
-  }
+      final id = DateTime.now().millisecondsSinceEpoch.toString();
+      String filePath;
 
-  Future<void> _saveData() async {
-    setState(() => _isSubmitting = true);
-    try {
-      // Create request object from form data - ensure non-empty strings or null
-      final request = RetailerOnboardingRequest(
-        firmName: _cleanString(firmNameController.text),
-        taxRegistrationNumber: _cleanString(taxRegNumberController.text),
-        registeredAddress: _cleanString(registeredAddressController.text),
-        effectiveRegistrationDate: _cleanString(effectiveDateController.text),
-        licenseNumber: _cleanString(licenseNumberController.text),
-        issuingAuthority: _cleanString(issuingAuthorityController.text),
-        establishmentDate: _cleanString(establishmentDateController.text),
-        expiryDate: _cleanString(expiryDateController.text),
-        tradeName: _cleanString(tradeNameController.text),
-        responsiblePerson: _cleanString(responsiblePersonController.text),
-        accountHolderName: _cleanString(accountNameController.text),
-        ibanNumber: _cleanString(ibanController.text),
-        bankName: _cleanString(bankNameController.text),
-        branchName: _cleanString(branchNameController.text),
-        branchAddress: _cleanString(branchAddressController.text),
-        latitude: _cleanString(latitudeController.text),
-        longitude: _cleanString(longitudeController.text),
-      );
-      print('DEBUG: About to submit request with data: ${request.toJson()}');
-      // Submit to API
-      print('DEBUG: Calling RetailerOnboardingService.registerRetailer...');
-      final response = await RetailerOnboardingService.registerRetailer(request);
-      print('DEBUG: Got response: success=${response.success}, message=${response.message}');
-      if (response.success) {
-        // Save to local storage as backup
-        await _saveToLocalStorage();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.check_circle, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Registration Successful!\nRetailer Code: ${response.retailerCode ?? 'N/A'}',
-                    ),
-                  ),
-                ],
-              ),
-              backgroundColor: Colors.green,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 5),
-            ),
-          );
-          // Navigate to success or show retailer code
-          _showSuccessDialog(response.retailerCode);
+      if (kIsWeb) {
+        if (file.bytes != null) {
+          final bytes = file.bytes!;
+          final base64String = base64Encode(bytes);
+          final mimeType = _getMimeType(file.extension);
+          filePath = 'data:$mimeType;base64,$base64String';
+        } else {
+          throw Exception('File bytes are null');
         }
       } else {
-        // Show error message
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.error, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Registration Failed: ${response.error ?? response.message}',
-                    ),
-                  ),
-                ],
-              ),
-              backgroundColor: Colors.red,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 5),
-            ),
-          );
+        filePath = file.path ?? '';
+      }
+
+      final pendingUpload = PendingImageUpload(
+        id: id,
+        fileName: file.name,
+        filePath: filePath,
+        fileBytes: file.bytes,
+        fileExtension: file.extension ?? '',
+        fileSize: file.size,
+        attFilTy: attFilTy,
+        createId: createId,
+      );
+
+      _pendingUploads[id] = pendingUpload;
+      return pendingUpload;
+    } catch (e) {
+      throw Exception('Failed to select image: ${e.toString()}');
+    }
+  }
+
+  static void removePendingUpload(String id) {
+    _pendingUploads.remove(id);
+  }
+
+  static List<PendingImageUpload> getPendingUploads() {
+    return _pendingUploads.values.toList();
+  }
+
+  static PendingImageUpload? getPendingUpload(String id) {
+    return _pendingUploads[id];
+  }
+
+  static void clearPendingUploads() {
+    _pendingUploads.clear();
+  }
+
+  static Future<List<ImageUploadResponse>> uploadPendingImages() async {
+    final results = <ImageUploadResponse>[];
+    final uploads = List<PendingImageUpload>.from(_pendingUploads.values);
+
+    for (final upload in uploads) {
+      try {
+        final result = await UploadService.uploadFile(
+          upload.filePath,
+          originalName: upload.fileName,
+        );
+
+        if (result['success'] == true) {
+          final data = result['data'] as Map<String, dynamic>?;
+          results.add(ImageUploadResponse(
+            msg: 'Image uploaded successfully',
+            success: true,
+            data: data != null ? ImageUploadData.fromJson(data) : null,
+          ));
+          _pendingUploads.remove(upload.id);
+        } else {
+          results.add(ImageUploadResponse(
+            msg: result['error']?.toString() ?? 'Upload failed for ${upload.fileName}',
+            success: false,
+          ));
         }
+      } catch (e) {
+        results.add(ImageUploadResponse(
+          msg: 'Network error for ${upload.fileName}: ${e.toString()}',
+          success: false,
+        ));
+      }
+    }
+
+    return results;
+  }
+
+  static Future<ImageUploadResponse> uploadSinglePendingImage(String id) async {
+    final upload = _pendingUploads[id];
+    if (upload == null) {
+      return ImageUploadResponse(
+        msg: 'Pending upload not found',
+        success: false,
+      );
+    }
+
+    try {
+      final result = await UploadService.uploadFile(
+        upload.filePath,
+        originalName: upload.fileName,
+      );
+
+      if (result['success'] == true) {
+        final data = result['data'] as Map<String, dynamic>?;
+        _pendingUploads.remove(id);
+        return ImageUploadResponse(
+          msg: 'Image uploaded successfully',
+          success: true,
+          data: data != null ? ImageUploadData.fromJson(data) : null,
+        );
+      } else {
+        return ImageUploadResponse(
+          msg: result['error']?.toString() ?? 'Upload failed',
+          success: false,
+        );
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.error, color: Colors.white, size: 20),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text('Network Error: $e'),
-                ),
-              ],
-            ),
-            backgroundColor: Colors.red,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 5),
-          ),
-        );
+      return ImageUploadResponse(
+        msg: 'Network error: ${e.toString()}',
+        success: false,
+      );
+    }
+  }
+
+  static Future<PlatformFile?> pickImage() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        allowMultiple: false,
+        withData: true, // This ensures bytes are loaded
+      );
+
+      if (result != null && result.files.isNotEmpty) {
+        return result.files.first;
       }
-    } finally {
-      if (mounted) {
-        setState(() => _isSubmitting = false);
-      }
+      return null;
+    } catch (e) {
+      throw Exception('Failed to pick image: ${e.toString()}');
     }
   }
 
-  Future<void> _saveToLocalStorage() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('firmName', firmNameController.text);
-    await prefs.setString('taxRegNumber', taxRegNumberController.text);
-    await prefs.setString('registeredAddress', registeredAddressController.text);
-    await prefs.setString('effectiveDate', effectiveDateController.text);
-    await prefs.setString('licenseNumber', licenseNumberController.text);
-    await prefs.setString('issuingAuthority', issuingAuthorityController.text);
-    await prefs.setString('establishmentDate', establishmentDateController.text);
-    await prefs.setString('expiryDate', expiryDateController.text);
-    await prefs.setString('tradeName', tradeNameController.text);
-    await prefs.setString('responsiblePerson', responsiblePersonController.text);
-    await prefs.setString('accountName', accountNameController.text);
-    await prefs.setString('iban', ibanController.text);
-    await prefs.setString('bankName', bankNameController.text);
-    await prefs.setString('branchName', branchNameController.text);
-    await prefs.setString('branchAddress', branchAddressController.text);
-    await prefs.setString('latitude', latitudeController.text);
-    await prefs.setString('longitude', longitudeController.text);
+  static bool isValidImageFile(PlatformFile file) {
+    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
+    final fileExtension = file.extension?.toLowerCase();
+
+    if (fileExtension == null) return false;
+
+    return allowedExtensions.contains('.$fileExtension');
   }
 
-  void _showSuccessDialog(String? retailerCode) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.check_circle,
-                size: 64,
-                color: Colors.green,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Registration Successful!',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 16),
-              if (retailerCode != null) ...[
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.green.shade50,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.green.shade200),
-                  ),
-                  child: Column(
-                    children: [
-                      const Text(
-                        'Your Retailer Code:',
-                        style: TextStyle(fontWeight: FontWeight.w500),
-                      ),
-                      const SizedBox(height: 4),
-                      SelectableText(
-                        retailerCode,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.green,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-              ],
-              const Text(
-                'Your registration has been submitted successfully. Please save your retailer code for future reference.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () {
-                    Navigator.pop(context);
-                    // You can navigate to a different screen here if needed
-                  },
-                  child: const Text('Continue'),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
+  static String formatFileSize(int bytes) {
+    if (bytes <= 0) return "0 B";
+    const suffixes = ["B", "KB", "MB", "GB"];
+    int i = 0;
+    double size = bytes.toDouble();
 
-  String? _validateTaxRegNumber(String? value) {
-    if (_isVATRequired && (value == null || value.isEmpty)) {
-      return 'Please enter Tax Registration Number';
+    while (size >= 1024 && i < suffixes.length - 1) {
+      size /= 1024;
+      i++;
     }
-    if (value != null &&
-        value.isNotEmpty &&
-        !RegExp(r'^\d{15}$').hasMatch(value)) {
-      return 'Tax Registration Number must be 15 digits';
-    }
-    return null;
+
+    return "${size.toStringAsFixed(1)} ${suffixes[i]}";
   }
 
-  String? _validateLicense(String? value) {
-    if (value == null || value.isEmpty) return 'Please enter License Number';
-    if (value.length > 20) return 'Max 20 characters allowed';
-    return null;
-  }
+  static String _getMimeType(String? extension) {
+    if (extension == null) return 'application/octet-stream';
 
-  String? _validateIBAN(String? value) {
-    if (value != null &&
-        value.isNotEmpty &&
-        !RegExp(r'^AE\d{21}$').hasMatch(value)) {
-      return 'IBAN must start with AE and be 23 characters';
-    }
-    return null;
-  }
-
-  String? _validateRequired(String? value, String fieldName) {
-    if (value == null || value.isEmpty) return 'Please enter $fieldName';
-    return null;
-  }
-
-  String? _cleanString(String value) {
-    final cleaned = value.trim();
-    return cleaned.isEmpty ? null : cleaned;
-  }
-
-  PreferredSizeWidget _buildModernAppBar() {
-    return AppBar(
-      elevation: 0,
-      backgroundColor: Colors.transparent,
-      foregroundColor: Colors.blue.shade800,
-      systemOverlayStyle: const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-      ),
-      leading: CustomBackButton(
-        onPressed: () {
-          context.pop();
-        },
-      ),
-      title: const Text(
-        'Retailer Onboarding',
-        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
-      ),
-      actions: [
-        IconButton(
-          icon: const Icon(Icons.help_outline_rounded),
-          onPressed: _showHelpDialog,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAnimatedHeader() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(30),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.blue.shade700, Colors.blue.shade500],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.blue.withValues(alpha: 0.2),
-            blurRadius: 20,
-            offset: const Offset(0, 10),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: const [
-          _FadeSlide(text: 'Welcome!', big: true),
-          SizedBox(height: 8),
-          _FadeSlide(text: 'Complete your retailer registration'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildModernSection({
-    required String title,
-    required IconData icon,
-    required List<Widget> children,
-    bool isOptional = false,
-  }) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withValues(alpha: 0.1),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Header
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: Colors.blue.shade50,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(16),
-              ),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: const BoxDecoration(
-                    color: Colors.blue,
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(icon, color: Colors.white, size: 24),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.blue.shade800,
-                        ),
-                      ),
-                      if (isOptional)
-                        Text(
-                          'Optional',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade500,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-                if (title == 'Location Details')
-                  AnimatedOpacity(
-                    duration: const Duration(milliseconds: 250),
-                    opacity: _isGettingLocation ? 1 : 0,
-                    child: const Padding(
-                      padding: EdgeInsets.only(right: 6),
-                      child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          // Content
-          Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: children,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildModernTextField({
-    required TextEditingController controller,
-    required String label,
-    required IconData icon,
-    bool isRequired = true,
-    String? Function(String?)? validator,
-    Widget? suffix,
-  }) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      builder: (context, value, child) => Transform.translate(
-        offset: Offset(0, 20 * (1 - value)),
-        child: Opacity(opacity: value, child: child),
-      ),
-      child: TextFormField(
-        controller: controller,
-        decoration: InputDecoration(
-          labelText: isRequired ? '$label *' : label,
-          prefixIcon: Icon(icon, color: Colors.grey.shade600),
-          suffixIcon: suffix,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Colors.blue, width: 2),
-          ),
-          filled: true,
-          fillColor: Colors.grey.shade50,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 16,
-          ),
-        ),
-        validator:
-            validator ??
-            (isRequired ? (v) => _validateRequired(v, label) : null),
-      ),
-    );
-  }
-
-  Widget _buildModernDateField({
-    required TextEditingController controller,
-    required String label,
-    required IconData icon,
-    required BuildContext context,
-    bool isRequired = true,
-  }) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      builder: (context, value, child) => Transform.translate(
-        offset: Offset(0, 20 * (1 - value)),
-        child: Opacity(opacity: value, child: child),
-      ),
-      child: TextFormField(
-        controller: controller,
-        readOnly: true,
-        decoration: InputDecoration(
-          labelText: isRequired ? '$label *' : label,
-          prefixIcon: Icon(icon, color: Colors.grey.shade600),
-          suffixIcon: const Icon(
-            Icons.calendar_today_rounded,
-            color: Colors.grey,
-          ),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Colors.blue, width: 2),
-          ),
-          filled: true,
-          fillColor: Colors.grey.shade50,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 16,
-          ),
-        ),
-        onTap: () async {
-          final date = await showDatePicker(
-            context: context,
-            initialDate: DateTime.now(),
-            firstDate: DateTime(1900),
-            lastDate: DateTime(2100),
-            builder: (context, child) => Theme(
-              data: Theme.of(context).copyWith(
-                colorScheme: const ColorScheme.light(primary: Colors.blue),
-              ),
-              child: child!,
-            ),
-          );
-          if (date != null && mounted) {
-            controller.text = date.toString().split(' ').first;
-          }
-        },
-        validator: isRequired ? (v) => _validateRequired(v, label) : null,
-      ),
-    );
-  }
-
-  Widget _buildAnimatedSubmitButton() {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 600),
-      curve: Curves.easeOutCubic,
-      builder: (context, value, child) =>
-          Transform.scale(scale: 0.8 + (0.2 * value), child: child),
-      child: SizedBox(
-        width: double.infinity,
-        height: 56,
-        child: ElevatedButton(
-          onPressed: _isSubmitting ? null : _submitForm,
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.blue.shade700,
-            foregroundColor: Colors.white,
-            elevation: 8,
-            shadowColor: Colors.blue.withValues(alpha: 0.3),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-            ),
-          ),
-          child: _isSubmitting
-              ? const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    ),
-                    SizedBox(width: 16),
-                    Text('Submitting...', style: TextStyle(fontSize: 16)),
-                  ],
-                )
-              : const Text(
-                  'Submit Registration',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                ),
-        ),
-      ),
-    );
-  }
-
-  void _showHelpDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.help_outline_rounded,
-                size: 48,
-                color: Colors.blue,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Registration Help',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Fill in all required fields marked with *.\nVAT Registration is required only if your firm\'s Annual Turnover exceeds AED 375,000.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Got it'),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _submitForm() async {
-    if (_formKey.currentState!.validate()) {
-      await _saveData();
+    switch (extension.toLowerCase()) {
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      case 'png':
+        return 'image/png';
+      case 'gif':
+        return 'image/gif';
+      case 'bmp':
+        return 'image/bmp';
+      case 'webp':
+        return 'image/webp';
+      default:
+        return 'application/octet-stream';
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final isDesktop = constraints.maxWidth > 1200;
-        final isTablet = constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
-        final isMobile = constraints.maxWidth <= 800;
-
-        return Scaffold(
-          backgroundColor: Colors.grey.shade50,
-          appBar: _buildModernAppBar(),
-          body: FadeTransition(
-            opacity: _fadeAnimation ?? const AlwaysStoppedAnimation(1.0),
-            child: SlideTransition(
-              position: _slideAnimation ?? const AlwaysStoppedAnimation(Offset.zero),
-              child: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.blue.shade50,
-                      Colors.white,
-                      Colors.grey.shade50,
-                    ],
-                  ),
-                ),
-                child: SingleChildScrollView(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
-                    vertical: 24,
-                  ),
-                  child: Center(
-                    child: ConstrainedBox(
-                      constraints: BoxConstraints(
-                        maxWidth: isDesktop ? 1400 : double.infinity,
-                      ),
-                      child: ScaleTransition(
-                        scale: _scaleAnimation ?? const AlwaysStoppedAnimation(1.0),
-                        child: Form(
-                          key: _formKey,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _buildAnimatedHeader(),
-                              const SizedBox(height: 32),
-                              // Main Content - Two columns on desktop
-                              if (isDesktop)
-                                _buildDesktopLayout()
-                              else
-                                _buildMobileLayout(),
-                              const SizedBox(height: 48),
-                              _buildAnimatedSubmitButton(),
-                              const SizedBox(height: 48),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildDesktopLayout() {
-    return Column(
-      children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Left Column
-            Expanded(
-              child: Column(
-                children: [
-                  // Trade License
-                  _buildModernSection(
-                    title: 'Trade License Details',
-                    icon: Icons.assignment_rounded,
-                    children: [
-                      _buildModernTextField(
-                        controller: licenseNumberController,
-                        label: 'License Number',
-                        icon: Icons.confirmation_number,
-                        validator: _validateLicense,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: issuingAuthorityController,
-                        label: 'Issuing Authority',
-                        icon: Icons.account_balance,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernDateField(
-                        controller: establishmentDateController,
-                        label: 'Establishment Date',
-                        icon: Icons.event,
-                        context: context,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernDateField(
-                        controller: expiryDateController,
-                        label: 'Expiry Date',
-                        icon: Icons.event_busy,
-                        context: context,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: tradeNameController,
-                        label: 'Trade Name',
-                        icon: Icons.store,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: responsiblePersonController,
-                        label: 'Responsible Person',
-                        icon: Icons.person,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: registeredAddressController,
-                        label: 'Registered Address',
-                        icon: Icons.location_on,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernDateField(
-                        controller: effectiveDateController,
-                        label: 'Effective Registration Date',
-                        icon: Icons.calendar_today,
-                        context: context,
-                      ),
-                      const SizedBox(height: 16),
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Colors.blue.shade50,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.blue.shade200),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              Icons.info_outline,
-                              color: Colors.blue.shade700,
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'License Numbers vary across Emirates. (Max 20 Characters)',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.blue.shade700,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 24),
-                  // Bank Details
-                  _buildModernSection(
-                    title: 'Bank Details',
-                    icon: Icons.account_balance_outlined,
-                    isOptional: true,
-                    children: [
-                      _buildModernTextField(
-                        controller: accountNameController,
-                        label: 'Account Holder Name',
-                        icon: Icons.person_outline_rounded,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: ibanController,
-                        label: 'IBAN Number',
-                        icon: Icons.account_balance_wallet_outlined,
-                        isRequired: false,
-                        validator: _validateIBAN,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: bankNameController,
-                        label: 'Bank Name',
-                        icon: Icons.business_outlined,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: branchNameController,
-                        label: 'Branch Name',
-                        icon: Icons.location_on_outlined,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: branchAddressController,
-                        label: 'Branch Address',
-                        icon: Icons.location_city_outlined,
-                        isRequired: false,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 24),
-            // Right Column
-            Expanded(
-              child: Column(
-                children: [
-                  // VAT Registration (conditionally shown)
-                  if (_isVATRequired)
-                    _buildModernSection(
-                      title: 'VAT Registration Details',
-                      icon: Icons.receipt_long,
-                      isOptional: true,
-                      children: [
-                        _buildModernTextField(
-                          controller: taxRegNumberController,
-                          label: 'Tax Registration Number',
-                          icon: Icons.numbers,
-                          validator: _validateTaxRegNumber,
-                        ),
-                        const SizedBox(height: 16),
-                        _buildModernTextField(
-                          controller: firmNameController,
-                          label: 'Firm Name',
-                          icon: Icons.business,
-                        ),
-                        const SizedBox(height: 16),
-                        _buildModernDateField(
-                          controller: effectiveDateController,
-                          label: 'Effective Registration Date',
-                          icon: Icons.calendar_today,
-                          context: context,
-                        ),
-                        const SizedBox(height: 16),
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: Colors.orange.shade50,
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color: Colors.orange.shade200,
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.info_outline,
-                                color: Colors.orange.shade700,
-                              ),
-                              const SizedBox(width: 8),
-                              const Expanded(
-                                child: Text(
-                                  'Required only if the firm\'s Annual Turnover exceeds AED 375,000.',
-                                  style: TextStyle(fontSize: 12),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  if (_isVATRequired) const SizedBox(height: 24),
-                  // Location Details
-                  _buildModernSection(
-                    title: 'Location Details',
-                    icon: Icons.location_on_outlined,
-                    isOptional: true,
-                    children: [
-                      _buildModernTextField(
-                        controller: latitudeController,
-                        label: 'Latitude',
-                        icon: Icons.my_location,
-                        isRequired: false,
-                        suffix: IconButton(
-                          tooltip: 'Refresh location',
-                          icon: const Icon(Icons.gps_fixed),
-                          onPressed: _isGettingLocation
-                              ? null
-                              : () async {
-                                  HapticFeedback.selectionClick();
-                                  await _initLocation();
-                                },
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: longitudeController,
-                        label: 'Longitude',
-                        icon: Icons.my_location,
-                        isRequired: false,
-                        suffix: IconButton(
-                          tooltip: 'Refresh location',
-                          icon: const Icon(Icons.gps_fixed),
-                          onPressed: _isGettingLocation
-                              ? null
-                              : () async {
-                                  HapticFeedback.selectionClick();
-                                  await _initLocation();
-                                },
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          const Icon(
-                            Icons.info_outline,
-                            size: 16,
-                            color: Colors.grey,
-                          ),
-                          const SizedBox(width: 6),
-                          Expanded(
-                            child: Text(
-                              _isGettingLocation
-                                  ? 'Fetching GPS…'
-                                  : (latitudeController.text.isEmpty ||
-                                          longitudeController.text.isEmpty)
-                                      ? 'Tap the GPS icon if fields are empty.'
-                                      : 'Coordinates captured from your device GPS.',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey.shade700,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildMobileLayout() {
-    return Column(
-      children: [
-        // Trade License
-        _buildModernSection(
-          title: 'Trade License Details',
-          icon: Icons.assignment_rounded,
-          children: [
-            _buildModernTextField(
-              controller: licenseNumberController,
-              label: 'License Number',
-              icon: Icons.confirmation_number,
-              validator: _validateLicense,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: issuingAuthorityController,
-              label: 'Issuing Authority',
-              icon: Icons.account_balance,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: establishmentDateController,
-              label: 'Establishment Date',
-              icon: Icons.event,
-              context: context,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: expiryDateController,
-              label: 'Expiry Date',
-              icon: Icons.event_busy,
-              context: context,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: tradeNameController,
-              label: 'Trade Name',
-              icon: Icons.store,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: responsiblePersonController,
-              label: 'Responsible Person',
-              icon: Icons.person,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: registeredAddressController,
-              label: 'Registered Address',
-              icon: Icons.location_on,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: effectiveDateController,
-              label: 'Effective Registration Date',
-              icon: Icons.calendar_today,
-              context: context,
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.blue.shade50,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.blue.shade200),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.info_outline,
-                    color: Colors.blue.shade700,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'License Numbers vary across Emirates. (Max 20 Characters)',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.blue.shade700,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // VAT Registration (conditionally shown)
-        if (_isVATRequired)
-          _buildModernSection(
-            title: 'VAT Registration Details',
-            icon: Icons.receipt_long,
-            isOptional: true,
-            children: [
-              _buildModernTextField(
-                controller: taxRegNumberController,
-                label: 'Tax Registration Number',
-                icon: Icons.numbers,
-                validator: _validateTaxRegNumber,
-              ),
-              const SizedBox(height: 16),
-              _buildModernTextField(
-                controller: firmNameController,
-                label: 'Firm Name',
-                icon: Icons.business,
-              ),
-              const SizedBox(height: 16),
-              _buildModernDateField(
-                controller: effectiveDateController,
-                label: 'Effective Registration Date',
-                icon: Icons.calendar_today,
-                context: context,
-              ),
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.orange.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: Colors.orange.shade200,
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.info_outline,
-                      color: Colors.orange.shade700,
-                    ),
-                    const SizedBox(width: 8),
-                    const Expanded(
-                      child: Text(
-                        'Required only if the firm\'s Annual Turnover exceeds AED 375,000.',
-                        style: TextStyle(fontSize: 12),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        const SizedBox(height: 24),
-        // Bank Details
-        _buildModernSection(
-          title: 'Bank Details',
-          icon: Icons.account_balance_outlined,
-          isOptional: true,
-          children: [
-            _buildModernTextField(
-              controller: accountNameController,
-              label: 'Account Holder Name',
-              icon: Icons.person_outline_rounded,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: ibanController,
-              label: 'IBAN Number',
-              icon: Icons.account_balance_wallet_outlined,
-              isRequired: false,
-              validator: _validateIBAN,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: bankNameController,
-              label: 'Bank Name',
-              icon: Icons.business_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: branchNameController,
-              label: 'Branch Name',
-              icon: Icons.location_on_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: branchAddressController,
-              label: 'Branch Address',
-              icon: Icons.location_city_outlined,
-              isRequired: false,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Location Details
-        _buildModernSection(
-          title: 'Location Details',
-          icon: Icons.location_on_outlined,
-          isOptional: true,
-          children: [
-            _buildModernTextField(
-              controller: latitudeController,
-              label: 'Latitude',
-              icon: Icons.my_location,
-              isRequired: false,
-              suffix: IconButton(
-                tooltip: 'Refresh location',
-                icon: const Icon(Icons.gps_fixed),
-                onPressed: _isGettingLocation
-                    ? null
-                    : () async {
-                        HapticFeedback.selectionClick();
-                        await _initLocation();
-                      },
-              ),
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: longitudeController,
-              label: 'Longitude',
-              icon: Icons.my_location,
-              isRequired: false,
-              suffix: IconButton(
-                tooltip: 'Refresh location',
-                icon: const Icon(Icons.gps_fixed),
-                onPressed: _isGettingLocation
-                    ? null
-                    : () async {
-                        HapticFeedback.selectionClick();
-                        await _initLocation();
-                      },
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Icon(
-                  Icons.info_outline,
-                  size: 16,
-                  color: Colors.grey,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    _isGettingLocation
-                        ? 'Fetching GPS…'
-                        : (latitudeController.text.isEmpty ||
-                                longitudeController.text.isEmpty)
-                            ? 'Tap the GPS icon if fields are empty.'
-                            : 'Coordinates captured from your device GPS.',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Colors.grey.shade700,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ],
-    );
+  static Future<bool> testConnectivity() async {
+    return await UploadService.testConnectivity();
   }
 }
 
-class _FadeSlide extends StatelessWidget {
-  final String text;
-  final bool big;
-  const _FadeSlide({required this.text, this.big = false});
 
-  @override
-  Widget build(BuildContext context) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 800),
-      curve: Curves.easeOut,
-      builder: (context, value, child) => Transform.translate(
-        offset: Offset(0, 30 * (1 - value)),
-        child: Opacity(opacity: value, child: child),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: big ? 32 : 16,
-          fontWeight: big ? FontWeight.bold : FontWeight.normal,
-          color: big ? Colors.white : Colors.white70,
-        ),
-      ),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// upload_service.dart
+import 'dart:convert';
+import 'dart:io' show File; // used only on mobile paths
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+// Web-only
+import 'package:web/web.dart' as web;
+
+class UploadService {
+  // Detect webview-ish contexts (wider net than widget side)
+  static bool get _isInAppWebView {
+    if (kIsWeb) {
+      try {
+        final ua = web.window.navigator.userAgent.toLowerCase();
+        final vendor = web.window.navigator.vendor.toLowerCase();
+        final loc = web.window.location;
+
+        final isInAppWebView =
+            ua.contains('inapp') ||
+            ua.contains('webview') ||
+            ua.contains('inappbrowser') ||
+            ua.contains('capacitor') ||
+            ua.contains('cordova') ||
+            ua.contains('phonegap') ||
+            vendor.contains('inapp') ||
+            loc.protocol == 'file:' ||
+            loc.protocol == 'capacitor:' ||
+            loc.protocol == 'ionic:' ||
+            (loc.hostname == 'localhost' && loc.port.isEmpty) ||
+            (ua.contains('mobile') && !ua.contains('chrome'));
+
+        return isInAppWebView;
+      } catch (_) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static List<String> get _fallbackUrls => <String>[
+    'https://10.166.220.182:8521/api', // Direct IP (HTTPS)
+    'http://10.166.220.182:8520/api', // HTTP variant
+    'http://localhost:8520/api',
+    'http://localhost:8080/api',
+  ];
+
+  static String get baseUrl {
+    if (kIsWeb) {
+      if (_isInAppWebView) {
+        try {
+          final host = web.window.location.hostname;
+          final port = web.window.location.port;
+          final protocol = web
+              .window
+              .location
+              .protocol; // keep same scheme to avoid mixed content
+          if (host.isNotEmpty && host != 'localhost') {
+            final portPart = (port.isNotEmpty && port != '80' && port != '443')
+                ? ':$port'
+                : '';
+            return '$protocol//$host$portPart/api';
+          }
+        } catch (_) {}
+        // Fallback for in-app
+        return 'https://10.166.220.182:8521/api';
+      } else {
+        // Browser dev default; change to your served origin if needed
+        return 'http://localhost:8080/api';
+      }
+    } else {
+      // Mobile builds – hit your server
+      return 'https://10.166.220.182:8520/api';
+    }
+  }
+
+  /// Upload file to server only - no local storage fallback
+  static Future<Map<String, dynamic>> uploadFile(
+    String filePath, {
+    String? originalName,
+  }) async {
+    return await _uploadWithFallback(filePath, originalName: originalName);
+  }
+
+  static Future<Map<String, dynamic>> _uploadWithFallback(
+    String filePath, {
+    String? originalName,
+  }) async {
+    // Try primary URL first
+    var result = await _uploadToUrl(
+      baseUrl,
+      filePath,
+      originalName: originalName,
     );
+    if (result['success'] == true) return result;
+
+    // Try fallbacks
+    for (final url in _fallbackUrls) {
+      result = await _uploadToUrl(url, filePath, originalName: originalName);
+      if (result['success'] == true) return result;
+    }
+
+    // Give up; caller may choose local fallback
+    return result;
+  }
+
+  static Future<Map<String, dynamic>> _uploadToUrl(
+    String baseUrl,
+    String filePath, {
+    String? originalName,
+  }) async {
+    try {
+      final uri = Uri.parse('$baseUrl/upload');
+      final request = http.MultipartRequest('POST', uri);
+
+      // Helpful (but CORS must be on server)
+      request.headers['Accept'] = 'application/json';
+
+      if (kIsWeb) {
+        if (filePath.startsWith('data:')) {
+          final parts = filePath.split(',');
+          if (parts.length != 2) {
+            throw Exception('Invalid data URL format');
+          }
+          final header = parts[0]; // data:<mime>;base64
+          final mimeType = header.split(':')[1].split(';')[0];
+          final bytes = base64Decode(parts[1]);
+
+          request.files.add(
+            http.MultipartFile.fromBytes(
+              'file',
+              bytes,
+              filename: originalName ?? 'upload.${_extFromMime(mimeType)}',
+            ),
+          );
+        } else {
+          // If you support blob: or object URLs, you’d need to fetch them first in JS and pass data:
+          throw Exception(
+            'Unsupported web file path format (expected data: URL)',
+          );
+        }
+      } else {
+        final file = File(filePath);
+        if (!await file.exists()) {
+          throw Exception('File does not exist: $filePath');
+        }
+        request.files.add(
+          await http.MultipartFile.fromPath(
+            'file',
+            filePath,
+            filename: originalName ?? file.path.split('/').last,
+          ),
+        );
+      }
+
+      // Reasonable timeouts
+      final timeout = _isInAppWebView
+          ? const Duration(seconds: 20)
+          : const Duration(seconds: 30);
+
+      final streamed = await request.send().timeout(
+        timeout,
+        onTimeout: () {
+          throw Exception('Upload timed out after ${timeout.inSeconds}s');
+        },
+      );
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode == 200) {
+        final data = _safeJson(response.body);
+        return {'success': true, 'data': data};
+      } else {
+        final err = _safeJson(response.body);
+        final msg = (err['error'] ?? 'Upload failed').toString();
+        return {
+          'success': false,
+          'error': _isInAppWebView ? 'InAppWebView upload error: $msg' : msg,
+        };
+      }
+    } catch (e) {
+      String msg = 'Upload failed: $e';
+      if (_isInAppWebView) {
+        if (e.toString().contains('timed out')) {
+          msg =
+              'Upload timed out in InAppWebView. Please check your connection and try again.';
+        } else if (e.toString().contains('SocketException') ||
+            e.toString().contains('Connection')) {
+          msg =
+              'Network connection failed in InAppWebView. Ensure the server is reachable.';
+        } else {
+          msg = 'InAppWebView upload error: $e';
+        }
+      }
+      return {'success': false, 'error': msg};
+    }
+  }
+
+  static Future<bool> testConnectivity() async {
+    try {
+      final resp = await http
+          .get(
+            Uri.parse('$baseUrl/health'),
+            headers: {'Accept': 'application/json'},
+          )
+          .timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => throw Exception('Timeout'),
+          );
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // -------- helpers --------
+
+  static String _extFromMime(String mime) {
+    switch (mime) {
+      case 'image/jpeg':
+        return 'jpg';
+      case 'image/png':
+        return 'png';
+      case 'image/gif':
+        return 'gif';
+      case 'image/webp':
+        return 'webp';
+      case 'application/pdf':
+        return 'pdf';
+      case 'text/plain':
+        return 'txt';
+      default:
+        return 'bin';
+    }
+  }
+
+  static Map<String, dynamic> _safeJson(String body) {
+    try {
+      final parsed = json.decode(body);
+      return parsed is Map<String, dynamic>
+          ? parsed
+          : <String, dynamic>{'raw': parsed};
+    } catch (_) {
+      return <String, dynamic>{'raw': body};
+    }
   }
 }
