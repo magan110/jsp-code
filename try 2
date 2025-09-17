@@ -3,8 +3,7 @@ using RAKControllers.DataAccess;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
- 
+
 namespace RAKControllers.Controllers
 {
     [ApiController]
@@ -12,12 +11,12 @@ namespace RAKControllers.Controllers
     public class SampleDistributionController : ControllerBase
     {
         private readonly DatabaseHelper _dbHelper;
- 
+
         public SampleDistributionController(DatabaseHelper dbHelper)
         {
             _dbHelper = dbHelper;
         }
- 
+
         // ----------------------------
         // 1) Emirates dropdown (Areas)
         // ----------------------------
@@ -31,18 +30,18 @@ SELECT areaCode, areaDesc
 FROM dbo.bkmAreaMast WITH (NOLOCK)
 WHERE (@onlyActive = 0 OR isActive = 'Y')
 ORDER BY areaDesc;";
- 
+
                 var parameters = new Dictionary<string, object>
                 {
                     { "@onlyActive", onlyActive ? 1 : 0 }
                 };
- 
-                var result = _dbHelper.WebSessBean(sql, parameters);
+
+                var rows = _dbHelper.WebSessBean(sql, parameters);
                 var list = new List<AreaItem>();
- 
-                if (result != null)
+
+                if (rows != null)
                 {
-                    foreach (var row in result)
+                    foreach (var row in rows)
                     {
                         list.Add(new AreaItem
                         {
@@ -51,7 +50,7 @@ ORDER BY areaDesc;";
                         });
                     }
                 }
- 
+
                 return Ok(list);
             }
             catch (Exception ex)
@@ -59,12 +58,13 @@ ORDER BY areaDesc;";
                 return StatusCode(500, new { success = false, message = ex.Message });
             }
         }
- 
+
         // -----------------------------------------
         // 2) Submit the Sample Distribution payload
+        //    Atomic: applock -> wcpDocNoGen -> inserts -> wcpDocNoUpd
         // -----------------------------------------
         [HttpPost("submit")]
-        public async Task<ActionResult<SubmitResponse>> Submit([FromBody] SampleDistributionRequest req)
+        public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
         {
             try
             {
@@ -76,152 +76,138 @@ ORDER BY areaDesc;";
                 if (string.IsNullOrWhiteSpace(req.painterName)) return BadRequest("Painter/Contractor Name is required.");
                 if (string.IsNullOrWhiteSpace(req.skuSize)) return BadRequest("Material SKU is required.");
                 if (string.IsNullOrWhiteSpace(req.distributionDate)) return BadRequest("Date of distribution is required.");
- 
+
                 if (!DateTime.TryParse(req.distributionDate, out var sampDate))
                     return BadRequest("Invalid distribution date.");
- 
+
                 // Map SKU text -> DB packSize & product name
                 var (packSize, prodName) = MapSku(req.skuSize);
- 
+
                 // CreateId from header or request
                 var loginId = Request.Headers.ContainsKey("LoginID")
                     ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
                     : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
                 loginId = (loginId ?? "SYSTEM").Trim();
                 if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
- 
-                // 3️⃣ Generate document number with retry mechanism
-                string docuNumb = null;
-                int maxRetries = 3;
-                for (int attempt = 1; attempt <= maxRetries; attempt++)
+
+                // Atomic T-SQL batch with application lock to avoid duplicate doc numbers
+                var sql = @"
+SET XACT_ABORT ON;
+DECLARE @rc INT, @doc NVARCHAR(64);
+
+BEGIN TRY
+    BEGIN TRAN;
+
+    -- Serialize per (DocType, Area)
+    EXEC @rc = sys.sp_getapplock 
+         @Resource = CONCAT('DOCNO:','SDE',':', @AreaCode),
+         @LockMode = 'Exclusive',
+         @LockOwner = 'Transaction',
+         @Timeout  = 15000;
+
+    IF (@rc < 0)
+        RAISERROR('Failed to acquire doc number lock.', 16, 1);
+
+    -- Generate doc number
+    DECLARE @t TABLE (docuNumb NVARCHAR(128));
+    INSERT INTO @t EXEC dbo.wcpDocNoGen @DocType = 'SDE', @AreaCode = @AreaCode;
+    SELECT TOP 1 @doc = docuNumb FROM @t;
+
+    IF (@doc IS NULL OR LTRIM(RTRIM(@doc)) = '')
+        RAISERROR('wcpDocNoGen did not return a document number.', 16, 1);
+
+    -- Insert HEADER
+    INSERT INTO dbo.catsamplead
+    (
+      docuNumb, docuDate, areaCode, custName, contName, mobileNo,
+      concDist, sampDate, misdQnty, packSize, prodName,
+      statFlag, createId, createDt
+    )
+    VALUES
+    (
+      @doc, GETDATE(), @AreaCode, @CustName, @ContName, @MobileNo,
+      @ConcDist, @SampDate, @MisdQnty, @PackSize, @ProdName,
+      'N', @CreateId, GETDATE()
+    );
+
+    -- Optional: retailer code on header if column exists
+    IF COL_LENGTH('dbo.catsamplead','cusRtlCode') IS NOT NULL
+    BEGIN
+        UPDATE dbo.catsamplead 
+        SET cusRtlCode = @CusRtlCode
+        WHERE docuNumb = @doc;
+    END
+
+    -- Insert DETAIL
+    INSERT INTO dbo.catsampleadDtl
+    (
+      docuNumb, docuDate, areaCode,
+      custName, contName, mobileNo, concDist,
+      sampDate, misdQnty, packSize, prodName, sampType,
+      createId, createDt
+    )
+    VALUES
+    (
+      @doc, GETDATE(), @AreaCode,
+      @CustName, @ContName, @MobileNo, @ConcDist,
+      @SampDate, @MisdQnty, @PackSize, @ProdName, 'SampleDistribution',
+      @CreateId, GETDATE()
+    );
+
+    -- Optional: retailer code on detail if column exists
+    IF COL_LENGTH('dbo.catsampleadDtl','cusRtlCode') IS NOT NULL
+    BEGIN
+        UPDATE dbo.catsampleadDtl 
+        SET cusRtlCode = @CusRtlCode
+        WHERE docuNumb = @doc;
+    END
+
+    -- Optional: pouchCnt (number of bags) on detail if column exists
+    IF COL_LENGTH('dbo.catsampleadDtl','pouchCnt') IS NOT NULL
+    BEGIN
+        UPDATE dbo.catsampleadDtl 
+        SET pouchCnt = @PouchCnt
+        WHERE docuNumb = @doc;
+    END
+
+    -- Reserve/confirm the number
+    EXEC dbo.wcpDocNoUpd @DocType = 'SDE', @AreaCode = @AreaCode;
+
+    COMMIT;
+
+    SELECT 1 AS success, 'Saved successfully.' AS message, @doc AS docuNumb;
+END TRY
+BEGIN CATCH
+    IF XACT_STATE() <> 0 ROLLBACK;
+    SELECT 0 AS success, ERROR_MESSAGE() AS message, NULL AS docuNumb;
+END CATCH
+";
+
+                var parameters = new Dictionary<string, object>
                 {
-                    const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
-                    var genParams = new Dictionary<string, object>
-                    {
-                        ["@DocType"] = "SDE",
-                        ["@AreaCode"] = req.emirate.Trim()
-                    };
-                    var genResult = _dbHelper.WebSessBean(genSql, genParams) as List<Dictionary<string, object>>;
-                    docuNumb = genResult?.FirstOrDefault()?["docuNumb"]?.ToString();
-
-                    if (string.IsNullOrWhiteSpace(docuNumb))
-                    {
-                        if (attempt == maxRetries)
-                            return StatusCode(500, new SubmitResponse { success = false, message = "Failed to generate document number after multiple attempts.", docuNumb = null });
-                        continue;
-                    }
-
-                    // Check if document number already exists in any related table
-                    const string checkSql = @"
-                        SELECT COUNT(*) as cnt FROM (
-                            SELECT docuNumb FROM catsamplead WHERE docuNumb = @docuNumb
-                            UNION ALL
-                            SELECT docuNumb FROM catsampleadDtl WHERE docuNumb = @docuNumb
-                        ) combined";
-
-                    var checkParams = new Dictionary<string, object> { ["@docuNumb"] = docuNumb };
-                    var checkResult = _dbHelper.WebSessBean(checkSql, checkParams) as List<Dictionary<string, object>>;
-                    var existingCount = Convert.ToInt32(checkResult?.FirstOrDefault()?["cnt"] ?? 0);
-
-                    if (existingCount == 0)
-                        break; // Document number is unique, proceed
-
-                    if (attempt == maxRetries)
-                        return StatusCode(500, new SubmitResponse { success = false, message = $"Duplicate document number detected: {docuNumb}. Please try again.", docuNumb = null });
-
-                    // Wait before retry
-                    await Task.Delay(100);
-                }
- 
-                // Insert HEADER (catsamplead)
-                var insertHeaderSql = @"
-INSERT INTO catsamplead
-(
-  docuNumb, docuDate, areaCode, custName, contName, mobileNo,
-  concDist, sampDate, misdQnty, packSize, prodName,
-  statFlag, createId, createDt
-)
-VALUES
-(
-  @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo,
-  @concDist, @sampDate, @misdQnty, @packSize, @prodName,
-  'N', @createId, GETDATE()
-);";
- 
-                var headerParams = new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = docuNumb,
-                    ["@areaCode"] = req.emirate.Trim(),
-                    ["@custName"] = req.retailerName?.Trim() ?? (object)DBNull.Value,
-                    ["@contName"] = req.painterName?.Trim() ?? (object)DBNull.Value,
-                    ["@mobileNo"] = req.painterMobile?.Trim() ?? (object)DBNull.Value,
-                    ["@concDist"] = req.distributor?.Trim() ?? (object)DBNull.Value,
-                    ["@sampDate"] = sampDate,
-                    ["@misdQnty"] = req.missedQty?.Trim() ?? (object)DBNull.Value,
-                    ["@packSize"] = packSize ?? (object)DBNull.Value,
-                    ["@prodName"] = prodName ?? (object)DBNull.Value,
-                    ["@createId"] = loginId
+                    ["@AreaCode"]   = req.emirate.Trim(),
+                    ["@CustName"]   = (object?)req.retailerName?.Trim() ?? DBNull.Value,
+                    ["@CusRtlCode"] = (object?)req.retailerCode?.Trim() ?? DBNull.Value,
+                    ["@ConcDist"]   = (object?)req.distributor?.Trim() ?? DBNull.Value,
+                    ["@ContName"]   = (object?)req.painterName?.Trim() ?? DBNull.Value,
+                    ["@MobileNo"]   = (object?)req.painterMobile?.Trim() ?? DBNull.Value,
+                    ["@SampDate"]   = sampDate,
+                    ["@MisdQnty"]   = (object?)req.missedQty?.Trim() ?? DBNull.Value,
+                    ["@PackSize"]   = (object?)packSize ?? DBNull.Value,
+                    ["@ProdName"]   = (object?)prodName ?? DBNull.Value,
+                    ["@CreateId"]   = loginId,
+                    ["@PouchCnt"]   = int.TryParse(req.materialQty, out var bags) ? (object)bags : DBNull.Value
                 };
- 
-                try
-                {
-                    _dbHelper.WebExecute(insertHeaderSql, headerParams);
-                }
-                catch (Exception ex) when (ex.Message.Contains("PRIMARY KEY constraint") || ex.Message.Contains("duplicate key"))
-                {
-                    return StatusCode(500, new SubmitResponse
-                    {
-                        success = false,
-                        message = $"Duplicate record detected for document {docuNumb}. This document may already exist in the system.",
-                        docuNumb = docuNumb
-                    });
-                }
- 
-                // Insert DETAIL (catsampleadDtl)
-                var insertDetailSql = @"
-INSERT INTO catsampleadDtl
-(
-  docuNumb, docuDate, areaCode,
-  custName, contName, mobileNo, concDist,
-  sampDate, misdQnty, packSize, prodName, sampType,
-  createId, createDt
-)
-VALUES
-(
-  @docuNumb, GETDATE(), @areaCode,
-  @custName, @contName, @mobileNo, @concDist,
-  @sampDate, @misdQnty, @packSize, @prodName, 'SampleDistribution',
-  @createId, GETDATE()
-);";
- 
-                try
-                {
-                    _dbHelper.WebExecute(insertDetailSql, headerParams);
-                }
-                catch (Exception ex) when (ex.Message.Contains("PRIMARY KEY constraint") || ex.Message.Contains("duplicate key"))
-                {
-                    return StatusCode(500, new SubmitResponse
-                    {
-                        success = false,
-                        message = $"Failed to insert detail record for document {docuNumb}. This may be a duplicate entry.",
-                        docuNumb = docuNumb
-                    });
-                }
- 
-                // 4️⃣ Update the sequence
-                const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
-                var updParams = new Dictionary<string, object>
-                {
-                    ["@DocType"] = "SDE",
-                    ["@AreaCode"] = req.emirate.Trim()
-                };
-                _dbHelper.WebSessBean(updSql, updParams);
- 
+
+                var rows = _dbHelper.WebSessBean(sql, parameters);
+                var row  = rows?.FirstOrDefault();
+                var ok   = row != null && (row.TryGetValue("success", out var s) && Convert.ToInt32(s) == 1);
+
                 return Ok(new SubmitResponse
                 {
-                    success = true,
-                    message = "Saved successfully.",
-                    docuNumb = docuNumb
+                    success = ok,
+                    message = row?["message"]?.ToString() ?? (ok ? "Saved successfully." : "Unknown result."),
+                    docuNumb = ok ? row?["docuNumb"]?.ToString() : null
                 });
             }
             catch (Exception ex)
@@ -234,34 +220,32 @@ VALUES
                 });
             }
         }
- 
+
         // -----------------------
         // Helpers / Utilities
         // -----------------------
- 
         private static (string packSize, string prodName) MapSku(string sku)
         {
-            // SKU mapping: "1 Kg" -> packSize = "01K"; "5 Kg" -> "05K"; default: digits + 'K'
+            // "1 Kg" -> ("01K", "BW Putty 1 Kg"); "5 Kg" -> ("05K", "BW Putty 5 Kg"); else: digits + 'K'
             if (string.IsNullOrWhiteSpace(sku)) return (null, null);
             var s = sku.Trim().ToLower();
             if (s.StartsWith("1")) return ("01K", "BW Putty 1 Kg");
             if (s.StartsWith("5")) return ("05K", "BW Putty 5 Kg");
- 
-            // fallback: extract first number (kg)
+
             var digits = new string(s.Where(char.IsDigit).ToArray());
             var pack = string.IsNullOrEmpty(digits) ? null : (digits.Length == 1 ? $"0{digits}K" : $"{digits}K");
-            var name  = string.IsNullOrEmpty(digits) ? null : $"BW Putty {digits} Kg";
+            var name = string.IsNullOrEmpty(digits) ? null : $"BW Putty {digits} Kg";
             return (pack, name);
         }
     }
- 
+
     // DTOs
     public class AreaItem
     {
         public string code { get; set; }  // areaCode (char(3))
         public string desc { get; set; }  // areaDesc
     }
- 
+
     public class SampleDistributionRequest
     {
         public string? loginId { get; set; }          // optional; or via header: LoginID
@@ -273,11 +257,11 @@ VALUES
         public string? painterMobile { get; set; }    // mobileNo
         public string skuSize { get; set; }           // -> packSize + prodName mapping
         public string? materialQty { get; set; }      // -> pouchCnt (if column exists)
-        public string? missedQty { get; set; }        // -> misdQnty (char(10))
+        public string? missedQty { get; set; }        // -> misdQnty
         public string distributionDate { get; set; }  // -> sampDate (yyyy-MM-dd)
-        public string? salesLead { get; set; }        // (reserved, not mapped now)
+        public string? salesLead { get; set; }        // reserved
     }
- 
+
     public class SubmitResponse
     {
         public bool success { get; set; }
@@ -285,4 +269,3 @@ VALUES
         public string? docuNumb { get; set; }
     }
 }
- 
