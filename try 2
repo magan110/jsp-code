@@ -1,69 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:image_picker/image_picker.dart';
 import '../../../core/widgets/modern_dropdown.dart';
-
-// =============================================================
-// UAE Sampling Drive — Entry Page 1 (Distribution Details)
-// SOP applied: modes, monthly target (13), missed qty, reimbursement stub,
-// phone validation for UAE, and local monthly progress tracking.
-// Entry Page 2 (Sample Execution + reimbursement recording + photos)
-// is linked via a navigation stub button (configure your route accordingly).
-// =============================================================
+import '../../SAMPLING/sample_model.dart';
 
 class SampleDistributEntry extends StatefulWidget {
-  const SampleDistributEntry({super.key});
   @override
-  State<SampleDistributEntry> createState() => _SampleDistributEntryState();
-}
-
-enum DistributionMode {
-  distributorToPainterViaRetailer, // Distributor -> Retailer -> Painter
-  retailerToPainters, // Retailer -> Painter
-  employeeToPainterViaRetailer, // Employee -> Retailer -> Painter (onsite sample)
-}
-
-extension DistributionModeX on DistributionMode {
-  String label() {
-    switch (this) {
-      case DistributionMode.distributorToPainterViaRetailer:
-        return 'Distributor → Retailer → Painter';
-      case DistributionMode.retailerToPainters:
-        return 'Retailer → Painter';
-      case DistributionMode.employeeToPainterViaRetailer:
-        return 'Employee → Retailer → Painter (Onsite)';
-    }
-  }
-}
-
-enum ReimbursementMode { hiredPainter, sitePainter }
-
-extension ReimbursementModeX on ReimbursementMode {
-  String label() {
-    switch (this) {
-      case ReimbursementMode.hiredPainter:
-        return '0';
-      case ReimbursementMode.sitePainter:
-        return 'AED 150';
-    }
-  }
-
-  double amount() {
-    switch (this) {
-      case ReimbursementMode.hiredPainter:
-        return 0; //
-      case ReimbursementMode.sitePainter:
-        return 150.0; // wages only
-    }
-  }
+  _SampleDistributEntryState createState() => _SampleDistributEntryState();
 }
 
 class _SampleDistributEntryState extends State<SampleDistributEntry>
     with TickerProviderStateMixin {
-  // Controllers (Entry Page 1)
-  final emiratesController = TextEditingController();
-  final areaController = TextEditingController();
+  // Controllers final missedQtyController = TextEditingController();
+
+  final missedQtyController = TextEditingController();
+  final emirateController = TextEditingController();
   final retailerNameController = TextEditingController();
   final retailerCodeController = TextEditingController();
   final distributorController = TextEditingController();
@@ -71,36 +22,22 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
   final painterMobileController = TextEditingController();
   final skuSizeController = TextEditingController();
   final materialQtyController = TextEditingController();
-  final missedQtyController = TextEditingController();
   final distributionDateController = TextEditingController();
-  final remarksController = TextEditingController();
-
+  final salesLeadController = TextEditingController();
   // Animation controllers
-  late final AnimationController _mainController;
-  late final AnimationController _fabController;
-  late final Animation<double> _fadeAnimation;
-  late final Animation<Offset> _slideAnimation;
-  late final Animation<double> _scaleAnimation;
-
-  // SOP additions
-  DistributionMode? _mode;
-  ReimbursementMode? _reimbMode; // for sample execution (Entry Page 2) stub
-  double _computedReimb = 0.0;
-
-  // Attachments (photos) — optional for Entry Page 2
-  final ImagePicker _picker = ImagePicker();
-  List<XFile> _photos = [];
-
+  late AnimationController _mainController;
+  late AnimationController _fabController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+  
   bool _isSubmitting = false;
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
-
-  // Target tracking (local)
-  static const int _monthlyTarget = 13; // SOP target
-  int _doneThisMonth = 0;
 
   @override
   void initState() {
     super.initState();
+    // Initialize animations
     _mainController = AnimationController(
       duration: const Duration(milliseconds: 1000),
       vsync: this,
@@ -117,11 +54,11 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
     );
     _slideAnimation =
         Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-          CurvedAnimation(
-            parent: _mainController,
-            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-          ),
-        );
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+      ),
+    );
     _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
       CurvedAnimation(
         parent: _mainController,
@@ -130,17 +67,14 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
     );
     _mainController.forward();
     _fabController.forward();
-
-    _restoreDraft();
-    _loadMonthlyProgress();
   }
 
   @override
   void dispose() {
     _mainController.dispose();
     _fabController.dispose();
-    emiratesController.dispose();
-    areaController.dispose();
+    missedQtyController.dispose();
+    emirateController.dispose();
     retailerNameController.dispose();
     retailerCodeController.dispose();
     distributorController.dispose();
@@ -148,147 +82,136 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
     painterMobileController.dispose();
     skuSizeController.dispose();
     materialQtyController.dispose();
-    missedQtyController.dispose();
     distributionDateController.dispose();
-    remarksController.dispose();
     super.dispose();
   }
 
-  String _monthKey() {
-    final now = DateTime.now();
-    return 'sample_count_${now.year}${now.month.toString().padLeft(2, '0')}';
-  }
-
-  Future<void> _loadMonthlyProgress() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _doneThisMonth = prefs.getInt(_monthKey()) ?? 0;
-    });
-  }
-
-  Future<void> _incrementMonthlyProgress() async {
-    final prefs = await SharedPreferences.getInstance();
-    final current = prefs.getInt(_monthKey()) ?? 0;
-    await prefs.setInt(_monthKey(), current + 1);
-    setState(() => _doneThisMonth = current + 1);
-  }
-
-  Future<void> _restoreDraft() async {
-    final prefs = await SharedPreferences.getInstance();
-    emiratesController.text = prefs.getString('emirates') ?? '';
-    areaController.text = prefs.getString('area') ?? '';
-    retailerNameController.text = prefs.getString('retailerName') ?? '';
-    retailerCodeController.text = prefs.getString('retailerCode') ?? '';
-    distributorController.text = prefs.getString('distributor') ?? '';
-    painterNameController.text = prefs.getString('painterName') ?? '';
-    painterMobileController.text = prefs.getString('painterMobile') ?? '';
-    skuSizeController.text = prefs.getString('skuSize') ?? '';
-    materialQtyController.text = prefs.getString('materialQty') ?? '';
-    distributionDateController.text = prefs.getString('distributionDate') ?? '';
-    missedQtyController.text = prefs.getString('missedQty') ?? '';
-
-    final modeStr = prefs.getString('distributionMode');
-    if (modeStr != null) {
-      _mode = DistributionMode.values.firstWhere(
-        (m) => m.toString() == modeStr,
-        orElse: () => DistributionMode.retailerToPainters,
-      );
-    }
-    final reimbStr = prefs.getString('reimbMode');
-    if (reimbStr != null) {
-      _reimbMode = ReimbursementMode.values.firstWhere(
-        (r) => r.toString() == reimbStr,
-        orElse: () => ReimbursementMode.sitePainter,
-      );
-      _computedReimb = _reimbMode!.amount();
-    }
-    setState(() {});
-  }
-
-  void _updateReimbAmount(ReimbursementMode? mode) {
-    setState(() {
-      _reimbMode = mode;
-      _computedReimb = mode?.amount() ?? 0.0;
-    });
-  }
-
-  Future<void> _pickPhotos() async {
-    final selection = await _picker.pickMultiImage();
-    if (selection.isNotEmpty) {
-      setState(() => _photos = selection);
-    }
-  }
-
-  Future<void> _submitForm() async {
-    if (!_formKey.currentState!.validate()) return;
-    if (_mode == null) {
-      _toast('Please select the Mode of distribution');
-      return;
-    }
-
-    setState(() => _isSubmitting = true);
-    try {
-      final prefs = await SharedPreferences.getInstance();
-
-      // Persist Entry Page 1 as draft (and for offline report calc)
-      await prefs.setString('emirates', emiratesController.text.trim());
-      await prefs.setString('area', areaController.text.trim());
-      await prefs.setString('retailerName', retailerNameController.text.trim());
-      await prefs.setString('retailerCode', retailerCodeController.text.trim());
-      await prefs.setString('distributor', distributorController.text.trim());
-      await prefs.setString('painterName', painterNameController.text.trim());
-      await prefs.setString(
-        'painterMobile',
-        painterMobileController.text.trim(),
-      );
-      await prefs.setString('skuSize', skuSizeController.text.trim());
-      await prefs.setString('materialQty', materialQtyController.text.trim());
-      await prefs.setString('missedQty', missedQtyController.text.trim());
-      await prefs.setString(
-        'distributionDate',
-        distributionDateController.text,
-      );
-      await prefs.setString('distributionMode', _mode.toString());
-
-      if (_reimbMode != null) {
-        await prefs.setString('reimbMode', _reimbMode.toString());
-        await prefs.setDouble('reimbAmount', _computedReimb);
+  void _submitForm() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() {
+        _isSubmitting = true;
+      });
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('MissedQty', missedQtyController.text);
+        await prefs.setString('Emirate', emirateController.text);
+        await prefs.setString('retailerName', retailerNameController.text);
+        await prefs.setString('retailerCode', retailerCodeController.text);
+        await prefs.setString('distributor', distributorController.text);
+        await prefs.setString('painterName', painterNameController.text);
+        await prefs.setString('painterMobile', painterMobileController.text);
+        await prefs.setString('skuSize', skuSizeController.text);
+        await prefs.setString('materialQty', materialQtyController.text);
+        await prefs.setString(
+          'distributionDate',
+          distributionDateController.text,
+        );
+        
+        // Simulate API call
+        await Future.delayed(const Duration(seconds: 2));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Row(
+                children: [
+                  Icon(Icons.check_circle, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Sample distribution data saved successfully!'),
+                  ),
+                ],
+              ),
+              backgroundColor: Colors.green,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.warning, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(child: Text('Error saving data: ${e.toString()}')),
+                ],
+              ),
+              backgroundColor: Colors.orange,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSubmitting = false;
+          });
+        }
       }
-
-      // TODO: Replace with real API call to your backend
-      await Future.delayed(const Duration(milliseconds: 800));
-
-      if (mounted) {
-        await _incrementMonthlyProgress();
-        _toast('Sample distribution saved successfully');
-      }
-    } catch (e) {
-      _toast('Error: ${e.toString()}', isError: true);
-    } finally {
-      if (mounted) setState(() => _isSubmitting = false);
     }
   }
 
-  void _toast(String msg, {bool isError = false}) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: isError ? Colors.orange : Colors.green,
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 3),
+  final demoSupplyChain = SupplyChainData(
+  totalReceived: 500,
+  billedToDistributor: 400,
+  billedToRetailer: 350,
+  distributedToPainter: 280,
+);
+
+  
+
+Widget buildSupplyChainTable(List<SupplyChainEntry> entries) {
+  return SingleChildScrollView(
+    scrollDirection: Axis.horizontal,
+    child: DataTable(
+      headingRowColor: MaterialStateProperty.all(const Color(0xFF1E3A8A)),
+      headingTextStyle: const TextStyle(
+        color: Colors.white,
+        fontWeight: FontWeight.bold,
       ),
-    );
-  }
+      columns: const [
+        DataColumn(label: Text("Retailer")),
+        DataColumn(label: Text("Code")),
+        DataColumn(label: Text("Distributor")),
+        DataColumn(label: Text("Painter")),
+        DataColumn(label: Text("Mobile")),
+        DataColumn(label: Text("SKU")),
+        DataColumn(label: Text("Distributed (Kg)")),
+        DataColumn(label: Text("Total Received (Kg)")),
+        DataColumn(label: Text("Remaining (Kg)")),
+      ],
+      rows: entries.map((entry) {
+        return DataRow(
+          cells: [
+            DataCell(Text(entry.retailerName)),
+            DataCell(Text(entry.retailerCode)),
+            DataCell(Text(entry.distributorName)),
+            DataCell(Text(entry.painterName)),
+            DataCell(Text(entry.painterMobile)),
+            DataCell(Text(entry.skuSize)),
+            DataCell(Text(entry.qtyDistributed.toString())),
+            DataCell(Text(entry.totalReceived.toString())),
+            DataCell(Text(entry.remaining.toString())),
+          ],
+        );
+      }).toList(),
+    ),
+  );
+}
+
+
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isDesktop = constraints.maxWidth > 1200;
-        final isTablet =
-            constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
-        // final isMobile = constraints.maxWidth <= 800;
-
+        final isTablet = constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
+        final isMobile = constraints.maxWidth <= 800;
+        
         return Scaffold(
           backgroundColor: const Color(0xFFF8FAFC),
           appBar: _buildModernAppBar(),
@@ -296,39 +219,47 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
             opacity: _fadeAnimation,
             child: SlideTransition(
               position: _slideAnimation,
-              child: SingleChildScrollView(
-                padding: EdgeInsets.symmetric(
-                  horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
-                  vertical: 24,
+              child: Container(
+                decoration: const BoxDecoration(
+                  color: Color(0xFFF8FAFC),
                 ),
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxWidth: isDesktop ? 1400 : double.infinity,
-                    ),
-                    child: ScaleTransition(
-                      scale: _scaleAnimation,
-                      child: Form(
-                        key: _formKey,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _buildAnimatedHeader(),
-                            const SizedBox(height: 16),
-                            _buildTargetBanner(),
-                            const SizedBox(height: 24),
-                            if (isDesktop)
-                              _buildDesktopLayout()
-                            else
-                              _buildMobileLayout(),
-                            const SizedBox(height: 24),
-                            _buildReimbursementStubSection(),
-                            const SizedBox(height: 24),
-                            _buildAttachmentsSection(),
-                            const SizedBox(height: 32),
-                            _buildAnimatedSubmitButton(),
-                            const SizedBox(height: 48),
-                          ],
+                child: SingleChildScrollView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
+                    vertical: 24,
+                  ),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: isDesktop ? 1400 : double.infinity,
+                      ),
+                      child: ScaleTransition(
+                        scale: _scaleAnimation,
+                        child: Form(
+                          key: _formKey,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // Header with animation
+                              _buildAnimatedHeader(),
+                              const SizedBox(height: 32),
+                              // Main Content - Two columns on desktop
+                              if (isDesktop)
+                                _buildDesktopLayout()
+                              else
+                                _buildMobileLayout(),
+                              const SizedBox(height: 32),
+                              // Submit Button
+                              // In your build method (below Submit button)
+
+                                if (currentEntries.isNotEmpty)
+                                     buildSupplyChainTable(currentEntries),
+
+                              const SizedBox(height: 20),
+                              _buildAnimatedSubmitButton(),
+                              const SizedBox(height: 48),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -348,33 +279,48 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Left Column
             Expanded(
               child: _buildModernSection(
                 title: 'Retailer Details',
                 icon: Icons.store_rounded,
                 children: [
-                  _buildModernTextField(
-                    controller: emiratesController,
-                    label: 'Emirate',
-                    icon: Icons.badge_outlined,
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Emirates',
+                    icon: Icons.location_on_outlined,
+                    items: const ['Dubai',
+          'Abu Dhabi',
+          'Sharjah',
+          'Ajman',
+          'Umm Al Quwain',
+          'Ras Al Khaimah',
+          'Fujairah',],
+                    value: emirateController.text.isEmpty
+                        ? null
+                        : emirateController.text,
+                    onChanged: (value) {
+                      setState(() {
+                        emirateController.text = value ?? '';
+                      });
+                    },
                   ),
                   const SizedBox(height: 20),
                   ModernDropdown(
-                    label: 'Area',
-                    icon: Icons.location_on_outlined,
-                    items: const ['Area 1', 'Area 2', 'Area 3'],
-                    value: areaController.text.isEmpty
-                        ? null
-                        : areaController.text,
-                    onChanged: (value) =>
-                        setState(() => areaController.text = value ?? ''),
-                  ),
-                  const SizedBox(height: 20),
-                  _buildModernTextField(
-                    controller: retailerNameController,
                     label: 'Retailer Name',
                     icon: Icons.store_outlined,
+                    items: const ['Retailer A', 'Retailer B'], // later from API
+                    value: retailerNameController.text.isEmpty
+                        ? null
+                        : retailerNameController.text,
+                    onChanged: (value) {
+                      setState(() {
+                        retailerNameController.text = value ?? '';
+                        currentEntries = retailerData[value] ?? []; // 🔹 auto-load data
+                      });
+                    },
                   ),
+
                   const SizedBox(height: 20),
                   _buildModernTextField(
                     controller: retailerCodeController,
@@ -387,17 +333,22 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
                     label: 'Concern Distributor',
                     icon: Icons.business_outlined,
                   ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                  controller: salesLeadController,
+                  label: 'Sales Leads',
+                  icon: Icons.leaderboard_rounded,
+                ),
                 ],
               ),
             ),
             const SizedBox(width: 24),
+            // Right Column
             Expanded(
               child: _buildModernSection(
                 title: 'Distribution Details',
                 icon: Icons.local_shipping_outlined,
                 children: [
-                  _buildDistributionModeDropdown(),
-                  const SizedBox(height: 20),
                   _buildModernTextField(
                     controller: painterNameController,
                     label: 'Name of Painter / Contractor',
@@ -412,62 +363,50 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
                   ),
                   const SizedBox(height: 20),
                   ModernDropdown(
-                    label: 'SKU Size (1/5 Kg)',
+                    label: 'Material SKU',
                     icon: Icons.inventory_2_outlined,
                     items: const ['1 Kg', '5 Kg'],
                     value: skuSizeController.text.isEmpty
                         ? null
                         : skuSizeController.text,
-                    onChanged: (value) =>
-                        setState(() => skuSizeController.text = value ?? ''),
+                    onChanged: (value) {
+                      setState(() {
+                        skuSizeController.text = value ?? '';
+                      });
+                    },
                   ),
                   const SizedBox(height: 20),
                   _buildModernTextField(
                     controller: materialQtyController,
-                    label: 'Material distributed in Kg',
+                    label: 'Sample distributed in Kg.',
                     icon: Icons.scale_outlined,
-                    keyboardType: const TextInputType.numberWithOptions(
+                    keyboardType: TextInputType.numberWithOptions(
                       decimal: true,
                     ),
                     inputFormatters: [
-                      FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+                      FilteringTextInputFormatter.allow(
+                        RegExp(r'^\d*\.?\d*'),
+                      ),
                     ],
                   ),
-                  const SizedBox(height: 20),
-                  _buildModernTextField(
-                    controller: missedQtyController,
-                    label: 'Missed quantity (if any) in Kg',
-                    icon: Icons.pending_outlined,
-                    isRequired: false,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    inputFormatters: [
-                      FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: missedQtyController,
+              label: 'Missed qty (if any)',
+              icon: Icons.remove_circle_outline,
+              keyboardType: TextInputType.numberWithOptions(decimal: true),
+              isRequired: false,
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+              ],
+            ),
+            const SizedBox(height: 20),
                   _buildModernDateField(
                     controller: distributionDateController,
                     label: 'Date of distribution',
                     icon: Icons.event_available_outlined,
                   ),
                 ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        _buildModernSection(
-          title: 'Remarks (Optional)',
-          icon: Icons.notes_outlined,
-          isOptional: true,
-          children: [
-            TextFormField(
-              controller: remarksController,
-              maxLines: 3,
-              decoration: _inputDecoration(
-                label: 'Any notes / site details (optional)',
               ),
             ),
           ],
@@ -479,30 +418,48 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
   Widget _buildMobileLayout() {
     return Column(
       children: [
+        // Retailer Details Section
         _buildModernSection(
           title: 'Retailer Details',
           icon: Icons.store_rounded,
           children: [
-            _buildModernTextField(
-              controller: emiratesController,
+
+            const SizedBox(height: 16),
+            ModernDropdown(
               label: 'Emirate',
-              icon: Icons.badge_outlined,
+              icon: Icons.location_on_outlined,
+              items: const ['Dubai',
+          'Abu Dhabi',
+          'Sharjah',
+          'Ajman',
+          'Umm Al Quwain',
+          'Ras Al Khaimah',
+          'Fujairah',],
+              value: emirateController.text.isEmpty
+                  ? null
+                  : emirateController.text,
+              onChanged: (value) {
+                setState(() {
+                  emirateController.text = value ?? '';
+                });
+              },
             ),
             const SizedBox(height: 16),
             ModernDropdown(
-              label: 'Area',
-              icon: Icons.location_on_outlined,
-              items: const ['Area 1', 'Area 2', 'Area 3'],
-              value: areaController.text.isEmpty ? null : areaController.text,
-              onChanged: (value) =>
-                  setState(() => areaController.text = value ?? ''),
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: retailerNameController,
               label: 'Retailer Name',
               icon: Icons.store_outlined,
+              items: const ['Retailer A', 'Retailer B'], // later from API
+              value: retailerNameController.text.isEmpty
+                  ? null
+                  : retailerNameController.text,
+              onChanged: (value) {
+                setState(() {
+                  retailerNameController.text = value ?? '';
+                  currentEntries = retailerData[value] ?? []; // 🔹 auto-load data
+                });
+              },
             ),
+
             const SizedBox(height: 16),
             _buildModernTextField(
               controller: retailerCodeController,
@@ -515,15 +472,20 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
               label: 'Concern Distributor',
               icon: Icons.business_outlined,
             ),
+            const SizedBox(height: 20),
+             _buildModernTextField(
+              controller: salesLeadController,
+              label: 'Sales Leads',
+              icon: Icons.leaderboard_rounded,
+            ),
           ],
         ),
         const SizedBox(height: 24),
+        // Distribution Details Section
         _buildModernSection(
           title: 'Distribution Details',
           icon: Icons.local_shipping_outlined,
           children: [
-            _buildDistributionModeDropdown(),
-            const SizedBox(height: 16),
             _buildModernTextField(
               controller: painterNameController,
               label: 'Name of Painter / Contractor',
@@ -538,60 +500,48 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
             ),
             const SizedBox(height: 16),
             ModernDropdown(
-              label: 'SKU Size (1/5 Kg)',
+              label:'Material SKU',
               icon: Icons.inventory_2_outlined,
               items: const ['1 Kg', '5 Kg'],
               value: skuSizeController.text.isEmpty
                   ? null
                   : skuSizeController.text,
-              onChanged: (value) =>
-                  setState(() => skuSizeController.text = value ?? ''),
+              onChanged: (value) {
+                setState(() {
+                  skuSizeController.text = value ?? '';
+                });
+              },
             ),
             const SizedBox(height: 16),
             _buildModernTextField(
               controller: materialQtyController,
-              label: 'Material distributed in Kg',
+              label: 'Number of Bags.',
               icon: Icons.scale_outlined,
-              keyboardType: const TextInputType.numberWithOptions(
+              keyboardType: TextInputType.numberWithOptions(
                 decimal: true,
               ),
               inputFormatters: [
-                FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+                FilteringTextInputFormatter.allow(
+                  RegExp(r'^\d*\.?\d*'),
+                ),
               ],
-            ),
-            const SizedBox(height: 16),
+            ),const SizedBox(height: 16),
             _buildModernTextField(
               controller: missedQtyController,
-              label: 'Missed quantity (if any) in Kg',
-              icon: Icons.pending_outlined,
+              label: 'Missed qty (if any)',
+              icon: Icons.remove_circle_outline,
+              keyboardType: TextInputType.numberWithOptions(decimal: true),
               isRequired: false,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
               inputFormatters: [
                 FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
               ],
             ),
+
             const SizedBox(height: 16),
             _buildModernDateField(
               controller: distributionDateController,
               label: 'Date of distribution',
               icon: Icons.event_available_outlined,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        _buildModernSection(
-          title: 'Remarks (Optional)',
-          icon: Icons.notes_outlined,
-          isOptional: true,
-          children: [
-            TextFormField(
-              controller: remarksController,
-              maxLines: 3,
-              decoration: _inputDecoration(
-                label: 'Any notes / site details (optional)',
-              ),
             ),
           ],
         ),
@@ -617,21 +567,14 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
               ),
             )
           : null,
-      title: const Text(
-        'Material Distribution',
-        style: TextStyle(
-          fontWeight: FontWeight.w600,
-          fontSize: 20,
-          color: Color(0xFF1E3A8A),
-        ),
+      title: Text(
+        'Sample Distribution Entry',
+        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20, color: const Color(0xFF1E3A8A)),
       ),
       actions: [
         IconButton(
-          icon: const Icon(
-            Icons.help_outline_rounded,
-            color: Color(0xFF1E3A8A),
-          ),
-          onPressed: _showHelpDialog,
+          icon: const Icon(Icons.help_outline_rounded, color: Color(0xFF1E3A8A)),
+          onPressed: () => _showHelpDialog(),
         ),
       ],
     );
@@ -640,7 +583,7 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
   Widget _buildAnimatedHeader() {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(32),
       decoration: BoxDecoration(
         gradient: const LinearGradient(
           colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
@@ -650,8 +593,8 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: Colors.blue.withOpacity(0.12),
-            blurRadius: 18,
+            color: Colors.blue.withOpacity(0.15),
+            blurRadius: 20,
             offset: const Offset(0, 8),
           ),
         ],
@@ -660,223 +603,20 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Material Distribution',
+            'Sample Distribution Entry',
             style: TextStyle(
-              fontSize: 28,
+              fontSize: 32,
               fontWeight: FontWeight.bold,
               color: Colors.white,
             ),
           ),
-          SizedBox(height: 8),
+          SizedBox(height: 12),
           Text(
             'Enter sample distribution details',
-            style: TextStyle(fontSize: 16, color: Colors.white70),
+            style: TextStyle(fontSize: 18, color: Colors.white70),
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildTargetBanner() {
-    final pct = _monthlyTarget == 0
-        ? 0.0
-        : (_doneThisMonth / _monthlyTarget).clamp(0.0, 1.0);
-    final pctText = ((_doneThisMonth * 100) / _monthlyTarget)
-        .clamp(0, 100)
-        .toStringAsFixed(0);
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 14,
-            offset: const Offset(0, 6),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF1E3A8A).withOpacity(0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(Icons.flag_rounded, color: Color(0xFF1E3A8A)),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text(
-                  'Monthly Sampling Target',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                ),
-              ),
-              Text(
-                '$_doneThisMonth / $_monthlyTarget',
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: LinearProgressIndicator(value: pct, minHeight: 10),
-          ),
-          const SizedBox(height: 8),
-          Text('Achieved: $pctText%'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDistributionModeDropdown() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          'Mode of distribution *',
-          style: TextStyle(fontWeight: FontWeight.w600),
-        ),
-        const SizedBox(height: 8),
-        DropdownButtonFormField<DistributionMode>(
-          value: _mode,
-          decoration: _inputDecoration(label: 'Select mode'),
-          items: DistributionMode.values
-              .map((m) => DropdownMenuItem(value: m, child: Text(m.label())))
-              .toList(),
-          onChanged: (v) => setState(() => _mode = v),
-          validator: (v) => v == null ? 'Please select mode' : null,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildReimbursementStubSection() {
-    return _buildModernSection(
-      title: 'Sample Execution & Reimbursement (Entry Page 2 – quick add) ',
-      icon: Icons.receipt_long_outlined,
-      isOptional: true,
-      children: [
-        const Text(
-          'If the on-site sample is completed now, choose reimbursement mode.\n'
-          'Full Entry Page 2 (photos + details) can be recorded from the next screen.',
-          style: TextStyle(color: Colors.black87),
-        ),
-        const SizedBox(height: 16),
-        DropdownButtonFormField<ReimbursementMode>(
-          value: _reimbMode,
-          decoration: _inputDecoration(label: 'Reimbursement mode (optional)'),
-          items: ReimbursementMode.values
-              .map((r) => DropdownMenuItem(value: r, child: Text(r.label())))
-              .toList(),
-          onChanged: _updateReimbAmount,
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            const Icon(Icons.payments_outlined),
-            const SizedBox(width: 8),
-            Text('Computed Amount: AED ${_computedReimb.toStringAsFixed(0)}'),
-          ],
-        ),
-        const SizedBox(height: 16),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: OutlinedButton.icon(
-            icon: const Icon(Icons.app_registration),
-            label: const Text('Go to Sample Execution (Entry Page 2)'),
-            onPressed: () {
-              // TODO: implement your navigation and pass needed args
-              // Navigator.of(context).pushNamed('/sampleExecution', arguments: {...});
-              _toast(
-                'Configure navigation to Sample Execution screen in your router.',
-              );
-            },
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAttachmentsSection() {
-    return _buildModernSection(
-      title: 'Photos (optional)',
-      icon: Icons.photo_library_outlined,
-      isOptional: true,
-      children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            ..._photos.map(
-              (x) => ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.network(
-                  x.path,
-                  width: 90,
-                  height: 90,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) {
-                    // image_picker returns file paths; you will display via Image.file in a real app
-                    return Container(
-                      width: 90,
-                      height: 90,
-                      color: const Color(0xFFF1F5F9),
-                      child: const Icon(Icons.insert_photo, color: Colors.grey),
-                    );
-                  },
-                ),
-              ),
-            ),
-            InkWell(
-              onTap: _pickPhotos,
-              child: Container(
-                width: 90,
-                height: 90,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF1F5F9),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: const Color(0xFFE2E8F0)),
-                ),
-                child: const Icon(Icons.add_a_photo_outlined),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        const Text(
-          'Attach sample photos when available (used in Entry Page 2).',
-        ),
-      ],
-    );
-  }
-
-  InputDecoration _inputDecoration({required String label}) {
-    return InputDecoration(
-      labelText: label,
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: BorderSide(color: Colors.grey.shade300),
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: BorderSide(color: Colors.grey.shade300),
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
-      ),
-      filled: true,
-      fillColor: const Color(0xFFF8FAFC),
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
     );
   }
 
@@ -901,8 +641,9 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Section Header
           Container(
-            padding: const EdgeInsets.all(20),
+            padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
               color: const Color(0xFFF8FAFC),
               borderRadius: const BorderRadius.vertical(
@@ -912,15 +653,15 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
             child: Row(
               children: [
                 Container(
-                  width: 44,
-                  height: 44,
+                  width: 48,
+                  height: 48,
                   decoration: BoxDecoration(
                     color: const Color(0xFF1E3A8A).withOpacity(0.1),
                     shape: BoxShape.circle,
                   ),
-                  child: Icon(icon, color: const Color(0xFF1E3A8A)),
+                  child: Icon(icon, color: const Color(0xFF1E3A8A), size: 24),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 16),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -928,7 +669,7 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
                       Text(
                         title,
                         style: const TextStyle(
-                          fontSize: 18,
+                          fontSize: 20,
                           fontWeight: FontWeight.bold,
                           color: Color(0xFF1F2937),
                         ),
@@ -937,8 +678,8 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
                         Text(
                           'Optional',
                           style: TextStyle(
-                            fontSize: 13,
-                            color: Colors.grey.shade600,
+                            fontSize: 14,
+                            color: Colors.grey.shade500,
                           ),
                         ),
                     ],
@@ -947,8 +688,9 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
               ],
             ),
           ),
+          // Section Content
           Padding(
-            padding: const EdgeInsets.all(20),
+            padding: const EdgeInsets.all(24),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: children,
@@ -970,28 +712,40 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
   }) {
     return TextFormField(
       controller: controller,
-      decoration: _inputDecoration(
-        label: isRequired ? '$label *' : label,
-      ).copyWith(prefixIcon: Icon(icon, color: Colors.grey.shade600)),
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
       keyboardType:
-          keyboardType ?? (isPhone ? TextInputType.phone : TextInputType.text),
+          keyboardType ??
+          (isPhone ? TextInputType.phone : TextInputType.text),
       inputFormatters: inputFormatters,
       validator: (value) {
         if (isRequired && (value == null || value.trim().isEmpty)) {
           return 'Please enter $label';
         }
         if (isPhone && value != null && value.isNotEmpty) {
-          // Valid UAE formats like 50xxxxxxx / 52xxxxxxx / 54xxxxxxx / 55xxxxxxx / 56xxxxxxx / 58xxxxxxx
-          final regex = RegExp(r'^(50|52|54|55|56|58)\d{7}\$');
-          if (!regex.hasMatch(value)) {
+          if (!RegExp(r'^[50|52|54|55|56|58]\d{7}$').hasMatch(value)) {
             return 'Please enter valid UAE mobile number';
           }
-        }
-        if ((label.toLowerCase().contains('kg')) &&
-            value != null &&
-            value.isNotEmpty) {
-          final v = double.tryParse(value);
-          if (v == null || v < 0) return 'Enter a valid non-negative number';
         }
         return null;
       },
@@ -1006,34 +760,50 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
   }) {
     return TextFormField(
       controller: controller,
-      decoration: _inputDecoration(label: isRequired ? '$label *' : label)
-          .copyWith(
-            prefixIcon: Icon(icon, color: Colors.grey.shade600),
-            suffixIcon: const Icon(
-              Icons.calendar_today_rounded,
-              color: Colors.grey,
-            ),
-          ),
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: const Icon(
+          Icons.calendar_today_rounded,
+          color: Colors.grey,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
       readOnly: true,
       onTap: () async {
         final date = await showDatePicker(
           context: context,
           initialDate: DateTime.now(),
-          firstDate: DateTime(2020),
+          firstDate: DateTime(1900),
           lastDate: DateTime(2100),
           builder: (context, child) {
             return Theme(
               data: Theme.of(context).copyWith(
-                colorScheme: const ColorScheme.light(
-                  primary: Color(0xFF1E3A8A),
-                ),
+                colorScheme: const ColorScheme.light(primary: Color(0xFF1E3A8A)),
               ),
               child: child!,
             );
           },
         );
         if (date != null) {
-          controller.text = date.toIso8601String().split('T').first;
+          controller.text = date.toString().split(' ')[0];
         }
       },
       validator: (value) {
@@ -1103,24 +873,18 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
                 color: Color(0xFF1E3A8A),
               ),
               const SizedBox(height: 16),
-              const Text(
+              Text(
                 'Distribution Help',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFF1F2937),
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: const Color(0xFF1F2937)),
               ),
               const SizedBox(height: 16),
               Text(
-                '• Follow SOP: Distribution must flow via Retailer, and record retailer-wise entries.\n'
-                '• Required fields are marked *.\n'
-                '• Record missed quantity if any.\n'
-                '• Reimbursement is recorded during Sample Execution (Entry Page 2).',
-                textAlign: TextAlign.left,
-                style: TextStyle(color: Colors.grey.shade700),
+                'Fill in all required fields marked with *. '
+                'Ensure all distribution details are accurate before submission.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey.shade600),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 24),
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
@@ -1129,7 +893,7 @@ class _SampleDistributEntryState extends State<SampleDistributEntry>
                     backgroundColor: const Color(0xFF1E3A8A),
                     foregroundColor: Colors.white,
                   ),
-                  child: const Text('Got it'),
+                  child: const Text('Got it', style: TextStyle(color: Colors.white)),
                 ),
               ),
             ],
