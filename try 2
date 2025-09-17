@@ -64,7 +64,7 @@ ORDER BY areaDesc;";
         // 2) Submit the Sample Distribution payload
         // -----------------------------------------
         [HttpPost("submit")]
-        public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
+        public async Task<ActionResult<SubmitResponse>> Submit([FromBody] SampleDistributionRequest req)
         {
             try
             {
@@ -90,17 +90,48 @@ ORDER BY areaDesc;";
                 loginId = (loginId ?? "SYSTEM").Trim();
                 if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
  
-                // 3️⃣ Generate document number
-                const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
-                var genParams = new Dictionary<string, object>
+                // 3️⃣ Generate document number with retry mechanism
+                string docuNumb = null;
+                int maxRetries = 3;
+                for (int attempt = 1; attempt <= maxRetries; attempt++)
                 {
-                    ["@DocType"] = "SDE",
-                    ["@AreaCode"] = req.emirate.Trim()
-                };
-                var genResult = _dbHelper.WebSessBean(genSql, genParams) as List<Dictionary<string, object>>;
-                var docuNumb = genResult?.FirstOrDefault()?["docuNumb"]?.ToString();
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                    return StatusCode(500, new SubmitResponse { success = false, message = "Failed to generate document number.", docuNumb = null });
+                    const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
+                    var genParams = new Dictionary<string, object>
+                    {
+                        ["@DocType"] = "SDE",
+                        ["@AreaCode"] = req.emirate.Trim()
+                    };
+                    var genResult = _dbHelper.WebSessBean(genSql, genParams) as List<Dictionary<string, object>>;
+                    docuNumb = genResult?.FirstOrDefault()?["docuNumb"]?.ToString();
+
+                    if (string.IsNullOrWhiteSpace(docuNumb))
+                    {
+                        if (attempt == maxRetries)
+                            return StatusCode(500, new SubmitResponse { success = false, message = "Failed to generate document number after multiple attempts.", docuNumb = null });
+                        continue;
+                    }
+
+                    // Check if document number already exists in any related table
+                    const string checkSql = @"
+                        SELECT COUNT(*) as cnt FROM (
+                            SELECT docuNumb FROM catsamplead WHERE docuNumb = @docuNumb
+                            UNION ALL
+                            SELECT docuNumb FROM catsampleadDtl WHERE docuNumb = @docuNumb
+                        ) combined";
+
+                    var checkParams = new Dictionary<string, object> { ["@docuNumb"] = docuNumb };
+                    var checkResult = _dbHelper.WebSessBean(checkSql, checkParams) as List<Dictionary<string, object>>;
+                    var existingCount = Convert.ToInt32(checkResult?.FirstOrDefault()?["cnt"] ?? 0);
+
+                    if (existingCount == 0)
+                        break; // Document number is unique, proceed
+
+                    if (attempt == maxRetries)
+                        return StatusCode(500, new SubmitResponse { success = false, message = $"Duplicate document number detected: {docuNumb}. Please try again.", docuNumb = null });
+
+                    // Wait before retry
+                    await Task.Delay(100);
+                }
  
                 // Insert HEADER (catsamplead)
                 var insertHeaderSql = @"
@@ -132,7 +163,19 @@ VALUES
                     ["@createId"] = loginId
                 };
  
-                _dbHelper.WebExecute(insertHeaderSql, headerParams);
+                try
+                {
+                    _dbHelper.WebExecute(insertHeaderSql, headerParams);
+                }
+                catch (Exception ex) when (ex.Message.Contains("PRIMARY KEY constraint") || ex.Message.Contains("duplicate key"))
+                {
+                    return StatusCode(500, new SubmitResponse
+                    {
+                        success = false,
+                        message = $"Duplicate record detected for document {docuNumb}. This document may already exist in the system.",
+                        docuNumb = docuNumb
+                    });
+                }
  
                 // Insert DETAIL (catsampleadDtl)
                 var insertDetailSql = @"
@@ -151,11 +194,28 @@ VALUES
   @createId, GETDATE()
 );";
  
-                _dbHelper.WebExecute(insertDetailSql, headerParams);
+                try
+                {
+                    _dbHelper.WebExecute(insertDetailSql, headerParams);
+                }
+                catch (Exception ex) when (ex.Message.Contains("PRIMARY KEY constraint") || ex.Message.Contains("duplicate key"))
+                {
+                    return StatusCode(500, new SubmitResponse
+                    {
+                        success = false,
+                        message = $"Failed to insert detail record for document {docuNumb}. This may be a duplicate entry.",
+                        docuNumb = docuNumb
+                    });
+                }
  
                 // 4️⃣ Update the sequence
                 const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
-                _dbHelper.WebSessBean(updSql, genParams);
+                var updParams = new Dictionary<string, object>
+                {
+                    ["@DocType"] = "SDE",
+                    ["@AreaCode"] = req.emirate.Trim()
+                };
+                _dbHelper.WebSessBean(updSql, updParams);
  
                 return Ok(new SubmitResponse
                 {
