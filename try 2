@@ -1,3197 +1,1141 @@
-import 'dart:convert';
-import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart';
-import '../models/image_upload_models.dart';
-import 'upload_service.dart';
-
-class ImageUploadService {
-  static final Map<String, PendingImageUpload> _pendingUploads = {};
-
-  static Future<PendingImageUpload?> selectImage({
-    String attFilTy = "01",
-    String createId = "SYSTEM",
-  }) async {
-    try {
-      final file = await pickImage();
-      if (file == null) return null;
-
-      if (!isValidImageFile(file)) {
-        throw Exception('Invalid file type. Only image files are allowed.');
-      }
-
-      final id = DateTime.now().millisecondsSinceEpoch.toString();
-      String filePath;
-
-      if (kIsWeb) {
-        if (file.bytes != null) {
-          final bytes = file.bytes!;
-          final base64String = base64Encode(bytes);
-          final mimeType = _getMimeType(file.extension);
-          filePath = 'data:$mimeType;base64,$base64String';
-        } else {
-          throw Exception('File bytes are null');
-        }
-      } else {
-        filePath = file.path ?? '';
-      }
-
-      final pendingUpload = PendingImageUpload(
-        id: id,
-        fileName: file.name,
-        filePath: filePath,
-        fileBytes: file.bytes,
-        fileExtension: file.extension ?? '',
-        fileSize: file.size,
-        attFilTy: attFilTy,
-        createId: createId,
-      );
-
-      _pendingUploads[id] = pendingUpload;
-      return pendingUpload;
-    } catch (e) {
-      throw Exception('Failed to select image: ${e.toString()}');
-    }
-  }
-
-  static void removePendingUpload(String id) {
-    _pendingUploads.remove(id);
-  }
-
-  static List<PendingImageUpload> getPendingUploads() {
-    return _pendingUploads.values.toList();
-  }
-
-  static PendingImageUpload? getPendingUpload(String id) {
-    return _pendingUploads[id];
-  }
-
-  static void clearPendingUploads() {
-    _pendingUploads.clear();
-  }
-
-  static Future<List<ImageUploadResponse>> uploadPendingImages() async {
-    final results = <ImageUploadResponse>[];
-    final uploads = List<PendingImageUpload>.from(_pendingUploads.values);
-
-    for (final upload in uploads) {
-      try {
-        final result = await UploadService.uploadFile(
-          upload.filePath,
-          originalName: upload.fileName,
-        );
-
-        if (result['success'] == true) {
-          final data = result['data'] as Map<String, dynamic>?;
-          results.add(ImageUploadResponse(
-            msg: 'Image uploaded successfully',
-            success: true,
-            data: data != null ? ImageUploadData.fromJson(data) : null,
-          ));
-          _pendingUploads.remove(upload.id);
-        } else {
-          results.add(ImageUploadResponse(
-            msg: result['error']?.toString() ?? 'Upload failed for ${upload.fileName}',
-            success: false,
-          ));
-        }
-      } catch (e) {
-        results.add(ImageUploadResponse(
-          msg: 'Network error for ${upload.fileName}: ${e.toString()}',
-          success: false,
-        ));
-      }
-    }
-
-    return results;
-  }
-
-  static Future<ImageUploadResponse> uploadSinglePendingImage(String id) async {
-    final upload = _pendingUploads[id];
-    if (upload == null) {
-      return ImageUploadResponse(
-        msg: 'Pending upload not found',
-        success: false,
-      );
-    }
-
-    try {
-      final result = await UploadService.uploadFile(
-        upload.filePath,
-        originalName: upload.fileName,
-      );
-
-      if (result['success'] == true) {
-        final data = result['data'] as Map<String, dynamic>?;
-        _pendingUploads.remove(id);
-        return ImageUploadResponse(
-          msg: 'Image uploaded successfully',
-          success: true,
-          data: data != null ? ImageUploadData.fromJson(data) : null,
-        );
-      } else {
-        return ImageUploadResponse(
-          msg: result['error']?.toString() ?? 'Upload failed',
-          success: false,
-        );
-      }
-    } catch (e) {
-      return ImageUploadResponse(
-        msg: 'Network error: ${e.toString()}',
-        success: false,
-      );
-    }
-  }
-
-  static Future<PlatformFile?> pickImage() async {
-    try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.image,
-        allowMultiple: false,
-        withData: true, // This ensures bytes are loaded
-      );
-
-      if (result != null && result.files.isNotEmpty) {
-        return result.files.first;
-      }
-      return null;
-    } catch (e) {
-      throw Exception('Failed to pick image: ${e.toString()}');
-    }
-  }
-
-  static bool isValidImageFile(PlatformFile file) {
-    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
-    final fileExtension = file.extension?.toLowerCase();
-
-    if (fileExtension == null) return false;
-
-    return allowedExtensions.contains('.$fileExtension');
-  }
-
-  static String formatFileSize(int bytes) {
-    if (bytes <= 0) return "0 B";
-    const suffixes = ["B", "KB", "MB", "GB"];
-    int i = 0;
-    double size = bytes.toDouble();
-
-    while (size >= 1024 && i < suffixes.length - 1) {
-      size /= 1024;
-      i++;
-    }
-
-    return "${size.toStringAsFixed(1)} ${suffixes[i]}";
-  }
-
-  static String _getMimeType(String? extension) {
-    if (extension == null) return 'application/octet-stream';
-
-    switch (extension.toLowerCase()) {
-      case 'jpg':
-      case 'jpeg':
-        return 'image/jpeg';
-      case 'png':
-        return 'image/png';
-      case 'gif':
-        return 'image/gif';
-      case 'bmp':
-        return 'image/bmp';
-      case 'webp':
-        return 'image/webp';
-      default:
-        return 'application/octet-stream';
-    }
-  }
-
-  static Future<bool> testConnectivity() async {
-    return await UploadService.testConnectivity();
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// upload_service.dart
-import 'dart:convert';
-import 'dart:io' show File; // used only on mobile paths
-import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-import 'package:http_parser/http_parser.dart';
-import 'package:file_picker/file_picker.dart';
-// Web-only
-import 'package:web/web.dart' as web;
-import '../models/image_upload_models.dart';
-
-class UploadService {
-  // Pending uploads management
-  static final Map<String, PendingImageUpload> _pendingUploads = {};
-
-  // Detect webview-ish contexts (wider net than widget side)
-  static bool get _isInAppWebView {
-    if (kIsWeb) {
-      try {
-        final ua = web.window.navigator.userAgent.toLowerCase();
-        final vendor = web.window.navigator.vendor.toLowerCase();
-        final loc = web.window.location;
-
-        final isInAppWebView =
-            ua.contains('inapp') ||
-            ua.contains('webview') ||
-            ua.contains('inappbrowser') ||
-            ua.contains('capacitor') ||
-            ua.contains('cordova') ||
-            ua.contains('phonegap') ||
-            vendor.contains('inapp') ||
-            loc.protocol == 'file:' ||
-            loc.protocol == 'capacitor:' ||
-            loc.protocol == 'ionic:' ||
-            (loc.hostname == 'localhost' && loc.port.isEmpty) ||
-            (ua.contains('mobile') && !ua.contains('chrome'));
-
-        return isInAppWebView;
-      } catch (_) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  static List<String> get _fallbackUrls => <String>[
-    'http://10.4.64.23:8521/api', // Your API endpoint
-  ];
-
-  static String get baseUrl {
-    return 'http://10.4.64.23:8521/api';
-  }
-
-  /// Upload file to server only - no local storage fallback
-  static Future<Map<String, dynamic>> uploadFile(
-    String filePath, {
-    String? originalName,
-    String attFilTy = "01",
-    String createId = "SYSTEM",
-  }) async {
-    return await _uploadWithFallback(
-      filePath,
-      originalName: originalName,
-      attFilTy: attFilTy,
-      createId: createId,
-    );
-  }
-
-  static Future<Map<String, dynamic>> _uploadWithFallback(
-    String filePath, {
-    String? originalName,
-    String attFilTy = "01",
-    String createId = "SYSTEM",
-  }) async {
-    // Try primary URL first
-    var result = await _uploadToUrl(
-      baseUrl,
-      filePath,
-      originalName: originalName,
-      attFilTy: attFilTy,
-      createId: createId,
-    );
-    if (result['success'] == true) return result;
-
-    // Try fallbacks
-    for (final url in _fallbackUrls) {
-      result = await _uploadToUrl(
-        url,
-        filePath,
-        originalName: originalName,
-        attFilTy: attFilTy,
-        createId: createId,
-      );
-      if (result['success'] == true) return result;
-    }
-
-    // Give up; caller may choose local fallback
-    return result;
-  }
-
-  static Future<Map<String, dynamic>> _uploadToUrl(
-    String baseUrl,
-    String filePath, {
-    String? originalName,
-    String attFilTy = "01",
-    String createId = "SYSTEM",
-  }) async {
-    try {
-      final uri = Uri.parse('$baseUrl/ImageUpload/upload');
-      final request = http.MultipartRequest('POST', uri);
-
-      // Helpful (but CORS must be on server)
-      request.headers['Accept'] = 'application/json';
-
-      // Add required metadata fields
-      request.fields['attFilTy'] = attFilTy;
-      request.fields['createId'] = createId;
-
-      if (kIsWeb) {
-        if (filePath.startsWith('data:')) {
-          final parts = filePath.split(',');
-          if (parts.length != 2) {
-            throw Exception('Invalid data URL format');
-          }
-          final header = parts[0]; // data:<mime>;base64
-          final mimeType = header.split(':')[1].split(';')[0];
-          final bytes = base64Decode(parts[1]);
-          final fileName = originalName ?? 'upload.${_extFromMime(mimeType)}';
-          final extension = '.${_extFromMime(mimeType)}';
-
-          // Add file metadata fields
-          request.fields['fileName'] = fileName;
-          request.fields['fileSize'] = bytes.length.toString();
-          request.fields['fileExtension'] = extension;
-
-          // Debug logging for web path
-          if (kIsWeb) {
-            print('WEB PATH DEBUG:');
-            print('- mimeType: $mimeType');
-            print('- _extFromMime result: ${_extFromMime(mimeType)}');
-            print('- final extension: $extension');
-          }
-
-          request.files.add(
-            http.MultipartFile.fromBytes(
-              'file',
-              bytes,
-              filename: fileName,
-              contentType: MediaType.parse(mimeType),
-            ),
-          );
-        } else {
-          // If you support blob: or object URLs, you'd need to fetch them first in JS and pass data:
-          throw Exception(
-            'Unsupported web file path format (expected data: URL)',
-          );
-        }
-      } else {
-        final file = File(filePath);
-        if (!await file.exists()) {
-          throw Exception('File does not exist: $filePath');
-        }
-
-        final fileName = originalName ?? file.path.split('/').last;
-        final fileSize = await file.length();
-        final fileExtension = fileName.split('.').last;
-
-        // Add file metadata fields
-        request.fields['fileName'] = fileName;
-        request.fields['fileSize'] = fileSize.toString();
-        request.fields['fileExtension'] = fileExtension.startsWith('.') ? fileExtension : '.$fileExtension';
-
-        request.files.add(
-          await http.MultipartFile.fromPath(
-            'file',
-            filePath,
-            filename: fileName,
-            contentType: MediaType.parse(_getMimeTypeFromExtension(fileExtension)),
-          ),
-        );
-      }
-
-      // Reasonable timeouts
-      final timeout = _isInAppWebView
-          ? const Duration(seconds: 20)
-          : const Duration(seconds: 30);
-
-      final streamed = await request.send().timeout(
-        timeout,
-        onTimeout: () {
-          throw Exception('Upload timed out after ${timeout.inSeconds}s');
-        },
-      );
-      final response = await http.Response.fromStream(streamed);
-
-      // Print debug info to web console
-      if (kIsWeb) {
-        print('=== UPLOAD DEBUG INFO ===');
-        print('URL: $baseUrl/ImageUpload/upload');
-        print('Status Code: ${response.statusCode}');
-        print('Request Fields: ${request.fields}');
-        print('Request Files: ${request.files.map((f) => '${f.field}: ${f.filename} (${f.length} bytes)')}');
-        print('Response Body: ${response.body}');
-        print('Response Headers: ${response.headers}');
-        print('==========================');
-      }
-
-      if (response.statusCode == 200) {
-        final data = _safeJson(response.body);
-        return {'success': true, 'data': data};
-      } else {
-        final err = _safeJson(response.body);
-        final msg = (err['error'] ?? err['message'] ?? 'Upload failed').toString();
-        return {
-          'success': false,
-          'error': _isInAppWebView ? 'InAppWebView upload error: $msg' : msg,
-        };
-      }
-    } catch (e) {
-      String msg = 'Upload failed: $e';
-      if (_isInAppWebView) {
-        if (e.toString().contains('timed out')) {
-          msg =
-              'Upload timed out in InAppWebView. Please check your connection and try again.';
-        } else if (e.toString().contains('SocketException') ||
-            e.toString().contains('Connection')) {
-          msg =
-              'Network connection failed in InAppWebView. Ensure the server is reachable.';
-        } else {
-          msg = 'InAppWebView upload error: $e';
-        }
-      }
-      return {'success': false, 'error': msg};
-    }
-  }
-
-  static Future<bool> testConnectivity() async {
-    try {
-      final resp = await http
-          .get(
-            Uri.parse('$baseUrl/health'),
-            headers: {'Accept': 'application/json'},
-          )
-          .timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => throw Exception('Timeout'),
-          );
-      return resp.statusCode == 200;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  // -------- Image Upload Methods --------
-
-  static Future<PendingImageUpload?> selectImage({
-    String attFilTy = "01",
-    String createId = "SYSTEM",
-  }) async {
-    try {
-      final file = await pickImage();
-      if (file == null) return null;
-
-      if (!isValidImageFile(file)) {
-        throw Exception('Invalid file type. Only image files are allowed.');
-      }
-
-      final id = DateTime.now().millisecondsSinceEpoch.toString();
-      String filePath;
-
-      if (kIsWeb) {
-        if (file.bytes != null) {
-          final bytes = file.bytes!;
-          final base64String = base64Encode(bytes);
-          final mimeType = _getMimeType(file.extension);
-          filePath = 'data:$mimeType;base64,$base64String';
-        } else {
-          throw Exception('File bytes are null');
-        }
-      } else {
-        filePath = file.path ?? '';
-      }
-
-      final pendingUpload = PendingImageUpload(
-        id: id,
-        fileName: file.name,
-        filePath: filePath,
-        fileBytes: file.bytes,
-        fileExtension: file.extension ?? '',
-        fileSize: file.size,
-        attFilTy: attFilTy,
-        createId: createId,
-      );
-
-      _pendingUploads[id] = pendingUpload;
-      return pendingUpload;
-    } catch (e) {
-      throw Exception('Failed to select image: ${e.toString()}');
-    }
-  }
-
-  static void removePendingUpload(String id) {
-    _pendingUploads.remove(id);
-  }
-
-  static List<PendingImageUpload> getPendingUploads() {
-    return _pendingUploads.values.toList();
-  }
-
-  static PendingImageUpload? getPendingUpload(String id) {
-    return _pendingUploads[id];
-  }
-
-  static void clearPendingUploads() {
-    _pendingUploads.clear();
-  }
-
-  static Future<List<ImageUploadResponse>> uploadPendingImages() async {
-    final results = <ImageUploadResponse>[];
-    final uploads = List<PendingImageUpload>.from(_pendingUploads.values);
-
-    for (final upload in uploads) {
-      try {
-        final result = await uploadFile(
-          upload.filePath,
-          originalName: upload.fileName,
-          attFilTy: upload.attFilTy,
-          createId: upload.createId,
-        );
-
-        if (result['success'] == true) {
-          final data = result['data'] as Map<String, dynamic>?;
-          results.add(ImageUploadResponse(
-            msg: 'Image uploaded successfully',
-            success: true,
-            data: data != null ? ImageUploadData.fromJson(data) : null,
-          ));
-          _pendingUploads.remove(upload.id);
-        } else {
-          results.add(ImageUploadResponse(
-            msg: result['error']?.toString() ?? 'Upload failed for ${upload.fileName}',
-            success: false,
-          ));
-        }
-      } catch (e) {
-        results.add(ImageUploadResponse(
-          msg: 'Network error for ${upload.fileName}: ${e.toString()}',
-          success: false,
-        ));
-      }
-    }
-
-    return results;
-  }
-
-  static Future<ImageUploadResponse> uploadSinglePendingImage(String id) async {
-    final upload = _pendingUploads[id];
-    if (upload == null) {
-      return ImageUploadResponse(
-        msg: 'Pending upload not found',
-        success: false,
-      );
-    }
-
-    try {
-      final result = await uploadFile(
-        upload.filePath,
-        originalName: upload.fileName,
-        attFilTy: upload.attFilTy,
-        createId: upload.createId,
-      );
-
-      if (result['success'] == true) {
-        final data = result['data'] as Map<String, dynamic>?;
-        _pendingUploads.remove(id);
-        return ImageUploadResponse(
-          msg: 'Image uploaded successfully',
-          success: true,
-          data: data != null ? ImageUploadData.fromJson(data) : null,
-        );
-      } else {
-        return ImageUploadResponse(
-          msg: result['error']?.toString() ?? 'Upload failed',
-          success: false,
-        );
-      }
-    } catch (e) {
-      return ImageUploadResponse(
-        msg: 'Network error: ${e.toString()}',
-        success: false,
-      );
-    }
-  }
-
-  static Future<PlatformFile?> pickImage() async {
-    try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.image,
-        allowMultiple: false,
-        withData: true, // This ensures bytes are loaded
-      );
-
-      if (result != null && result.files.isNotEmpty) {
-        return result.files.first;
-      }
-      return null;
-    } catch (e) {
-      throw Exception('Failed to pick image: ${e.toString()}');
-    }
-  }
-
-  static bool isValidImageFile(PlatformFile file) {
-    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
-    final fileExtension = file.extension?.toLowerCase();
-
-    if (fileExtension == null) return false;
-
-    return allowedExtensions.contains('.$fileExtension');
-  }
-
-  static String formatFileSize(int bytes) {
-    if (bytes <= 0) return "0 B";
-    const suffixes = ["B", "KB", "MB", "GB"];
-    int i = 0;
-    double size = bytes.toDouble();
-
-    while (size >= 1024 && i < suffixes.length - 1) {
-      size /= 1024;
-      i++;
-    }
-
-    return "${size.toStringAsFixed(1)} ${suffixes[i]}";
-  }
-
-  // -------- helpers --------
-
-  static String _extFromMime(String mime) {
-    switch (mime) {
-      case 'image/jpeg':
-        return 'jpg';
-      case 'image/png':
-        return 'png';
-      case 'image/gif':
-        return 'gif';
-      case 'image/webp':
-        return 'webp';
-      case 'application/pdf':
-        return 'pdf';
-      case 'text/plain':
-        return 'txt';
-      default:
-        return 'bin';
-    }
-  }
-
-  static String _getMimeType(String? extension) {
-    if (extension == null) return 'application/octet-stream';
-
-    switch (extension.toLowerCase()) {
-      case 'jpg':
-      case 'jpeg':
-        return 'image/jpeg';
-      case 'png':
-        return 'image/png';
-      case 'gif':
-        return 'image/gif';
-      case 'bmp':
-        return 'image/bmp';
-      case 'webp':
-        return 'image/webp';
-      default:
-        return 'application/octet-stream';
-    }
-  }
-
-  static String _getMimeTypeFromExtension(String extension) {
-    // Remove leading dot if present
-    final ext = extension.startsWith('.') ? extension.substring(1) : extension;
-
-    switch (ext.toLowerCase()) {
-      case 'jpg':
-      case 'jpeg':
-        return 'image/jpeg';
-      case 'png':
-        return 'image/png';
-      case 'gif':
-        return 'image/gif';
-      case 'bmp':
-        return 'image/bmp';
-      case 'webp':
-        return 'image/webp';
-      case 'pdf':
-        return 'application/pdf';
-      case 'txt':
-        return 'text/plain';
-      default:
-        return 'application/octet-stream';
-    }
-  }
-
-  static Map<String, dynamic> _safeJson(String body) {
-    try {
-      final parsed = json.decode(body);
-      return parsed is Map<String, dynamic>
-          ? parsed
-          : <String, dynamic>{'raw': parsed};
-    } catch (_) {
-      return <String, dynamic>{'raw': body};
-    }
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// file_upload_widget.dart
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io' show File; // OK on mobile; guarded by kIsWeb checks
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:file_picker/file_picker.dart';
+import '../../../core/widgets/modern_dropdown.dart';
 
-// Web-only libs (guarded by kIsWeb)
-import 'package:web/web.dart' as web;
-// ignore: deprecated_member_use
-import 'dart:js' as js;
-import 'dart:js_util' as js_util;
+// =============================================================
+// UAE Sampling Drive — Entry Page 1 (Distribution Details)
+// SOP applied: modes, monthly target (13), missed qty, reimbursement stub,
+// phone validation for UAE, and local monthly progress tracking.
+// Entry Page 2 (Sample Execution + reimbursement recording + photos)
+// is linked via a navigation stub button (configure your route accordingly).
+// =============================================================
 
-import '../services/upload_service.dart';
+class SampleDistributEntry extends StatefulWidget {
+  const SampleDistributEntry({super.key});
+  @override
+  State<SampleDistributEntry> createState() => _SampleDistributEntryState();
+}
 
-// PDF viewer
-import 'package:pdfx/pdfx.dart';
+enum DistributionMode {
+  distributorToPainterViaRetailer, // Distributor -> Retailer -> Painter
+  retailerToPainters, // Retailer -> Painter
+  employeeToPainterViaRetailer, // Employee -> Retailer -> Painter (onsite sample)
+}
 
-/// Detect if running inside an InAppWebView-like environment
-bool get _isInAppWebView {
-  if (kIsWeb) {
-    try {
-      final userAgent = web.window.navigator.userAgent.toLowerCase();
-      final location = web.window.location;
-
-      final isStandardBrowser =
-          (userAgent.contains('chrome') &&
-              userAgent.contains('chrome/') &&
-              !userAgent.contains('webview')) ||
-          userAgent.contains('firefox') ||
-          (userAgent.contains('safari') &&
-              !userAgent.contains('webview') &&
-              !userAgent.contains('mobile')) ||
-          userAgent.contains('edge');
-
-      if (isStandardBrowser &&
-          location.protocol.startsWith('http') &&
-          location.hostname != 'localhost') {
-        // Standard browser → NOT InAppWebView
-        return false;
-      }
-
-      // Assume InAppWebView in all other web cases (safer for camera)
-      return true;
-    } catch (_) {
-      return true; // Fail-safe: treat as InAppWebView
+extension DistributionModeX on DistributionMode {
+  String label() {
+    switch (this) {
+      case DistributionMode.distributorToPainterViaRetailer:
+        return 'Distributor → Retailer → Painter';
+      case DistributionMode.retailerToPainters:
+        return 'Retailer → Painter';
+      case DistributionMode.employeeToPainterViaRetailer:
+        return 'Employee → Retailer → Painter (Onsite)';
     }
   }
-  return false;
 }
 
-class FileUploadWidget extends StatefulWidget {
-  final String label;
-  final IconData icon;
-  final Function(String?) onFileSelected;
-  final Duration delay;
-  final bool isRequired;
-  final List<String> allowedExtensions;
-  final double maxSizeInMB;
-  final String? currentFilePath;
-  final String? formType; // 'contractor' or 'painter' get a simplified picker
+enum ReimbursementMode { hiredPainter, sitePainter }
 
-  const FileUploadWidget({
-    super.key,
-    required this.label,
-    required this.icon,
-    required this.onFileSelected,
-    this.delay = Duration.zero,
-    this.isRequired = true,
-    this.allowedExtensions = const ['*'],
-    this.maxSizeInMB = 15.0,
-    this.currentFilePath,
-    this.formType,
-  });
+extension ReimbursementModeX on ReimbursementMode {
+  String label() {
+    switch (this) {
+      case ReimbursementMode.hiredPainter:
+        return '0';
+      case ReimbursementMode.sitePainter:
+        return 'AED 150';
+    }
+  }
 
-  @override
-  State<FileUploadWidget> createState() => _FileUploadWidgetState();
+  double amount() {
+    switch (this) {
+      case ReimbursementMode.hiredPainter:
+        return 0; //
+      case ReimbursementMode.sitePainter:
+        return 150.0; // wages only
+    }
+  }
 }
 
-class _FileUploadWidgetState extends State<FileUploadWidget>
-    with SingleTickerProviderStateMixin {
+class _SampleDistributEntryState extends State<SampleDistributEntry>
+    with TickerProviderStateMixin {
+  // Controllers (Entry Page 1)
+  final emiratesController = TextEditingController();
+  final areaController = TextEditingController();
+  final retailerNameController = TextEditingController();
+  final retailerCodeController = TextEditingController();
+  final distributorController = TextEditingController();
+  final painterNameController = TextEditingController();
+  final painterMobileController = TextEditingController();
+  final skuSizeController = TextEditingController();
+  final materialQtyController = TextEditingController();
+  final missedQtyController = TextEditingController();
+  final distributionDateController = TextEditingController();
+  final remarksController = TextEditingController();
+
+  // Animation controllers
+  late final AnimationController _mainController;
+  late final AnimationController _fabController;
+  late final Animation<double> _fadeAnimation;
+  late final Animation<Offset> _slideAnimation;
+  late final Animation<double> _scaleAnimation;
+
+  // SOP additions
+  DistributionMode? _mode;
+  ReimbursementMode? _reimbMode; // for sample execution (Entry Page 2) stub
+  double _computedReimb = 0.0;
+
+  // Attachments (photos) — optional for Entry Page 2
   final ImagePicker _picker = ImagePicker();
+  List<XFile> _photos = [];
 
-  String? _selectedFilePath;
-  String? _originalFileName;
-  String? _fileType; // captured type hint for UI (does NOT control detection)
-  bool _isVisible = false;
-  bool _isUploading = false;
-  bool _isUploaded = false;
-  String? _uploadError;
+  bool _isSubmitting = false;
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
 
-  AnimationController? _animationController;
-  Animation<double>? _scaleAnimation;
-  ScaffoldMessengerState? _scaffoldMessenger;
+  // Target tracking (local)
+  static const int _monthlyTarget = 13; // SOP target
+  int _doneThisMonth = 0;
 
   @override
   void initState() {
     super.initState();
-
-    _selectedFilePath = widget.currentFilePath;
-
-    _animationController = AnimationController(
-      duration: const Duration(milliseconds: 200),
+    _mainController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
       vsync: this,
     );
-    _scaleAnimation = Tween<double>(begin: 1.0, end: 0.95).animate(
-      CurvedAnimation(parent: _animationController!, curve: Curves.easeInOut),
+    _fabController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
     );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _mainController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+    _mainController.forward();
+    _fabController.forward();
 
-    Future.delayed(widget.delay, () {
-      if (mounted) setState(() => _isVisible = true);
-    });
-  }
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _scaffoldMessenger = ScaffoldMessenger.of(context);
-  }
-
-  @override
-  void didUpdateWidget(FileUploadWidget oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.currentFilePath != oldWidget.currentFilePath) {
-      setState(() {
-        _selectedFilePath = widget.currentFilePath;
-        if (_selectedFilePath != null && _selectedFilePath!.isNotEmpty) {
-          _isUploading = false;
-          _isUploaded = true;
-          _uploadError = null;
-        }
-      });
-    }
+    _restoreDraft();
+    _loadMonthlyProgress();
   }
 
   @override
   void dispose() {
-    _animationController?.dispose();
-    _scaffoldMessenger = null;
+    _mainController.dispose();
+    _fabController.dispose();
+    emiratesController.dispose();
+    areaController.dispose();
+    retailerNameController.dispose();
+    retailerCodeController.dispose();
+    distributorController.dispose();
+    painterNameController.dispose();
+    painterMobileController.dispose();
+    skuSizeController.dispose();
+    materialQtyController.dispose();
+    missedQtyController.dispose();
+    distributionDateController.dispose();
+    remarksController.dispose();
     super.dispose();
   }
 
-  bool _isContractorOrPainterForm() =>
-      widget.formType == 'contractor' || widget.formType == 'painter';
+  String _monthKey() {
+    final now = DateTime.now();
+    return 'sample_count_${now.year}${now.month.toString().padLeft(2, '0')}';
+  }
 
-  void _safeShowSnackBar(SnackBar bar) {
-    if (mounted && _scaffoldMessenger != null) {
-      _scaffoldMessenger!.showSnackBar(bar);
+  Future<void> _loadMonthlyProgress() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _doneThisMonth = prefs.getInt(_monthKey()) ?? 0;
+    });
+  }
+
+  Future<void> _incrementMonthlyProgress() async {
+    final prefs = await SharedPreferences.getInstance();
+    final current = prefs.getInt(_monthKey()) ?? 0;
+    await prefs.setInt(_monthKey(), current + 1);
+    setState(() => _doneThisMonth = current + 1);
+  }
+
+  Future<void> _restoreDraft() async {
+    final prefs = await SharedPreferences.getInstance();
+    emiratesController.text = prefs.getString('emirates') ?? '';
+    areaController.text = prefs.getString('area') ?? '';
+    retailerNameController.text = prefs.getString('retailerName') ?? '';
+    retailerCodeController.text = prefs.getString('retailerCode') ?? '';
+    distributorController.text = prefs.getString('distributor') ?? '';
+    painterNameController.text = prefs.getString('painterName') ?? '';
+    painterMobileController.text = prefs.getString('painterMobile') ?? '';
+    skuSizeController.text = prefs.getString('skuSize') ?? '';
+    materialQtyController.text = prefs.getString('materialQty') ?? '';
+    distributionDateController.text = prefs.getString('distributionDate') ?? '';
+    missedQtyController.text = prefs.getString('missedQty') ?? '';
+
+    final modeStr = prefs.getString('distributionMode');
+    if (modeStr != null) {
+      _mode = DistributionMode.values.firstWhere(
+        (m) => m.toString() == modeStr,
+        orElse: () => DistributionMode.retailerToPainters,
+      );
+    }
+    final reimbStr = prefs.getString('reimbMode');
+    if (reimbStr != null) {
+      _reimbMode = ReimbursementMode.values.firstWhere(
+        (r) => r.toString() == reimbStr,
+        orElse: () => ReimbursementMode.sitePainter,
+      );
+      _computedReimb = _reimbMode!.amount();
+    }
+    setState(() {});
+  }
+
+  void _updateReimbAmount(ReimbursementMode? mode) {
+    setState(() {
+      _reimbMode = mode;
+      _computedReimb = mode?.amount() ?? 0.0;
+    });
+  }
+
+  Future<void> _pickPhotos() async {
+    final selection = await _picker.pickMultiImage();
+    if (selection.isNotEmpty) {
+      setState(() => _photos = selection);
     }
   }
 
-  void _safeHideCurrentSnackBar() {
-    if (mounted && _scaffoldMessenger != null) {
-      _scaffoldMessenger!.hideCurrentSnackBar();
+  Future<void> _submitForm() async {
+    if (!_formKey.currentState!.validate()) return;
+    if (_mode == null) {
+      _toast('Please select the Mode of distribution');
+      return;
     }
+
+    setState(() => _isSubmitting = true);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      // Persist Entry Page 1 as draft (and for offline report calc)
+      await prefs.setString('emirates', emiratesController.text.trim());
+      await prefs.setString('area', areaController.text.trim());
+      await prefs.setString('retailerName', retailerNameController.text.trim());
+      await prefs.setString('retailerCode', retailerCodeController.text.trim());
+      await prefs.setString('distributor', distributorController.text.trim());
+      await prefs.setString('painterName', painterNameController.text.trim());
+      await prefs.setString(
+        'painterMobile',
+        painterMobileController.text.trim(),
+      );
+      await prefs.setString('skuSize', skuSizeController.text.trim());
+      await prefs.setString('materialQty', materialQtyController.text.trim());
+      await prefs.setString('missedQty', missedQtyController.text.trim());
+      await prefs.setString(
+        'distributionDate',
+        distributionDateController.text,
+      );
+      await prefs.setString('distributionMode', _mode.toString());
+
+      if (_reimbMode != null) {
+        await prefs.setString('reimbMode', _reimbMode.toString());
+        await prefs.setDouble('reimbAmount', _computedReimb);
+      }
+
+      // TODO: Replace with real API call to your backend
+      await Future.delayed(const Duration(milliseconds: 800));
+
+      if (mounted) {
+        await _incrementMonthlyProgress();
+        _toast('Sample distribution saved successfully');
+      }
+    } catch (e) {
+      _toast('Error: ${e.toString()}', isError: true);
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
+  }
+
+  void _toast(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? Colors.orange : Colors.green,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 3),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              widget.isRequired ? '${widget.label} *' : widget.label,
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w500,
-                color: Colors.black87,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isDesktop = constraints.maxWidth > 1200;
+        final isTablet =
+            constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
+        // final isMobile = constraints.maxWidth <= 800;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF8FAFC),
+          appBar: _buildModernAppBar(),
+          body: FadeTransition(
+            opacity: _fadeAnimation,
+            child: SlideTransition(
+              position: _slideAnimation,
+              child: SingleChildScrollView(
+                padding: EdgeInsets.symmetric(
+                  horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
+                  vertical: 24,
+                ),
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: isDesktop ? 1400 : double.infinity,
+                    ),
+                    child: ScaleTransition(
+                      scale: _scaleAnimation,
+                      child: Form(
+                        key: _formKey,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _buildAnimatedHeader(),
+                            const SizedBox(height: 16),
+                            _buildTargetBanner(),
+                            const SizedBox(height: 24),
+                            if (isDesktop)
+                              _buildDesktopLayout()
+                            else
+                              _buildMobileLayout(),
+                            const SizedBox(height: 24),
+                            _buildReimbursementStubSection(),
+                            const SizedBox(height: 24),
+                            _buildAttachmentsSection(),
+                            const SizedBox(height: 32),
+                            _buildAnimatedSubmitButton(),
+                            const SizedBox(height: 48),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ),
             ),
-            const SizedBox(height: 12),
-            ScaleTransition(
-              scale: _scaleAnimation ?? const AlwaysStoppedAnimation(1.0),
-              child: GestureDetector(
-                onTapDown: (_) => _animationController?.forward(),
-                onTapUp: (_) => _animationController?.reverse(),
-                onTapCancel: () => _animationController?.reverse(),
-                onTap: _selectedFilePath == null
-                    ? () => _showUploadOptions(context)
-                    : () => _showFileActions(context),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  height: 120,
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: _selectedFilePath != null
-                          ? Colors.green.shade300
-                          : Colors.grey.shade300,
-                      width: 2,
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                    color: _selectedFilePath != null
-                        ? Colors.white
-                        : Colors.grey.shade50,
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDesktopLayout() {
+    return Column(
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: _buildModernSection(
+                title: 'Retailer Details',
+                icon: Icons.store_rounded,
+                children: [
+                  _buildModernTextField(
+                    controller: emiratesController,
+                    label: 'Emirate',
+                    icon: Icons.badge_outlined,
                   ),
-                  child: _selectedFilePath != null
-                      ? _buildUploadedFileDisplay()
-                      : _buildUploadPrompt(),
-                ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Area',
+                    icon: Icons.location_on_outlined,
+                    items: const ['Area 1', 'Area 2', 'Area 3'],
+                    value: areaController.text.isEmpty
+                        ? null
+                        : areaController.text,
+                    onChanged: (value) =>
+                        setState(() => areaController.text = value ?? ''),
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: retailerNameController,
+                    label: 'Retailer Name',
+                    icon: Icons.store_outlined,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: retailerCodeController,
+                    label: 'Retailer Code',
+                    icon: Icons.qr_code_outlined,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: distributorController,
+                    label: 'Concern Distributor',
+                    icon: Icons.business_outlined,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 24),
+            Expanded(
+              child: _buildModernSection(
+                title: 'Distribution Details',
+                icon: Icons.local_shipping_outlined,
+                children: [
+                  _buildDistributionModeDropdown(),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: painterNameController,
+                    label: 'Name of Painter / Contractor',
+                    icon: Icons.person_outline_rounded,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: painterMobileController,
+                    label: 'Mobile no Painter / Contractor',
+                    icon: Icons.phone_outlined,
+                    isPhone: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'SKU Size (1/5 Kg)',
+                    icon: Icons.inventory_2_outlined,
+                    items: const ['1 Kg', '5 Kg'],
+                    value: skuSizeController.text.isEmpty
+                        ? null
+                        : skuSizeController.text,
+                    onChanged: (value) =>
+                        setState(() => skuSizeController.text = value ?? ''),
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: materialQtyController,
+                    label: 'Material distributed in Kg',
+                    icon: Icons.scale_outlined,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: missedQtyController,
+                    label: 'Missed quantity (if any) in Kg',
+                    icon: Icons.pending_outlined,
+                    isRequired: false,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernDateField(
+                    controller: distributionDateController,
+                    label: 'Date of distribution',
+                    icon: Icons.event_available_outlined,
+                  ),
+                ],
               ),
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildUploadPrompt() {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Container(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
-            color: Colors.blue.shade50,
-            shape: BoxShape.circle,
-            border: Border.all(color: Colors.blue.shade200, width: 2),
-          ),
-          child: Icon(widget.icon, size: 28, color: Colors.blue.shade600),
-        ),
-        const SizedBox(height: 12),
-        Text(
-          'Tap to upload ${widget.label.toLowerCase()}',
-          style: TextStyle(
-            fontSize: 14,
-            color: Colors.grey.shade700,
-            fontWeight: FontWeight.w600,
-          ),
-          textAlign: TextAlign.center,
-        ),
-        const SizedBox(height: 6),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          decoration: BoxDecoration(
-            color: Colors.blue.shade50,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Text(
-            _isContractorOrPainterForm()
-                ? (_isInAppWebView
-                      ? '🖼️ Gallery Recommended • 📷 Camera (Limited) • 📁 Browse Files'
-                      : '📷 Camera • 🖼️ Gallery • 📁 Browse Files')
-                : '📷 Camera • 🖼️ Gallery • 📁 Files',
-            style: TextStyle(
-              fontSize: 11,
-              color: Colors.blue.shade600,
-              fontWeight: FontWeight.w500,
+        const SizedBox(height: 24),
+        _buildModernSection(
+          title: 'Remarks (Optional)',
+          icon: Icons.notes_outlined,
+          isOptional: true,
+          children: [
+            TextFormField(
+              controller: remarksController,
+              maxLines: 3,
+              decoration: _inputDecoration(
+                label: 'Any notes / site details (optional)',
+              ),
             ),
-          ),
+          ],
         ),
       ],
     );
   }
 
-  Widget _buildUploadedFileDisplay() {
-    final isImage = _isImageFileLocal(_selectedFilePath!);
-
-    return Stack(
+  Widget _buildMobileLayout() {
+    return Column(
       children: [
-        Container(
-          width: double.infinity,
-          height: double.infinity,
-          decoration: BoxDecoration(borderRadius: BorderRadius.circular(10)),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: isImage
-                ? (kIsWeb
-                      ? (_selectedFilePath!.startsWith('data:')
-                            ? Builder(
-                                builder: (context) {
-                                  try {
-                                    final parts = _selectedFilePath!.split(',');
-                                    if (parts.length != 2)
-                                      return _buildFileIconForUploadArea();
-                                    final imageBytes = base64Decode(parts[1]);
-                                    return Image.memory(
-                                      imageBytes,
-                                      width: double.infinity,
-                                      height: double.infinity,
-                                      fit: BoxFit.cover,
-                                      errorBuilder: (_, __, ___) =>
-                                          _buildFileIconForUploadArea(),
-                                    );
-                                  } catch (_) {
-                                    return _buildFileIconForUploadArea();
-                                  }
-                                },
-                              )
-                            : Image.network(
-                                _selectedFilePath!,
-                                width: double.infinity,
-                                height: double.infinity,
-                                fit: BoxFit.cover,
-                                errorBuilder: (_, __, ___) =>
-                                    _buildFileIconForUploadArea(),
-                              ))
-                      : Image.file(
-                          File(_selectedFilePath!),
-                          width: double.infinity,
-                          height: double.infinity,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) =>
-                              _buildFileIconForUploadArea(),
-                        ))
-                : _buildFileIconForUploadArea(),
-          ),
+        _buildModernSection(
+          title: 'Retailer Details',
+          icon: Icons.store_rounded,
+          children: [
+            _buildModernTextField(
+              controller: emiratesController,
+              label: 'Emirate',
+              icon: Icons.badge_outlined,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Area',
+              icon: Icons.location_on_outlined,
+              items: const ['Area 1', 'Area 2', 'Area 3'],
+              value: areaController.text.isEmpty ? null : areaController.text,
+              onChanged: (value) =>
+                  setState(() => areaController.text = value ?? ''),
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: retailerNameController,
+              label: 'Retailer Name',
+              icon: Icons.store_outlined,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: retailerCodeController,
+              label: 'Retailer Code',
+              icon: Icons.qr_code_outlined,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: distributorController,
+              label: 'Concern Distributor',
+              icon: Icons.business_outlined,
+            ),
+          ],
         ),
-        Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [Colors.transparent, Colors.black.withOpacity(0.6)],
+        const SizedBox(height: 24),
+        _buildModernSection(
+          title: 'Distribution Details',
+          icon: Icons.local_shipping_outlined,
+          children: [
+            _buildDistributionModeDropdown(),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: painterNameController,
+              label: 'Name of Painter / Contractor',
+              icon: Icons.person_outline_rounded,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: painterMobileController,
+              label: 'Mobile no Painter / Contractor',
+              icon: Icons.phone_outlined,
+              isPhone: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'SKU Size (1/5 Kg)',
+              icon: Icons.inventory_2_outlined,
+              items: const ['1 Kg', '5 Kg'],
+              value: skuSizeController.text.isEmpty
+                  ? null
+                  : skuSizeController.text,
+              onChanged: (value) =>
+                  setState(() => skuSizeController.text = value ?? ''),
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: materialQtyController,
+              label: 'Material distributed in Kg',
+              icon: Icons.scale_outlined,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+              ],
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: missedQtyController,
+              label: 'Missed quantity (if any) in Kg',
+              icon: Icons.pending_outlined,
+              isRequired: false,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+              ],
+            ),
+            const SizedBox(height: 16),
+            _buildModernDateField(
+              controller: distributionDateController,
+              label: 'Date of distribution',
+              icon: Icons.event_available_outlined,
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        _buildModernSection(
+          title: 'Remarks (Optional)',
+          icon: Icons.notes_outlined,
+          isOptional: true,
+          children: [
+            TextFormField(
+              controller: remarksController,
+              maxLines: 3,
+              decoration: _inputDecoration(
+                label: 'Any notes / site details (optional)',
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  PreferredSizeWidget _buildModernAppBar() {
+    return AppBar(
+      elevation: 0,
+      backgroundColor: Colors.white,
+      foregroundColor: const Color(0xFF1E3A8A),
+      systemOverlayStyle: const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+      ),
+      leading: Navigator.of(context).canPop()
+          ? Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: IconButton(
+                icon: const Icon(Icons.arrow_back, color: Color(0xFF1E3A8A)),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            )
+          : null,
+      title: const Text(
+        'Material Distribution',
+        style: TextStyle(
+          fontWeight: FontWeight.w600,
+          fontSize: 20,
+          color: Color(0xFF1E3A8A),
+        ),
+      ),
+      actions: [
+        IconButton(
+          icon: const Icon(
+            Icons.help_outline_rounded,
+            color: Color(0xFF1E3A8A),
+          ),
+          onPressed: _showHelpDialog,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAnimatedHeader() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.blue.withOpacity(0.12),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: const Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Material Distribution',
+            style: TextStyle(
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
             ),
           ),
-        ),
-        Positioned(
-          bottom: 8,
-          left: 8,
-          right: 8,
-          child: Row(
+          SizedBox(height: 8),
+          Text(
+            'Enter sample distribution details',
+            style: TextStyle(fontSize: 16, color: Colors.white70),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTargetBanner() {
+    final pct = _monthlyTarget == 0
+        ? 0.0
+        : (_doneThisMonth / _monthlyTarget).clamp(0.0, 1.0);
+    final pctText = ((_doneThisMonth * 100) / _monthlyTarget)
+        .clamp(0, 100)
+        .toStringAsFixed(0);
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.05),
+            blurRadius: 14,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
             children: [
-              if (_isUploading)
-                const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                )
-              else if (_uploadError != null)
-                const Icon(Icons.error, size: 16, color: Colors.red)
-              else if (_isUploaded)
-                const Icon(Icons.check_circle, size: 16, color: Colors.white)
-              else
-                const Icon(Icons.file_present, size: 16, color: Colors.white),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  _isUploading
-                      ? 'Uploading...'
-                      : _uploadError != null
-                      ? 'Upload failed'
-                      : _getFileNameLocal(_selectedFilePath!),
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w500,
-                    color: Colors.white,
-                  ),
-                  overflow: TextOverflow.ellipsis,
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E3A8A).withOpacity(0.1),
+                  shape: BoxShape.circle,
                 ),
+                child: const Icon(Icons.flag_rounded, color: Color(0xFF1E3A8A)),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Monthly Sampling Target',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+              ),
+              Text(
+                '$_doneThisMonth / $_monthlyTarget',
+                style: const TextStyle(fontWeight: FontWeight.bold),
               ),
             ],
           ),
+          const SizedBox(height: 12),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: LinearProgressIndicator(value: pct, minHeight: 10),
+          ),
+          const SizedBox(height: 8),
+          Text('Achieved: $pctText%'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDistributionModeDropdown() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Mode of distribution *',
+          style: TextStyle(fontWeight: FontWeight.w600),
         ),
-        const Positioned(
-          top: 8,
-          right: 8,
-          child: CircleAvatar(
-            radius: 12,
-            backgroundColor: Colors.black54,
-            child: Icon(Icons.more_vert, color: Colors.white, size: 16),
+        const SizedBox(height: 8),
+        DropdownButtonFormField<DistributionMode>(
+          value: _mode,
+          decoration: _inputDecoration(label: 'Select mode'),
+          items: DistributionMode.values
+              .map((m) => DropdownMenuItem(value: m, child: Text(m.label())))
+              .toList(),
+          onChanged: (v) => setState(() => _mode = v),
+          validator: (v) => v == null ? 'Please select mode' : null,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildReimbursementStubSection() {
+    return _buildModernSection(
+      title: 'Sample Execution & Reimbursement (Entry Page 2 – quick add) ',
+      icon: Icons.receipt_long_outlined,
+      isOptional: true,
+      children: [
+        const Text(
+          'If the on-site sample is completed now, choose reimbursement mode.\n'
+          'Full Entry Page 2 (photos + details) can be recorded from the next screen.',
+          style: TextStyle(color: Colors.black87),
+        ),
+        const SizedBox(height: 16),
+        DropdownButtonFormField<ReimbursementMode>(
+          value: _reimbMode,
+          decoration: _inputDecoration(label: 'Reimbursement mode (optional)'),
+          items: ReimbursementMode.values
+              .map((r) => DropdownMenuItem(value: r, child: Text(r.label())))
+              .toList(),
+          onChanged: _updateReimbAmount,
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            const Icon(Icons.payments_outlined),
+            const SizedBox(width: 8),
+            Text('Computed Amount: AED ${_computedReimb.toStringAsFixed(0)}'),
+          ],
+        ),
+        const SizedBox(height: 16),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: OutlinedButton.icon(
+            icon: const Icon(Icons.app_registration),
+            label: const Text('Go to Sample Execution (Entry Page 2)'),
+            onPressed: () {
+              // TODO: implement your navigation and pass needed args
+              // Navigator.of(context).pushNamed('/sampleExecution', arguments: {...});
+              _toast(
+                'Configure navigation to Sample Execution screen in your router.',
+              );
+            },
           ),
         ),
       ],
     );
   }
 
-  Widget _buildFileIconForUploadArea() {
+  Widget _buildAttachmentsSection() {
+    return _buildModernSection(
+      title: 'Photos (optional)',
+      icon: Icons.photo_library_outlined,
+      isOptional: true,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            ..._photos.map(
+              (x) => ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.network(
+                  x.path,
+                  width: 90,
+                  height: 90,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) {
+                    // image_picker returns file paths; you will display via Image.file in a real app
+                    return Container(
+                      width: 90,
+                      height: 90,
+                      color: const Color(0xFFF1F5F9),
+                      child: const Icon(Icons.insert_photo, color: Colors.grey),
+                    );
+                  },
+                ),
+              ),
+            ),
+            InkWell(
+              onTap: _pickPhotos,
+              child: Container(
+                width: 90,
+                height: 90,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF1F5F9),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFFE2E8F0)),
+                ),
+                child: const Icon(Icons.add_a_photo_outlined),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Attach sample photos when available (used in Entry Page 2).',
+        ),
+      ],
+    );
+  }
+
+  InputDecoration _inputDecoration({required String label}) {
+    return InputDecoration(
+      labelText: label,
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide(color: Colors.grey.shade300),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide(color: Colors.grey.shade300),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+      ),
+      filled: true,
+      fillColor: const Color(0xFFF8FAFC),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+    );
+  }
+
+  Widget _buildModernSection({
+    required String title,
+    required IconData icon,
+    required List<Widget> children,
+    bool isOptional = false,
+  }) {
     return Container(
-      color: Colors.grey.shade100,
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              _getFileIconLocal(_selectedFilePath!),
-              size: 32,
-              color: Colors.blue.shade600,
-            ),
-            const SizedBox(height: 6),
-            Text(
-              _getFileExtensionLocal(_selectedFilePath!).toUpperCase(),
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                color: Colors.blue.shade700,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _showFileActions(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (context) => Container(
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 40,
-              height: 4,
-              margin: const EdgeInsets.symmetric(vertical: 12),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    _getFileNameLocal(_selectedFilePath!),
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Choose an action for this file',
-                    style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
-                  ),
-                  const SizedBox(height: 24),
-                  _buildActionOption(
-                    icon: Icons.visibility_rounded,
-                    title: 'View File',
-                    subtitle: 'Preview the uploaded file',
-                    onTap: () {
-                      Navigator.pop(context);
-                      _showFilePreview();
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  if (_uploadError != null) ...[
-                    _buildActionOption(
-                      icon: Icons.refresh_rounded,
-                      title: 'Retry Upload',
-                      subtitle: 'Try uploading the file again',
-                      onTap: () {
-                        Navigator.pop(context);
-                        _retryUpload();
-                      },
-                    ),
-                    const SizedBox(height: 16),
-                  ],
-                  _buildActionOption(
-                    icon: Icons.edit_rounded,
-                    title: 'Change File',
-                    subtitle: 'Upload a different file',
-                    onTap: () {
-                      Navigator.pop(context);
-                      _showUploadOptions(context);
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  _buildActionOption(
-                    icon: Icons.delete_rounded,
-                    title: 'Remove File',
-                    subtitle: 'Delete this uploaded file',
-                    onTap: () {
-                      Navigator.pop(context);
-                      _removeFile();
-                    },
-                    isDestructive: true,
-                  ),
-                  const SizedBox(height: 20),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildActionOption({
-    required IconData icon,
-    required String title,
-    required String subtitle,
-    required VoidCallback onTap,
-    bool isDestructive = false,
-  }) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          border: Border.all(color: Colors.grey.shade200),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: isDestructive ? Colors.red.shade50 : Colors.blue.shade50,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(
-                icon,
-                color: isDestructive
-                    ? Colors.red.shade600
-                    : Colors.blue.shade600,
-                size: 24,
-              ),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                      color: isDestructive
-                          ? Colors.red.shade700
-                          : Colors.black87,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
-                  ),
-                ],
-              ),
-            ),
-            Icon(
-              Icons.arrow_forward_ios,
-              size: 16,
-              color: Colors.grey.shade400,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _showUploadOptions(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (context) => Container(
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 40,
-              height: 4,
-              margin: const EdgeInsets.symmetric(vertical: 12),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Upload ${widget.label}',
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Choose how you want to upload your file',
-                    style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
-                  ),
-                  const SizedBox(height: 24),
-                  if (_isContractorOrPainterForm()) ...[
-                    _buildUploadOption(
-                      icon: Icons.camera_alt_rounded,
-                      title: _isInAppWebView
-                          ? 'Take Photo (Limited)'
-                          : 'Take Photo',
-                      subtitle: _isInAppWebView
-                          ? 'Camera access may be restricted'
-                          : 'Use camera to capture',
-                      onTap: () => _pickFromCamera(context),
-                      warning: _isInAppWebView
-                          ? 'Camera may not work in this environment'
-                          : null,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildUploadOption(
-                      icon: Icons.photo_library_rounded,
-                      title: 'Choose from Gallery',
-                      subtitle: 'Select from photo library (Recommended)',
-                      onTap: () => _pickFromGallery(context),
-                      isRecommended: _isInAppWebView,
-                    ),
-                    const SizedBox(height: 16),
-                    _buildUploadOption(
-                      icon: Icons.folder_rounded,
-                      title: 'Browse Files',
-                      subtitle: 'Select PDF or other files from device',
-                      onTap: () => _pickFromFiles(context),
-                    ),
-                  ] else ...[
-                    _buildUploadOption(
-                      icon: Icons.camera_alt_rounded,
-                      title: 'Take Photo',
-                      subtitle: 'Use camera to capture',
-                      onTap: () => _pickFromCamera(context),
-                    ),
-                    const SizedBox(height: 16),
-                    _buildUploadOption(
-                      icon: Icons.photo_library_rounded,
-                      title: 'Choose from Gallery',
-                      subtitle: 'Select from photo library',
-                      onTap: () => _pickFromGallery(context),
-                    ),
-                    const SizedBox(height: 16),
-                    _buildUploadOption(
-                      icon: Icons.folder_rounded,
-                      title: 'Choose from Files',
-                      subtitle: 'Select from device storage',
-                      onTap: () => _pickFromFiles(context),
-                    ),
-                  ],
-                  const SizedBox(height: 24),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.blue.shade50,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Icon(
-                              Icons.info_outline,
-                              size: 16,
-                              color: Colors.blue.shade700,
-                            ),
-                            const SizedBox(width: 8),
-                            Text(
-                              'File Requirements',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.blue.shade700,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Supported: ${widget.allowedExtensions.contains('*') ? 'All file types' : widget.allowedExtensions.join(', ').toUpperCase()}\n'
-                          'Max size: ${widget.maxSizeInMB}MB',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Colors.blue.shade600,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildUploadOption({
-    required IconData icon,
-    required String title,
-    required String subtitle,
-    required VoidCallback onTap,
-    String? warning,
-    bool isRecommended = false,
-  }) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          border: Border.all(
-            color: isRecommended
-                ? Colors.green.shade300
-                : warning != null
-                ? Colors.orange.shade300
-                : Colors.grey.shade200,
-            width: isRecommended ? 2 : 1,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 16,
+            offset: const Offset(0, 4),
           ),
-          borderRadius: BorderRadius.circular(12),
-          color: isRecommended
-              ? Colors.green.shade50
-              : warning != null
-              ? Colors.orange.shade50
-              : Colors.white,
-        ),
-        child: Column(
-          children: [
-            Row(
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(16),
+              ),
+            ),
+            child: Row(
               children: [
                 Container(
-                  width: 48,
-                  height: 48,
+                  width: 44,
+                  height: 44,
                   decoration: BoxDecoration(
-                    color: isRecommended
-                        ? Colors.green.shade50
-                        : warning != null
-                        ? Colors.orange.shade50
-                        : Colors.blue.shade50,
-                    borderRadius: BorderRadius.circular(12),
+                    color: const Color(0xFF1E3A8A).withOpacity(0.1),
+                    shape: BoxShape.circle,
                   ),
-                  child: Icon(
-                    icon,
-                    color: isRecommended
-                        ? Colors.green.shade600
-                        : warning != null
-                        ? Colors.orange.shade600
-                        : Colors.blue.shade600,
-                    size: 24,
-                  ),
+                  child: Icon(icon, color: const Color(0xFF1E3A8A)),
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: 12),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              title,
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.w600,
-                                color: warning != null
-                                    ? Colors.orange.shade800
-                                    : null,
-                              ),
-                            ),
-                          ),
-                          if (isRecommended)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.green.shade600,
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: const Text(
-                                'RECOMMENDED',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 2),
                       Text(
-                        subtitle,
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: warning != null
-                              ? Colors.orange.shade700
-                              : Colors.grey.shade600,
+                        title,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF1F2937),
                         ),
                       ),
-                    ],
-                  ),
-                ),
-                Icon(
-                  Icons.arrow_forward_ios,
-                  size: 16,
-                  color: Colors.grey.shade400,
-                ),
-              ],
-            ),
-            if (warning != null) ...[
-              const SizedBox(height: 12),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.orange.shade100,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.orange.shade300),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.warning,
-                      size: 14,
-                      color: Colors.orange.shade600,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        warning,
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.orange.shade800,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _pickFromCamera(BuildContext context) async {
-    Navigator.pop(context);
-
-    _safeShowSnackBar(
-      SnackBar(
-        content: const Text('Opening camera...'),
-        backgroundColor: Colors.blue,
-        duration: const Duration(seconds: 2),
-      ),
-    );
-
-    // Try simple hidden input for InAppWebView first (better compatibility)
-    if (_isInAppWebView && kIsWeb) {
-      try {
-        final completer = Completer<String?>();
-        final inputId = 'camera_input_${DateTime.now().millisecondsSinceEpoch}';
-
-        js.context.callMethod('eval', [
-          '''
-          (function() {
-            const existing = document.getElementById('$inputId');
-            if (existing) existing.remove();
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.accept = 'image/*';
-            input.capture = 'environment';
-            input.id = '$inputId';
-            input.style.position = 'fixed';
-            input.style.left = '-9999px';
-            input.style.opacity = '0';
-            document.body.appendChild(input);
-            input.onchange = function(e) {
-              const file = e.target.files && e.target.files[0];
-              if (!file) { window.dartCameraResult_$inputId({success:false}); return; }
-              const reader = new FileReader();
-              reader.onload = function(e) {
-                window.dartCameraResult_$inputId({
-                  success: true,
-                  base64: e.target.result,
-                  fileName: file.name,
-                  mimeType: file.type
-                });
-              };
-              reader.onerror = function() { window.dartCameraResult_$inputId({success:false}); };
-              reader.readAsDataURL(file);
-            };
-            input.click();
-          })();
-          ''',
-        ]);
-
-        js.context['dartCameraResult_$inputId'] = js.allowInterop((result) {
-          try {
-            final ok = js_util.getProperty(result, 'success') == true;
-            if (ok) {
-              final base64 = js_util.getProperty(result, 'base64')?.toString();
-              completer.complete(base64);
-            } else {
-              completer.complete(null);
-            }
-          } catch (_) {
-            completer.complete(null);
-          }
-        });
-
-        final base64Result = await completer.future.timeout(
-          const Duration(seconds: 60),
-          onTimeout: () => null,
-        );
-
-        try {
-          js.context.deleteProperty('dartCameraResult_$inputId');
-          js.context.callMethod('eval', [
-            'document.getElementById("$inputId")?.remove()',
-          ]);
-        } catch (_) {}
-
-        if (base64Result != null && base64Result.isNotEmpty) {
-          _safeHideCurrentSnackBar();
-          _showSuccessSnackBar('📷 Photo captured successfully!');
-          await _handleSelectedFile(
-            base64Result,
-            fileType: 'image',
-            originalName: 'camera_${DateTime.now().millisecondsSinceEpoch}.jpg',
-          );
-          return;
-        } else if (_isInAppWebView) {
-          _safeHideCurrentSnackBar();
-          _showInAppWebViewCameraHint();
-          return;
-        }
-      } catch (_) {
-        // continue to ImagePicker fallback
-      }
-    }
-
-    // Fallback (and primary on mobile): ImagePicker
-    try {
-      final XFile? image = await _picker.pickImage(
-        source: ImageSource.camera,
-        maxWidth: _isInAppWebView ? 1920 : 1280,
-        maxHeight: _isInAppWebView ? 1080 : 720,
-        imageQuality: _isInAppWebView ? 85 : 70,
-        preferredCameraDevice: CameraDevice.rear,
-      );
-
-      if (image == null) {
-        _safeHideCurrentSnackBar();
-        if (_isInAppWebView) {
-          _showInAppWebViewCameraHint();
-        } else {
-          _showErrorSnackBar('Camera cancelled.');
-        }
-        return;
-      }
-
-      _safeHideCurrentSnackBar();
-
-      String imagePath = image.path;
-      if (kIsWeb || _isInAppWebView) {
-        final bytes = await image.readAsBytes();
-        final b64 = base64Encode(bytes);
-        imagePath = 'data:image/jpeg;base64,$b64';
-      }
-
-      await _handleSelectedFile(
-        imagePath,
-        fileType: 'image',
-        originalName: image.name,
-      );
-    } catch (e) {
-      _safeHideCurrentSnackBar();
-      _showErrorSnackBar(
-        _isInAppWebView
-            ? 'Camera failed in InAppWebView. Use "Choose from Gallery".'
-            : 'Failed to capture image: $e',
-      );
-      if (_isInAppWebView && mounted) {
-        Future.delayed(const Duration(seconds: 2), () {
-          if (mounted) _showInAppWebViewCameraHelpDialog();
-        });
-      }
-    }
-  }
-
-  Future<void> _pickFromGallery(BuildContext context) async {
-    Navigator.pop(context);
-    try {
-      final XFile? image = await _picker.pickImage(
-        source: ImageSource.gallery,
-        maxWidth: 1920,
-        maxHeight: 1080,
-        imageQuality: 85,
-      );
-      if (image == null) return;
-
-      String path = image.path;
-      if (kIsWeb) {
-        final b = await image.readAsBytes();
-        path = 'data:image/jpeg;base64,${base64Encode(b)}';
-      }
-
-      await _handleSelectedFile(
-        path,
-        fileType: 'image',
-        originalName: image.name,
-      );
-    } catch (e) {
-      _showErrorSnackBar('Failed to select image: $e');
-    }
-  }
-
-  Future<void> _pickFromFiles(BuildContext context) async {
-    Navigator.pop(context);
-    try {
-      FilePickerResult? result;
-
-      if (kIsWeb || _isInAppWebView) {
-        result = await FilePicker.platform.pickFiles(
-          type: FileType.any,
-          allowMultiple: false,
-          withData: true,
-        );
-      } else {
-        if (widget.allowedExtensions.contains('*') ||
-            widget.allowedExtensions.isEmpty) {
-          result = await FilePicker.platform.pickFiles(
-            type: FileType.any,
-            allowMultiple: false,
-          );
-        } else {
-          result = await FilePicker.platform.pickFiles(
-            type: FileType.custom,
-            allowedExtensions: widget.allowedExtensions,
-            allowMultiple: false,
-          );
-        }
-      }
-
-      if (result != null && result.files.isNotEmpty) {
-        final file = result.files.single;
-        String fileType = 'document';
-        final ext = (file.extension ?? '').toLowerCase();
-
-        if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].contains(ext))
-          fileType = 'image';
-        else if (ext == 'pdf')
-          fileType = 'pdf';
-        else if (ext == 'txt')
-          fileType = 'text';
-        else if (['doc', 'docx'].contains(ext))
-          fileType = 'word';
-        else if (['xls', 'xlsx'].contains(ext))
-          fileType = 'excel';
-        else if (['ppt', 'pptx'].contains(ext))
-          fileType = 'powerpoint';
-
-        String pathForState;
-        if (kIsWeb && file.bytes != null && file.bytes!.isNotEmpty) {
-          final mime = _mimeFromExtensionLocal(ext.isEmpty ? 'bin' : ext);
-          pathForState = 'data:$mime;base64,${base64Encode(file.bytes!)}';
-        } else if (!kIsWeb && file.path != null) {
-          pathForState = file.path!;
-        } else {
-          _showErrorSnackBar('Unable to access selected file');
-          return;
-        }
-
-        await _handleSelectedFile(
-          pathForState,
-          fileType: fileType,
-          originalName: file.name,
-        );
-      }
-    } catch (e) {
-      _showErrorSnackBar('Failed to select file: $e');
-    }
-  }
-
-  Future<void> _handleSelectedFile(
-    String filePath, {
-    String? fileType,
-    String? originalName,
-  }) async {
-    // Lenient validation in web/InApp when the context implies images
-    bool skipValidation = false;
-    if (kIsWeb || _isInAppWebView) {
-      final isImageContext =
-          fileType == 'image' ||
-          widget.allowedExtensions.any(
-            (e) => [
-              'jpg',
-              'jpeg',
-              'png',
-              'gif',
-              'webp',
-              'bmp',
-            ].contains(e.toLowerCase()),
-          ) ||
-          widget.label.toLowerCase().contains('emirates') ||
-          widget.label.toLowerCase().contains('id') ||
-          widget.label.toLowerCase().contains('photo');
-      if (isImageContext) skipValidation = true;
-    }
-
-    String extension = '';
-    if (filePath.contains('.')) {
-      extension = filePath.split('.').last.toLowerCase();
-    } else if (originalName != null && originalName.contains('.')) {
-      extension = originalName.split('.').last.toLowerCase();
-    }
-
-    if (!skipValidation &&
-        widget.allowedExtensions.isNotEmpty &&
-        !widget.allowedExtensions.contains('*') &&
-        extension.isNotEmpty) {
-      final normalized = widget.allowedExtensions
-          .map((e) => e.toLowerCase())
-          .toList();
-      final imageAliases = {'jpeg': 'jpg', 'jfif': 'jpg', 'webp': 'jpg'};
-      bool isAllowed = normalized.contains(extension);
-      if (!isAllowed && imageAliases.containsKey(extension)) {
-        isAllowed = normalized.contains(imageAliases[extension]!);
-      }
-      if (!isAllowed && extension.isEmpty && fileType == 'image') {
-        isAllowed = normalized.any((e) => ['jpg', 'jpeg', 'png'].contains(e));
-      }
-      if (!isAllowed) {
-        _showErrorSnackBar(
-          'Invalid file type. Allowed: ${widget.allowedExtensions.join(', ').toUpperCase()}',
-        );
-        return;
-      }
-    }
-
-    // Check file size for both web and mobile
-    double fileSizeInMB = 0;
-    if (kIsWeb && filePath.startsWith('data:')) {
-      // For web data URLs, calculate size from base64
-      try {
-        final parts = filePath.split(',');
-        if (parts.length == 2) {
-          final base64Data = parts[1];
-          final bytes = base64Decode(base64Data);
-          fileSizeInMB = bytes.length / (1024 * 1024);
-        }
-      } catch (_) {}
-    } else if (!kIsWeb && !filePath.startsWith('data:')) {
-      // For mobile files
-      try {
-        final file = File(filePath);
-        final sizeInBytes = await file.length();
-        fileSizeInMB = sizeInBytes / (1024 * 1024);
-      } catch (_) {}
-    }
-
-    if (fileSizeInMB > widget.maxSizeInMB) {
-      _showFileSizeErrorSnackBar(fileSizeInMB, widget.maxSizeInMB);
-      return;
-    }
-
-    setState(() {
-      _selectedFilePath = filePath;
-      _fileType = fileType;
-      _originalFileName = originalName;
-      _isUploading = true;
-      _isUploaded = false;
-      _uploadError = null;
-    });
-
-    widget.onFileSelected(filePath);
-
-    // Force immediate visual refresh
-    if (mounted) setState(() {});
-
-    try {
-      // Try real network first (even in InAppWebView); UploadService handles fallback
-      final uploadResult = await UploadService.uploadFile(
-        filePath,
-        originalName: originalName,
-        attFilTy: "01", // Default file type for painters/contractors
-        createId: "SYSTEM", // Default creator ID
-      );
-
-      if (uploadResult['success'] == true) {
-        setState(() {
-          _isUploading = false;
-          _isUploaded = true;
-        });
-
-        if (_isContractorOrPainterForm()) {
-          String msg = _isInAppWebView
-              ? '✅ ${widget.label} uploaded successfully in app!'
-              : '✅ ${widget.label} uploaded successfully!';
-          _showEnhancedSuccessSnackBar(msg);
-        }
-      } else {
-        setState(() {
-          _isUploading = false;
-          _isUploaded = false;
-          _uploadError = (uploadResult['error'] ?? 'Unknown error').toString();
-        });
-
-        var message = 'Upload failed: $_uploadError';
-        if (_isInAppWebView) {
-          message = 'Upload failed in InAppWebView: $_uploadError';
-          if (_uploadError!.contains('Network') ||
-              _uploadError!.contains('Connection')) {
-            message +=
-                '\n\nTip: Check connectivity and whether the server is reachable from the app.';
-          }
-        }
-        _showErrorSnackBar(message);
-      }
-    } catch (e) {
-      setState(() {
-        _isUploading = false;
-        _isUploaded = false;
-        _uploadError = e.toString();
-      });
-
-      String message = 'Upload failed: $e';
-      if (_isInAppWebView) {
-        if (e.toString().contains('XMLHttpRequest')) {
-          message =
-              'InAppWebView upload failed: Network request blocked/failed. Server may not be accessible.';
-        } else if (e.toString().contains('CORS')) {
-          message =
-              'InAppWebView upload failed: CORS blocked the request. Configure your server to allow your origin.';
-        } else {
-          message = 'InAppWebView upload failed: $e';
-        }
-      }
-      _showErrorSnackBar(message);
-    }
-  }
-
-  Future<void> _retryUpload() async {
-    if (_selectedFilePath == null) return;
-    await _handleSelectedFile(
-      _selectedFilePath!,
-      fileType: _fileType,
-      originalName: _originalFileName,
-    );
-  }
-
-  void _removeFile() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
-          children: [
-            Icon(Icons.warning, color: Colors.orange),
-            SizedBox(width: 8),
-            Text('Remove File'),
-          ],
-        ),
-        content: Text(
-          'Are you sure you want to remove "${_getFileNameLocal(_selectedFilePath!)}"?',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              setState(() {
-                _selectedFilePath = null;
-                _isUploading = false;
-                _isUploaded = false;
-                _uploadError = null;
-              });
-              widget.onFileSelected(null);
-              _showSuccessSnackBar('File removed successfully');
-            },
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Remove'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showSuccessSnackBar(String message) {
-    _safeShowSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.check_circle, color: Colors.white, size: 20),
-            const SizedBox(width: 8),
-            Expanded(child: Text(message)),
-          ],
-        ),
-        backgroundColor: Colors.green,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        duration: const Duration(seconds: 2),
-      ),
-    );
-  }
-
-  void _showEnhancedSuccessSnackBar(String message) {
-    _safeShowSnackBar(
-      SnackBar(
-        content: Container(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.2),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.check_circle,
-                  color: Colors.white,
-                  size: 20,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Upload Complete!',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                      ),
-                    ),
-                    Text(message, style: const TextStyle(fontSize: 12)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-        backgroundColor: Colors.green.shade600,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        duration: const Duration(seconds: 3),
-        margin: const EdgeInsets.all(16),
-      ),
-    );
-  }
-
-  void _showErrorSnackBar(String message) {
-    _safeShowSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.error, color: Colors.white, size: 20),
-            const SizedBox(width: 8),
-            Expanded(child: Text(message)),
-          ],
-        ),
-        backgroundColor: Colors.red,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        duration: const Duration(seconds: 5),
-        action: message.toLowerCase().contains('camera')
-            ? SnackBarAction(
-                label: 'Try Gallery',
-                textColor: Colors.white,
-                onPressed: () {
-                  _safeHideCurrentSnackBar();
-                  _pickFromGallery(context);
-                },
-              )
-            : null,
-      ),
-    );
-  }
-
-  void _showFileSizeErrorSnackBar(double actualSize, double maxSize) {
-    _safeShowSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.warning, color: Colors.white, size: 20),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'File too large! Size: ${actualSize.toStringAsFixed(1)}MB (Max: ${maxSize}MB)\nPlease select a smaller file.',
-                style: const TextStyle(fontSize: 14),
-              ),
-            ),
-          ],
-        ),
-        backgroundColor: Colors.orange.shade700,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        duration: const Duration(seconds: 6),
-        action: SnackBarAction(
-          label: 'Choose Different File',
-          textColor: Colors.white,
-          onPressed: () {
-            _safeHideCurrentSnackBar();
-            _showUploadOptions(context);
-          },
-        ),
-      ),
-    );
-  }
-
-  void _showInAppWebViewCameraHint() {
-    _safeShowSnackBar(
-      SnackBar(
-        content: const Row(
-          children: [
-            Icon(Icons.info, color: Colors.white, size: 20),
-            SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Camera access is limited. Try "Choose from Gallery" instead.',
-              ),
-            ),
-          ],
-        ),
-        backgroundColor: Colors.orange,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        duration: const Duration(seconds: 4),
-        action: SnackBarAction(
-          label: 'Use Gallery',
-          textColor: Colors.white,
-          onPressed: () {
-            _safeHideCurrentSnackBar();
-            _pickFromGallery(context);
-          },
-        ),
-      ),
-    );
-  }
-
-  void _showInAppWebViewCameraHelpDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
-          children: [
-            Icon(Icons.camera_alt, color: Colors.orange),
-            SizedBox(width: 8),
-            Text('Camera Issue'),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Camera access is limited in InAppWebView environments.',
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'InAppWebView apps often restrict direct camera access for security reasons.',
-              style: TextStyle(fontSize: 14, color: Colors.grey),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.green.shade50,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.green.shade200),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.lightbulb, size: 20, color: Colors.green.shade600),
-                  const SizedBox(width: 8),
-                  const Expanded(
-                    child: Text(
-                      'Use "Choose from Gallery" to select photos from your device.',
-                      style: TextStyle(fontSize: 12),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _showUploadOptions(context);
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-            child: const Text(
-              'Use Gallery',
-              style: TextStyle(color: Colors.white),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showFilePreview() {
-    if (_selectedFilePath == null) return;
-
-    final isImage = _isImageFileLocal(_selectedFilePath!);
-    if (isImage) {
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (context) => Scaffold(
-            backgroundColor: Colors.black,
-            appBar: AppBar(
-              backgroundColor: Colors.black,
-              foregroundColor: Colors.white,
-              title: Text(widget.label),
-              actions: [
-                IconButton(
-                  onPressed: _showFileDetails,
-                  icon: const Icon(Icons.info_outline),
-                ),
-              ],
-            ),
-            body: Center(
-              child: InteractiveViewer(
-                child: kIsWeb
-                    ? (_selectedFilePath!.startsWith('data:')
-                          ? Image.memory(
-                              base64Decode(_selectedFilePath!.split(',')[1]),
-                              fit: BoxFit.contain,
-                              errorBuilder: (_, __, ___) => _imageError(),
-                            )
-                          : Image.network(
-                              _selectedFilePath!,
-                              fit: BoxFit.contain,
-                              errorBuilder: (_, __, ___) => _imageError(),
-                            ))
-                    : Image.file(
-                        File(_selectedFilePath!),
-                        fit: BoxFit.contain,
-                        errorBuilder: (_, __, ___) => _imageError(),
-                      ),
-              ),
-            ),
-          ),
-        ),
-      );
-    } else {
-      _showDocumentViewer();
-    }
-  }
-
-  Widget _imageError() => const Center(
-    child: Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(Icons.error, size: 64, color: Colors.white),
-        SizedBox(height: 16),
-        Text('Unable to load image', style: TextStyle(color: Colors.white)),
-      ],
-    ),
-  );
-
-  void _showDocumentViewer() {
-    if (_selectedFilePath == null) return;
-
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (context) => Scaffold(
-          appBar: AppBar(
-            title: Text(widget.label),
-            actions: [
-              IconButton(
-                onPressed: _showFileDetails,
-                icon: const Icon(Icons.info_outline),
-              ),
-            ],
-          ),
-          body: _buildDocumentContent(),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildDocumentContent() {
-    String fileType = _fileType ?? 'unknown';
-
-    if (fileType == 'unknown') {
-      final extension = _getFileExtensionLocal(_selectedFilePath!);
-      if (['pdf'].contains(extension))
-        fileType = 'pdf';
-      else if (['txt'].contains(extension))
-        fileType = 'text';
-      else if (['doc', 'docx'].contains(extension))
-        fileType = 'word';
-      else if (['xls', 'xlsx'].contains(extension))
-        fileType = 'excel';
-      else if (['ppt', 'pptx'].contains(extension))
-        fileType = 'powerpoint';
-      else if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].contains(extension))
-        fileType = 'image';
-    }
-
-    switch (fileType) {
-      case 'pdf':
-        return _buildPdfViewer();
-      case 'text':
-        return _buildTextViewer();
-      case 'word':
-        return _buildDocumentPlaceholder('Word Document');
-      case 'excel':
-        return _buildDocumentPlaceholder('Excel Spreadsheet');
-      case 'powerpoint':
-        return _buildDocumentPlaceholder('PowerPoint Presentation');
-      case 'image':
-        return _buildImagePlaceholder();
-      default:
-        return _buildUnsupportedDocument();
-    }
-  }
-
-  Widget _buildPdfViewer() {
-    return FutureBuilder<PdfDocument?>(
-      future: _loadPdfDocument(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 16),
-                Text('Loading PDF...', style: TextStyle(color: Colors.grey)),
-              ],
-            ),
-          );
-        }
-
-        if (snapshot.hasError) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.error, size: 80, color: Colors.red.shade600),
-                const SizedBox(height: 16),
-                Text(
-                  'Failed to load PDF',
-                  style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.red.shade700,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  snapshot.error.toString(),
-                  style: const TextStyle(fontSize: 14, color: Colors.grey),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton.icon(
-                  onPressed: _openExternalViewer,
-                  icon: const Icon(Icons.open_in_new),
-                  label: const Text('Open Externally'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red.shade600,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 24,
-                      vertical: 12,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          );
-        }
-
-        final pdfDocument = snapshot.data;
-        if (pdfDocument == null) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  Icons.picture_as_pdf,
-                  size: 80,
-                  color: Colors.red.shade600,
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'PDF Document',
-                  style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.red.shade700,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _getFileNameLocal(_selectedFilePath!),
-                  style: const TextStyle(fontSize: 16, color: Colors.grey),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton.icon(
-                  onPressed: _openExternalViewer,
-                  icon: const Icon(Icons.open_in_new),
-                  label: const Text('Open Externally'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red.shade600,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 24,
-                      vertical: 12,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          );
-        }
-
-        return Column(
-          children: [
-            // PDF Header
-            Container(
-              padding: const EdgeInsets.all(16),
-              color: Colors.red.shade50,
-              child: Row(
-                children: [
-                  Icon(Icons.picture_as_pdf, color: Colors.red.shade600),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
+                      if (isOptional)
                         Text(
-                          _getFileNameLocal(_selectedFilePath!),
-                          style: const TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        Text(
-                          '${pdfDocument.pagesCount} pages',
+                          'Optional',
                           style: TextStyle(
-                            fontSize: 12,
+                            fontSize: 13,
                             color: Colors.grey.shade600,
                           ),
                         ),
-                      ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: children,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModernTextField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isPhone = false,
+    bool isRequired = true,
+    TextInputType? keyboardType,
+    List<TextInputFormatter>? inputFormatters,
+  }) {
+    return TextFormField(
+      controller: controller,
+      decoration: _inputDecoration(
+        label: isRequired ? '$label *' : label,
+      ).copyWith(prefixIcon: Icon(icon, color: Colors.grey.shade600)),
+      keyboardType:
+          keyboardType ?? (isPhone ? TextInputType.phone : TextInputType.text),
+      inputFormatters: inputFormatters,
+      validator: (value) {
+        if (isRequired && (value == null || value.trim().isEmpty)) {
+          return 'Please enter $label';
+        }
+        if (isPhone && value != null && value.isNotEmpty) {
+          // Valid UAE formats like 50xxxxxxx / 52xxxxxxx / 54xxxxxxx / 55xxxxxxx / 56xxxxxxx / 58xxxxxxx
+          final regex = RegExp(r'^(50|52|54|55|56|58)\d{7}\$');
+          if (!regex.hasMatch(value)) {
+            return 'Please enter valid UAE mobile number';
+          }
+        }
+        if ((label.toLowerCase().contains('kg')) &&
+            value != null &&
+            value.isNotEmpty) {
+          final v = double.tryParse(value);
+          if (v == null || v < 0) return 'Enter a valid non-negative number';
+        }
+        return null;
+      },
+    );
+  }
+
+  Widget _buildModernDateField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isRequired = true,
+  }) {
+    return TextFormField(
+      controller: controller,
+      decoration: _inputDecoration(label: isRequired ? '$label *' : label)
+          .copyWith(
+            prefixIcon: Icon(icon, color: Colors.grey.shade600),
+            suffixIcon: const Icon(
+              Icons.calendar_today_rounded,
+              color: Colors.grey,
+            ),
+          ),
+      readOnly: true,
+      onTap: () async {
+        final date = await showDatePicker(
+          context: context,
+          initialDate: DateTime.now(),
+          firstDate: DateTime(2020),
+          lastDate: DateTime(2100),
+          builder: (context, child) {
+            return Theme(
+              data: Theme.of(context).copyWith(
+                colorScheme: const ColorScheme.light(
+                  primary: Color(0xFF1E3A8A),
+                ),
+              ),
+              child: child!,
+            );
+          },
+        );
+        if (date != null) {
+          controller.text = date.toIso8601String().split('T').first;
+        }
+      },
+      validator: (value) {
+        if (isRequired && (value == null || value.isEmpty)) {
+          return 'Please enter $label';
+        }
+        return null;
+      },
+    );
+  }
+
+  Widget _buildAnimatedSubmitButton() {
+    return SizedBox(
+      width: double.infinity,
+      height: 56,
+      child: ElevatedButton(
+        onPressed: _isSubmitting ? null : _submitForm,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF1E3A8A),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+        child: _isSubmitting
+            ? const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
                     ),
                   ),
-                  IconButton(
-                    onPressed: _openExternalViewer,
-                    icon: const Icon(Icons.open_in_new),
-                    tooltip: 'Open externally',
-                  ),
+                  SizedBox(width: 16),
+                  Text('Submitting...', style: TextStyle(color: Colors.white)),
                 ],
+              )
+            : const Text(
+                'Submit Distribution',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
               ),
-            ),
-            // PDF Viewer
-            Expanded(
-              child: PdfView(
-                controller: PdfController(document: Future.value(pdfDocument)),
-                scrollDirection: Axis.vertical,
-                pageSnapping: false,
-                physics: const BouncingScrollPhysics(),
-                renderer: (PdfPage page) => page.render(
-                  width: page.width * 2,
-                  height: page.height * 2,
-                  format: PdfPageImageFormat.jpeg,
-                  backgroundColor: '#FFFFFF',
-                ),
-                onDocumentLoaded: (document) {
-                  // PDF loaded successfully
-                },
-                onPageChanged: (page) {
-                  // Page changed
-                },
-                onDocumentError: (error) {
-                  // Handle PDF error
-                },
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Future<PdfDocument?> _loadPdfDocument() async {
-    try {
-      if (_selectedFilePath == null) return null;
-
-      if (_selectedFilePath!.startsWith('data:')) {
-        // Handle base64 data URL
-        final parts = _selectedFilePath!.split(',');
-        if (parts.length == 2) {
-          final base64Data = parts[1];
-          final bytes = base64Decode(base64Data);
-          return PdfDocument.openData(bytes);
-        }
-      } else if (_selectedFilePath!.startsWith('http')) {
-        // Handle URL
-        return PdfDocument.openFile(_selectedFilePath!);
-      } else if (!kIsWeb) {
-        // Handle local file path (mobile)
-        return PdfDocument.openFile(_selectedFilePath!);
-      }
-
-      return null;
-    } catch (e) {
-      print('Error loading PDF: $e');
-      return null;
-    }
-  }
-
-  Widget _buildTextViewer() {
-    return FutureBuilder<String>(
-      future: _readTextFile(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        if (snapshot.hasError) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.error, size: 64, color: Colors.red),
-                const SizedBox(height: 16),
-                Text('Error loading file: ${snapshot.error}'),
-              ],
-            ),
-          );
-        }
-        return Container(
-          padding: const EdgeInsets.all(16),
-          child: SingleChildScrollView(
-            child: Text(
-              snapshot.data ?? 'Empty file',
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildDocumentPlaceholder(String documentType) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            _getFileIconLocal(_selectedFilePath!),
-            size: 80,
-            color: Colors.blue.shade600,
-          ),
-          const SizedBox(height: 16),
-          Text(
-            documentType,
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-              color: Colors.blue.shade700,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            _getFileNameLocal(_selectedFilePath!),
-            style: const TextStyle(fontSize: 16, color: Colors.grey),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-            decoration: BoxDecoration(
-              color: Colors.blue.shade100,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.visibility, color: Colors.blue.shade700, size: 18),
-                const SizedBox(width: 8),
-                Text(
-                  'Ready to View',
-                  style: TextStyle(
-                    color: Colors.blue.shade700,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
       ),
     );
   }
 
-  Widget _buildImagePlaceholder() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Container(
-            width: 200,
-            height: 200,
-            decoration: BoxDecoration(
-              color: Colors.green.shade50,
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.green.shade300, width: 2),
-            ),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.image, size: 80, color: Colors.green.shade600),
-                const SizedBox(height: 16),
-                Text(
-                  'Image File',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.green.shade700,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _originalFileName ?? _getFileNameLocal(_selectedFilePath!),
-                  style: const TextStyle(fontSize: 14, color: Colors.grey),
-                  textAlign: TextAlign.center,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.all(16),
-            margin: const EdgeInsets.symmetric(horizontal: 32),
-            decoration: BoxDecoration(
-              color: Colors.green.shade50,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.green.shade200),
-            ),
-            child: Column(
-              children: [
-                Icon(
-                  Icons.check_circle,
-                  color: Colors.green.shade600,
-                  size: 24,
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _isUploaded
-                      ? 'Image Uploaded Successfully'
-                      : (_isUploading ? 'Uploading...' : 'Ready to Upload'),
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _uploadError == null
-                      ? (_isUploaded
-                            ? 'Your image has been uploaded and is ready for processing.'
-                            : 'We will upload your image now.')
-                      : 'Upload failed: $_uploadError',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 14),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildUnsupportedDocument() {
-    final ext = _getFileExtensionLocal(_selectedFilePath!).toUpperCase();
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.insert_drive_file, size: 80, color: Colors.grey.shade600),
-          const SizedBox(height: 16),
-          Text(
-            'Unsupported File Type',
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-              color: Colors.grey.shade700,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            _originalFileName ?? _getFileNameLocal(_selectedFilePath!),
-            style: const TextStyle(fontSize: 16, color: Colors.grey),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '$ext files cannot be previewed',
-            style: TextStyle(fontSize: 14, color: Colors.grey.shade500),
-          ),
-          const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-            decoration: BoxDecoration(
-              color: Colors.grey.shade200,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.info_outline, color: Colors.grey.shade600, size: 18),
-                const SizedBox(width: 8),
-                Text(
-                  'File Type Not Supported',
-                  style: TextStyle(
-                    color: Colors.grey.shade600,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<String> _readTextFile() async {
-    try {
-      final file = File(_selectedFilePath!);
-      return await file.readAsString();
-    } catch (e) {
-      throw Exception('Failed to read file: $e');
-    }
-  }
-
-  void _openExternalViewer() {
-    if (_selectedFilePath == null) return;
-
-    if (kIsWeb) {
-      _openFileOnWeb();
-    } else {
-      _openFileOnMobile();
-    }
-  }
-
-  void _openFileOnWeb() {
-    if (_selectedFilePath!.startsWith('data:')) {
-      // For base64 data URLs, create a download link
-      try {
-        final parts = _selectedFilePath!.split(',');
-        if (parts.length == 2) {
-          final mimeType = parts[0].split(':')[1].split(';')[0];
-          final base64Data = parts[1];
-          final bytes = base64Decode(base64Data);
-
-          // Create a blob URL for download using JavaScript interop
-          final blob = js_util.callConstructor(
-            js_util.getProperty(web.window, 'Blob'),
-            [
-              js_util.jsify([bytes]),
-              js_util.jsify({'type': mimeType}),
-            ],
-          );
-          final url = web.URL.createObjectURL(blob as web.Blob);
-
-          // Create and trigger download
-          final anchor = web.HTMLAnchorElement()
-            ..href = url
-            ..download = _getFileNameLocal(_selectedFilePath!)
-            ..style.display = 'none';
-
-          web.document.body!.append(anchor);
-          anchor.click();
-          anchor.remove();
-
-          // Clean up the blob URL
-          web.URL.revokeObjectURL(url);
-
-          _safeShowSnackBar(
-            SnackBar(
-              content: Text(
-                'File downloaded: ${_getFileNameLocal(_selectedFilePath!)}',
-              ),
-              backgroundColor: Colors.green,
-              duration: const Duration(seconds: 2),
-            ),
-          );
-        }
-      } catch (e) {
-        _safeShowSnackBar(
-          SnackBar(
-            content: const Text('Failed to download file'),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      }
-    } else {
-      // For regular URLs, try to open in new tab
-      try {
-        final isPdf = _getFileExtensionLocal(_selectedFilePath!) == 'pdf';
-        if (isPdf) {
-          // Try to open PDF in new tab
-          js.context.callMethod('open', [_selectedFilePath!, '_blank']);
-        } else {
-          // For other files, download
-          final anchor = web.HTMLAnchorElement()
-            ..href = _selectedFilePath!
-            ..download = _getFileNameLocal(_selectedFilePath!)
-            ..target = '_blank'
-            ..style.display = 'none';
-
-          web.document.body!.append(anchor);
-          anchor.click();
-          anchor.remove();
-        }
-
-        _safeShowSnackBar(
-          SnackBar(
-            content: Text(
-              'Opening ${_getFileNameLocal(_selectedFilePath!)}...',
-            ),
-            backgroundColor: Colors.blue,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      } catch (e) {
-        _safeShowSnackBar(
-          SnackBar(
-            content: const Text('Failed to open file'),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      }
-    }
-  }
-
-  void _openFileOnMobile() {
-    // For mobile, we can't directly open files in external apps from Flutter
-    // The best we can do is show a helpful message
-    _safeShowSnackBar(
-      SnackBar(
-        content: Text(
-          'File "${_getFileNameLocal(_selectedFilePath!)}" is ready. '
-          'You can find it in your downloads or use a file manager to open it.',
-        ),
-        backgroundColor: Colors.blue,
-        duration: const Duration(seconds: 4),
-      ),
-    );
-  }
-
-  void _showFileDetails() {
-    if (_selectedFilePath == null) return;
-
+  void _showHelpDialog() {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => Dialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
-          children: [
-            Icon(_getFileIconLocal(_selectedFilePath!), color: Colors.blue),
-            const SizedBox(width: 8),
-            const Text('File Details'),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _buildDetailRow('Label', widget.label),
-            _buildDetailRow('Name', _getFileNameLocal(_selectedFilePath!)),
-            _buildDetailRow(
-              'Type',
-              _getFileExtensionLocal(_selectedFilePath!).toUpperCase(),
-            ),
-            _buildDetailRow('Path', _getUserFriendlyPath(_selectedFilePath!)),
-            if (!kIsWeb) ...[
-              const SizedBox(height: 8),
-              FutureBuilder<int>(
-                future: File(_selectedFilePath!).length(),
-                builder: (context, snapshot) {
-                  if (snapshot.hasData) {
-                    final bytes = snapshot.data!;
-                    String size;
-                    if (bytes < 1024) {
-                      size = '$bytes B';
-                    } else if (bytes < 1024 * 1024) {
-                      size = '${(bytes / 1024).toStringAsFixed(1)} KB';
-                    } else {
-                      size = '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-                    }
-                    return _buildDetailRow('Size', size);
-                  }
-                  return const SizedBox.shrink();
-                },
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.help_outline_rounded,
+                size: 48,
+                color: Color(0xFF1E3A8A),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Distribution Help',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF1F2937),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                '• Follow SOP: Distribution must flow via Retailer, and record retailer-wise entries.\n'
+                '• Required fields are marked *.\n'
+                '• Record missed quantity if any.\n'
+                '• Reimbursement is recorded during Sample Execution (Entry Page 2).',
+                textAlign: TextAlign.left,
+                style: TextStyle(color: Colors.grey.shade700),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E3A8A),
+                    foregroundColor: Colors.white,
+                  ),
+                  child: const Text('Got it'),
+                ),
               ),
             ],
-          ],
+          ),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-          if (_isImageFileLocal(_selectedFilePath!) && !kIsWeb)
-            TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _showFilePreview();
-              },
-              child: const Text('View Full Size'),
-            ),
-        ],
       ),
     );
-  }
-
-  Widget _buildDetailRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 60,
-            child: Text(
-              '$label:',
-              style: const TextStyle(
-                fontWeight: FontWeight.w500,
-                color: Colors.grey,
-              ),
-            ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(fontWeight: FontWeight.w400),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // -------- Local helper methods (no globals!) --------
-
-  String _getFileNameLocal(String path) {
-    if (path.startsWith('data:')) {
-      // For base64 data URLs, extract filename from original name if available
-      if (_originalFileName != null && _originalFileName!.isNotEmpty) {
-        return _originalFileName!;
-      }
-      // Fallback: extract mime type and create a generic name
-      final mimeType = path.split(',')[0].split(':')[1].split(';')[0];
-      final ext = mimeType.split('/').last;
-      return 'uploaded_file.$ext';
-    }
-    return path.split('/').last;
-  }
-
-  String _getUserFriendlyPath(String path) {
-    if (path.startsWith('data:')) {
-      // For base64 data URLs, show a user-friendly message instead of the raw data
-      final mimeType = path.split(',')[0].split(':')[1].split(';')[0];
-      return 'Data URL (${mimeType})';
-    }
-    // For regular file paths, show the path but truncate if too long
-    if (path.length > 50) {
-      return '${path.substring(0, 20)}...${path.substring(path.length - 20)}';
-    }
-    return path;
-  }
-
-  String _getFileExtensionLocal(String path) {
-    if (!path.contains('.')) return 'jpg'; // sensible default for camera photos
-    return path.split('.').last.toLowerCase();
-  }
-
-  bool _isImageFileLocal(String path) {
-    final lower = path.toLowerCase();
-
-    if (lower.startsWith('data:')) {
-      final comma = lower.indexOf(',');
-      final header = lower.substring(5, comma == -1 ? lower.length : comma);
-      final mime = header.split(';').first;
-      return mime.startsWith('image/');
-    }
-
-    final ext = _getFileExtensionLocal(path);
-    const imageExts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'};
-    return imageExts.contains(ext);
-  }
-
-  IconData _getFileIconLocal(String path) {
-    final extension = _getFileExtensionLocal(path);
-    switch (extension) {
-      case 'pdf':
-        return Icons.picture_as_pdf;
-      case 'doc':
-      case 'docx':
-        return Icons.description;
-      case 'xls':
-      case 'xlsx':
-        return Icons.table_chart;
-      case 'ppt':
-      case 'pptx':
-        return Icons.slideshow;
-      case 'txt':
-        return Icons.text_snippet;
-      case 'zip':
-      case 'rar':
-        return Icons.archive;
-      case 'jpg':
-      case 'jpeg':
-      case 'png':
-      case 'gif':
-      case 'bmp':
-      case 'webp':
-        return Icons.image;
-      case 'mp4':
-      case 'avi':
-      case 'mov':
-        return Icons.video_file;
-      case 'mp3':
-      case 'wav':
-      case 'flac':
-        return Icons.audio_file;
-      default:
-        return Icons.insert_drive_file;
-    }
-  }
-
-  String _mimeFromExtensionLocal(String ext) {
-    switch (ext.toLowerCase()) {
-      case 'jpg':
-      case 'jpeg':
-        return 'image/jpeg';
-      case 'png':
-        return 'image/png';
-      case 'gif':
-        return 'image/gif';
-      case 'webp':
-        return 'image/webp';
-      case 'bmp':
-        return 'image/bmp';
-      case 'pdf':
-        return 'application/pdf';
-      case 'txt':
-        return 'text/plain';
-      case 'doc':
-        return 'application/msword';
-      case 'docx':
-        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-      case 'xls':
-        return 'application/vnd.ms-excel';
-      case 'xlsx':
-        return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-      case 'ppt':
-        return 'application/vnd.ms-powerpoint';
-      case 'pptx':
-        return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
-      default:
-        return 'application/octet-stream';
-    }
   }
 }
