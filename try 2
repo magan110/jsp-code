@@ -51,10 +51,8 @@ namespace RAKControllers.Controllers
 
                 if (!string.IsNullOrWhiteSpace(retailerCode))
                 {
-                    // If you store retailer code in catsamplead, change the column below.
-                    // Many schemas keep only retailer NAME, so we search in detail table too (if present).
-                    // Here we assume catsamplead has either cusRtlCd or custName ONLY.
-                    whereParts.Add("(ISNULL(a.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
+                    // Search retailerCode in both custName (header) and cusRtlCd (detail) fields
+                    whereParts.Add("(ISNULL(d.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
                     p["@retailerCode"] = retailerCode.Trim();
                 }
                 if (!string.IsNullOrWhiteSpace(retailerName))
@@ -87,7 +85,7 @@ SELECT TOP (@top)
        a.docuDate,
        a.areaCode,
        a.custName,             -- retailerName
-       ISNULL(a.cusRtlCd,'') AS retailerCode, -- if you don't have this column, leave as ''
+       ISNULL(d.cusRtlCd,'') AS retailerCode, -- retailer code from detail table
        a.concDist,             -- distributor name
        a.sampDate,             -- distribution date
        a.contName,             -- painter name
@@ -150,6 +148,300 @@ ORDER BY a.docuDate DESC, d.serialNo;";
                         // additional fields from detail table
                         var serialNo = r.ContainsKey("serialNo") ? (r["serialNo"]?.ToString() ?? "") : "";
                         var sampleCancelFlag = r.ContainsKey("sampCnCl") ? (r["sampCnCl"]?.ToString() ?? "") : "";
+
+                        list.Add(new SamplingDriveEntryDto
+                        {
+                            docuNumb = docuNumb,
+                            retailerName = retailerNm,
+                            retailerCode = retailerCd,
+                            distributorName = distName,
+                            area = area,
+                            distributionDate = distDate,
+                            painterName = painterName,
+                            painterMobile = painterMob,
+                            skuSizeLabel = skuLabel,
+                            qtyDistributedKg = qtyDistributedKg,
+                            missedQtyKg = missedQtyKg,
+                            effectiveDistributedKg = effectiveDistributedKg,
+                            totalReceivedKg = totalReceivedKg,
+                            remainingKg = remainingKg,
+                            reimbursementMode = reimbMode,
+                            reimbursementAmountAED = reimbAmt,
+                            photoImage = null,          // not stored; wire up later if you link image table
+                            serialNo = serialNo,
+                            materialQty = materialQty,
+                            sampleCancelFlag = sampleCancelFlag
+                        });
+                    }
+                }
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // -----------------------
+        // Helpers
+        // -----------------------
+        private static DateTime? TryParseDate(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            if (DateTime.TryParseExact(s.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                                       DateTimeStyles.None, out var dt))
+                return dt;
+            if (DateTime.TryParse(s, out var any)) return any;
+            return null;
+        }
+
+        private static DateTime? ToDate(object o)
+        {
+            if (o == null) return null;
+            if (o is DateTime dt) return dt;
+            var s = o.ToString();
+            return DateTime.TryParse(s, out var parsed) ? parsed : (DateTime?)null;
+        }
+
+        private static double ToDouble(object o)
+        {
+            if (o == null) return 0.0;
+            if (o is double d) return d;
+            if (o is decimal m) return (double)m;
+            if (o is float f) return f;
+            var s = o.ToString();
+            return double.TryParse(s, out var val) ? val : 0.0;
+        }
+
+        private static string PackSizeToLabel(string packSize, string productName)
+        {
+            // Your save uses "01K", "05K" etc. Convert to "1 Kg", "5 Kg".
+            if (string.IsNullOrWhiteSpace(packSize)) return productName ?? "";
+            var s = packSize.Trim().ToUpperInvariant();
+            if (s.EndsWith("K")) s = s.Substring(0, s.Length - 1);
+            if (s.StartsWith("0")) s = s.TrimStart('0');
+            if (string.IsNullOrWhiteSpace(s)) return productName ?? "";
+            return $"{s} Kg";
+        }
+    }
+
+    /// <summary>
+    /// DTO aligned with your Flutter SamplingDriveEntry
+    /// </summary>
+    public class SamplingDriveEntryDto
+    {
+        public string docuNumb { get; set; }
+        public string retailerName { get; set; }
+        public string retailerCode { get; set; }
+        public string distributorName { get; set; }
+        public string area { get; set; }
+        public DateTime distributionDate { get; set; }
+        public string painterName { get; set; }
+        public string painterMobile { get; set; }
+        public string skuSizeLabel { get; set; }
+        public double qtyDistributedKg { get; set; }
+        public double missedQtyKg { get; set; }
+        public double effectiveDistributedKg { get; set; }
+        public double totalReceivedKg { get; set; }
+        public double remainingKg { get; set; }
+        public string reimbursementMode { get; set; }
+        public double reimbursementAmountAED { get; set; }
+        public string photoImage { get; set; }
+        public string serialNo { get; set; }
+        public double materialQty { get; set; }
+        public string sampleCancelFlag { get; set; }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+namespace RAKControllers.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class SamplingExecutionEntryController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public SamplingExecutionEntryController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        /// <summary>
+        /// Search sampling drive entries by retailerCode or retailerName (either one),
+        /// with optional start/end dates (yyyy-MM-dd).
+        ///
+        /// Example:
+        /// GET api/SamplingDriveQuery/search?retailerCode=R001
+        /// GET api/SamplingDriveQuery/search?retailerName=Retailer%20A&start=2025-01-01&end=2025-02-28
+        /// </summary>
+        [HttpGet("search")]
+        public ActionResult<IEnumerable<SamplingDriveEntryDto>> Search(
+            [FromQuery] string retailerCode = null,
+            [FromQuery] string retailerName = null,
+            [FromQuery] string start = null,
+            [FromQuery] string end = null,
+            [FromQuery] int top = 200)
+        {
+            try
+            {
+                // Allow search without mandatory parameters to get all records
+                // if (string.IsNullOrWhiteSpace(retailerCode) && string.IsNullOrWhiteSpace(retailerName))
+                // {
+                //     return BadRequest("Provide either retailerCode or retailerName.");
+                // }
+
+                // Parse dates if provided (yyyy-MM-dd)
+                DateTime? startDate = TryParseDate(start);
+                DateTime? endDate = TryParseDate(end);
+
+                // Build WHERE parts
+                var whereParts = new List<string> { "1 = 1" };
+                var p = new Dictionary<string, object>();
+
+                if (!string.IsNullOrWhiteSpace(retailerCode))
+                {
+                    // Search retailerCode in both custName (header) and cusRtlCd (detail) fields
+                    whereParts.Add("(ISNULL(d.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
+                    p["@retailerCode"] = retailerCode.Trim();
+                }
+                if (!string.IsNullOrWhiteSpace(retailerName))
+                {
+                    whereParts.Add("ISNULL(a.custName,'') LIKE '%' + @retailerName + '%'");
+                    p["@retailerName"] = retailerName.Trim();
+                }
+                if (startDate.HasValue)
+                {
+                    whereParts.Add("a.sampDate >= @start");
+                    p["@start"] = startDate.Value;
+                }
+                if (endDate.HasValue)
+                {
+                    // inclusive end-date (add one day then < next-day)
+                    whereParts.Add("a.sampDate < DATEADD(DAY,1,@end)");
+                    p["@end"] = endDate.Value;
+                }
+
+                // NOTE:
+                // catsamplead columns we saved earlier:
+                //   docuNumb, docuDate, areaCode, custName, contName, mobileNo,
+                //   concDist, sampDate, misdQnty, packSize, prodName
+                //
+                // Some fields your Flutter shows do not exist in DB. We’ll return defaults.
+                //
+                var sql = $@"
+SELECT TOP (@top)
+       a.docuNumb,
+       a.docuDate,
+       a.areaCode,
+       a.custName,             -- retailerName
+       ISNULL(d.cusRtlCd,'') AS retailerCode, -- retailer code from detail table
+       a.concDist,             -- distributor name
+       a.sampDate,             -- distribution date
+       a.contName,             -- painter name
+       a.mobileNo,             -- painter mobile
+       a.packSize,             -- '01K','05K' etc.
+       a.prodName,             -- product name
+       a.misdQnty,             -- missed quantity (string)
+       d.serialNo,             -- detail serial number
+       d.pouchCnt,             -- material quantity from detail table
+       d.sampCnCl              -- sample/cancel flag from detail table
+FROM dbo.catsamplead a WITH (NOLOCK)
+LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
+WHERE {string.Join(" AND ", whereParts)}
+ORDER BY a.docuDate DESC, d.serialNo;";
+
+                p["@top"] = top;
+
+                var rows = _db.WebSessBean(sql, p) as List<Dictionary<string, object>>;
+                var list = new List<SamplingDriveEntryDto>();
+
+                if (rows != null)
+                {
+                    foreach (var r in rows)
+                    {
+                        // doc number
+                        var docuNumb = r["docuNumb"]?.ToString();
+
+                        // names/codes
+                        var retailerNm = (r["custName"] ?? "").ToString();
+                        var retailerCd = (r.ContainsKey("retailerCode") && r["retailerCode"] != DBNull.Value ? r["retailerCode"] : "")?.ToString() ?? "";
+                        var distName = (r["concDist"] ?? "").ToString();
+                        var area = (r["areaCode"] ?? "").ToString();
+
+                        // dates
+                        var distDate = ToDate(r["sampDate"]) ?? DateTime.UtcNow;
+
+                        // painter
+                        var painterName = (r["contName"] ?? "").ToString();
+                        var painterMob = (r["mobileNo"] ?? "").ToString();
+
+                        // sku/pack
+                        var packSize = (r["packSize"] ?? "").ToString();
+                        var productName = (r["prodName"] ?? "").ToString();
+                        var skuLabel = PackSizeToLabel(packSize, productName); // e.g. "5 Kg"
+
+                        // quantities
+                        var missedQtyKg = ToDouble(r["misdQnty"]);       // what you saved as misdQnty
+                        var materialQty = r.ContainsKey("pouchCnt") && r["pouchCnt"] != DBNull.Value ? ToDouble(r["pouchCnt"]) : 0.0; // material quantity from detail table
+                        var qtyDistributedKg = materialQty;              // use pouchCnt as distributed quantity
+                        var effectiveDistributedKg = Math.Max(0.0, qtyDistributedKg - missedQtyKg);
+
+                        // totals — not in DB; return 0
+                        var totalReceivedKg = 0.0;
+                        var remainingKg = 0.0;
+
+                        // reimbursement — not in DB; return defaults
+                        var reimbMode = "";
+                        var reimbAmt = 0.0;
+
+                        // additional fields from detail table (handle nulls from LEFT JOIN)
+                        var serialNo = r.ContainsKey("serialNo") && r["serialNo"] != DBNull.Value ? (r["serialNo"]?.ToString() ?? "") : "";
+                        var sampleCancelFlag = r.ContainsKey("sampCnCl") && r["sampCnCl"] != DBNull.Value ? (r["sampCnCl"]?.ToString() ?? "") : "";
 
                         list.Add(new SamplingDriveEntryDto
                         {
