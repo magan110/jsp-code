@@ -1,9 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.SqlClient;
 using RAKControllers.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -13,262 +11,229 @@ namespace RAKControllers.Controllers
     [Route("api/[controller]")]
     public class SampleDistributionController : ControllerBase
     {
-        private readonly string _connStr;
         private readonly DatabaseHelper _dbHelper;
 
-        public SampleDistributionController(IConfiguration config, DatabaseHelper dbHelper)
+        public SampleDistributionController(DatabaseHelper dbHelper)
         {
-            _connStr = config.GetConnectionString("bwlive")
-                        ?? throw new InvalidOperationException("DefaultConnection missing.");
             _dbHelper = dbHelper;
         }
 
         // ----------------------------
         // 1) Emirates dropdown (Areas)
         // ----------------------------
-
-
-        [HttpPost("generateDocumentNumber")]
-        public IActionResult GenerateDocumentNumber([FromBody] string areaCode)
+        [HttpGet("areas")]
+        public ActionResult<IEnumerable<AreaItem>> GetAreas([FromQuery] bool onlyActive = true)
         {
-            if (string.IsNullOrWhiteSpace(areaCode))
-                return BadRequest("AreaCode is required.");
-
             try
             {
-                var key = $"DocumentNumber_{areaCode}";
-                if (HttpContext.Session.TryGetValue(key, out var existing))
-                {
-                    var num = System.Text.Encoding.UTF8.GetString(existing);
-                    return Ok(new { DocumentNumber = num });
-                }
-
-                const string genSql = "EXEC [dbo].[wcpDocNoGen] @DocType, @AreaCode";
-                var genParams = new Dictionary<string, object>
-                {
-                    ["@DocType"] = "SDE",
-                    ["@AreaCode"] = areaCode
-                };
-                var r1 = _dbHelper.WebSessBean(genSql, genParams)
-                           as List<Dictionary<string, object>>;
-                var docuNumb = r1?.FirstOrDefault()?["docuNumb"]?.ToString();
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                    return StatusCode(500, "Failed to generate document number.");
-
-                const string updSql = "EXEC [dbo].[wcpDocNoUpd] @DocType, @AreaCode";
-                _dbHelper.WebSessBean(updSql, genParams);
-
-                HttpContext.Session.Set(key, System.Text.Encoding.UTF8.GetBytes(docuNumb));
-                return Ok(new { DocumentNumber = docuNumb });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ex.Message);
-            }
-        }
-
-
-
-        [HttpGet("areas")]
-                                  public async Task<ActionResult<IEnumerable<AreaItem>>> GetAreas([FromQuery] bool onlyActive = true)
-        {
-            const string sql = @"
+                const string sql = @"
 SELECT areaCode, areaDesc
 FROM dbo.bkmAreaMast WITH (NOLOCK)
 WHERE (@onlyActive = 0 OR isActive = 'Y')
 ORDER BY areaDesc;";
 
-            var list = new List<AreaItem>();
-            await using var conn = new SqlConnection(_connStr);
-            await conn.OpenAsync();
-            await using (var cmd = new SqlCommand(sql, conn))
-            {
-                cmd.Parameters.AddWithValue("@onlyActive", onlyActive ? 1 : 0);
-                using var rd = await cmd.ExecuteReaderAsync();
-                while (await rd.ReadAsync())
+                var parameters = new Dictionary<string, object>
                 {
-                    list.Add(new AreaItem
+                    { "@onlyActive", onlyActive ? 1 : 0 }
+                };
+
+                var result = _dbHelper.WebSessBean(sql, parameters);
+                var list = new List<AreaItem>();
+
+                if (result != null)
+                {
+                    foreach (var row in result)
                     {
-                        code = rd.GetString(0).Trim(),
-                        desc = rd.GetString(1).Trim()
-                    });
+                        list.Add(new AreaItem
+                        {
+                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
+                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
+                        });
+                    }
                 }
+
+                return Ok(list);
             }
-            return Ok(list);
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
         }
 
         // -----------------------------------------
         // 2) Submit the Sample Distribution payload
         // -----------------------------------------
         [HttpPost("submit")]
-public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
-{
-    try
-    {
-        // Basic validations
-        if (req == null) return BadRequest("Empty request.");
-        if (string.IsNullOrWhiteSpace(req.emirate)) return BadRequest("Emirate (areaCode) is required.");
-        if (string.IsNullOrWhiteSpace(req.retailerName)) return BadRequest("Retailer Name is required.");
-        if (string.IsNullOrWhiteSpace(req.distributor)) return BadRequest("Concern Distributor is required.");
-        if (string.IsNullOrWhiteSpace(req.painterName)) return BadRequest("Painter/Contractor Name is required.");
-        if (string.IsNullOrWhiteSpace(req.skuSize)) return BadRequest("Material SKU is required.");
-        if (string.IsNullOrWhiteSpace(req.distributionDate)) return BadRequest("Date of distribution is required.");
-        if (!DateTime.TryParse(req.distributionDate, out var sampDate)) return BadRequest("Invalid distribution date.");
+        public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
+        {
+            try
+            {
+                // Basic validations
+                if (req == null) return BadRequest("Empty request.");
+                if (string.IsNullOrWhiteSpace(req.emirate)) return BadRequest("Emirate (areaCode) is required.");
+                if (string.IsNullOrWhiteSpace(req.retailerName)) return BadRequest("Retailer Name is required.");
+                if (string.IsNullOrWhiteSpace(req.distributor)) return BadRequest("Concern Distributor is required.");
+                if (string.IsNullOrWhiteSpace(req.painterName)) return BadRequest("Painter/Contractor Name is required.");
+                if (string.IsNullOrWhiteSpace(req.skuSize)) return BadRequest("Material SKU is required.");
+                if (string.IsNullOrWhiteSpace(req.distributionDate)) return BadRequest("Date of distribution is required.");
 
-        var (packSize, prodName) = MapSku(req.skuSize);
+                if (!DateTime.TryParse(req.distributionDate, out var sampDate))
+                    return BadRequest("Invalid distribution date.");
 
-        var loginId = Request.Headers.ContainsKey("LoginID")
-            ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
-            : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
-        loginId = (loginId ?? "SYSTEM").Trim();
-        if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
+                // Map SKU text -> DB packSize & product name
+                var (packSize, prodName) = MapSku(req.skuSize);
 
-        // SINGLE ATOMIC BATCH: lock -> gen -> insert -> update seq -> commit
-        // Captures docuNumb into @doc and returns a single row to C#
-        var sql = @"
-SET XACT_ABORT ON;
-DECLARE @rc INT, @doc NVARCHAR(64), @msg NVARCHAR(4000);
+                // CreateId from header or request (max 6 chars)
+                var loginId = Request.Headers.ContainsKey("LoginID")
+                    ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
+                    : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
+                loginId = (loginId ?? "SYSTEM").Trim();
+                if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
 
-BEGIN TRY
-    BEGIN TRAN;
+                var areaCode = req.emirate.Trim();
 
-    -- App lock ensures only one generator per (DocType,Area) at a time
-    EXEC @rc = sys.sp_getapplock 
-         @Resource = CONCAT('DOCNO:','SDE',':', @AreaCode),
-         @LockMode = 'Exclusive',
-         @LockOwner = 'Transaction',
-         @Timeout  = 15000;
+                // --- Generate the document number ---
+                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
+                var genParams = new Dictionary<string, object>
+                {
+                    ["@DocType"] = "SDE",
+                    ["@AreaCode"] = areaCode
+                };
 
-    IF (@rc < 0)
-    BEGIN
-        RAISERROR('Failed to acquire doc number lock.', 16, 1);
-    END
+                var genRows = _dbHelper.WebSessBean(genSql, genParams) as List<Dictionary<string, object>>;
+                string docuNumb = null;
+                if (genRows != null && genRows.Count > 0)
+                {
+                    var row = genRows.First();
+                    var candidates = new[] { "docuNumb", "DocuNumb", "DOCUNUMB", "DocNo", "DocumentNo" };
+                    foreach (var key in candidates)
+                    {
+                        if (row.TryGetValue(key, out var val) && val != null)
+                        {
+                            docuNumb = val.ToString();
+                            break;
+                        }
+                    }
+                    if (string.IsNullOrWhiteSpace(docuNumb) && row.Count > 0)
+                        docuNumb = row.First().Value?.ToString();
+                }
 
-    -- Generate doc number and capture it
-    DECLARE @t TABLE (docuNumb NVARCHAR(128));
-    INSERT INTO @t EXEC dbo.wcpDocNoGen @DocType = 'SDE', @AreaCode = @AreaCode;
-    SELECT TOP 1 @doc = docuNumb FROM @t;
+                if (string.IsNullOrWhiteSpace(docuNumb))
+                {
+                    return StatusCode(500, new SubmitResponse
+                    {
+                        success = false,
+                        message = $"Failed to generate document number for area '{areaCode}'.",
+                        docuNumb = null
+                    });
+                }
 
-    IF (@doc IS NULL OR LTRIM(RTRIM(@doc)) = '')
-    BEGIN
-        RAISERROR('wcpDocNoGen did not return a document number.', 16, 1);
-    END
+                // --- Immediately advance the sequence ---
+                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
+                _dbHelper.WebSessBean(updSql, genParams);
 
-    -- Insert HEADER
-    INSERT INTO dbo.catsamplead
-    (
-      docuNumb, docuDate, areaCode, custName, contName, mobileNo,
-      concDist, sampDate, misdQnty, packSize, prodName,
-      statFlag, createId, createDt
-    )
-    VALUES
-    (
-      @doc, GETDATE(), @AreaCode, @CustName, @ContName, @MobileNo,
-      @ConcDist, @SampDate, @MisdQnty, @PackSize, @ProdName,
-      'N', @CreateId, GETDATE()
-    );
+                // ================= HEADER: dbo.catsamplead =================
+                var insertHeaderSql = @"
+INSERT INTO dbo.catsamplead
+(
+  docuNumb, docuDate, areaCode, custName, contName, mobileNo,
+  concDist, sampDate, misdQnty, packSize, prodName, sampType,
+  statFlag, createId, createDt
+)
+VALUES
+(
+  @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo,
+  @concDist, @sampDate, @misdQnty, @packSize, @prodName, @sampType,
+  'N', @createId, GETDATE()
+);";
 
-    -- Optional: retailer code on header if column exists
-    IF COL_LENGTH('dbo.catsamplead','cusRtlCode') IS NOT NULL
-    BEGIN
-        UPDATE dbo.catsamplead 
-        SET cusRtlCode = @CusRtlCode
-        WHERE docuNumb = @doc;
-    END
+                var headerParams = new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb,                         // varchar(16)
+                    ["@areaCode"] = areaCode,                         // varchar(20)
+                    ["@custName"] = req.retailerName?.Trim() ?? (object)DBNull.Value,  // varchar(50) null
+                    ["@contName"] = req.painterName?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
+                    ["@mobileNo"] = req.painterMobile?.Trim() ?? (object)DBNull.Value, // varchar(13) null
+                    ["@concDist"] = req.distributor?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
+                    ["@sampDate"] = sampDate,                         // smalldatetime null
+                    ["@misdQnty"] = req.missedQty?.Trim() ?? (object)DBNull.Value,     // char(10) null
+                    ["@packSize"] = (object?)packSize ?? DBNull.Value,                  // char(3) null
+                    ["@prodName"] = (object?)prodName ?? DBNull.Value,                  // varchar(100) null
+                    ["@sampType"] = "SampleDistribution",             // varchar(20) null
+                    ["@createId"] = loginId                           // varchar(6) null
+                };
 
-    -- Insert DETAIL (base columns)
-    INSERT INTO dbo.catsampleadDtl
-    (
-      docuNumb, docuDate, areaCode,
-      custName, contName, mobileNo, concDist,
-      sampDate, misdQnty, packSize, prodName, sampType,
-      createId, createDt
-    )
-    VALUES
-    (
-      @doc, GETDATE(), @AreaCode,
-      @CustName, @ContName, @MobileNo, @ConcDist,
-      @SampDate, @MisdQnty, @PackSize, @ProdName, 'SampleDistribution',
-      @CreateId, GETDATE()
-    );
+                _dbHelper.WebExecute(insertHeaderSql, headerParams);
 
-    -- Optional: retailer code on detail if column exists
-    IF COL_LENGTH('dbo.catsampleadDtl','cusRtlCode') IS NOT NULL
-    BEGIN
-        UPDATE dbo.catsampleadDtl 
-        SET cusRtlCode = @CusRtlCode
-        WHERE docuNumb = @doc;
-    END
+                // ================ DETAIL: dbo.catsampleadDtl ================
+                // Required: serialNo (NOT NULL), docuNumb (NOT NULL), sampCnCl (NOT NULL, 1 char)
+                // We'll set serialNo = next value within this docuNumb, sampCnCl = 'S' (sample).
+                var nextSerialSql = @"
+SELECT ISNULL(MAX(serialNo), 0) + 1 AS nextSerial
+FROM dbo.catsampleadDtl WITH (NOLOCK)
+WHERE docuNumb = @docuNumb;";
 
-    -- Optional: pouchCnt (number of bags) on detail if column exists
-    IF COL_LENGTH('dbo.catsampleadDtl','pouchCnt') IS NOT NULL
-    BEGIN
-        UPDATE dbo.catsampleadDtl 
-        SET pouchCnt = @PouchCnt
-        WHERE docuNumb = @doc;
-    END
+                var nextSerialRows = _dbHelper.WebSessBean(nextSerialSql, new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb
+                }) as List<Dictionary<string, object>>;
 
-    -- Reserve/confirm the number
-    EXEC dbo.wcpDocNoUpd @DocType = 'SDE', @AreaCode = @AreaCode;
+                int nextSerial = 1;
+                if (nextSerialRows != null && nextSerialRows.Count > 0)
+                {
+                    var v = nextSerialRows[0].Values?.FirstOrDefault()?.ToString();
+                    if (int.TryParse(v, out var parsed)) nextSerial = parsed;
+                }
 
-    COMMIT;
-
-    SELECT 1 AS success, 'Saved successfully.' AS message, @doc AS docuNumb;
-END TRY
-BEGIN CATCH
-    IF XACT_STATE() <> 0 ROLLBACK;
-    SELECT 0 AS success, ERROR_MESSAGE() AS message, NULL AS docuNumb;
-END CATCH
+                var insertDetailSql = @"
+INSERT INTO dbo.catsampleadDtl
+(
+  docuNumb, sampDate, pouchCnt, sampCnCl,
+  statFlag, createId, createDt
+)
+VALUES
+(
+  @docuNumb, @sampDate, @pouchCnt, @sampCnCl,
+  'N', @createId, GETDATE()
+);
 ";
 
-        var parameters = new Dictionary<string, object>
-        {
-            ["@AreaCode"]  = req.emirate.Trim(),
-            ["@CustName"]  = (object?)req.retailerName?.Trim() ?? DBNull.Value,
-            ["@CusRtlCode"]= (object?)req.retailerCode?.Trim() ?? DBNull.Value,
-            ["@ConcDist"]  = (object?)req.distributor?.Trim() ?? DBNull.Value,
-            ["@ContName"]  = (object?)req.painterName?.Trim() ?? DBNull.Value,
-            ["@MobileNo"]  = (object?)req.painterMobile?.Trim() ?? DBNull.Value,
-            ["@SampDate"]  = sampDate,
-            ["@MisdQnty"]  = (object?)req.missedQty?.Trim() ?? DBNull.Value,
-            ["@PackSize"]  = (object?)packSize ?? DBNull.Value,
-            ["@ProdName"]  = (object?)prodName ?? DBNull.Value,
-            ["@CreateId"]  = loginId,
-            // pouchCnt expects INT if present; parse safely
-            ["@PouchCnt"]  = int.TryParse(req.materialQty, out var bags) ? (object)bags : DBNull.Value
-        };
+                var detailParams = new Dictionary<string, object>
+                {
+                    ["@serialNo"] = nextSerial,                                     // int NOT NULL
+                    ["@docuNumb"] = docuNumb,                                       // varchar(16) NOT NULL
+                    ["@sampDate"] = sampDate,                                       // smalldatetime
+                    ["@pouchCnt"] = (object?)(req.materialQty?.Trim()) ?? DBNull.Value, // varchar(10) null
+                    ["@sampCnCl"] = "S",                                            // varchar(1) NOT NULL (set as Sample)
+                    ["@createId"] = loginId
+                };
 
-        var rows = _dbHelper.WebSessBean(sql, parameters);
-        var row  = rows?.FirstOrDefault();
-        var ok   = row != null && (row.TryGetValue("success", out var s) && Convert.ToInt32(s) == 1);
+                _dbHelper.WebExecute(insertDetailSql, detailParams);
 
-        return Ok(new SubmitResponse
-        {
-            success = ok,
-            message = row?["message"]?.ToString() ?? (ok ? "Saved successfully." : "Unknown result."),
-            docuNumb = ok ? row?["docuNumb"]?.ToString() : null
-        });
-    }
-    catch (Exception ex)
-    {
-        return StatusCode(500, new SubmitResponse
-        {
-            success = false,
-            message = ex.Message,
-            docuNumb = null
-        });
-    }
-}
-
+                return Ok(new SubmitResponse
+                {
+                    success = true,
+                    message = "Saved successfully.",
+                    docuNumb = docuNumb
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new SubmitResponse
+                {
+                    success = false,
+                    message = ex.Message,
+                    docuNumb = null
+                });
+            }
+        }
 
         // -----------------------
         // Helpers / Utilities
         // -----------------------
-
         private static (string packSize, string prodName) MapSku(string sku)
         {
-            // You asked me to decide the SKU mapping:
-            // "1 Kg" -> packSize = "01K"; "5 Kg" -> "05K"; default: digits + 'K'
+            // SKU mapping: "1 Kg" -> packSize = "01K"; "5 Kg" -> "05K"; default: digits + 'K'
             if (string.IsNullOrWhiteSpace(sku)) return (null, null);
             var s = sku.Trim().ToLower();
             if (s.StartsWith("1")) return ("01K", "BW Putty 1 Kg");
@@ -277,81 +242,32 @@ END CATCH
             // fallback: extract first number (kg)
             var digits = new string(s.Where(char.IsDigit).ToArray());
             var pack = string.IsNullOrEmpty(digits) ? null : (digits.Length == 1 ? $"0{digits}K" : $"{digits}K");
-            var name  = string.IsNullOrEmpty(digits) ? null : $"BW Putty {digits} Kg";
+            var name = string.IsNullOrEmpty(digits) ? null : $"BW Putty {digits} Kg";
             return (pack, name);
-        }
-
-        private static int? ParseNullableInt(string v)
-        {
-            if (int.TryParse(v, out var n)) return n;
-            return null;
-        }
-
-        private static async Task<bool> ColumnExists(SqlConnection conn, SqlTransaction tx, string tableName, string colName)
-        {
-            var sql = "SELECT COL_LENGTH(@t, @c)";
-            await using var cmd = new SqlCommand(sql, conn, tx);
-            cmd.Parameters.AddWithValue("@t", tableName);
-            cmd.Parameters.AddWithValue("@c", colName);
-            var obj = await cmd.ExecuteScalarAsync();
-            return obj != DBNull.Value && obj != null;
-        }
-
-        private static async Task<string> ExecDocNoGen(SqlConnection conn, SqlTransaction tx, string docType, string areaCode)
-        {
-            // Matches: exec [dbo].[wcpDocNoGen] 'SDE', 'KJR'
-            var sql = "EXEC dbo.wcpDocNoGen @p1, @p2;";
-            await using var cmd = new SqlCommand(sql, conn, tx);
-            cmd.Parameters.AddWithValue("@p1", docType);
-            cmd.Parameters.AddWithValue("@p2", areaCode);
-            // Try scalar, else reader
-            var scalar = await cmd.ExecuteScalarAsync();
-            if (scalar != null && scalar != DBNull.Value) return Convert.ToString(scalar);
-
-            // Some implementations return a SELECT row
-            await using var cmd2 = new SqlCommand(sql, conn, tx);
-            cmd2.Parameters.AddWithValue("@p1", docType);
-            cmd2.Parameters.AddWithValue("@p2", areaCode);
-            using var rd = await cmd2.ExecuteReaderAsync();
-            if (await rd.ReadAsync())
-            {
-                // take the first column as doc number
-                return rd.GetValue(0)?.ToString();
-            }
-            return null;
-        }
-
-        private static async Task ExecDocNoUpd(SqlConnection conn, SqlTransaction tx, string docType, string areaCode)
-        {
-            var sql = "EXEC dbo.wcpDocNoUpd @p1, @p2;";
-            await using var cmd = new SqlCommand(sql, conn, tx);
-            cmd.Parameters.AddWithValue("@p1", docType);
-            cmd.Parameters.AddWithValue("@p2", areaCode);
-            await cmd.ExecuteNonQueryAsync();
         }
     }
 
     // DTOs
     public class AreaItem
     {
-        public string code { get; set; }  // areaCode (char(3))
+        public string code { get; set; }  // areaCode (char/varchar)
         public string desc { get; set; }  // areaDesc
     }
 
     public class SampleDistributionRequest
     {
         public string? loginId { get; set; }          // optional; or via header: LoginID
-        public string emirate { get; set; }           // areaCode (char(3))
+        public string emirate { get; set; }           // areaCode
         public string retailerName { get; set; }      // custName
-        public string? retailerCode { get; set; }     // cusRtlCode (if column exists)
+        public string? retailerCode { get; set; }     // not used here
         public string distributor { get; set; }       // concDist
         public string painterName { get; set; }       // contName
         public string? painterMobile { get; set; }    // mobileNo
         public string skuSize { get; set; }           // -> packSize + prodName mapping
-        public string? materialQty { get; set; }      // -> pouchCnt (if column exists)
-        public string? missedQty { get; set; }        // -> misdQnty (char(10))
+        public string? materialQty { get; set; }      // -> pouchCnt (Dtl)
+        public string? missedQty { get; set; }        // -> misdQnty (Hdr)
         public string distributionDate { get; set; }  // -> sampDate (yyyy-MM-dd)
-        public string? salesLead { get; set; }        // (reserved, not mapped now)
+        public string? salesLead { get; set; }        // reserved
     }
 
     public class SubmitResponse
