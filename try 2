@@ -1,1414 +1,3 @@
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class ContractorController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-
-        public ContractorController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
-
-        // POST: /api/Contractor/register
-        [HttpPost("register")]
-        [Consumes("application/json")]
-        public IActionResult Register([FromBody] ContractorRegistrationRequest? request = null)
-        {
-            try
-            {
-                request ??= new ContractorRegistrationRequest();
-
-                // --- Keys / defaults ---
-                var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant();       // char(2)
-                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();             // char(3) - use emirates code as area code
-
-                // Generate sequential inflCode = pure numeric in ascending order
-                string inflCode = GetNextInfluencerCode(inflType);
-
-                // Build names and enforce column sizes
-                var fullName = string.Join(" ",
-                    new[] { request.FirstName, request.MiddleName, request.LastName }
-                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
-
-                var inflName256 = Cut(fullName, 256); // inflName nvarchar(256)
-                var contName40  = Cut(fullName, 40);  // contName varchar(40)
-
-                // Address fields (NOT NULL: inflAdd3, district, inflPinC)
-                var inflAdd1_50 = Cut(request.Address, 50);
-                var inflAdd2_100 = "";            // not using; keep empty
-                var inflAdd3_30 = "";             // keep empty to avoid overflow (NOT NULL but "" is allowed)
-                var inflCity_255 = "";
-
-                // Phone and other short fields
-                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
-
-                // Bank fields
-                var bankName100   = Cut(request.BankName, 100);
-                var branchName100 = Cut(request.BranchName, 100);
-                var acctHolder40  = Cut(request.AccountHolderName, 40);
-
-                // New 255 columns (cut to 255 just in case)
-                var contrtyp255 = Cut(request.ContractorType, 255);
-                var frstname255 = Cut(request.FirstName, 255);
-                var middname255 = Cut(request.MiddleName, 255);
-                var lastname255 = Cut(request.LastName, 255);
-                var emirates255 = Cut(request.Emirates, 255);
-
-                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
-                var vatfrmnm255 = Cut(request.FirmName, 255);
-                var vatraddr255 = Cut(request.VatAddress, 255);
-                var vattxreg255 = Cut(request.TaxRegistrationNumber, 255);
-                var vatefdt255  = Cut(request.VatEffectiveDate, 255);
-                var comlcnno255 = Cut(request.LicenseNumber, 255);
-                var comissau255 = Cut(request.IssuingAuthority, 255);
-                var comlctyp255 = Cut(request.LicenseType, 255);
-                var comestdt255 = Cut(request.EstablishmentDate, 255);
-                var comexpdt255 = Cut(request.LicenseExpiryDate, 255);
-                var comtrdnm255 = Cut(request.TradeName, 255);
-                var comrespn255 = Cut(request.ResponsiblePerson, 255);
-                var comraddr255 = Cut(request.LicenseAddress, 255);
-                var comeffdt255 = Cut(request.EffectiveDate, 255);
-
-                // Build parameter bag: supply EVERYTHING used in INSERT
-                var p = new Dictionary<string, object?>
-                {
-                    // ==== Required legacy (NOT NULL) ====
-                    ["@inflCode"] = inflCode,                // char(8)
-                    ["@inflType"] = inflType,                // char(2)
-                    ["@inflName"] = inflName256,             // nvarchar(256)
-                    ["@contName"] = contName40,              // varchar(40)
-
-                    // Address cluster
-                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
-                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
-                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
-                    ["@inflCity"] = inflCity_255,            // varchar(255)
-                    ["@district"] = "",                      // varchar(30)  NOT NULL
-                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
-
-                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
-                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
-                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
-                    ["@birthDat"] = DBNull.Value,            // smalldatetime NULL
-                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
-                    ["@expertis"] = "",                      // varchar(100) YES (send "")
-                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
-                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
-                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
-                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
-                    ["@isActive"] = "T",                     // char(1)      NOT NULL
-                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
-                    ["@updateId"] = DBNull.Value,            // varchar(10)  NULL
-                    ["@updateDt"] = DBNull.Value,            // smalldatetime NULL
-                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
-                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
-                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
-
-                    // Tax IDs / misc
-                    ["@itxPanNo"] = "",                      // varchar(50)
-                    ["@locStxNo"] = "",                      // varchar(30)
-
-                    // Banking (legacy)
-                    ["@bankAcNo"] = "",                      // varchar(25)
-                    ["@bankBnNm"] = bankName100,             // varchar(100)
-                    ["@bankBnDs"] = branchName100,           // varchar(100)
-                    ["@bankBnNo"] = "",                      // varchar(20)
-                    ["@bankIFSC"] = "",                      // varchar(20)
-
-                    // KYC & misc
-                    ["@kycVerFl"] = "",
-                    ["@kycVerDt"] = DBNull.Value,
-                    ["@idCardTy"] = "",
-                    ["@idCardNo"] = "",
-                    ["@inDocCnt"] = DBNull.Value,
-                    ["@rjcRemrk"] = "",
-                    ["@entrBySg"] = "",
-                    ["@kycVrTyp"] = "",
-                    ["@adhrName"] = "",
-                    ["@panCName"] = "",
-                    ["@sapInsDt"] = DBNull.Value,
-                    ["@sapUpdDt"] = DBNull.Value,
-                    ["@urbRurFl"] = "",
-
-                    ["@bankApNm"] = acctHolder40,            // varchar(40)
-
-                    // Permanent/alt address
-                    ["@infAddP1"] = "",
-                    ["@infAddP2"] = "",
-                    ["@infAddP3"] = "",
-                    ["@infPCity"] = "",
-                    ["@distrctP"] = "",
-                    ["@infPinCP"] = "",
-
-                    ["@adhOtpFl"] = "",
-                    ["@concEmpl"] = "",
-                    ["@bnkKycFl"] = "",
-                    ["@bnkKycDt"] = DBNull.Value,
-                    ["@inflPinL"] = "",
-                    ["@adhCpUId"] = "",
-                    ["@adhCpUDt"] = DBNull.Value,
-                    ["@panCpUId"] = "",
-                    ["@panCpUDt"] = DBNull.Value,
-                    ["@bnkCpUId"] = "",
-                    ["@bnkCpUDt"] = DBNull.Value,
-                    ["@randNmSt"] = "",
-                    ["@kycStats"] = "",
-                    ["@inflTyOl"] = "",
-                    ["@kycAprBy"] = "",
-                    ["@blkStuts"] = "",
-                    ["@blkStDat"] = DBNull.Value,
-                    ["@cntrApFl"] = "",
-                    ["@frstScDt"] = DBNull.Value,
-                    ["@sourceCnt"] = "",
-                    ["@promoteNm"] = "",
-                    ["@pmobilen"] = "",
-                    ["@isTDSEli"] = "",
-                    ["@panAdhLk"] = "",
-                    ["@panVldIn"] = "",
-                    ["@panCatgF"] = "",
-
-                    // ==== New varchar(255) columns ====
-                    ["@contrtyp"] = contrtyp255,
-                    ["@frstname"] = frstname255,
-                    ["@middname"] = middname255,
-                    ["@lastname"] = lastname255,
-                    ["@emirates"] = emirates255,
-
-                    ["@ibannumb"] = ibannumb255,
-                    ["@vatfrmnm"] = vatfrmnm255,
-                    ["@vatraddr"] = vatraddr255,
-                    ["@vattxreg"] = vattxreg255,
-                    ["@vatefdt"]  = vatefdt255,
-                    ["@comlcnno"] = comlcnno255,
-                    ["@comissau"] = comissau255,
-                    ["@comlctyp"] = comlctyp255,
-                    ["@comestdt"] = comestdt255,
-                    ["@comexpdt"] = comexpdt255,
-                    ["@comtrdnm"] = comtrdnm255,
-                    ["@comrespn"] = comrespn255,
-                    ["@comraddr"] = comraddr255,
-                    ["@comeffdt"] = comeffdt255
-                };
-
-                var sql = @"
-INSERT INTO dbo.ctmInfluncr
-(
-    inflCode, inflType, inflName, contName,
-    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
-    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
-    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
-    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
-    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
-    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
-    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
-    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
-    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
-    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
-
-    contrtyp, frstname, middname, lastname, emirates,  ibannumb,
-    vatfrmnm, vatraddr, vattxreg, vatefdt,
-    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt
-)
-VALUES
-(
-    @inflCode, @inflType, @inflName, @contName,
-    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
-    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
-    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
-    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
-    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
-    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
-    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
-    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
-    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
-    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
-
-    @contrtyp, @frstname, @middname, @lastname, @emirates,  @ibannumb,
-    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
-    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt
-);
-
-SELECT @inflCode AS InflCode;
-";
-
-                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Registration saved",
-                    influencerCode = savedCode,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        // Dropdowns to match Flutter UI
-        [HttpGet("contractor-types")]
-        public IActionResult ContractorTypes() => Ok(new
-        {
-            success = true,
-            data = new[] { "Maintenance Contractor", "Petty contractors" },
-            timestamp = DateTime.Now
-        });
-
-        [HttpGet("emirates-list")]
-        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
-        {
-            try
-            {
-                const string sql = @"
-SELECT areaCode, areaDesc
-FROM dbo.bkmAreaMast WITH (NOLOCK)
-WHERE (@onlyActive = 0 OR isActive = 'Y')
-ORDER BY areaDesc;";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@onlyActive", onlyActive ? 1 : 0 }
-                };
-
-                var result = _db.WebSessBean(sql, parameters);
-                var list = new List<AreaItem>();
-
-                if (result != null)
-                {
-                    foreach (var row in result)
-                    {
-                        list.Add(new AreaItem
-                        {
-                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
-                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        // ----------------- helpers -----------------
-        private string GetNextInfluencerCode(string inflType)
-        {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                // Get the next sequential number for 2IK codes
-                int nextNumber = GetNextInfluencerSequence();
-                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
-                attempts++;
-
-                if (attempts >= maxAttempts)
-                {
-                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
-                }
-
-            } while (IsInfluencerCodeExists(newCode));
-
-            return newCode;
-        }
-
-        private int GetNextInfluencerSequence()
-        {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.ctmInfluncr
-                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
-
-            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
-
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
-        }
-
-        private bool IsInfluencerCodeExists(string influencerCode)
-        {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
-            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
-
-            var result = _db.WebSessBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-
-            return count != null && Convert.ToInt32(count) > 0;
-        }
-
-        private static string MakeFixed(int size, string input)
-        {
-            if (string.IsNullOrEmpty(input)) input = "";
-            return input.Length >= size ? input[..size]
-                   : input + new string('A', size - input.Length);
-        }
-
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return new string(s.Where(char.IsDigit).ToArray());
-        }
-
-        // keep last 11 digits if user typed country code
-        private static string FormatMobile11(string? s)
-        {
-            var d = Digits(s);
-            if (d.Length <= 11) return d;
-            return d.Substring(d.Length - 11);
-        }
-
-        private static string? FormatIban(string? s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return s;
-            return s.Replace(" ", "").ToUpperInvariant();
-        }
-    }
-
-    // ----------------- request model (matches Flutter) -----------------
-    public class ContractorRegistrationRequest
-    {
-        // Personal
-        public string? ContractorType { get; set; }
-        public string? FirstName { get; set; }
-        public string? MiddleName { get; set; }
-        public string? LastName { get; set; }
-        public string? MobileNumber { get; set; }
-        public string? Address { get; set; }
-        public string? Area { get; set; }
-        public string? Emirates { get; set; }
-        public string? ProfilePhoto { get; set; }
-
-        // Bank
-        public string? AccountHolderName { get; set; }
-        public string? IbanNumber { get; set; }
-        public string? BankName { get; set; }
-        public string? BranchName { get; set; }
-        public string? BankAddress { get; set; }
-
-        // VAT
-        public string? VatCertificate { get; set; }
-        public string? FirmName { get; set; }
-        public string? VatAddress { get; set; }
-        public string? TaxRegistrationNumber { get; set; }
-        public string? VatEffectiveDate { get; set; }
-
-        // License
-        public string? LicenseDocument { get; set; }
-        public string? LicenseNumber { get; set; }
-        public string? IssuingAuthority { get; set; }
-        public string? LicenseType { get; set; }
-        public string? EstablishmentDate { get; set; }
-        public string? LicenseExpiryDate { get; set; }
-        public string? TradeName { get; set; }
-        public string? ResponsiblePerson { get; set; }
-        public string? LicenseAddress { get; set; }
-        public string? EffectiveDate { get; set; }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class PainterController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-
-        public PainterController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
-
-        // POST: /api/Painter/register
-        [HttpPost("register")]
-        [Consumes("application/json")]
-        public IActionResult Register([FromBody] PainterRegistrationRequest? request = null)
-        {
-            try
-            {
-                request ??= new PainterRegistrationRequest();
-
-                // --- Keys / defaults ---
-                var inflType = "PN";                                                           // char(2) -> Painter
-                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();           // char(3) - use emirates code as area code
-
-                // NEW: Generate sequential inflCode = "PN" + 6-digit number (char(8))
-                string inflCode = GetNextInfluencerCode(inflType);
-
-                // Names
-                var fullName = string.Join(" ",
-                    new[] { request.FirstName, request.MiddleName, request.LastName }
-                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
-
-                var inflName256 = Cut(fullName, 256);  // inflName nvarchar(256)
-                var contName40 = Cut(fullName, 40);   // contName varchar(40)
-
-                // Address cluster (legacy)
-                var inflAdd1_50 = Cut(request.Address, 50);
-                var inflAdd2_100 = "";
-                var inflAdd3_30 = "";                // keep empty (NOT NULL but "" allowed)
-                var inflCity_255 = "";
-
-                // Mobile
-                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
-
-                // Bank (legacy)
-                var bankName100 = Cut(request.BankName, 100);
-                var branchName100 = Cut(request.BranchName, 100);
-                var acctHolder40 = Cut(request.AccountHolderName, 40);
-
-                // Painter extra (varchar 255 columns we added)
-                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
-                var idholder255 = Cut(request.IdName, 255);
-                var nationty255 = Cut(request.Nationality, 255);
-                var employer255 = Cut(request.CompanyDetails, 255);
-                var issudate255 = Cut(request.IssueDate, 255);
-                var expirydt255 = Cut(request.ExpiryDate, 255);
-                var occupatn255 = Cut(request.Occupation, 255);
-                var bankaddr255 = Cut(request.BankAddress, 255);
-
-                // Existing “new” 255 columns reused when relevant
-                var contrtyp255 = "Painter";                            // painter role label
-                var frstname255 = Cut(request.FirstName, 255);
-                var middname255 = Cut(request.MiddleName, 255);
-                var lastname255 = Cut(request.LastName, 255);
-                var emirates255 = Cut(request.Emirates, 255);
-                var referenc255 = Cut(request.Reference, 255);
-                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
-
-                // DOB -> map to legacy smalldatetime birthDat
-                var birthDat = SafeParseDate(request.DateOfBirth);
-
-                // Build parameter bag (EVERY param used in INSERT must exist)
-                var p = new Dictionary<string, object?>
-                {
-                    // ==== Required legacy (NOT NULL) ====
-                    ["@inflCode"] = inflCode,                // char(8) - sequential PN000001...
-                    ["@inflType"] = inflType,                // char(2)
-                    ["@inflName"] = inflName256,             // nvarchar(256)
-                    ["@contName"] = contName40,              // varchar(40)
-
-                    // Address cluster
-                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
-                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
-                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
-                    ["@inflCity"] = inflCity_255,            // varchar(255)
-                    ["@district"] = "",                      // varchar(30)  NOT NULL
-                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
-
-                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
-                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
-                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
-                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
-                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
-                    ["@expertis"] = "",                      // varchar(100) YES (send "")
-                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
-                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
-                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
-                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
-                    ["@isActive"] = "T",                     // char(1)      NOT NULL
-                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
-                    ["@updateId"] = DBNull.Value,
-                    ["@updateDt"] = DBNull.Value,
-                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
-                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
-                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
-
-                    // Tax IDs / misc
-                    ["@itxPanNo"] = "",
-                    ["@locStxNo"] = "",
-
-                    // Banking (legacy)
-                    ["@bankAcNo"] = "",
-                    ["@bankBnNm"] = bankName100,
-                    ["@bankBnDs"] = branchName100,
-                    ["@bankBnNo"] = "",
-                    ["@bankIFSC"] = "",
-
-                    // KYC & misc
-                    ["@kycVerFl"] = "",
-                    ["@kycVerDt"] = DBNull.Value,
-                    ["@idCardTy"] = "",
-                    ["@idCardNo"] = "",
-                    ["@inDocCnt"] = DBNull.Value,
-                    ["@rjcRemrk"] = "",
-                    ["@entrBySg"] = "",
-                    ["@kycVrTyp"] = "",
-                    ["@adhrName"] = "",
-                    ["@panCName"] = "",
-                    ["@sapInsDt"] = DBNull.Value,
-                    ["@sapUpdDt"] = DBNull.Value,
-                    ["@urbRurFl"] = "",
-
-                    ["@bankApNm"] = acctHolder40,            // varchar(40)
-
-                    // Permanent/alt address
-                    ["@infAddP1"] = "",
-                    ["@infAddP2"] = "",
-                    ["@infAddP3"] = "",
-                    ["@infPCity"] = "",
-                    ["@distrctP"] = "",
-                    ["@infPinCP"] = "",
-
-                    ["@adhOtpFl"] = "",
-                    ["@concEmpl"] = "",
-                    ["@bnkKycFl"] = "",
-                    ["@bnkKycDt"] = DBNull.Value,
-                    ["@inflPinL"] = "",
-                    ["@adhCpUId"] = "",
-                    ["@adhCpUDt"] = DBNull.Value,
-                    ["@panCpUId"] = "",
-                    ["@panCpUDt"] = DBNull.Value,
-                    ["@bnkCpUId"] = "",
-                    ["@bnkCpUDt"] = DBNull.Value,
-                    ["@randNmSt"] = "",
-                    ["@kycStats"] = "",
-                    ["@inflTyOl"] = "",
-                    ["@kycAprBy"] = "",
-                    ["@blkStuts"] = "",
-                    ["@blkStDat"] = DBNull.Value,
-                    ["@cntrApFl"] = "",
-                    ["@frstScDt"] = DBNull.Value,
-                    ["@sourceCnt"] = "",
-                    ["@promoteNm"] = "",
-                    ["@pmobilen"] = "",
-                    ["@isTDSEli"] = "",
-                    ["@panAdhLk"] = "",
-                    ["@panVldIn"] = "",
-                    ["@panCatgF"] = "",
-
-                    // ==== Existing 255s we reuse ====
-                    ["@contrtyp"] = "Painter",
-                    ["@frstname"] = frstname255,
-                    ["@middname"] = middname255,
-                    ["@lastname"] = lastname255,
-                    ["@emirates"] = emirates255,
-                    ["@referenc"] = referenc255,
-                    ["@ibannumb"] = ibannumb255,
-                    ["@vatfrmnm"] = "",
-                    ["@vatraddr"] = "",
-                    ["@vattxreg"] = "",
-                    ["@vatefdt"] = "",
-                    ["@comlcnno"] = "",
-                    ["@comissau"] = "",
-                    ["@comlctyp"] = "",
-                    ["@comestdt"] = "",
-                    ["@comexpdt"] = "",
-                    ["@comtrdnm"] = "",
-                    ["@comrespn"] = "",
-                    ["@comraddr"] = "",
-                    ["@comeffdt"] = "",
-
-                    // ==== Painter-specific 8-char columns ====
-                    ["@emiridno"] = emiridno255,
-                    ["@idholder"] = idholder255,
-                    ["@nationty"] = nationty255,
-                    ["@employer"] = employer255,
-                    ["@issudate"] = issudate255,
-                    ["@expirydt"] = expirydt255,
-                    ["@occupatn"] = occupatn255,
-                    ["@bankaddr"] = bankaddr255,
-                };
-
-                // INSERT (covers all required legacy + reused 255s + painter extras)
-                var sql = @"
-INSERT INTO dbo.ctmInfluncr
-(
-    inflCode, inflType, inflName, contName,
-    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
-    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
-    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
-    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
-    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
-    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
-    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
-    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
-    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
-    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
-
-    -- shared 255s
-    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
-    vatfrmnm, vatraddr, vattxreg, vatefdt,
-    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
-
-    -- painter-specific 8-char name columns (varchar 255)
-    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
-)
-VALUES
-(
-    @inflCode, @inflType, @inflName, @contName,
-    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
-    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
-    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
-    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
-    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
-    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
-    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
-    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
-    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
-    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
-
-    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
-    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
-    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
-
-    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
-);
-
-SELECT @inflCode AS InflCode;
-";
-
-                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Painter registration saved",
-                    influencerCode = savedCode,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        // (Optional) dropdowns if you need them for painter UI
-        [HttpGet("emirates-list")]
-        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
-        {
-            try
-            {
-                const string sql = @"
-SELECT areaCode, areaDesc
-FROM dbo.bkmAreaMast WITH (NOLOCK)
-WHERE (@onlyActive = 0 OR isActive = 'Y')
-ORDER BY areaDesc;";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@onlyActive", onlyActive ? 1 : 0 }
-                };
-
-                var result = _db.WebSessBean(sql, parameters);
-                var list = new List<AreaItem>();
-
-                if (result != null)
-                {
-                    foreach (var row in result)
-                    {
-                        list.Add(new AreaItem
-                        {
-                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
-                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        // ----------------- helpers -----------------
-        private string GetNextInfluencerCode(string inflType)
-        {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                // Get the next sequential number for 2IK codes
-                int nextNumber = GetNextInfluencerSequence();
-                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
-                attempts++;
-
-                if (attempts >= maxAttempts)
-                {
-                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
-                }
-
-            } while (IsInfluencerCodeExists(newCode));
-
-            return newCode;
-        }
-
-        private int GetNextInfluencerSequence()
-        {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.ctmInfluncr
-                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
-
-            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
-
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
-        }
-
-        private bool IsInfluencerCodeExists(string influencerCode)
-        {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
-            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
-
-            var result = _db.WebSessBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-
-            return count != null && Convert.ToInt32(count) > 0;
-        }
-
-        private static string MakeFixed(int size, string input)
-        {
-            if (string.IsNullOrEmpty(input)) input = "";
-            return input.Length >= size ? input[..size]
-                   : input + new string('A', size - input.Length);
-        }
-
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return new string(s.Where(char.IsDigit).ToArray());
-        }
-
-        // keep last 11 digits if user typed country code
-        private static string FormatMobile11(string? s)
-        {
-            var d = Digits(s);
-            if (d.Length <= 11) return d;
-            return d.Substring(d.Length - 11);
-        }
-
-        private static string? FormatIban(string? s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return s;
-            return s.Replace(" ", "").ToUpperInvariant();
-        }
-
-        private static DateTime? SafeParseDate(string? dateString)
-        {
-            if (string.IsNullOrWhiteSpace(dateString)) return null;
-            var formats = new[] {
-                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
-                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
-            };
-            foreach (var f in formats)
-            {
-                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out var dt))
-                    return dt;
-            }
-            if (DateTime.TryParse(dateString, out var any)) return any;
-            return null;
-        }
-    }
-
-    // -------- request model --------
-    public class PainterRegistrationRequest
-    {
-        // Personal
-        public string? FirstName { get; set; }
-        public string? MiddleName { get; set; }
-        public string? LastName { get; set; }
-        public string? MobileNumber { get; set; }
-        public string? Address { get; set; }
-        public string? Area { get; set; }
-        public string? Emirates { get; set; }
-        public string? Reference { get; set; }
-
-        // Emirates ID Details
-        public string? EmiratesIdNumber { get; set; }
-        public string? IdName { get; set; }          // Name on ID
-        public string? DateOfBirth { get; set; }     // maps to birthDat
-        public string? Nationality { get; set; }
-        public string? CompanyDetails { get; set; }  // Employer
-        public string? IssueDate { get; set; }
-        public string? ExpiryDate { get; set; }
-        public string? Occupation { get; set; }
-
-        // Bank Details (optional)
-        public string? AccountHolderName { get; set; }
-        public string? IbanNumber { get; set; }
-        public string? BankName { get; set; }
-        public string? BranchName { get; set; }
-        public string? BankAddress { get; set; }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-using Microsoft.AspNetCore.Mvc;
-
-using RAKControllers.DataAccess;
-
-using System;
-
-using System.Collections.Generic;
-
-using System.Linq;
- 
-namespace RAKControllers.Controllers
-
-{
-
-    [Route("api/[controller]")]
-
-    [ApiController]
-
-    [Produces("application/json")]
-
-    public class RetailerOnboardingController : ControllerBase
-
-    {
-
-        private readonly DatabaseHelper _db;
-
-        public RetailerOnboardingController(DatabaseHelper dbHelper) => _db = dbHelper;
- 
-        // POST: api/RetailerOnboarding/register
-
-        [HttpPost("register")]
-
-        [Consumes("application/json")]
-
-        public IActionResult RegisterRetailer([FromBody] RetailerOnboardingRequest? request = null)
-
-        {
-
-            try
-
-            {
-
-                request ??= new RetailerOnboardingRequest();
- 
-                // Dates: keep NULL if not provided ("" is invalid for smalldatetime)
-
-                DateTime? estDate = SafeParseDate(request.EstablishmentDate);
-
-                DateTime? expDate = SafeParseDate(request.ExpiryDate);
-
-                DateTime? effvDate = SafeParseDate(request.EffectiveRegistrationDate);
- 
-                // Generate retlCode (8 chars)
-
-                string retlCode = GenerateRetailerCode();
- 
-                // Map Flutter → table; everything NOT from Flutter => "" (empty string)
-
-                var p = new Dictionary<string, object?>
-
-                {
-
-                    // Required identity/audit
-
-                    ["@retlCode"] = retlCode,
-
-                    ["@sapRtlCd"] = "",       // not in Flutter → ""
-
-                    ["@createId"] = "",       // not in Flutter → ""
-
-                    ["@createDt"] = DateTime.Now, // audit we set server-side
-
-                    ["@isActive"] = "Y",      // default active
- 
-                    // Names / Address (from Flutter or "")
-
-                    ["@retlName"] = SafeStringOrEmpty(request.FirmName),
-
-                    ["@retlChNm"] = SafeStringOrEmpty(request.FirmName),
-
-                    ["@contName"] = SafeStringOrEmpty(request.ResponsiblePerson),
-
-                    ["@location"] = SafeStringOrEmpty(request.RegisteredAddress),
-
-                    ["@retlAdd1"] = SafeStringOrEmpty(request.RegisteredAddress),
-
-                    ["@retlAdd2"] = "",
-
-                    ["@retlAdd3"] = "",
-
-                    ["@district"] = "",
-
-                    ["@retlPinC"] = "",
- 
-                    // Codes / fixed fields (not in Flutter → "")
-
-                    ["@custCode"] = "",
-
-                    ["@areaCode"] = "",
-
-                    ["@locStxNo"] = "",
-
-                    ["@retlCatg"] = "",
-
-                    ["@typeOfBs"] = "",
-
-                    ["@busSttYr"] = "",
-
-                    ["@busBwYrs"] = "",
-
-                    ["@schmAbFL"] = "",
-
-                    ["@ubsRtlF1"] = "",
- 
-                    // Phones / email (not in Flutter → "")
-
-                    ["@offTelN1"] = "",
-
-                    ["@offTelN2"] = "",
-
-                    ["@mobileNo"] = "",
-
-                    ["@emailAdd"] = "",
- 
-                    // KYC flags (not in Flutter → "")
-
-                    ["@benfNmFl"] = "",
-
-                    ["@itxPanNo"] = "",
- 
-                    // Bank (map what exists in Flutter; not present → "")
-
-                    ["@bankAcNo"] = "",
-
-                    ["@benfName"] = SafeStringOrEmpty(request.AccountHolderName),
-
-                    ["@bankBnNm"] = SafeStringOrEmpty(request.BranchName),
-
-                    ["@bankBnDs"] = SafeStringOrEmpty(request.BranchAddress),
-
-                    ["@bankBnNo"] = "",
-
-                    ["@bankIFSC"] = "",
-
-                    ["@ibannmbr"] = SafeStringOrEmpty(request.IbanNumber), // added column
- 
-                    // VAT / License (map; dates stay NULL if not supplied)
-
-                    ["@gstnNumb"] = SafeStringOrEmpty(request.TaxRegistrationNumber),
-
-                    ["@licnumbr"] = SafeStringOrEmpty(request.LicenseNumber),
-
-                    ["@issauthr"] = SafeStringOrEmpty(request.IssuingAuthority),
-
-                    ["@tradname"] = SafeStringOrEmpty(request.TradeName),
-
-                    ["@respprsn"] = SafeStringOrEmpty(request.ResponsiblePerson),
-
-                    ["@estdatee"] = (object?)estDate ?? DBNull.Value,
-
-                    ["@licexpdt"] = (object?)expDate ?? DBNull.Value,
-
-                    ["@effregdt"] = (object?)effvDate ?? DBNull.Value,
- 
-                    // Location
-
-                    ["@latitute"] = SafeStringOrEmpty(request.Latitude),
-
-                    ["@lgtitute"] = SafeStringOrEmpty(request.Longitude),
-
-                };
- 
-                var sql = @"
-
-INSERT INTO dbo.rtmRetailer
-
-(
-
-    retlCode, sapRtlCd, retlName, retlChNm, contName, custCode, areaCode, location,
-
-    retlAdd1, retlAdd2, retlAdd3, district, retlPinC,
-
-    benfNmFl, bankAcNo, benfName, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-
-    retlCatg, itxPanNo, offTelN1, offTelN2, mobileNo, emailAdd, typeOfBs, busSttYr, busBwYrs,
-
-    isActive, createId, createDt, locStxNo, schmAbFL, ubsRtlF1,
-
-    gstnNumb, licnumbr, issauthr, estdatee, licexpdt, tradname, respprsn, effregdt,
-
-    ibannmbr, latitute, lgtitute
-
-)
-
-VALUES
-
-(
-
-    @retlCode, @sapRtlCd, @retlName, @retlChNm, @contName, @custCode, @areaCode, @location,
-
-    @retlAdd1, @retlAdd2, @retlAdd3, @district, @retlPinC,
-
-    @benfNmFl, @bankAcNo, @benfName, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-
-    @retlCatg, @itxPanNo, @offTelN1, @offTelN2, @mobileNo, @emailAdd, @typeOfBs, @busSttYr, @busBwYrs,
-
-    @isActive, @createId, @createDt, @locStxNo, @schmAbFL, @ubsRtlF1,
-
-    @gstnNumb, @licnumbr, @issauthr, @estdatee, @licexpdt, @tradname, @respprsn, @effregdt,
-
-    @ibannmbr, @latitute, @lgtitute
-
-);
- 
-SELECT @retlCode AS RetailerCode;
-
-";
- 
-                var res = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-
-                var code = res.FirstOrDefault()?["RetailerCode"]?.ToString() ?? retlCode;
- 
-                return Ok(new
-
-                {
-
-                    success = true,
-
-                    message = "Retailer onboarded successfully",
-
-                    retailerCode = code,
-
-                    timestamp = DateTime.Now
-
-                });
-
-            }
-
-            catch (Exception ex)
-
-            {
-
-                return BadRequest(new
-
-                {
-
-                    success = false,
-
-                    message = "Onboarding failed",
-
-                    error = ex.Message,
-
-                    timestamp = DateTime.Now
-
-                });
-
-            }
-
-        }
- 
-        // -------- helpers --------
-
-        private static string SafeStringOrEmpty(string? s)
-
-            => string.IsNullOrWhiteSpace(s) ? "" : s.Trim();
- 
-        private static DateTime? SafeParseDate(string? dateString)
-
-        {
-
-            if (string.IsNullOrWhiteSpace(dateString)) return null;
-
-            var fmts = new[] { "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
-
-                               "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy" };
-
-            foreach (var f in fmts)
-
-                if (DateTime.TryParseExact(dateString, f, null,
-
-                    System.Globalization.DateTimeStyles.None, out var dt)) return dt;
-
-            if (DateTime.TryParse(dateString, out var any)) return any;
-
-            return null;
-
-        }
- 
-        private string GenerateRetailerCode()
-
-        {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                // Get the next sequential number from database
-                int nextNumber = GetNextRetailerSequence();
-                newCode = "2RK" + nextNumber.ToString().PadLeft(5, '0'); // 2RK + 5 digits = 8 chars
-                attempts++;
-
-                if (attempts >= maxAttempts)
-                {
-                    throw new InvalidOperationException("Unable to generate unique retailer code after maximum attempts");
-                }
-
-            } while (IsRetailerCodeExists(newCode));
-
-            return newCode;
-
-        }
-
-        private int GetNextRetailerSequence()
-
-        {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(retlCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.rtmRetailer
-                WHERE retlCode LIKE '2RK%' AND LEN(retlCode) = 8 AND ISNUMERIC(SUBSTRING(retlCode, 4, 5)) = 1";
-
-            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
-
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
-
-        }
-
-        private bool IsRetailerCodeExists(string retailerCode)
-
-        {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.rtmRetailer WHERE retlCode = @retlCode";
-            var parameters = new Dictionary<string, object?> { ["@retlCode"] = retailerCode };
-
-            var result = _db.WebSessBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-
-            return count != null && Convert.ToInt32(count) > 0;
-
-        }
-
-    }
- 
-    // DTO: only fields that exist in the Flutter code
-
-    public class RetailerOnboardingRequest
-
-    {
-
-        // VAT
-
-        public string? FirmName { get; set; }
-
-        public string? TaxRegistrationNumber { get; set; }
-
-        public string? RegisteredAddress { get; set; }
-
-        public string? EffectiveRegistrationDate { get; set; }
- 
-        // License
-
-        public string? LicenseNumber { get; set; }
-
-        public string? IssuingAuthority { get; set; }
-
-        public string? EstablishmentDate { get; set; }
-
-        public string? ExpiryDate { get; set; }
-
-        public string? TradeName { get; set; }
-
-        public string? ResponsiblePerson { get; set; }
- 
-        // Bank
-
-        public string? AccountHolderName { get; set; }
-
-        public string? IbanNumber { get; set; }
-
-        public string? BankName { get; set; }     // no column; ignored/empty
-
-        public string? BranchName { get; set; }
-
-        public string? BranchAddress { get; set; }
- 
-        // Location
-
-        public string? Latitude { get; set; }
-
-        public string? Longitude { get; set; }
-
-    }
-
-}
-
- 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class RetailerOnboardingRequest {
   final String? firmName;
   final String? taxRegistrationNumber;
@@ -1555,8 +144,6 @@ class RetailerOnboardingResponse {
 
 
 
-
-
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../models/retailer_onboarding_models.dart';
@@ -1665,13 +252,13 @@ class RetailerOnboardingService {
     }
   }
 
-  // Validation methods
+  // Validation methods based on database schema
   static String? validateMobileNumber(String? value) {
     if (value == null || value.isEmpty) return null;
 
     final cleaned = value.replaceAll(RegExp(r'[^\d+]'), '');
-    if (cleaned.length < 10 || cleaned.length > 15) {
-      return 'Please enter a valid mobile number';
+    if (cleaned.length < 10 || cleaned.length > 11) { // mobileNo varchar(11)
+      return 'Please enter a valid mobile number (max 11 digits)';
     }
 
     if (!cleaned.startsWith('+971') && !cleaned.startsWith('971') && !cleaned.startsWith('05')) {
@@ -1685,6 +272,10 @@ class RetailerOnboardingService {
     if (value == null || value.isEmpty) return null;
 
     final cleaned = value.replaceAll(' ', '').toUpperCase();
+    if (cleaned.length > 255) { // ibannmbr varchar(255)
+      return 'IBAN must be less than 255 characters';
+    }
+
     if (!cleaned.startsWith('AE')) {
       return 'IBAN should start with AE for UAE banks';
     }
@@ -1699,6 +290,10 @@ class RetailerOnboardingService {
   static String? validateTaxRegistrationNumber(String? value) {
     if (value == null || value.isEmpty) return null;
 
+    if (value.length > 40) { // gstnNumb varchar(40)
+      return 'TRN must be less than 40 characters';
+    }
+
     final cleaned = value.replaceAll(RegExp(r'[^\d]'), '');
     if (cleaned.length != 15) {
       return 'TRN should be 15 digits';
@@ -1707,13 +302,17 @@ class RetailerOnboardingService {
     return null;
   }
 
-  static String? validateName(String? value, String fieldName) {
+  static String? validateName(String? value, String fieldName, {int maxLength = 100}) {
     if (value == null || value.trim().isEmpty) {
       return 'Please enter $fieldName';
     }
 
     if (value.trim().length < 2) {
       return '$fieldName must be at least 2 characters';
+    }
+
+    if (value.trim().length > maxLength) {
+      return '$fieldName must be less than $maxLength characters';
     }
 
     if (!RegExp(r'^[a-zA-Z\s]+$').hasMatch(value.trim())) {
@@ -1723,14 +322,75 @@ class RetailerOnboardingService {
     return null;
   }
 
+  static String? validateTextField(String? value, String fieldName, {int maxLength = 255, bool isRequired = true}) {
+    if (isRequired && (value == null || value.trim().isEmpty)) {
+      return 'Please enter $fieldName';
+    }
+
+    if (value != null && value.trim().length > maxLength) {
+      return '$fieldName must be less than $maxLength characters';
+    }
+
+    return null;
+  }
+
   static String? validateLicenseNumber(String? value) {
-    if (value == null || value.isEmpty) return null;
+    if (value == null || value.isEmpty) return 'Please enter License Number';
+
+    if (value.trim().length > 255) { // licnumbr varchar(255)
+      return 'License number must be less than 255 characters';
+    }
 
     if (value.trim().length < 5) {
       return 'License number must be at least 5 characters';
     }
 
     return null;
+  }
+
+  // Specific field validations based on database schema
+  static String? validateFirmName(String? value) {
+    return validateTextField(value, 'Firm Name', maxLength: 90, isRequired: true); // retlName varchar(90)
+  }
+
+  static String? validateTradeName(String? value) {
+    return validateTextField(value, 'Trade Name', maxLength: 255, isRequired: true); // tradname varchar(255)
+  }
+
+  static String? validateResponsiblePerson(String? value) {
+    return validateTextField(value, 'Responsible Person', maxLength: 255, isRequired: true); // respprsn varchar(255)
+  }
+
+  static String? validateRegisteredAddress(String? value) {
+    return validateTextField(value, 'Registered Address', maxLength: 100, isRequired: true); // retlAdd1 varchar(100)
+  }
+
+  static String? validateIssuingAuthority(String? value) {
+    return validateTextField(value, 'Issuing Authority', maxLength: 255, isRequired: true); // issauthr varchar(255)
+  }
+
+  static String? validateAccountHolderName(String? value) {
+    return validateTextField(value, 'Account Holder Name', maxLength: 90, isRequired: false); // benfName varchar(90)
+  }
+
+  static String? validateBankName(String? value) {
+    return validateTextField(value, 'Bank Name', maxLength: 60, isRequired: false); // bankBnNm varchar(60)
+  }
+
+  static String? validateBranchName(String? value) {
+    return validateTextField(value, 'Branch Name', maxLength: 60, isRequired: false); // bankBnDs varchar(60)
+  }
+
+  static String? validateBranchAddress(String? value) {
+    return validateTextField(value, 'Branch Address', maxLength: 60, isRequired: false); // bankBnDs varchar(60)
+  }
+
+  static String? validateLatitude(String? value) {
+    return validateTextField(value, 'Latitude', maxLength: 30, isRequired: false); // latitute varchar(30)
+  }
+
+  static String? validateLongitude(String? value) {
+    return validateTextField(value, 'Longitude', maxLength: 30, isRequired: false); // lgtitute varchar(30)
   }
 
   // Format helpers
@@ -1754,6 +414,7 @@ class RetailerOnboardingService {
     return trn.replaceAll(RegExp(r'[^\d]'), '');
   }
 }
+
 
 
 
@@ -2181,35 +842,59 @@ class RetailerFormPageState extends State<RetailerFormPage>
   }
 
   String? _validateTaxRegNumber(String? value) {
-    if (_isVATRequired && (value == null || value.isEmpty)) {
-      return 'Please enter Tax Registration Number';
-    }
-    if (value != null &&
-        value.isNotEmpty &&
-        !RegExp(r'^\d{15}$').hasMatch(value)) {
-      return 'Tax Registration Number must be 15 digits';
-    }
-    return null;
+    return RetailerOnboardingService.validateTaxRegistrationNumber(value);
   }
 
   String? _validateLicense(String? value) {
-    if (value == null || value.isEmpty) return 'Please enter License Number';
-    if (value.length > 20) return 'Max 20 characters allowed';
-    return null;
+    return RetailerOnboardingService.validateLicenseNumber(value);
   }
 
   String? _validateIBAN(String? value) {
-    if (value != null &&
-        value.isNotEmpty &&
-        !RegExp(r'^AE\d{21}$').hasMatch(value)) {
-      return 'IBAN must start with AE and be 23 characters';
-    }
-    return null;
+    return RetailerOnboardingService.validateIban(value);
   }
 
-  String? _validateRequired(String? value, String fieldName) {
-    if (value == null || value.isEmpty) return 'Please enter $fieldName';
-    return null;
+  String? _validateFirmName(String? value) {
+    return RetailerOnboardingService.validateFirmName(value);
+  }
+
+  String? _validateTradeName(String? value) {
+    return RetailerOnboardingService.validateTradeName(value);
+  }
+
+  String? _validateResponsiblePerson(String? value) {
+    return RetailerOnboardingService.validateResponsiblePerson(value);
+  }
+
+  String? _validateRegisteredAddress(String? value) {
+    return RetailerOnboardingService.validateRegisteredAddress(value);
+  }
+
+  String? _validateIssuingAuthority(String? value) {
+    return RetailerOnboardingService.validateIssuingAuthority(value);
+  }
+
+  String? _validateAccountHolderName(String? value) {
+    return RetailerOnboardingService.validateAccountHolderName(value);
+  }
+
+  String? _validateBankName(String? value) {
+    return RetailerOnboardingService.validateBankName(value);
+  }
+
+  String? _validateBranchName(String? value) {
+    return RetailerOnboardingService.validateBranchName(value);
+  }
+
+  String? _validateBranchAddress(String? value) {
+    return RetailerOnboardingService.validateBranchAddress(value);
+  }
+
+  String? _validateLatitude(String? value) {
+    return RetailerOnboardingService.validateLatitude(value);
+  }
+
+  String? _validateLongitude(String? value) {
+    return RetailerOnboardingService.validateLongitude(value);
   }
 
   String? _cleanString(String value) {
@@ -2409,9 +1094,7 @@ class RetailerFormPageState extends State<RetailerFormPage>
             vertical: 16,
           ),
         ),
-        validator:
-            validator ??
-            (isRequired ? (v) => _validateRequired(v, label) : null),
+        validator: validator,
       ),
     );
   }
@@ -2477,7 +1160,7 @@ class RetailerFormPageState extends State<RetailerFormPage>
             controller.text = date.toString().split(' ').first;
           }
         },
-        validator: isRequired ? (v) => _validateRequired(v, label) : null,
+        validator: isRequired ? (v) => v?.isEmpty == true ? 'Please enter $label' : null : null,
       ),
     );
   }
@@ -2808,6 +1491,7 @@ class RetailerFormPageState extends State<RetailerFormPage>
                           controller: firmNameController,
                           label: 'Firm Name',
                           icon: Icons.business,
+                          validator: _validateFirmName,
                         ),
                         const SizedBox(height: 16),
                         _buildModernDateField(
@@ -2856,6 +1540,7 @@ class RetailerFormPageState extends State<RetailerFormPage>
                         label: 'Latitude',
                         icon: Icons.my_location,
                         isRequired: false,
+                        validator: _validateLatitude,
                         suffix: IconButton(
                           tooltip: 'Refresh location',
                           icon: const Icon(Icons.gps_fixed),
@@ -2873,6 +1558,7 @@ class RetailerFormPageState extends State<RetailerFormPage>
                         label: 'Longitude',
                         icon: Icons.my_location,
                         isRequired: false,
+                        validator: _validateLongitude,
                         suffix: IconButton(
                           tooltip: 'Refresh location',
                           icon: const Icon(Icons.gps_fixed),
@@ -3205,8 +1891,5 @@ class _FadeSlide extends StatelessWidget {
     );
   }
 }
-
-
-
 
 
