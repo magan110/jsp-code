@@ -1,1258 +1,816 @@
-import '../../../core/models/sampling_drive_models.dart';
-import '../../../core/services/sampling_execution_service.dart';
-import '../../../core/services/contractor_service.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:rak_web/features/auth/screens/login_screen_with_otp.dart';
-import '../../../core/widgets/file_upload_widget.dart';
-import '../../../core/widgets/modern_dropdown.dart';
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
 
-class SamplingDriveFormPage extends StatefulWidget {
-  @override
-  _SamplingDriveFormPageState createState() => _SamplingDriveFormPageState();
+namespace RAKControllers.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class ContractorController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public ContractorController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        // POST: /api/Contractor/register
+        [HttpPost("register")]
+        [Consumes("application/json")]
+        public IActionResult Register([FromBody] ContractorRegistrationRequest? request = null)
+        {
+            try
+            {
+                request ??= new ContractorRegistrationRequest();
+
+                // --- Keys / defaults ---
+                var inflCode = MakeFixed(8, Guid.NewGuid().ToString("N").ToUpperInvariant());   // char(8)
+                var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant();       // char(2)
+                var areaCode = (Left(request.Area, 3) ?? "").ToUpperInvariant();                 // char(3)
+
+                // Build names and enforce column sizes
+                var fullName = string.Join(" ",
+                    new[] { request.FirstName, request.MiddleName, request.LastName }
+                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
+
+                var inflName256 = Cut(fullName, 256); // inflName nvarchar(256)
+                var contName40  = Cut(fullName, 40);  // contName varchar(40)
+
+                // Address fields (NOT NULL: inflAdd3, district, inflPinC)
+                var inflAdd1_50 = Cut(request.Address, 50);
+                var inflAdd2_100 = "";            // not using; keep empty
+                var inflAdd3_30 = "";             // keep empty to avoid overflow (NOT NULL but "" is allowed)
+                var inflCity_255 = "";
+
+                // Phone and other short fields
+                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
+
+                // Bank fields
+                var bankName100   = Cut(request.BankName, 100);
+                var branchName100 = Cut(request.BranchName, 100);
+                var acctHolder40  = Cut(request.AccountHolderName, 40);
+
+                // New 255 columns (cut to 255 just in case)
+                var contrtyp255 = Cut(request.ContractorType, 255);
+                var frstname255 = Cut(request.FirstName, 255);
+                var middname255 = Cut(request.MiddleName, 255);
+                var lastname255 = Cut(request.LastName, 255);
+                var emirates255 = Cut(request.Emirates, 255);
+                var referenc255 = Cut(request.Reference, 255);
+                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
+                var vatfrmnm255 = Cut(request.FirmName, 255);
+                var vatraddr255 = Cut(request.VatAddress, 255);
+                var vattxreg255 = Cut(request.TaxRegistrationNumber, 255);
+                var vatefdt255  = Cut(request.VatEffectiveDate, 255);
+                var comlcnno255 = Cut(request.LicenseNumber, 255);
+                var comissau255 = Cut(request.IssuingAuthority, 255);
+                var comlctyp255 = Cut(request.LicenseType, 255);
+                var comestdt255 = Cut(request.EstablishmentDate, 255);
+                var comexpdt255 = Cut(request.LicenseExpiryDate, 255);
+                var comtrdnm255 = Cut(request.TradeName, 255);
+                var comrespn255 = Cut(request.ResponsiblePerson, 255);
+                var comraddr255 = Cut(request.LicenseAddress, 255);
+                var comeffdt255 = Cut(request.EffectiveDate, 255);
+
+                // Build parameter bag: supply EVERYTHING used in INSERT
+                var p = new Dictionary<string, object?>
+                {
+                    // ==== Required legacy (NOT NULL) ====
+                    ["@inflCode"] = inflCode,                // char(8)
+                    ["@inflType"] = inflType,                // char(2)
+                    ["@inflName"] = inflName256,             // nvarchar(256)
+                    ["@contName"] = contName40,              // varchar(40)
+
+                    // Address cluster
+                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
+                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
+                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
+                    ["@inflCity"] = inflCity_255,            // varchar(255)
+                    ["@district"] = "",                      // varchar(30)  NOT NULL
+                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
+
+                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
+                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
+                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
+                    ["@birthDat"] = DBNull.Value,            // smalldatetime NULL
+                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
+                    ["@expertis"] = "",                      // varchar(100) YES (send "")
+                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
+                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
+                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
+                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
+                    ["@isActive"] = "T",                     // char(1)      NOT NULL
+                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
+                    ["@updateId"] = DBNull.Value,            // varchar(10)  NULL
+                    ["@updateDt"] = DBNull.Value,            // smalldatetime NULL
+                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
+                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
+                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
+
+                    // Tax IDs / misc
+                    ["@itxPanNo"] = "",                      // varchar(50)
+                    ["@locStxNo"] = "",                      // varchar(30)
+
+                    // Banking (legacy)
+                    ["@bankAcNo"] = "",                      // varchar(25)
+                    ["@bankBnNm"] = bankName100,             // varchar(100)
+                    ["@bankBnDs"] = branchName100,           // varchar(100)
+                    ["@bankBnNo"] = "",                      // varchar(20)
+                    ["@bankIFSC"] = "",                      // varchar(20)
+
+                    // KYC & misc
+                    ["@kycVerFl"] = "",
+                    ["@kycVerDt"] = DBNull.Value,
+                    ["@idCardTy"] = "",
+                    ["@idCardNo"] = "",
+                    ["@inDocCnt"] = DBNull.Value,
+                    ["@rjcRemrk"] = "",
+                    ["@entrBySg"] = "",
+                    ["@kycVrTyp"] = "",
+                    ["@adhrName"] = "",
+                    ["@panCName"] = "",
+                    ["@sapInsDt"] = DBNull.Value,
+                    ["@sapUpdDt"] = DBNull.Value,
+                    ["@urbRurFl"] = "",
+
+                    ["@bankApNm"] = acctHolder40,            // varchar(40)
+
+                    // Permanent/alt address
+                    ["@infAddP1"] = "",
+                    ["@infAddP2"] = "",
+                    ["@infAddP3"] = "",
+                    ["@infPCity"] = "",
+                    ["@distrctP"] = "",
+                    ["@infPinCP"] = "",
+
+                    ["@adhOtpFl"] = "",
+                    ["@concEmpl"] = "",
+                    ["@bnkKycFl"] = "",
+                    ["@bnkKycDt"] = DBNull.Value,
+                    ["@inflPinL"] = "",
+                    ["@adhCpUId"] = "",
+                    ["@adhCpUDt"] = DBNull.Value,
+                    ["@panCpUId"] = "",
+                    ["@panCpUDt"] = DBNull.Value,
+                    ["@bnkCpUId"] = "",
+                    ["@bnkCpUDt"] = DBNull.Value,
+                    ["@randNmSt"] = "",
+                    ["@kycStats"] = "",
+                    ["@inflTyOl"] = "",
+                    ["@kycAprBy"] = "",
+                    ["@blkStuts"] = "",
+                    ["@blkStDat"] = DBNull.Value,
+                    ["@cntrApFl"] = "",
+                    ["@frstScDt"] = DBNull.Value,
+                    ["@sourceCnt"] = "",
+                    ["@promoteNm"] = "",
+                    ["@pmobilen"] = "",
+                    ["@isTDSEli"] = "",
+                    ["@panAdhLk"] = "",
+                    ["@panVldIn"] = "",
+                    ["@panCatgF"] = "",
+
+                    // ==== New varchar(255) columns ====
+                    ["@contrtyp"] = contrtyp255,
+                    ["@frstname"] = frstname255,
+                    ["@middname"] = middname255,
+                    ["@lastname"] = lastname255,
+                    ["@emirates"] = emirates255,
+                    ["@referenc"] = referenc255,
+                    ["@ibannumb"] = ibannumb255,
+                    ["@vatfrmnm"] = vatfrmnm255,
+                    ["@vatraddr"] = vatraddr255,
+                    ["@vattxreg"] = vattxreg255,
+                    ["@vatefdt"]  = vatefdt255,
+                    ["@comlcnno"] = comlcnno255,
+                    ["@comissau"] = comissau255,
+                    ["@comlctyp"] = comlctyp255,
+                    ["@comestdt"] = comestdt255,
+                    ["@comexpdt"] = comexpdt255,
+                    ["@comtrdnm"] = comtrdnm255,
+                    ["@comrespn"] = comrespn255,
+                    ["@comraddr"] = comraddr255,
+                    ["@comeffdt"] = comeffdt255
+                };
+
+                var sql = @"
+INSERT INTO dbo.ctmInfluncr
+(
+    inflCode, inflType, inflName, contName,
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
+    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
+    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
+    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
+    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
+    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
+    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
+    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
+
+    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt
+)
+VALUES
+(
+    @inflCode, @inflType, @inflName, @contName,
+    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
+    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
+    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
+    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
+    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
+    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
+    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
+    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
+    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
+    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
+
+    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
+    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
+    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt
+);
+
+SELECT @inflCode AS InflCode;
+";
+
+                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Registration saved",
+                    influencerCode = savedCode,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // Dropdowns to match Flutter UI
+        [HttpGet("contractor-types")]
+        public IActionResult ContractorTypes() => Ok(new
+        {
+            success = true,
+            data = new[] { "Maintenance Contractor", "Petty contractors" },
+            timestamp = DateTime.Now
+        });
+
+        [HttpGet("emirates-list")]
+        public IActionResult EmiratesList() => Ok(new
+        {
+            success = true,
+            data = new[] { "Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah" },
+            timestamp = DateTime.Now
+        });
+
+        // ----------------- helpers -----------------
+        private static string MakeFixed(int size, string input)
+        {
+            if (string.IsNullOrEmpty(input)) input = "";
+            return input.Length >= size ? input[..size]
+                   : input + new string('A', size - input.Length);
+        }
+
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // keep last 11 digits if user typed country code
+        private static string FormatMobile11(string? s)
+        {
+            var d = Digits(s);
+            if (d.Length <= 11) return d;
+            return d.Substring(d.Length - 11);
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+    }
+
+    // ----------------- request model (matches Flutter) -----------------
+    public class ContractorRegistrationRequest
+    {
+        // Personal
+        public string? ContractorType { get; set; }
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? Reference { get; set; }
+        public string? ProfilePhoto { get; set; }
+
+        // Bank
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+
+        // VAT
+        public string? VatCertificate { get; set; }
+        public string? FirmName { get; set; }
+        public string? VatAddress { get; set; }
+        public string? TaxRegistrationNumber { get; set; }
+        public string? VatEffectiveDate { get; set; }
+
+        // License
+        public string? LicenseDocument { get; set; }
+        public string? LicenseNumber { get; set; }
+        public string? IssuingAuthority { get; set; }
+        public string? LicenseType { get; set; }
+        public string? EstablishmentDate { get; set; }
+        public string? LicenseExpiryDate { get; set; }
+        public string? TradeName { get; set; }
+        public string? ResponsiblePerson { get; set; }
+        public string? LicenseAddress { get; set; }
+        public string? EffectiveDate { get; set; }
+    }
 }
 
-class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
-    with TickerProviderStateMixin {
-  final _formKey = GlobalKey<FormState>();
-  String? _photoImage;
 
-  // Controllers for all fields
-  final retailerController = TextEditingController();
-  final retailerCodeController = TextEditingController();
-  final distributorController = TextEditingController();
-  final areaController = TextEditingController();
-  final dateController = TextEditingController();
-  final painterController = TextEditingController();
-  final phoneController = TextEditingController();
-  final skuController = TextEditingController();
-  final missedQtyController = TextEditingController();
-  final siteAdController = TextEditingController();
-  final qtyController = TextEditingController();
-  final remarksController = TextEditingController();
-  final reimbursementModeController = TextEditingController();
-  final reimbursementAmtController = TextEditingController();
-  final searchRetailerCodeController = TextEditingController();
-  final startDateController = TextEditingController();
-  final endDateController = TextEditingController();
-  final emiratesController = TextEditingController();
-  final samplDateController = TextEditingController();
-  final prodController = TextEditingController();
 
-  List<SamplingDriveEntry> filteredRetailerEntries = [];
-  bool _isSubmitting = false;
-  bool _isSearching = false;
-  String? _searchError;
 
-  // Emirates dropdown data
-  List<String> _emirates = [];
-  bool _isLoadingEmirates = true;
 
-  late AnimationController _mainController;
-  late AnimationController _fabController;
-  late Animation<double> _fadeAnimation;
-  late Animation<Offset> _slideAnimation;
-  late Animation<double> _scaleAnimation;
 
-  final ScrollController _scrollController = ScrollController();
 
-  final ScrollController _horizontalScrollController = ScrollController();
-  @override
-  void initState() {
-    super.initState();
-    _mainController = AnimationController(
-      duration: const Duration(milliseconds: 1000),
-      vsync: this,
-    );
-    _fabController = AnimationController(
-      duration: const Duration(milliseconds: 400),
-      vsync: this,
-    );
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController,
-        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
-      ),
-    );
-    _slideAnimation =
-        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-          CurvedAnimation(
-            parent: _mainController,
-            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-          ),
-        );
-    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController,
-        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
-      ),
-    );
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _mainController.forward();
-      _fabController.forward();
-    });
 
-    // Initialize with empty list - data will be loaded on search
-    _loadEmirates();
-  }
 
-  Future<void> _loadEmirates() async {
-    setState(() {
-      _isLoadingEmirates = true;
-    });
-    try {
-      final emirates = await ContractorService.getEmiratesList();
-      setState(() {
-        _emirates = emirates;
-        _isLoadingEmirates = false;
-      });
-    } catch (e) {
-      setState(() {
-        _emirates = const [
-          'Dubai',
-          'Abu Dhabi',
-          'Sharjah',
-          'Ajman',
-          'Umm Al Quwain',
-          'Ras Al Khaimah',
-          'Fujairah',
-        ];
-        _isLoadingEmirates = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error loading emirates: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
 
-  @override
-  void dispose() {
-    _mainController.dispose();
-    _fabController.dispose();
-    retailerController.dispose();
-    retailerCodeController.dispose();
-    distributorController.dispose();
-    areaController.dispose();
-    dateController.dispose();
-    painterController.dispose();
-    phoneController.dispose();
-    skuController.dispose();
-    qtyController.dispose();
-    missedQtyController.dispose();
-    reimbursementModeController.dispose();
-    reimbursementAmtController.dispose();
-    _scrollController.dispose();
-    _horizontalScrollController.dispose();
-    super.dispose();
-  }
 
-  String reimbursementModeToText(String mode) {
-    return mode;
-  }
 
-  void populateControllers(SamplingDriveEntry entry) {
-    retailerController.text = entry.retailerName;
-    retailerCodeController.text = entry.retailerCode;
-    distributorController.text = entry.distributorName;
-    areaController.text = entry.area;
-    dateController.text =
-        "${entry.distributionDate.year}-${entry.distributionDate.month.toString().padLeft(2, '0')}-${entry.distributionDate.day.toString().padLeft(2, '0')}";
-    painterController.text = entry.painterName;
-    phoneController.text = entry.painterMobile;
-    skuController.text = entry.skuSizeLabel;
-    qtyController.text = entry.qtyDistributedKg.toStringAsFixed(1);
-    missedQtyController.text = entry.missedQtyKg.toStringAsFixed(1);
-    reimbursementModeController.text = reimbursementModeToText(
-      entry.reimbursementMode,
-    );
-    reimbursementAmtController.text = entry.reimbursementAmountAED
-        .toStringAsFixed(1);
-  }
 
-  Widget _buildSearchSection() {
-    return _buildModernSection(
-      title: 'Search Sampling Entries',
-      icon: Icons.search,
-      children: [
-        _buildModernTextField(
-          controller: searchRetailerCodeController,
-          label: 'Retailer Code / Retailer Name / Painter Name',
-          icon: Icons.search,
-          isRequired: false,
-        ),
-        const SizedBox(height: 16),
-        _buildModernDateField(
-          controller: startDateController,
-          label: 'Start Date',
-          icon: Icons.calendar_today,
-          isRequired: false,
-        ),
-        const SizedBox(height: 16),
-        _buildModernDateField(
-          controller: endDateController,
-          label: 'End Date',
-          icon: Icons.calendar_today,
-          isRequired: false,
-        ),
-        const SizedBox(height: 8),
 
-        Align(
-          alignment: Alignment.centerRight,
-          child: TextButton.icon(
-            onPressed: () {
-              startDateController.clear();
-              endDateController.clear();
-            },
-            icon: const Icon(Icons.clear),
-            label: const Text('Clear Dates'),
-          ),
-        ),
-        const SizedBox(height: 16),
-        SizedBox(
-          width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: _isSearching ? null : _performSearch,
-            icon: _isSearching
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : const Icon(Icons.search),
-            label: Text(_isSearching ? 'Searching...' : 'Search'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1E3A8A),
-              foregroundColor: Colors.white,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
 
-  void _performSearch() async {
-    final searchText = searchRetailerCodeController.text.trim();
-    final startDate = startDateController.text.trim();
-    final endDate = endDateController.text.trim();
 
-    // Validation: Either search text OR both dates must be provided
-    if (searchText.isEmpty && (startDate.isEmpty || endDate.isEmpty)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Please enter a Retailer Code/Name/Painter Name or both Start and End Dates',
-          ),
-          backgroundColor: Colors.red,
-        ),
-      );
-      return;
-    }
 
-    setState(() {
-      _isSearching = true;
-      _searchError = null;
-    });
 
-    try {
-      Map<String, dynamic> result;
 
-      // Try searching by retailer code first, then by retailer name if no results
-      if (searchText.isNotEmpty) {
-        print('🔍 Searching with retailer code: "$searchText"');
-        print('📅 Start date: "$startDate"');
-        print('📅 End date: "$endDate"');
 
-        // First, try searching as retailer code
-        result = await SamplingExecutionService.searchSamplingDriveEntries(
-          retailerCode: searchText,
-          start: startDate.isNotEmpty ? startDate : null,
-          end: endDate.isNotEmpty ? endDate : null,
-        );
 
-        print(
-          '✅ Retailer code search result: ${result['success']}, entries: ${result['data']?.length ?? 0}',
-        );
-        print('📊 Full result data: ${result}');
 
-        // If no results with retailer code, try searching as retailer name
-        if (result['success'] == true && (result['data'] as List).isEmpty) {
-          print('🔄 No results with retailer code, trying retailer name...');
-          result = await SamplingExecutionService.searchSamplingDriveEntries(
-            retailerName: searchText,
-            start: startDate.isNotEmpty ? startDate : null,
-            end: endDate.isNotEmpty ? endDate : null,
-          );
-          print(
-            '✅ Retailer name search result: ${result['success']}, entries: ${result['data']?.length ?? 0}',
-          );
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+namespace RAKControllers.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class PainterController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public PainterController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
         }
 
-        // If still no results, try searching as painter name
-        if (result['success'] == true && (result['data'] as List).isEmpty) {
-          print('🔄 No results with retailer name, trying painter name...');
-          result = await SamplingExecutionService.searchSamplingDriveEntries(
-            painterName: searchText,
-            start: startDate.isNotEmpty ? startDate : null,
-            end: endDate.isNotEmpty ? endDate : null,
-          );
-          print(
-            '✅ Painter name search result: ${result['success']}, entries: ${result['data']?.length ?? 0}',
-          );
-        }
-      } else {
-        // Search by date range only
-        result = await SamplingExecutionService.searchSamplingDriveEntries(
-          start: startDate,
-          end: endDate,
-        );
-      }
+        // POST: /api/Painter/register
+        [HttpPost("register")]
+        [Consumes("application/json")]
+        public IActionResult Register([FromBody] PainterRegistrationRequest? request = null)
+        {
+            try
+            {
+                request ??= new PainterRegistrationRequest();
 
-      if (result['success'] == true) {
-        final entries = result['data'] as List<SamplingDriveEntry>;
-        setState(() {
-          filteredRetailerEntries = entries;
-          _isSearching = false;
+                // --- Keys / defaults ---
+                var inflType = "PN";                                                           // char(2) -> Painter
+                var areaCode = (Left(request.Area, 3) ?? "").ToUpperInvariant();               // char(3)
+
+                // NEW: Generate sequential inflCode = "PN" + 6-digit number (char(8))
+                string inflCode = GetNextInfluencerCode(inflType);
+
+                // Names
+                var fullName = string.Join(" ",
+                    new[] { request.FirstName, request.MiddleName, request.LastName }
+                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
+
+                var inflName256 = Cut(fullName, 256);  // inflName nvarchar(256)
+                var contName40 = Cut(fullName, 40);   // contName varchar(40)
+
+                // Address cluster (legacy)
+                var inflAdd1_50 = Cut(request.Address, 50);
+                var inflAdd2_100 = "";
+                var inflAdd3_30 = "";                // keep empty (NOT NULL but "" allowed)
+                var inflCity_255 = "";
+
+                // Mobile
+                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
+
+                // Bank (legacy)
+                var bankName100 = Cut(request.BankName, 100);
+                var branchName100 = Cut(request.BranchName, 100);
+                var acctHolder40 = Cut(request.AccountHolderName, 40);
+
+                // Painter extra (varchar 255 columns we added)
+                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
+                var idholder255 = Cut(request.IdName, 255);
+                var nationty255 = Cut(request.Nationality, 255);
+                var employer255 = Cut(request.CompanyDetails, 255);
+                var issudate255 = Cut(request.IssueDate, 255);
+                var expirydt255 = Cut(request.ExpiryDate, 255);
+                var occupatn255 = Cut(request.Occupation, 255);
+                var bankaddr255 = Cut(request.BankAddress, 255);
+
+                // Existing “new” 255 columns reused when relevant
+                var contrtyp255 = "Painter";                            // painter role label
+                var frstname255 = Cut(request.FirstName, 255);
+                var middname255 = Cut(request.MiddleName, 255);
+                var lastname255 = Cut(request.LastName, 255);
+                var emirates255 = Cut(request.Emirates, 255);
+                var referenc255 = Cut(request.Reference, 255);
+                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
+
+                // DOB -> map to legacy smalldatetime birthDat
+                var birthDat = SafeParseDate(request.DateOfBirth);
+
+                // Build parameter bag (EVERY param used in INSERT must exist)
+                var p = new Dictionary<string, object?>
+                {
+                    // ==== Required legacy (NOT NULL) ====
+                    ["@inflCode"] = inflCode,                // char(8) - sequential PN000001...
+                    ["@inflType"] = inflType,                // char(2)
+                    ["@inflName"] = inflName256,             // nvarchar(256)
+                    ["@contName"] = contName40,              // varchar(40)
+
+                    // Address cluster
+                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
+                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
+                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
+                    ["@inflCity"] = inflCity_255,            // varchar(255)
+                    ["@district"] = "",                      // varchar(30)  NOT NULL
+                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
+
+                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
+                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
+                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
+                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
+                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
+                    ["@expertis"] = "",                      // varchar(100) YES (send "")
+                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
+                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
+                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
+                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
+                    ["@isActive"] = "T",                     // char(1)      NOT NULL
+                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
+                    ["@updateId"] = DBNull.Value,
+                    ["@updateDt"] = DBNull.Value,
+                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
+                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
+                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
+
+                    // Tax IDs / misc
+                    ["@itxPanNo"] = "",
+                    ["@locStxNo"] = "",
+
+                    // Banking (legacy)
+                    ["@bankAcNo"] = "",
+                    ["@bankBnNm"] = bankName100,
+                    ["@bankBnDs"] = branchName100,
+                    ["@bankBnNo"] = "",
+                    ["@bankIFSC"] = "",
+
+                    // KYC & misc
+                    ["@kycVerFl"] = "",
+                    ["@kycVerDt"] = DBNull.Value,
+                    ["@idCardTy"] = "",
+                    ["@idCardNo"] = "",
+                    ["@inDocCnt"] = DBNull.Value,
+                    ["@rjcRemrk"] = "",
+                    ["@entrBySg"] = "",
+                    ["@kycVrTyp"] = "",
+                    ["@adhrName"] = "",
+                    ["@panCName"] = "",
+                    ["@sapInsDt"] = DBNull.Value,
+                    ["@sapUpdDt"] = DBNull.Value,
+                    ["@urbRurFl"] = "",
+
+                    ["@bankApNm"] = acctHolder40,            // varchar(40)
+
+                    // Permanent/alt address
+                    ["@infAddP1"] = "",
+                    ["@infAddP2"] = "",
+                    ["@infAddP3"] = "",
+                    ["@infPCity"] = "",
+                    ["@distrctP"] = "",
+                    ["@infPinCP"] = "",
+
+                    ["@adhOtpFl"] = "",
+                    ["@concEmpl"] = "",
+                    ["@bnkKycFl"] = "",
+                    ["@bnkKycDt"] = DBNull.Value,
+                    ["@inflPinL"] = "",
+                    ["@adhCpUId"] = "",
+                    ["@adhCpUDt"] = DBNull.Value,
+                    ["@panCpUId"] = "",
+                    ["@panCpUDt"] = DBNull.Value,
+                    ["@bnkCpUId"] = "",
+                    ["@bnkCpUDt"] = DBNull.Value,
+                    ["@randNmSt"] = "",
+                    ["@kycStats"] = "",
+                    ["@inflTyOl"] = "",
+                    ["@kycAprBy"] = "",
+                    ["@blkStuts"] = "",
+                    ["@blkStDat"] = DBNull.Value,
+                    ["@cntrApFl"] = "",
+                    ["@frstScDt"] = DBNull.Value,
+                    ["@sourceCnt"] = "",
+                    ["@promoteNm"] = "",
+                    ["@pmobilen"] = "",
+                    ["@isTDSEli"] = "",
+                    ["@panAdhLk"] = "",
+                    ["@panVldIn"] = "",
+                    ["@panCatgF"] = "",
+
+                    // ==== Existing 255s we reuse ====
+                    ["@contrtyp"] = "Painter",
+                    ["@frstname"] = frstname255,
+                    ["@middname"] = middname255,
+                    ["@lastname"] = lastname255,
+                    ["@emirates"] = emirates255,
+                    ["@referenc"] = referenc255,
+                    ["@ibannumb"] = ibannumb255,
+                    ["@vatfrmnm"] = "",
+                    ["@vatraddr"] = "",
+                    ["@vattxreg"] = "",
+                    ["@vatefdt"] = "",
+                    ["@comlcnno"] = "",
+                    ["@comissau"] = "",
+                    ["@comlctyp"] = "",
+                    ["@comestdt"] = "",
+                    ["@comexpdt"] = "",
+                    ["@comtrdnm"] = "",
+                    ["@comrespn"] = "",
+                    ["@comraddr"] = "",
+                    ["@comeffdt"] = "",
+
+                    // ==== Painter-specific 8-char columns ====
+                    ["@emiridno"] = emiridno255,
+                    ["@idholder"] = idholder255,
+                    ["@nationty"] = nationty255,
+                    ["@employer"] = employer255,
+                    ["@issudate"] = issudate255,
+                    ["@expirydt"] = expirydt255,
+                    ["@occupatn"] = occupatn255,
+                    ["@bankaddr"] = bankaddr255,
+                };
+
+                // INSERT (covers all required legacy + reused 255s + painter extras)
+                var sql = @"
+INSERT INTO dbo.ctmInfluncr
+(
+    inflCode, inflType, inflName, contName,
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
+    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
+    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
+    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
+    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
+    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
+    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
+    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
+
+    -- shared 255s
+    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
+
+    -- painter-specific 8-char name columns (varchar 255)
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
+)
+VALUES
+(
+    @inflCode, @inflType, @inflName, @contName,
+    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
+    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
+    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
+    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
+    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
+    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
+    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
+    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
+    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
+    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
+
+    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
+    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
+    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
+
+    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
+);
+
+SELECT @inflCode AS InflCode;
+";
+
+                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Painter registration saved",
+                    influencerCode = savedCode,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // (Optional) dropdowns if you need them for painter UI
+        [HttpGet("emirates-list")]
+        public IActionResult EmiratesList() => Ok(new
+        {
+            success = true,
+            data = new[] { "Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah" },
+            timestamp = DateTime.Now
         });
 
-        if (entries.isEmpty) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('No entries found for the given criteria'),
-              backgroundColor: Colors.orange,
-            ),
-          );
+        // ----------------- helpers -----------------
+        private string GetNextInfluencerCode(string inflType)
+        {
+            // Atomic next-number fetch for this inflType, e.g., PN000001 → PN000002
+            const string nextSql = @"
+DECLARE @n int;
+
+-- Lock the influencer table rowset during MAX() to avoid race conditions
+SELECT @n = ISNULL(MAX(CAST(SUBSTRING(inflCode, 3, 6) AS int)), 0) + 1
+FROM dbo.ctmInfluncr WITH (UPDLOCK, HOLDLOCK)
+WHERE inflType = @inflType
+  AND inflCode LIKE 'PN[0-9][0-9][0-9][0-9][0-9][0-9]';
+
+SELECT RIGHT('000000' + CAST(@n AS varchar(6)), 6) AS nxt;
+";
+            var rows = _db.WebSessBean(nextSql, new Dictionary<string, object> { ["@inflType"] = inflType })
+                       as List<Dictionary<string, object>>;
+
+            var num = rows?.FirstOrDefault()?.Values?.FirstOrDefault()?.ToString();
+            if (string.IsNullOrWhiteSpace(num)) num = "000001";
+
+            return "PN" + num; // 8 chars total
         }
-      } else {
-        setState(() {
-          _searchError = result['error'] ?? 'Search failed';
-          _isSearching = false;
-        });
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Search failed: ${result['error']}'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } catch (e) {
-      setState(() {
-        _searchError = 'Network error: $e';
-        _isSearching = false;
-      });
+        private static string MakeFixed(int size, string input)
+        {
+            if (string.IsNullOrEmpty(input)) input = "";
+            return input.Length >= size ? input[..size]
+                   : input + new string('A', size - input.Length);
+        }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Network error: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // keep last 11 digits if user typed country code
+        private static string FormatMobile11(string? s)
+        {
+            var d = Digits(s);
+            if (d.Length <= 11) return d;
+            return d.Substring(d.Length - 11);
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+
+        private static DateTime? SafeParseDate(string? dateString)
+        {
+            if (string.IsNullOrWhiteSpace(dateString)) return null;
+            var formats = new[] {
+                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
+                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
+            };
+            foreach (var f in formats)
+            {
+                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            if (DateTime.TryParse(dateString, out var any)) return any;
+            return null;
+        }
     }
-  }
 
-  Widget buildSupplyChainTableExtended(
-    List<SamplingDriveEntry> retailerData,
-    ScrollController scrollController,
-  ) {
-    Widget numCell(double v) => Align(
-      alignment: Alignment.centerRight,
-      child: Text(v.toStringAsFixed(1)),
-    );
+    // -------- request model --------
+    public class PainterRegistrationRequest
+    {
+        // Personal
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? Reference { get; set; }
 
-    String dateText(DateTime d) =>
-        "${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}";
+        // Emirates ID Details
+        public string? EmiratesIdNumber { get; set; }
+        public string? IdName { get; set; }          // Name on ID
+        public string? DateOfBirth { get; set; }     // maps to birthDat
+        public string? Nationality { get; set; }
+        public string? CompanyDetails { get; set; }  // Employer
+        public string? IssueDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? Occupation { get; set; }
 
-    return Scrollbar(
-      controller: scrollController,
-      thumbVisibility: true,
-      child: SingleChildScrollView(
-        controller: scrollController,
-        scrollDirection: Axis.horizontal,
-        child: DataTable(
-          showCheckboxColumn: false,
-          columns: const [
-            DataColumn(label: Text("DocuNumb")),
-            DataColumn(label: Text("Retailer")),
-            DataColumn(label: Text("Code")),
-            DataColumn(label: Text("Distributor")),
-            DataColumn(label: Text("Area")),
-            DataColumn(label: Text("Date")),
-            DataColumn(label: Text("Painter")),
-            DataColumn(label: Text("Mobile")),
-            DataColumn(label: Text("Distributed (Kg)")),
-          ],
-          rows: retailerData.map((entry) {
-            return DataRow(
-              cells: [
-                DataCell(Text(entry.docuNumb ?? '')),
-                DataCell(Text(entry.retailerName)),
-                DataCell(Text(entry.retailerCode)),
-                DataCell(Text(entry.distributorName)),
-                DataCell(Text(entry.area)),
-                DataCell(Text(dateText(entry.distributionDate))),
-                DataCell(Text(entry.painterName)),
-                DataCell(Text(entry.painterMobile)),
-                DataCell(numCell(entry.qtyDistributedKg)),
-              ],
-              onSelectChanged: (_) {
-                populateControllers(entry);
-              },
-            );
-          }).toList(),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isDesktop = MediaQuery.of(context).size.width >= 1200;
-
-    return Scaffold(
-      appBar: _buildModernAppBar(),
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (ctx, constraints) {
-            return SingleChildScrollView(
-              // only ONE vertical scroller
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxWidth: isDesktop ? 1800 : double.infinity,
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(6),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        // 1) Header - Always show
-                        _buildAnimatedHeader(),
-                        const SizedBox(height: 32),
-
-                        // 2) Search - Always show
-                        _buildSearchSection(),
-                        const SizedBox(height: 32),
-
-                        // 3) Table/List section - Only show when we have data
-                        if (filteredRetailerEntries.isNotEmpty) ...[
-                          buildSupplyChainTableExtended(
-                            filteredRetailerEntries,
-                            _horizontalScrollController,
-                          ),
-                          const SizedBox(height: 20),
-                        ] else if (_searchError != null) ...[
-                          // Show error message if search failed
-                          Container(
-                            padding: const EdgeInsets.all(24),
-                            decoration: BoxDecoration(
-                              color: Colors.red.shade50,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.red.shade200),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.error_outline,
-                                  color: Colors.red.shade600,
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Text(
-                                    'Search Error: $_searchError',
-                                    style: TextStyle(
-                                      color: Colors.red.shade700,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                        ] else ...[
-                          // Show instructions when no search has been performed
-                          Container(
-                            padding: const EdgeInsets.all(24),
-                            decoration: BoxDecoration(
-                              color: Colors.blue.shade50,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.blue.shade200),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.info_outline,
-                                  color: Colors.blue.shade600,
-                                ),
-                                const SizedBox(width: 12),
-                                const Expanded(
-                                  child: Text(
-                                    'Enter a Retailer Code/Name/Painter Name or date range above and click Search to view sampling drive entries.',
-                                    style: TextStyle(fontSize: 16),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                        ],
-
-                        // 4) Form fields - Always show
-                        const SizedBox(height: 48),
-                        if (isDesktop)
-                          buildDesktopLayout()
-                        else
-                          buildMobileLayout(),
-
-                        const SizedBox(height: 48),
-                        _buildAnimatedSubmitButton(),
-                        const SizedBox(height: 48),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
-
-  Widget buildDesktopLayout() {
-    return Column(
-      children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Left Column
-            Expanded(
-              child: Column(
-                children: [
-                  _buildModernSection(
-                    title: 'Sample Material Distribution',
-                    icon: Icons.inventory_2_outlined,
-                    children: [
-                      _buildModernTextField(
-                        controller: retailerController,
-                        label: 'Retailer Name',
-                        icon: Icons.storefront,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: retailerCodeController,
-                        label: 'Retailer Code',
-                        icon: Icons.qr_code_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: distributorController,
-                        label: 'Concern Distributor',
-                        icon: Icons.business_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      ModernDropdown(
-                        label: 'Emirates',
-                        icon: Icons.location_on_outlined,
-                        items: _emirates,
-                        value: emiratesController.text.isEmpty
-                            ? null
-                            : emiratesController.text,
-                        onChanged: (value) {
-                          setState(() {
-                            emiratesController.text = value ?? '';
-                          });
-                        },
-                        isLoading: _isLoadingEmirates,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernDateField(
-                        controller: dateController,
-                        label: 'Date of Distribution',
-                        icon: Icons.calendar_today_outlined,
-                      ),
-                      const SizedBox(height: 24),
-                      _buildModernSection(
-                        title: 'Sample Proof',
-                        icon: Icons.photo_camera_outlined,
-                        children: [
-                          _buildModernDateField(
-                            controller: samplDateController,
-                            label: 'Sample Date',
-                            icon: Icons.calendar_today_outlined,
-                            isRequired: false,
-                          ),
-                          const SizedBox(height: 20),
-                          ModernDropdown(
-                            label: 'Product',
-                            icon: Icons.palette_outlined,
-                            items: const ['Wallcare Putty'],
-                            value: prodController.text.isEmpty
-                                ? null
-                                : prodController.text,
-                            onChanged: (value) {
-                              setState(() {
-                                prodController.text = value ?? '';
-                              });
-                            },
-                          ),
-                          const SizedBox(height: 20),
-                          FileUploadWidget(
-                            label: 'Sample Photograph',
-                            icon: Icons.camera_alt_outlined,
-                            onFileSelected: (value) {
-                              setState(() => _photoImage = value);
-                            },
-                            allowedExtensions: const ['jpg', 'jpeg', 'png'],
-                            maxSizeInMB: 10.0,
-                            currentFilePath: _photoImage,
-                            formType: 'sampling',
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 24),
-            // Right Column
-            Expanded(
-              child: Column(
-                children: [
-                  _buildModernSection(
-                    title: 'Execution Details',
-                    icon: Icons.engineering_outlined,
-                    children: [
-                      _buildModernTextField(
-                        controller: painterController,
-                        label: 'Painter/Contractor Name',
-                        icon: Icons.person_outline_rounded,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: phoneController,
-                        label: 'Contact Number',
-                        icon: Icons.phone_outlined,
-                        isPhone: true,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: qtyController,
-                        label: 'Material Qty Distributed (Kg)',
-                        icon: Icons.inventory_outlined,
-                        isNumeric: true,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: siteAdController,
-                        label: 'Site Address',
-                        icon: Icons.location_on_outlined,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 20),
-                    ],
-                  ),
-                  const SizedBox(height: 24),
-                  _buildModernSection(
-                    title: 'Reimbursement',
-                    icon: Icons.payments_outlined,
-                    children: [
-                      ModernDropdown(
-                        label: 'Reimbursement Mode',
-                        icon: Icons.monetization_on_outlined,
-                        items: ['0 AED (No Reimbursement)', 'Max 150 AED '],
-                        value: reimbursementModeController.text.isEmpty
-                            ? null
-                            : reimbursementModeController.text,
-                        onChanged: (String? value) {
-                          setState(() {
-                            reimbursementModeController.text = value ?? '';
-                            if (value != null) {
-                              if (value.contains('Max 150 AED')) {
-                                reimbursementAmtController.text = '150';
-                              } else if (value.contains('0')) {
-                                reimbursementAmtController.text = '0';
-                              }
-                            }
-                          });
-                        },
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: reimbursementAmtController,
-                        label: 'Amount Reimbursed',
-                        icon: Icons.attach_money_outlined,
-                        isNumeric: true,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget buildMobileLayout() {
-    return Column(
-      children: [
-        // Sample Material Distribution
-        _buildModernSection(
-          title: 'Sample Material Distribution',
-          icon: Icons.inventory_2_outlined,
-          children: [
-            _buildModernTextField(
-              controller: retailerController,
-              label: 'Retailer Name',
-              icon: Icons.storefront,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: retailerCodeController,
-              label: 'Retailer Code',
-              icon: Icons.qr_code_outlined,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: distributorController,
-              label: 'Concern Distributor',
-              icon: Icons.business_outlined,
-            ),
-            const SizedBox(height: 16),
-            ModernDropdown(
-              label: 'Emirates',
-              icon: Icons.location_on_outlined,
-              items: _emirates,
-              value: emiratesController.text.isEmpty
-                  ? null
-                  : emiratesController.text,
-              onChanged: (value) {
-                setState(() {
-                  emiratesController.text = value ?? '';
-                });
-              },
-              isLoading: _isLoadingEmirates,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: dateController,
-              label: 'Date of Distribution',
-              icon: Icons.calendar_today_outlined,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Execution Details
-        _buildModernSection(
-          title: 'Execution Details',
-          icon: Icons.engineering_outlined,
-          children: [
-            _buildModernTextField(
-              controller: painterController,
-              label: 'Painter/Contractor Name',
-              icon: Icons.person_outline_rounded,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: phoneController,
-              label: 'Contact Number',
-              icon: Icons.phone_outlined,
-              isPhone: true,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: qtyController,
-              label: 'Material Qty Distributed (Kg)',
-              icon: Icons.inventory_outlined,
-              isNumeric: true,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: siteAdController,
-              label: 'Site Address',
-              icon: Icons.location_on_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Sample Proof
-        _buildModernSection(
-          title: 'Sample Proof',
-          icon: Icons.photo_camera_outlined,
-          children: [
-            _buildModernDateField(
-              controller: samplDateController,
-              label: 'Sample Date',
-              icon: Icons.calendar_today_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            ModernDropdown(
-              label: 'Product',
-              icon: Icons.palette_outlined,
-              items: const ['Wallcare Putty'],
-              value: prodController.text.isEmpty ? null : prodController.text,
-              onChanged: (value) {
-                setState(() {
-                  prodController.text = value ?? '';
-                });
-              },
-            ),
-            const SizedBox(height: 16),
-            FileUploadWidget(
-              label: 'Sample Photograph',
-              icon: Icons.camera_alt_outlined,
-              onFileSelected: (value) {
-                setState(() => _photoImage = value);
-              },
-              allowedExtensions: const ['jpg', 'jpeg', 'png'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _photoImage,
-              formType: 'sampling',
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Reimbursement
-        _buildModernSection(
-          title: 'Reimbursement',
-          icon: Icons.payments_outlined,
-          children: [
-            ModernDropdown(
-              label: 'Reimbursement Mode',
-              icon: Icons.monetization_on_outlined,
-              items: ['0 AED (No Reimbursement)', 'Max 150 AED '],
-              value: reimbursementModeController.text.isEmpty
-                  ? null
-                  : reimbursementModeController.text,
-              onChanged: (String? value) {
-                setState(() {
-                  reimbursementModeController.text = value ?? '';
-                  // Auto-fill amount based on selection
-                  if (value != null) {
-                    if (value.contains('Max 150 AED')) {
-                      reimbursementAmtController.text = '150';
-                    } else if (value.contains('0')) {
-                      reimbursementAmtController.text = '0';
-                    }
-                  }
-                });
-              },
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: reimbursementAmtController,
-              label: 'Amount Reimbursed',
-              icon: Icons.attach_money_outlined,
-              isNumeric: true,
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  PreferredSizeWidget _buildModernAppBar() {
-    return AppBar(
-      elevation: 0,
-      backgroundColor: Colors.white,
-      foregroundColor: const Color(0xFF1E3A8A),
-      systemOverlayStyle: const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-      ),
-      title: Text(
-        'Sample Execution Entry',
-        style: TextStyle(
-          fontWeight: FontWeight.w600,
-          fontSize: 20,
-          color: const Color(0xFF1E3A8A),
-        ),
-      ),
-      actions: [
-        IconButton(
-          icon: const Icon(
-            Icons.help_outline_rounded,
-            color: Color(0xFF1E3A8A),
-          ),
-          onPressed: () => _showHelpDialog(),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAnimatedHeader() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(32),
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.blue.withOpacity(0.15),
-            blurRadius: 20,
-            offset: const Offset(0, 8),
-          ),
-        ],
-      ),
-      child: const Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Sample Execution Entry',
-            style: TextStyle(
-              fontSize: 32,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
-          SizedBox(height: 12),
-          Text(
-            'Sample Execution Entry',
-            style: TextStyle(fontSize: 18, color: Colors.white70),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildModernSection({
-    required String title,
-    required IconData icon,
-    required List<Widget> children,
-    bool isOptional = false,
-  }) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.04),
-            blurRadius: 16,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Section Header
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF8FAFC),
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(16),
-              ),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E3A8A).withOpacity(0.1),
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(icon, color: const Color(0xFF1E3A8A), size: 24),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF1F2937),
-                        ),
-                      ),
-                      if (isOptional)
-                        Text(
-                          'Optional',
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.grey.shade500,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          // Section Content
-          Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: children,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildModernTextField({
-    required TextEditingController controller,
-    required String label,
-    required IconData icon,
-    bool isPhone = false,
-    bool isNumeric = false,
-    bool isRequired = true,
-  }) {
-    return TextFormField(
-      controller: controller,
-      decoration: InputDecoration(
-        labelText: isRequired ? '$label *' : label,
-        prefixIcon: Icon(icon, color: Colors.grey.shade600),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
-        ),
-        filled: true,
-        fillColor: const Color(0xFFF8FAFC),
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: 16,
-        ),
-      ),
-      keyboardType: isPhone
-          ? TextInputType.phone
-          : isNumeric
-          ? TextInputType.number
-          : TextInputType.text,
-      validator: (value) {
-        if (isRequired && (value == null || value.trim().isEmpty)) {
-          return 'Please enter $label';
-        }
-        if (isPhone && value != null && value.isNotEmpty) {
-          if (!RegExp(r'^[50|52|54|55|56|58]\d{7}$').hasMatch(value)) {
-            return 'Please enter valid UAE mobile number';
-          }
-        }
-        return null;
-      },
-    );
-  }
-
-  Widget _buildModernDateField({
-    required TextEditingController controller,
-    required String label,
-    required IconData icon,
-    bool isRequired = true,
-  }) {
-    return TextFormField(
-      controller: controller,
-      decoration: InputDecoration(
-        labelText: isRequired ? '$label *' : label,
-        prefixIcon: Icon(icon, color: Colors.grey.shade600),
-        suffixIcon: const Icon(
-          Icons.calendar_today_rounded,
-          color: Colors.grey,
-        ),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
-        ),
-        filled: true,
-        fillColor: const Color(0xFFF8FAFC),
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: 16,
-        ),
-      ),
-      readOnly: true,
-      onTap: () async {
-        final date = await showDatePicker(
-          context: context,
-          initialDate: DateTime.now(),
-          firstDate: DateTime(1900),
-          lastDate: DateTime(2100),
-          builder: (context, child) {
-            return Theme(
-              data: Theme.of(context).copyWith(
-                colorScheme: const ColorScheme.light(
-                  primary: Color(0xFF1E3A8A),
-                ),
-              ),
-              child: child!,
-            );
-          },
-        );
-        if (date != null) {
-          controller.text = date.toString().split(' ')[0];
-        }
-      },
-      validator: (value) {
-        if (isRequired && (value == null || value.isEmpty)) {
-          return 'Please enter $label';
-        }
-        return null;
-      },
-    );
-  }
-
-  Widget _buildAnimatedSubmitButton() {
-    return SizedBox(
-      width: double.infinity,
-      height: 56,
-      child: ElevatedButton(
-        onPressed: _isSubmitting ? null : _submitForm,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF1E3A8A),
-          foregroundColor: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-        ),
-        child: _isSubmitting
-            ? const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  ),
-                  SizedBox(width: 16),
-                  Text('Submitting...', style: TextStyle(color: Colors.white)),
-                ],
-              )
-            : Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.save, size: 20),
-                  const SizedBox(width: 12),
-                  const Text(
-                    'Submit',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                ],
-              ),
-      ),
-    );
-  }
-
-  void _showHelpDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.help_outline_rounded,
-                size: 48,
-                color: Color(0xFF1E3A8A),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Sampling Drive Help',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: const Color(0xFF1F2937),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Fill in all required fields marked with *. '
-                'Reimbursement amount will be auto-filled based on the selected mode.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.grey.shade600),
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF1E3A8A),
-                    foregroundColor: Colors.white,
-                  ),
-                  child: const Text(
-                    'Got it',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _submitForm() async {
-    if (_formKey.currentState!.validate()) {
-      setState(() {
-        _isSubmitting = true;
-      });
-      // Simulate API call
-      await Future.delayed(const Duration(seconds: 2));
-      setState(() {
-        _isSubmitting = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white, size: 20),
-                SizedBox(width: 8),
-                Expanded(child: Text('Sampling Entry Saved Successfully!')),
-              ],
-            ),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
+        // Bank Details (optional)
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
     }
-  }
 }
