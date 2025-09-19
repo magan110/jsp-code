@@ -1,948 +1,1840 @@
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:web/web.dart' as web;
+import 'dart:js_interop';
+import '../../../core/widgets/modern_dropdown.dart';
+import '../../../core/widgets/file_upload_widget.dart';
 
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class ContractorController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
+@JS()
+@staticInterop
+class WindowWithGeoLocation {}
 
-        public ContractorController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
-
-        // POST: /api/Contractor/register
-        [HttpPost("register")]
-        [Consumes("application/json")]
-        public IActionResult Register([FromBody] ContractorRegistrationRequest? request = null)
-        {
-            try
-            {
-                request ??= new ContractorRegistrationRequest();
-
-                // --- Keys / defaults ---
-                var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant();       // char(2)
-                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();             // char(3) - use emirates code as area code
-
-                // Generate sequential inflCode = pure numeric in ascending order
-                string inflCode = GetNextInfluencerCode(inflType);
-
-                // Build names and enforce column sizes
-                var fullName = string.Join(" ",
-                    new[] { request.FirstName, request.MiddleName, request.LastName }
-                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
-
-                var inflName256 = Cut(fullName, 256); // inflName nvarchar(256)
-                var contName40  = Cut(fullName, 40);  // contName varchar(40)
-
-                // Address fields (NOT NULL: inflAdd3, district, inflPinC)
-                var inflAdd1_50 = Cut(request.Address, 50);
-                var inflAdd2_100 = "";            // not using; keep empty
-                var inflAdd3_30 = "";             // keep empty to avoid overflow (NOT NULL but "" is allowed)
-                var inflCity_255 = "";
-
-                // Phone and other short fields
-                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
-
-                // Bank fields
-                var bankName100   = Cut(request.BankName, 100);
-                var branchName100 = Cut(request.BranchName, 100);
-                var acctHolder40  = Cut(request.AccountHolderName, 40);
-
-                // New 255 columns (cut to 255 just in case)
-                var contrtyp255 = Cut(request.ContractorType, 255);
-                var frstname255 = Cut(request.FirstName, 255);
-                var middname255 = Cut(request.MiddleName, 255);
-                var lastname255 = Cut(request.LastName, 255);
-                var emirates255 = Cut(request.Emirates, 255);
-
-                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
-                var vatfrmnm255 = Cut(request.FirmName, 255);
-                var vatraddr255 = Cut(request.VatAddress, 255);
-                var vattxreg255 = Cut(request.TaxRegistrationNumber, 255);
-                var vatefdt255  = Cut(request.VatEffectiveDate, 255);
-                var comlcnno255 = Cut(request.LicenseNumber, 255);
-                var comissau255 = Cut(request.IssuingAuthority, 255);
-                var comlctyp255 = Cut(request.LicenseType, 255);
-                var comestdt255 = Cut(request.EstablishmentDate, 255);
-                var comexpdt255 = Cut(request.LicenseExpiryDate, 255);
-                var comtrdnm255 = Cut(request.TradeName, 255);
-                var comrespn255 = Cut(request.ResponsiblePerson, 255);
-                var comraddr255 = Cut(request.LicenseAddress, 255);
-                var comeffdt255 = Cut(request.EffectiveDate, 255);
-
-                // Build parameter bag: supply EVERYTHING used in INSERT
-                var p = new Dictionary<string, object?>
-                {
-                    // ==== Required legacy (NOT NULL) ====
-                    ["@inflCode"] = inflCode,                // char(8)
-                    ["@inflType"] = inflType,                // char(2)
-                    ["@inflName"] = inflName256,             // nvarchar(256)
-                    ["@contName"] = contName40,              // varchar(40)
-
-                    // Address cluster
-                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
-                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
-                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
-                    ["@inflCity"] = inflCity_255,            // varchar(255)
-                    ["@district"] = "",                      // varchar(30)  NOT NULL
-                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
-
-                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
-                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
-                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
-                    ["@birthDat"] = DBNull.Value,            // smalldatetime NULL
-                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
-                    ["@expertis"] = "",                      // varchar(100) YES (send "")
-                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
-                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
-                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
-                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
-                    ["@isActive"] = "T",                     // char(1)      NOT NULL
-                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
-                    ["@updateId"] = DBNull.Value,            // varchar(10)  NULL
-                    ["@updateDt"] = DBNull.Value,            // smalldatetime NULL
-                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
-                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
-                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
-
-                    // Tax IDs / misc
-                    ["@itxPanNo"] = "",                      // varchar(50)
-                    ["@locStxNo"] = "",                      // varchar(30)
-
-                    // Banking (legacy)
-                    ["@bankAcNo"] = "",                      // varchar(25)
-                    ["@bankBnNm"] = bankName100,             // varchar(100)
-                    ["@bankBnDs"] = branchName100,           // varchar(100)
-                    ["@bankBnNo"] = "",                      // varchar(20)
-                    ["@bankIFSC"] = "",                      // varchar(20)
-
-                    // KYC & misc
-                    ["@kycVerFl"] = "",
-                    ["@kycVerDt"] = DBNull.Value,
-                    ["@idCardTy"] = "",
-                    ["@idCardNo"] = "",
-                    ["@inDocCnt"] = DBNull.Value,
-                    ["@rjcRemrk"] = "",
-                    ["@entrBySg"] = "",
-                    ["@kycVrTyp"] = "",
-                    ["@adhrName"] = "",
-                    ["@panCName"] = "",
-                    ["@sapInsDt"] = DBNull.Value,
-                    ["@sapUpdDt"] = DBNull.Value,
-                    ["@urbRurFl"] = "",
-
-                    ["@bankApNm"] = acctHolder40,            // varchar(40)
-
-                    // Permanent/alt address
-                    ["@infAddP1"] = "",
-                    ["@infAddP2"] = "",
-                    ["@infAddP3"] = "",
-                    ["@infPCity"] = "",
-                    ["@distrctP"] = "",
-                    ["@infPinCP"] = "",
-
-                    ["@adhOtpFl"] = "",
-                    ["@concEmpl"] = "",
-                    ["@bnkKycFl"] = "",
-                    ["@bnkKycDt"] = DBNull.Value,
-                    ["@inflPinL"] = "",
-                    ["@adhCpUId"] = "",
-                    ["@adhCpUDt"] = DBNull.Value,
-                    ["@panCpUId"] = "",
-                    ["@panCpUDt"] = DBNull.Value,
-                    ["@bnkCpUId"] = "",
-                    ["@bnkCpUDt"] = DBNull.Value,
-                    ["@randNmSt"] = "",
-                    ["@kycStats"] = "",
-                    ["@inflTyOl"] = "",
-                    ["@kycAprBy"] = "",
-                    ["@blkStuts"] = "",
-                    ["@blkStDat"] = DBNull.Value,
-                    ["@cntrApFl"] = "",
-                    ["@frstScDt"] = DBNull.Value,
-                    ["@sourceCnt"] = "",
-                    ["@promoteNm"] = "",
-                    ["@pmobilen"] = "",
-                    ["@isTDSEli"] = "",
-                    ["@panAdhLk"] = "",
-                    ["@panVldIn"] = "",
-                    ["@panCatgF"] = "",
-
-                    // ==== New varchar(255) columns ====
-                    ["@contrtyp"] = contrtyp255,
-                    ["@frstname"] = frstname255,
-                    ["@middname"] = middname255,
-                    ["@lastname"] = lastname255,
-                    ["@emirates"] = emirates255,
-
-                    ["@ibannumb"] = ibannumb255,
-                    ["@vatfrmnm"] = vatfrmnm255,
-                    ["@vatraddr"] = vatraddr255,
-                    ["@vattxreg"] = vattxreg255,
-                    ["@vatefdt"]  = vatefdt255,
-                    ["@comlcnno"] = comlcnno255,
-                    ["@comissau"] = comissau255,
-                    ["@comlctyp"] = comlctyp255,
-                    ["@comestdt"] = comestdt255,
-                    ["@comexpdt"] = comexpdt255,
-                    ["@comtrdnm"] = comtrdnm255,
-                    ["@comrespn"] = comrespn255,
-                    ["@comraddr"] = comraddr255,
-                    ["@comeffdt"] = comeffdt255
-                };
-
-                var sql = @"
-INSERT INTO dbo.ctmInfluncr
-(
-    inflCode, inflType, inflName, contName,
-    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
-    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
-    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
-    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
-    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
-    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
-    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
-    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
-    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
-    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
-
-    contrtyp, frstname, middname, lastname, emirates,  ibannumb,
-    vatfrmnm, vatraddr, vattxreg, vatefdt,
-    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt
-)
-VALUES
-(
-    @inflCode, @inflType, @inflName, @contName,
-    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
-    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
-    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
-    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
-    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
-    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
-    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
-    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
-    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
-    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
-
-    @contrtyp, @frstname, @middname, @lastname, @emirates,  @ibannumb,
-    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
-    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt
-);
-
-SELECT @inflCode AS InflCode;
-";
-
-                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Registration saved",
-                    influencerCode = savedCode,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        // Dropdowns to match Flutter UI
-        [HttpGet("contractor-types")]
-        public IActionResult ContractorTypes() => Ok(new
-        {
-            success = true,
-            data = new[] { "Maintenance Contractor", "Petty contractors" },
-            timestamp = DateTime.Now
-        });
-
-        [HttpGet("emirates-list")]
-        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
-        {
-            try
-            {
-                const string sql = @"
-SELECT areaCode, areaDesc
-FROM dbo.bkmAreaMast WITH (NOLOCK)
-WHERE (@onlyActive = 0 OR isActive = 'Y')
-ORDER BY areaDesc;";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@onlyActive", onlyActive ? 1 : 0 }
-                };
-
-                var result = _db.WebSessBean(sql, parameters);
-                var list = new List<AreaItem>();
-
-                if (result != null)
-                {
-                    foreach (var row in result)
-                    {
-                        list.Add(new AreaItem
-                        {
-                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
-                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        // ----------------- helpers -----------------
-        private string GetNextInfluencerCode(string inflType)
-        {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                // Get the next sequential number for 2IK codes
-                int nextNumber = GetNextInfluencerSequence();
-                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
-                attempts++;
-
-                if (attempts >= maxAttempts)
-                {
-                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
-                }
-
-            } while (IsInfluencerCodeExists(newCode));
-
-            return newCode;
-        }
-
-        private int GetNextInfluencerSequence()
-        {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.ctmInfluncr
-                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
-
-            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
-
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
-        }
-
-        private bool IsInfluencerCodeExists(string influencerCode)
-        {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
-            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
-
-            var result = _db.WebSessBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-
-            return count != null && Convert.ToInt32(count) > 0;
-        }
-
-        private static string MakeFixed(int size, string input)
-        {
-            if (string.IsNullOrEmpty(input)) input = "";
-            return input.Length >= size ? input[..size]
-                   : input + new string('A', size - input.Length);
-        }
-
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return new string(s.Where(char.IsDigit).ToArray());
-        }
-
-        // keep last 11 digits if user typed country code
-        private static string FormatMobile11(string? s)
-        {
-            var d = Digits(s);
-            if (d.Length <= 11) return d;
-            return d.Substring(d.Length - 11);
-        }
-
-        private static string? FormatIban(string? s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return s;
-            return s.Replace(" ", "").ToUpperInvariant();
-        }
-    }
-
-    // ----------------- request model (matches Flutter) -----------------
-    public class ContractorRegistrationRequest
-    {
-        // Personal
-        public string? ContractorType { get; set; }
-        public string? FirstName { get; set; }
-        public string? MiddleName { get; set; }
-        public string? LastName { get; set; }
-        public string? MobileNumber { get; set; }
-        public string? Address { get; set; }
-        public string? Area { get; set; }
-        public string? Emirates { get; set; }
-        public string? ProfilePhoto { get; set; }
-
-        // Bank
-        public string? AccountHolderName { get; set; }
-        public string? IbanNumber { get; set; }
-        public string? BankName { get; set; }
-        public string? BranchName { get; set; }
-        public string? BankAddress { get; set; }
-
-        // VAT
-        public string? VatCertificate { get; set; }
-        public string? FirmName { get; set; }
-        public string? VatAddress { get; set; }
-        public string? TaxRegistrationNumber { get; set; }
-        public string? VatEffectiveDate { get; set; }
-
-        // License
-        public string? LicenseDocument { get; set; }
-        public string? LicenseNumber { get; set; }
-        public string? IssuingAuthority { get; set; }
-        public string? LicenseType { get; set; }
-        public string? EstablishmentDate { get; set; }
-        public string? LicenseExpiryDate { get; set; }
-        public string? TradeName { get; set; }
-        public string? ResponsiblePerson { get; set; }
-        public string? LicenseAddress { get; set; }
-        public string? EffectiveDate { get; set; }
-    }
+extension WindowGeoLocationExtension on WindowWithGeoLocation {
+  external JSPromise<JSAny?> requestGeoPosition();
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-
-namespace RAKControllers.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class PainterController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-
-        public PainterController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
-
-        // POST: /api/Painter/register
-        [HttpPost("register")]
-        [Consumes("application/json")]
-        public IActionResult Register([FromBody] PainterRegistrationRequest? request = null)
-        {
-            try
-            {
-                request ??= new PainterRegistrationRequest();
-
-                // --- Keys / defaults ---
-                var inflType = "PN";                                                           // char(2) -> Painter
-                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();           // char(3) - use emirates code as area code
-
-                // NEW: Generate sequential inflCode = "PN" + 6-digit number (char(8))
-                string inflCode = GetNextInfluencerCode(inflType);
-
-                // Names
-                var fullName = string.Join(" ",
-                    new[] { request.FirstName, request.MiddleName, request.LastName }
-                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
-
-                var inflName256 = Cut(fullName, 256);  // inflName nvarchar(256)
-                var contName40 = Cut(fullName, 40);   // contName varchar(40)
-
-                // Address cluster (legacy)
-                var inflAdd1_50 = Cut(request.Address, 50);
-                var inflAdd2_100 = "";
-                var inflAdd3_30 = "";                // keep empty (NOT NULL but "" allowed)
-                var inflCity_255 = "";
-
-                // Mobile
-                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
-
-                // Bank (legacy)
-                var bankName100 = Cut(request.BankName, 100);
-                var branchName100 = Cut(request.BranchName, 100);
-                var acctHolder40 = Cut(request.AccountHolderName, 40);
-
-                // Painter extra (varchar 255 columns we added)
-                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
-                var idholder255 = Cut(request.IdName, 255);
-                var nationty255 = Cut(request.Nationality, 255);
-                var employer255 = Cut(request.CompanyDetails, 255);
-                var issudate255 = Cut(request.IssueDate, 255);
-                var expirydt255 = Cut(request.ExpiryDate, 255);
-                var occupatn255 = Cut(request.Occupation, 255);
-                var bankaddr255 = Cut(request.BankAddress, 255);
-
-                // Existing “new” 255 columns reused when relevant
-                var contrtyp255 = "Painter";                            // painter role label
-                var frstname255 = Cut(request.FirstName, 255);
-                var middname255 = Cut(request.MiddleName, 255);
-                var lastname255 = Cut(request.LastName, 255);
-                var emirates255 = Cut(request.Emirates, 255);
-                var referenc255 = Cut(request.Reference, 255);
-                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
-
-                // DOB -> map to legacy smalldatetime birthDat
-                var birthDat = SafeParseDate(request.DateOfBirth);
-
-                // Build parameter bag (EVERY param used in INSERT must exist)
-                var p = new Dictionary<string, object?>
-                {
-                    // ==== Required legacy (NOT NULL) ====
-                    ["@inflCode"] = inflCode,                // char(8) - sequential PN000001...
-                    ["@inflType"] = inflType,                // char(2)
-                    ["@inflName"] = inflName256,             // nvarchar(256)
-                    ["@contName"] = contName40,              // varchar(40)
-
-                    // Address cluster
-                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
-                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
-                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
-                    ["@inflCity"] = inflCity_255,            // varchar(255)
-                    ["@district"] = "",                      // varchar(30)  NOT NULL
-                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
-
-                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
-                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
-                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
-                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
-                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
-                    ["@expertis"] = "",                      // varchar(100) YES (send "")
-                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
-                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
-                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
-                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
-                    ["@isActive"] = "T",                     // char(1)      NOT NULL
-                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
-                    ["@updateId"] = DBNull.Value,
-                    ["@updateDt"] = DBNull.Value,
-                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
-                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
-                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
-
-                    // Tax IDs / misc
-                    ["@itxPanNo"] = "",
-                    ["@locStxNo"] = "",
-
-                    // Banking (legacy)
-                    ["@bankAcNo"] = "",
-                    ["@bankBnNm"] = bankName100,
-                    ["@bankBnDs"] = branchName100,
-                    ["@bankBnNo"] = "",
-                    ["@bankIFSC"] = "",
-
-                    // KYC & misc
-                    ["@kycVerFl"] = "",
-                    ["@kycVerDt"] = DBNull.Value,
-                    ["@idCardTy"] = "",
-                    ["@idCardNo"] = "",
-                    ["@inDocCnt"] = DBNull.Value,
-                    ["@rjcRemrk"] = "",
-                    ["@entrBySg"] = "",
-                    ["@kycVrTyp"] = "",
-                    ["@adhrName"] = "",
-                    ["@panCName"] = "",
-                    ["@sapInsDt"] = DBNull.Value,
-                    ["@sapUpdDt"] = DBNull.Value,
-                    ["@urbRurFl"] = "",
-
-                    ["@bankApNm"] = acctHolder40,            // varchar(40)
-
-                    // Permanent/alt address
-                    ["@infAddP1"] = "",
-                    ["@infAddP2"] = "",
-                    ["@infAddP3"] = "",
-                    ["@infPCity"] = "",
-                    ["@distrctP"] = "",
-                    ["@infPinCP"] = "",
-
-                    ["@adhOtpFl"] = "",
-                    ["@concEmpl"] = "",
-                    ["@bnkKycFl"] = "",
-                    ["@bnkKycDt"] = DBNull.Value,
-                    ["@inflPinL"] = "",
-                    ["@adhCpUId"] = "",
-                    ["@adhCpUDt"] = DBNull.Value,
-                    ["@panCpUId"] = "",
-                    ["@panCpUDt"] = DBNull.Value,
-                    ["@bnkCpUId"] = "",
-                    ["@bnkCpUDt"] = DBNull.Value,
-                    ["@randNmSt"] = "",
-                    ["@kycStats"] = "",
-                    ["@inflTyOl"] = "",
-                    ["@kycAprBy"] = "",
-                    ["@blkStuts"] = "",
-                    ["@blkStDat"] = DBNull.Value,
-                    ["@cntrApFl"] = "",
-                    ["@frstScDt"] = DBNull.Value,
-                    ["@sourceCnt"] = "",
-                    ["@promoteNm"] = "",
-                    ["@pmobilen"] = "",
-                    ["@isTDSEli"] = "",
-                    ["@panAdhLk"] = "",
-                    ["@panVldIn"] = "",
-                    ["@panCatgF"] = "",
-
-                    // ==== Existing 255s we reuse ====
-                    ["@contrtyp"] = "Painter",
-                    ["@frstname"] = frstname255,
-                    ["@middname"] = middname255,
-                    ["@lastname"] = lastname255,
-                    ["@emirates"] = emirates255,
-                    ["@referenc"] = referenc255,
-                    ["@ibannumb"] = ibannumb255,
-                    ["@vatfrmnm"] = "",
-                    ["@vatraddr"] = "",
-                    ["@vattxreg"] = "",
-                    ["@vatefdt"] = "",
-                    ["@comlcnno"] = "",
-                    ["@comissau"] = "",
-                    ["@comlctyp"] = "",
-                    ["@comestdt"] = "",
-                    ["@comexpdt"] = "",
-                    ["@comtrdnm"] = "",
-                    ["@comrespn"] = "",
-                    ["@comraddr"] = "",
-                    ["@comeffdt"] = "",
-
-                    // ==== Painter-specific 8-char columns ====
-                    ["@emiridno"] = emiridno255,
-                    ["@idholder"] = idholder255,
-                    ["@nationty"] = nationty255,
-                    ["@employer"] = employer255,
-                    ["@issudate"] = issudate255,
-                    ["@expirydt"] = expirydt255,
-                    ["@occupatn"] = occupatn255,
-                    ["@bankaddr"] = bankaddr255,
-                };
-
-                // INSERT (covers all required legacy + reused 255s + painter extras)
-                var sql = @"
-INSERT INTO dbo.ctmInfluncr
-(
-    inflCode, inflType, inflName, contName,
-    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
-    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
-    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
-    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
-    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
-    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
-    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
-    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
-    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
-    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
-
-    -- shared 255s
-    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
-    vatfrmnm, vatraddr, vattxreg, vatefdt,
-    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
-
-    -- painter-specific 8-char name columns (varchar 255)
-    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
-)
-VALUES
-(
-    @inflCode, @inflType, @inflName, @contName,
-    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
-    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
-    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
-    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
-    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
-    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
-    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
-    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
-    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
-    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
-
-    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
-    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
-    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
-
-    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
-);
-
-SELECT @inflCode AS InflCode;
-";
-
-                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
-                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Painter registration saved",
-                    influencerCode = savedCode,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
-        }
-
-        // (Optional) dropdowns if you need them for painter UI
-        [HttpGet("emirates-list")]
-        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
-        {
-            try
-            {
-                const string sql = @"
-SELECT areaCode, areaDesc
-FROM dbo.bkmAreaMast WITH (NOLOCK)
-WHERE (@onlyActive = 0 OR isActive = 'Y')
-ORDER BY areaDesc;";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@onlyActive", onlyActive ? 1 : 0 }
-                };
-
-                var result = _db.WebSessBean(sql, parameters);
-                var list = new List<AreaItem>();
-
-                if (result != null)
-                {
-                    foreach (var row in result)
-                    {
-                        list.Add(new AreaItem
-                        {
-                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
-                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        // ----------------- helpers -----------------
-        private string GetNextInfluencerCode(string inflType)
-        {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                // Get the next sequential number for 2IK codes
-                int nextNumber = GetNextInfluencerSequence();
-                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
-                attempts++;
-
-                if (attempts >= maxAttempts)
-                {
-                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
-                }
-
-            } while (IsInfluencerCodeExists(newCode));
-
-            return newCode;
-        }
-
-        private int GetNextInfluencerSequence()
-        {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.ctmInfluncr
-                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
-
-            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
-
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
-        }
-
-        private bool IsInfluencerCodeExists(string influencerCode)
-        {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
-            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
-
-            var result = _db.WebSessBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-
-            return count != null && Convert.ToInt32(count) > 0;
-        }
-
-        private static string MakeFixed(int size, string input)
-        {
-            if (string.IsNullOrEmpty(input)) input = "";
-            return input.Length >= size ? input[..size]
-                   : input + new string('A', size - input.Length);
-        }
-
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return new string(s.Where(char.IsDigit).ToArray());
-        }
-
-        // keep last 11 digits if user typed country code
-        private static string FormatMobile11(string? s)
-        {
-            var d = Digits(s);
-            if (d.Length <= 11) return d;
-            return d.Substring(d.Length - 11);
-        }
-
-        private static string? FormatIban(string? s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return s;
-            return s.Replace(" ", "").ToUpperInvariant();
-        }
-
-        private static DateTime? SafeParseDate(string? dateString)
-        {
-            if (string.IsNullOrWhiteSpace(dateString)) return null;
-            var formats = new[] {
-                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
-                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
-            };
-            foreach (var f in formats)
-            {
-                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out var dt))
-                    return dt;
-            }
-            if (DateTime.TryParse(dateString, out var any)) return any;
-            return null;
-        }
-    }
-
-    // -------- request model --------
-    public class PainterRegistrationRequest
-    {
-        // Personal
-        public string? FirstName { get; set; }
-        public string? MiddleName { get; set; }
-        public string? LastName { get; set; }
-        public string? MobileNumber { get; set; }
-        public string? Address { get; set; }
-        public string? Area { get; set; }
-        public string? Emirates { get; set; }
-        public string? Reference { get; set; }
-
-        // Emirates ID Details
-        public string? EmiratesIdNumber { get; set; }
-        public string? IdName { get; set; }          // Name on ID
-        public string? DateOfBirth { get; set; }     // maps to birthDat
-        public string? Nationality { get; set; }
-        public string? CompanyDetails { get; set; }  // Employer
-        public string? IssueDate { get; set; }
-        public string? ExpiryDate { get; set; }
-        public string? Occupation { get; set; }
-
-        // Bank Details (optional)
-        public string? AccountHolderName { get; set; }
-        public string? IbanNumber { get; set; }
-        public string? BankName { get; set; }
-        public string? BranchName { get; set; }
-        public string? BankAddress { get; set; }
-    }
+class ActivityEntryScreen extends StatefulWidget {
+  const ActivityEntryScreen({super.key});
+
+  @override
+  _ActivityEntryScreenState createState() => _ActivityEntryScreenState();
 }
 
+class _ActivityEntryScreenState extends State<ActivityEntryScreen>
+    with TickerProviderStateMixin {
+  // Controllers
+  final processTypeController = TextEditingController();
+  final activityController = TextEditingController();
+  final descriptionController = TextEditingController();
+  final objectiveController = TextEditingController();
+  final activityDateController = TextEditingController();
+  final meetingVenueController = TextEditingController();
+  final areaController = TextEditingController();
+  final cityNameController = TextEditingController();
+  final districtController = TextEditingController();
+  final pinCodeController = TextEditingController();
+
+  final employeesCountController = TextEditingController();
+  final channelPartnerCountController = TextEditingController();
+  final influencersCountController = TextEditingController();
+  final totalParticipantsController = TextEditingController();
+
+  final prodController = TextEditingController();
+
+  final latitudeController = TextEditingController();
+  final longitudeController = TextEditingController();
+
+  // Animation controllers
+  late AnimationController _mainController;
+  late AnimationController _fabController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+
+  final List<ChannelPartnerRow> channelPartners = [];
+  List<PainterContractor> painterContractors = [];
+  List<ChannelPartner> channelPartnersData = [];
+
+  void updatePartnerCount() {
+    channelPartnerCountController.text = channelPartners.length.toString();
+  }
+
+  List<Map<String, dynamic>> painterList = [];
+
+  // When adding
+  void addPainterRow() {
+    setState(() {
+      painterList.add({
+        'typeController': TextEditingController(),
+        'mobileController': TextEditingController(),
+        'nameController': TextEditingController(),
+        'selectedType': null,
+      });
+    });
+  }
+
+  void deletePainterAt(int index) {
+    setState(() {
+      painterList.removeAt(index);
+    });
+  }
+
+  void addChannelPartner() {
+    setState(() {
+      channelPartners.add(ChannelPartnerRow());
+      updatePartnerCount();
+    });
+  }
+
+  void deleteChannelPartner(int index) {
+    setState(() {
+      channelPartners.removeAt(index);
+      updatePartnerCount();
+    });
+  }
+
+  bool _isSubmitting = false;
+  bool _isGettingLocation = false;
+  String? _uploadedFileName;
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+
+  // Lists for tables
+  List<Map<String, String>> employeesList = [];
+
+  // Image upload paths - dynamic list starting with one
+  List<String?> imagePaths = [null];
+
+  @override
+  void initState() {
+    super.initState();
+    // Initialize animations
+    _mainController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
+      vsync: this,
+    );
+    _fabController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _mainController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+    _mainController.forward();
+    _fabController.forward();
+
+    // Auto-fill location on load
+    _initLocation();
+  }
+
+  @override
+  void dispose() {
+    _mainController.dispose();
+    _fabController.dispose();
+    processTypeController.dispose();
+    activityController.dispose();
+    descriptionController.dispose();
+    objectiveController.dispose();
+    activityDateController.dispose();
+    meetingVenueController.dispose();
+    areaController.dispose();
+    cityNameController.dispose();
+    districtController.dispose();
+    pinCodeController.dispose();
+
+    employeesCountController.dispose();
+    channelPartnerCountController.dispose();
+    influencersCountController.dispose();
+    totalParticipantsController.dispose();
+
+    prodController.dispose();
+
+    latitudeController.dispose();
+    longitudeController.dispose();
+    super.dispose();
+  }
+
+  void _submitForm() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() {
+        _isSubmitting = true;
+      });
+      try {
+        // Here you would create and submit the activity entry
+        // For now, we'll just show a success message
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.check_circle, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Activity entry submitted successfully'),
+                  ),
+                ],
+              ),
+              backgroundColor: Colors.green,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 5),
+            ),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.warning, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(child: Text('Unexpected error: ${e.toString()}')),
+                ],
+              ),
+              backgroundColor: Colors.orange,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSubmitting = false;
+          });
+        }
+      }
+    }
+  }
+
+  void _saveAsDraft() {
+    // Save form data to SharedPreferences
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(Icons.save, color: Colors.white, size: 20),
+            SizedBox(width: 8),
+            Expanded(child: Text('Draft saved successfully')),
+          ],
+        ),
+        backgroundColor: Colors.blue,
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 4),
+      ),
+    );
+  }
+
+  // --- GEOLOCATION (using web JavaScript helper from index.html) ---
+  Future<void> _initLocation() async {
+    setState(() => _isGettingLocation = true);
+    try {
+      await _getWebLocation();
+    } catch (e) {
+      _toast('Could not fetch location: $e');
+    } finally {
+      if (mounted) setState(() => _isGettingLocation = false);
+    }
+  }
+
+  Future<void> _getWebLocation() async {
+    try {
+      // First try to get from localStorage (cached values from index.html)
+      final lastLat = web.window.localStorage.getItem('lastLat');
+      final lastLng = web.window.localStorage.getItem('lastLng');
+      if (lastLat != null && lastLng != null && mounted) {
+        latitudeController.text = double.parse(lastLat).toStringAsFixed(6);
+        longitudeController.text = double.parse(lastLng).toStringAsFixed(6);
+      }
+
+      // Use the JavaScript geolocation helper from index.html
+      final jsWindow = web.window as WindowWithGeoLocation;
+      final result = await jsWindow.requestGeoPosition().toDart;
+      if (result != null) {
+        // Convert JSAny to proper Dart object
+        final resultDart = result.dartify();
+        if (resultDart is Map<String, dynamic>) {
+          if (resultDart['ok'] == true) {
+            if (mounted) {
+              final lat = resultDart['lat'] as num?;
+              final lng = resultDart['lng'] as num?;
+              if (lat != null && lng != null) {
+                latitudeController.text = lat.toStringAsFixed(6);
+                longitudeController.text = lng.toStringAsFixed(6);
+              }
+            }
+          } else {
+            final error = resultDart['error']?.toString() ?? 'Unknown error';
+            _toast('Web geolocation failed: $error');
+          }
+        }
+      }
+    } catch (e) {
+      _toast('Web geolocation error: $e');
+    }
+  }
+
+  void _captureLocation() {
+    // Location capture logic - now calls the web location
+    _initLocation();
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  void _addEmployee() {
+    // Add a new empty employee to the list
+    setState(() {
+      employeesList.add({'employeeCode': '', 'name': ''});
+    });
+  }
+
+  void _deleteEmployee(int index) {
+    // Remove an employee from the list
+    setState(() {
+      employeesList.removeAt(index);
+    });
+  }
+
+  Widget buildChannelPartnerSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        buildModernTextField(
+          controller: channelPartnerCountController,
+          label: 'No. of Channel Partners',
+          icon: Icons.people_outline,
+          isRequired: false,
+          isNumeric: true,
+        ),
+        const SizedBox(height: 16),
+        const Text(
+          "List of Channel Partners",
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 16),
+        ...List.generate(channelPartners.length, (index) {
+          final row = channelPartners[index];
+          return Card(
+            margin: const EdgeInsets.symmetric(vertical: 8),
+            elevation: 2,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Wrap(
+                spacing: 16,
+                runSpacing: 16,
+                children: [
+                  ModernDropdown(
+                    label: 'Type ',
+                    icon: Icons.event_outlined,
+                    items: const [
+                      'Authorsied dealer',
+                      'Direct Dealer',
+                      'Principal Rural Distributors',
+                      'Retailer',
+                      'Stockist',
+                      'Ultra tech Retailer',
+                    ],
+                    value: row.selectedType,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        row.selectedType = newValue ?? '';
+                        row.typeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  buildModernTextField(
+                    controller: row.purchaserCodeController,
+                    label: "Purchaser Code",
+                    icon: Icons.code,
+                  ),
+                  buildModernTextField(
+                    controller: row.mobileController,
+                    label: "Mobile No",
+                    icon: Icons.phone,
+                    isPhone: true,
+                  ),
+                  buildModernTextField(
+                    controller: row.nameController,
+                    label: "Name",
+                    icon: Icons.person,
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => deleteChannelPartner(index),
+                    icon: const Icon(Icons.delete, color: Colors.red),
+                    label: const Text(
+                      "Del",
+                      style: TextStyle(color: Colors.red),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }),
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ElevatedButton.icon(
+            onPressed: addChannelPartner,
+            icon: const Icon(Icons.add, color: Colors.white),
+            label: const Text(
+              "Add Channel Partner",
+              style: TextStyle(color: Colors.white),
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1E3A8A),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isDesktop = constraints.maxWidth > 1200;
+        final isTablet =
+            constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
+        final isMobile = constraints.maxWidth <= 800;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF8FAFC),
+          appBar: _buildModernAppBar(),
+          body: FadeTransition(
+            opacity: _fadeAnimation,
+            child: SlideTransition(
+              position: _slideAnimation,
+              child: Container(
+                decoration: const BoxDecoration(color: Color(0xFFF8FAFC)),
+                child: SingleChildScrollView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
+                    vertical: 24,
+                  ),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: isDesktop ? 1400 : double.infinity,
+                      ),
+                      child: ScaleTransition(
+                        scale: _scaleAnimation,
+                        child: Form(
+                          key: _formKey,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // Header with animation
+                              _buildAnimatedHeader(),
+                              const SizedBox(height: 32),
+                              // Main Content - Two columns on desktop
+                              if (isDesktop)
+                                _buildDesktopLayout()
+                              else
+                                _buildMobileLayout(),
+                              const SizedBox(height: 48),
+
+                              const SizedBox(height: 24),
+                              _buildActionButtons(),
+                              const SizedBox(height: 48),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDesktopLayout() {
+    return Column(
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Left Column
+            Expanded(
+              child: _buildModernSection(
+                title: 'Activity Details',
+                icon: Icons.event_note_rounded,
+                children: [
+                  ModernDropdown(
+                    label: 'Process Type',
+                    icon: Icons.category_outlined,
+                    items: const ['Add', 'Update'],
+                    value: processTypeController.text.isEmpty
+                        ? null
+                        : processTypeController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        processTypeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Activity',
+                    icon: Icons.event_outlined,
+                    items: [
+                      'Painter Meet',
+                      'Contractor Meet',
+                      'Applicator Meet',
+                    ],
+                    value: activityController.text.isEmpty
+                        ? null
+                        : activityController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        activityController.text = newValue ?? '';
+                        if (newValue!.isNotEmpty) {
+                          if (painterList.isEmpty) addPainterRow();
+                        } else {
+                          painterList.clear();
+                        }
+                      });
+                    },
+
+                    isRequired: true,
+                  ),
+
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: descriptionController,
+                    label: 'Description',
+                    icon: Icons.description_outlined,
+                    isRequired: false,
+                    isMultiline: true,
+                  ),
+
+                  const SizedBox(height: 20),
+                  _buildModernDateField(
+                    controller: activityDateController,
+                    label: 'Activity Date',
+                    icon: Icons.calendar_today_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: meetingVenueController,
+                    label: 'Meeting Venue(Enter Address)',
+                    icon: Icons.location_on_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: cityNameController,
+                    label: 'City Name',
+                    icon: Icons.location_city_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Emirates',
+                    icon: Icons.location_city_outlined,
+                    items: [
+                      'Dubai',
+                      'Abu Dhabi',
+                      'Sharjah',
+                      'Ajman',
+                      'Umm Al Quwain',
+                      'Ras Al Khaimah',
+                      'Fujairah',
+                    ],
+                    value: districtController.text.isEmpty
+                        ? null
+                        : districtController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        districtController.text = newValue ?? '';
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Product',
+                    icon: Icons.production_quantity_limits_sharp,
+                    items: const ['Wall Care Putty'],
+                    value: prodController.text.isEmpty
+                        ? null
+                        : prodController.text,
+                    onChanged: (value) =>
+                        setState(() => prodController.text = value ?? ''),
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Pin Code',
+                    icon: Icons.pin_outlined,
+                    items: ['Select', 'Pin 2', 'Pin 3'],
+                    value: pinCodeController.text.isEmpty
+                        ? null
+                        : pinCodeController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        pinCodeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: employeesCountController,
+                    label: 'No. of Employees',
+                    icon: Icons.people_outline,
+                    isRequired: false,
+                    isNumeric: true,
+                  ),
+                  const SizedBox(height: 20),
+
+                  Column(
+                    children: [
+                      _buildModernTextField(
+                        controller: latitudeController,
+                        label: 'Latitude',
+                        icon: Icons.my_location_outlined,
+                        isRequired: false,
+                        suffix: IconButton(
+                          tooltip: 'Refresh location',
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _isGettingLocation
+                              ? null
+                              : () async {
+                                  HapticFeedback.selectionClick();
+                                  await _initLocation();
+                                },
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      _buildModernTextField(
+                        controller: longitudeController,
+                        label: 'Longitude',
+                        icon: Icons.my_location_outlined,
+                        isRequired: false,
+                        suffix: IconButton(
+                          tooltip: 'Refresh location',
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _isGettingLocation
+                              ? null
+                              : () async {
+                                  HapticFeedback.selectionClick();
+                                  await _initLocation();
+                                },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.info_outline,
+                        size: 16,
+                        color: Colors.grey,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _isGettingLocation
+                              ? 'Fetching GPS…'
+                              : (latitudeController.text.isEmpty ||
+                                    longitudeController.text.isEmpty)
+                              ? 'Tap the GPS icon if fields are empty.'
+                              : 'Coordinates captured from your device GPS.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey.shade700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  if (activityController.text.isNotEmpty) ...[
+                    _buildModernSection(
+                      title: "List of Painters/ Contractors/ Applicators",
+                      icon: Icons.handshake_outlined,
+                      children: [
+                        // Show painter row table, using AddPainterRowWidget for each painter in painterList
+                        ...List.generate(painterList.length, (index) {
+                          final row = painterList[index];
+
+                          return AddPainterRowWidget(
+                            typeController: TextEditingController(
+                              text: row['typeController']?.text ?? '',
+                            ),
+                            mobileController: TextEditingController(
+                              text: row['mobileController']?.text ?? '',
+                            ),
+                            nameController: TextEditingController(
+                              text: row['nameController']?.text ?? '',
+                            ),
+
+                            selectedType: row['selectedType'],
+                            onAdd: addPainterRow,
+                            onDelete: () => deletePainterAt(index),
+
+                            onTypeChanged: (val) {
+                              setState(() {
+                                row['selectedType'] = val;
+                                row['typeController'].text = val ?? '';
+                              });
+                            },
+                          );
+                        }),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: ElevatedButton.icon(
+                            onPressed: addPainterRow,
+                            icon: const Icon(Icons.add, color: Colors.white),
+                            label: const Text(
+                              "Add Painter",
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF1E3A8A),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 24),
+            Expanded(
+              child: Column(
+                children: [
+                  // BW Employees Present Table
+                  _buildModernSection(
+                    title: 'Employees Present',
+                    icon: Icons.people_outline,
+                    children: [
+                      _buildEmployeesTable(),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.start,
+                        children: [
+                          ElevatedButton(
+                            onPressed: _addEmployee,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.grey.shade200,
+                              foregroundColor: Colors.black87,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Add'),
+                          ),
+                          const SizedBox(width: 16),
+                          ElevatedButton(
+                            onPressed: employeesList.isEmpty
+                                ? null
+                                : () {
+                                    if (employeesList.isNotEmpty) {
+                                      _deleteEmployee(employeesList.length - 1);
+                                    }
+                                  },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade400,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Delete'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  if (activityController.text.isNotEmpty) ...[
+                    // Channel Partner Section
+                    _buildModernSection(
+                      title: 'Channel Partners',
+                      icon: Icons.handshake_outlined,
+                      children: [buildChannelPartnerSection()],
+                    ),
+                  ],
+                  const SizedBox(height: 32),
+                  // Image Upload Section
+                  _buildModernSection(
+                    title: 'Image Upload',
+                    icon: Icons.image_outlined,
+                    children: [_buildImageUploadSection()],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMobileLayout() {
+    return Column(
+      children: [
+        // Activity Details Section
+        _buildModernSection(
+          title: 'Activity Details',
+          icon: Icons.event_note_rounded,
+          children: [
+            ModernDropdown(
+              label: 'Process Type',
+              icon: Icons.category_outlined,
+              items: const ['Add', 'Update'],
+              value: processTypeController.text.isEmpty
+                  ? null
+                  : processTypeController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  processTypeController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Activity',
+              icon: Icons.event_outlined,
+              items: ['Painter Meet', 'Contractor Meet', 'Applicator Meet'],
+              value: activityController.text.isEmpty
+                  ? null
+                  : activityController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  activityController.text = newValue ?? '';
+                  // Show painter row table if selecting "Painter Meet", otherwise clear
+                  if (newValue!.isNotEmpty) {
+                    //&& newValue == 'Painter Meet'
+                    if (painterList.isEmpty) addPainterRow();
+                  } else {
+                    painterList.clear();
+                  }
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: descriptionController,
+              label: 'Description',
+              icon: Icons.description_outlined,
+              isRequired: false,
+              isMultiline: true,
+            ),
+
+            const SizedBox(height: 16),
+            _buildModernDateField(
+              controller: activityDateController,
+              label: 'Activity Date',
+              icon: Icons.calendar_today_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: meetingVenueController,
+              label: 'Meeting Venue(Enter Address)',
+              icon: Icons.location_on_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: cityNameController,
+              label: 'City Name',
+              icon: Icons.location_city_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Product',
+              icon: Icons.production_quantity_limits_sharp,
+              items: const ['Wall Care Putty'],
+              value: prodController.text.isEmpty ? null : prodController.text,
+              onChanged: (value) =>
+                  setState(() => prodController.text = value ?? ''),
+            ),
+
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Pin Code',
+              icon: Icons.pin_outlined,
+              items: ['Select', 'Pin 2', 'Pin 3'],
+              value: pinCodeController.text.isEmpty
+                  ? null
+                  : pinCodeController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  pinCodeController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: employeesCountController,
+              label: 'No. of Employees',
+              icon: Icons.people_outline,
+              isRequired: false,
+              isNumeric: true,
+            ),
+            const SizedBox(height: 16),
+
+            Column(
+              children: [
+                _buildModernTextField(
+                  controller: latitudeController,
+                  label: 'Latitude',
+                  icon: Icons.my_location_outlined,
+                  isRequired: false,
+                  suffix: IconButton(
+                    tooltip: 'Refresh location',
+                    icon: const Icon(Icons.gps_fixed),
+                    onPressed: _isGettingLocation
+                        ? null
+                        : () async {
+                            HapticFeedback.selectionClick();
+                            await _initLocation();
+                          },
+                  ),
+                ),
+                const SizedBox(height: 24),
+                _buildModernTextField(
+                  controller: longitudeController,
+                  label: 'Longitude',
+                  icon: Icons.my_location_outlined,
+                  isRequired: false,
+                  suffix: IconButton(
+                    tooltip: 'Refresh location',
+                    icon: const Icon(Icons.gps_fixed),
+                    onPressed: _isGettingLocation
+                        ? null
+                        : () async {
+                            HapticFeedback.selectionClick();
+                            await _initLocation();
+                          },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Icon(Icons.info_outline, size: 16, color: Colors.grey),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    _isGettingLocation
+                        ? 'Fetching GPS…'
+                        : (latitudeController.text.isEmpty ||
+                              longitudeController.text.isEmpty)
+                        ? 'Tap the GPS icon if fields are empty.'
+                        : 'Coordinates captured from your device GPS.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                ),
+              ],
+            ),
+
+            if (activityController.text.isNotEmpty) ...[
+              // Show painter row table, using AddPainterRowWidget for each painter in painterList
+              const SizedBox(height: 16),
+              const Text(
+                "List of Painters/ Contractors/ Applicators",
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 16),
+              ...List.generate(painterList.length, (index) {
+                final row = painterList[index];
+                return AddPainterRowWidget(
+                  typeController: TextEditingController(
+                    text: row['typeController']?.text ?? '',
+                  ),
+                  mobileController: TextEditingController(
+                    text: row['mobileController']?.text ?? '',
+                  ),
+                  nameController: TextEditingController(
+                    text: row['nameController']?.text ?? '',
+                  ),
+
+                  selectedType: row['selectedType'],
+                  onAdd: addPainterRow,
+                  onDelete: () => deletePainterAt(index),
+
+                  onTypeChanged: (val) {
+                    setState(() {
+                      row['selectedType'] = val;
+                      row['typeController'].text = val ?? '';
+                    });
+                  },
+                );
+              }),
+              Align(
+                alignment: Alignment.centerRight,
+                child: ElevatedButton.icon(
+                  onPressed: addPainterRow,
+                  icon: const Icon(Icons.add, color: Colors.white),
+                  label: const Text(
+                    "Add Painter",
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E3A8A),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 24),
+        // BW Employees Present Table
+        _buildModernSection(
+          title: 'Employees Present',
+          icon: Icons.people_outline,
+          children: [
+            _buildEmployeesTable(),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.start,
+              children: [
+                ElevatedButton(
+                  onPressed: _addEmployee,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.grey.shade200,
+                    foregroundColor: Colors.black87,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Add'),
+                ),
+                const SizedBox(width: 16),
+                ElevatedButton(
+                  onPressed: employeesList.isEmpty
+                      ? null
+                      : () {
+                          if (employeesList.isNotEmpty) {
+                            _deleteEmployee(employeesList.length - 1);
+                          }
+                        },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade400,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Delete'),
+                ),
+              ],
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+
+        // Image Upload Section
+        if (activityController.text.isNotEmpty) ...[
+          // Channel Partner Section
+          _buildModernSection(
+            title: 'Channel Partners',
+            icon: Icons.handshake_outlined,
+            children: [buildChannelPartnerSection()],
+          ),
+        ],
+        const SizedBox(height: 24),
+        _buildModernSection(
+          title: 'Image Upload',
+          icon: Icons.image_outlined,
+          children: [_buildImageUploadSection()],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEmployeesTable() {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        children: [
+          // Table Header
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                topRight: Radius.circular(8),
+              ),
+            ),
+            child: Row(
+              children: [
+                _buildTableHeaderCell('Del', flex: 1),
+                _buildTableHeaderCell('Employees Present', flex: 3),
+                _buildTableHeaderCell('Employee Code', flex: 3),
+                _buildTableHeaderCell('Name', flex: 5),
+                _buildTableHeaderCell('Mobile No', flex: 5),
+              ],
+            ),
+          ),
+          // Table Rows
+          if (employeesList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No employees added yet. Click "Add" to add an employee.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          else
+            ...employeesList.asMap().entries.map((entry) {
+              final index = entry.key;
+              final employee = entry.value;
+              return Row(
+                children: [
+                  _buildTableCell(
+                    Checkbox(
+                      value: false,
+                      onChanged: (value) {
+                        if (value == true) {
+                          _deleteEmployee(index);
+                        }
+                      },
+                    ),
+                    flex: 1,
+                  ),
+                  _buildTableCell(Text('Employee ${index + 1}'), flex: 3),
+                  _buildTableCell(
+                    TextField(
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Enter code',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          employeesList[index]['employeeCode'] = value;
+                        });
+                      },
+                    ),
+                    flex: 3,
+                  ),
+                  _buildTableCell(
+                    TextField(
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Enter name',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          employeesList[index]['name'] = value;
+                        });
+                      },
+                    ),
+                    flex: 5,
+                  ),
+                ],
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildImageUploadSection() {
+    return Column(
+      children: [
+        // Dynamic image upload widgets
+        ...List.generate(imagePaths.length, (index) {
+          return Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: FileUploadWidget(
+                      label: 'Document ${index + 1}',
+                      icon: Icons.image_outlined,
+                      isRequired: false,
+                      allowedExtensions: ['jpg', 'jpeg', 'png', 'pdf'],
+                      formType: 'activity',
+                      currentFilePath: imagePaths[index],
+                      onFileSelected: (String? filePath) {
+                        setState(() {
+                          imagePaths[index] = filePath;
+                        });
+                      },
+                    ),
+                  ),
+                  if (imagePaths.length >
+                      1) // Only show remove button if more than one widget
+                    IconButton(
+                      onPressed: () => _removeImageWidget(index),
+                      icon: const Icon(Icons.remove_circle, color: Colors.red),
+                      tooltip: 'Remove this image',
+                    ),
+                ],
+              ),
+              if (index < imagePaths.length - 1) const SizedBox(height: 16),
+            ],
+          );
+        }),
+        const SizedBox(height: 16),
+        // Add button
+        if (imagePaths.length < 5) // Limit to maximum 5 images
+          Center(
+            child: ElevatedButton.icon(
+              onPressed: _addImageWidget,
+              icon: const Icon(Icons.add, color: Colors.white),
+              label: const Text(
+                'Add Another Image',
+                style: TextStyle(color: Colors.white),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF1E3A8A),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 12,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  void _addImageWidget() {
+    setState(() {
+      imagePaths.add(null);
+    });
+  }
+
+  void _removeImageWidget(int index) {
+    setState(() {
+      imagePaths.removeAt(index);
+    });
+  }
+
+  Widget _buildTableHeaderCell(String text, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: Colors.grey.shade300),
+            bottom: BorderSide(color: Colors.grey.shade300),
+          ),
+        ),
+        child: Text(text, style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+    );
+  }
+
+  Widget _buildTableCell(Widget child, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: Colors.grey.shade300),
+            bottom: BorderSide(color: Colors.grey.shade300),
+          ),
+        ),
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildActionButtons() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        SizedBox(width: 200, height: 56),
+        const SizedBox(width: 24),
+        SizedBox(
+          width: 200,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: _isSubmitting ? null : _submitForm,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1E3A8A),
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            child: _isSubmitting
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(width: 16),
+                      Text(
+                        'Submitting...',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                    ],
+                  )
+                : const Text(
+                    'Submit',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  PreferredSizeWidget _buildModernAppBar() {
+    return AppBar(
+      elevation: 0,
+      backgroundColor: Colors.white,
+      foregroundColor: const Color(0xFF1E3A8A),
+      systemOverlayStyle: const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+      ),
+      leading: Navigator.of(context).canPop()
+          ? Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: IconButton(
+                icon: const Icon(Icons.arrow_back, color: Color(0xFF1E3A8A)),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            )
+          : null,
+      title: Text(
+        'Promotion Activity Entry',
+        style: TextStyle(
+          fontWeight: FontWeight.w600,
+          fontSize: 20,
+          color: const Color(0xFF1E3A8A),
+        ),
+      ),
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.home, color: Color(0xFF1E3A8A)),
+          onPressed: () {
+            // Navigate to home
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAnimatedHeader() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(32),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.blue.withOpacity(0.15),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: const Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Promotion Activity Entry',
+            style: TextStyle(
+              fontSize: 32,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          SizedBox(height: 12),
+          Text(
+            'Enter activity details and capture location',
+            style: TextStyle(fontSize: 18, color: Colors.white70),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModernSection({
+    required String title,
+    required IconData icon,
+    required List<Widget> children,
+    bool isOptional = false,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 16,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Section Header
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(16),
+              ),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E3A8A).withOpacity(0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: const Color(0xFF1E3A8A), size: 24),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF1F2937),
+                        ),
+                      ),
+                      if (isOptional)
+                        Text(
+                          'Optional',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey.shade500,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Section Content
+          Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: children,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModernTextField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isPhone = false,
+    bool isNumeric = false,
+    bool isMultiline = false,
+    bool isRequired = true,
+    Widget? suffix,
+  }) {
+    return TextFormField(
+      controller: controller,
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: suffix,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
+      keyboardType: isPhone
+          ? TextInputType.phone
+          : isNumeric
+          ? TextInputType.number
+          : isMultiline
+          ? TextInputType.multiline
+          : TextInputType.text,
+      maxLines: isMultiline ? 3 : 1,
+      validator: (value) {
+        if (isRequired && (value == null || value.trim().isEmpty)) {
+          return 'Please enter $label';
+        }
+        if (isPhone && value != null && value.isNotEmpty) {
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
+          }
+        }
+        if (isNumeric && value != null && value.isNotEmpty) {
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
+          }
+        }
+        return null;
+      },
+    );
+  }
+
+  Widget _buildModernDateField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isRequired = true,
+  }) {
+    return TextFormField(
+      controller: controller,
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: const Icon(
+          Icons.calendar_today_rounded,
+          color: Colors.grey,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
+      readOnly: true,
+      onTap: () async {
+        final date = await showDatePicker(
+          context: context,
+          initialDate: DateTime.now(),
+          firstDate: DateTime(1900),
+          lastDate: DateTime(2100),
+          builder: (context, child) {
+            return Theme(
+              data: Theme.of(context).copyWith(
+                colorScheme: const ColorScheme.light(
+                  primary: Color(0xFF1E3A8A),
+                ),
+              ),
+              child: child!,
+            );
+          },
+        );
+        if (date != null) {
+          controller.text = date.toString().split(' ')[0];
+        }
+      },
+      validator: (value) {
+        if (isRequired && (value == null || value.isEmpty)) {
+          return 'Please enter $label';
+        }
+        return null;
+      },
+    );
+  }
+}
+
+class PainterContractor {
+  String type;
+  String mobile;
+  String name;
+
+  PainterContractor({
+    required this.type,
+    required this.mobile,
+    required this.name,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'type': type,
+    'mobile': mobile,
+    'name': name,
+  };
+}
+
+class ChannelPartner {
+  String type;
+  String purchaserCode;
+  String mobile;
+  String name;
+
+  ChannelPartner({
+    required this.type,
+    required this.purchaserCode,
+    required this.mobile,
+    required this.name,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'type': type,
+    'purchaserCode': purchaserCode,
+    'mobile': mobile,
+    'name': name,
+  };
+}
+
+class RowData {
+  final typeController = TextEditingController();
+  final mobileController = TextEditingController();
+  final nameController = TextEditingController();
+}
+
+class ChannelPartnerRow {
+  final typeController = TextEditingController();
+  final purchaserCodeController = TextEditingController();
+  final mobileController = TextEditingController();
+  final nameController = TextEditingController();
+
+  String? selectedType;
+}
+
+class AddPainterRowWidget extends StatelessWidget {
+  final TextEditingController typeController;
+  final TextEditingController mobileController;
+  final TextEditingController nameController;
+
+  final String? selectedType; // Add this for dropdown value
+  final VoidCallback onAdd;
+  final VoidCallback onDelete;
+
+  final Function(String?) onTypeChanged;
+
+  const AddPainterRowWidget({
+    super.key,
+    required this.typeController,
+    required this.mobileController,
+    required this.nameController,
+
+    required this.selectedType,
+    required this.onAdd,
+    required this.onDelete,
+
+    required this.onTypeChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Wrap(
+          spacing: 16,
+          runSpacing: 16,
+          children: [
+            ModernDropdown(
+              label: 'Type',
+              icon: Icons.event_outlined,
+              items: const ['Painter', 'Contractor', 'Applicator'],
+              value: selectedType,
+              onChanged: (String? newValue) {
+                onTypeChanged(newValue);
+                typeController.text = newValue ?? '';
+              },
+              isRequired: true,
+            ),
+            buildModernTextField(
+              controller: mobileController,
+              label: "Mobile No",
+              icon: Icons.phone,
+              isPhone: true,
+            ),
+            buildModernTextField(
+              controller: nameController,
+              label: "Name",
+              icon: Icons.person,
+            ),
+
+            OutlinedButton.icon(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete, color: Colors.red),
+              label: const Text("Del", style: TextStyle(color: Colors.red)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Widget buildModernTextField({
+  required TextEditingController controller,
+  required String label,
+  required IconData icon,
+  bool isPhone = false,
+  bool isNumeric = false,
+  bool isMultiline = false,
+  bool isRequired = true,
+  Widget? suffix,
+}) {
+  return SizedBox(
+    width: 250,
+    child: TextFormField(
+      controller: controller,
+      decoration: InputDecoration(
+        labelText: isRequired ? '$label *' : label,
+        prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: suffix,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.grey.shade300),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+        ),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
+      ),
+      keyboardType: isPhone
+          ? TextInputType.phone
+          : isNumeric
+          ? TextInputType.number
+          : isMultiline
+          ? TextInputType.multiline
+          : TextInputType.text,
+      maxLines: isMultiline ? 3 : 1,
+      validator: (value) {
+        if (isRequired && (value == null || value.trim().isEmpty)) {
+          return 'Please enter $label';
+        }
+        if ((isPhone || isNumeric) && value != null && value.isNotEmpty) {
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
+          }
+        }
+        return null;
+      },
+    ),
+  );
+}
+
+Widget _buildRadioGroup({
+  required String label,
+  required String? value,
+  required List<String> options,
+  required Function(String?) onChanged,
+}) {
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+      Wrap(
+        spacing: 10,
+        children: options.map((option) {
+          return Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Radio<String>(
+                value: option,
+                groupValue: value,
+                onChanged: onChanged,
+              ),
+              Text(option),
+            ],
+          );
+        }).toList(),
+      ),
+    ],
+  );
+}
