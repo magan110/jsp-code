@@ -1,3 +1,674 @@
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+namespace RAKControllers.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class SamplingExecutionEntryController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public SamplingExecutionEntryController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        /// <summary>
+        /// Search sampling drive entries by retailerCode, retailerName, or painterName (any one),
+        /// with optional start/end dates (yyyy-MM-dd).
+        ///
+        /// Example:
+        /// GET api/SamplingDriveQuery/search?retailerCode=R001
+        /// GET api/SamplingDriveQuery/search?retailerName=Retailer%20A&start=2025-01-01&end=2025-02-28
+        /// GET api/SamplingDriveQuery/search?painterName=John%20Doe
+        /// </summary>
+        [HttpGet("search")]
+        public ActionResult<IEnumerable<SamplingDriveEntryDto>> Search(
+            [FromQuery] string retailerCode = null,
+            [FromQuery] string retailerName = null,
+            [FromQuery] string painterNameFilter = null,
+            [FromQuery] string start = null,
+            [FromQuery] string end = null,
+            [FromQuery] int top = 200)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(retailerCode) && string.IsNullOrWhiteSpace(retailerName) && string.IsNullOrWhiteSpace(painterNameFilter))
+                {
+                    return BadRequest("Provide either retailerCode, retailerName, or painterName.");
+                }
+
+                // Parse dates if provided (yyyy-MM-dd)
+                DateTime? startDate = TryParseDate(start);
+                DateTime? endDate = TryParseDate(end);
+
+                // Build WHERE parts
+                var whereParts = new List<string> { "1 = 1" };
+                var p = new Dictionary<string, object>();
+
+                if (!string.IsNullOrWhiteSpace(retailerCode))
+                {
+                    // Search retailerCode in both custName (header) and cusRtlCd (detail) fields
+                    whereParts.Add("(ISNULL(d.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
+                    p["@retailerCode"] = retailerCode.Trim();
+                }
+                if (!string.IsNullOrWhiteSpace(retailerName))
+                {
+                    whereParts.Add("ISNULL(a.custName,'') LIKE '%' + @retailerName + '%'");
+                    p["@retailerName"] = retailerName.Trim();
+                }
+                if (!string.IsNullOrWhiteSpace(painterNameFilter))
+                {
+                    whereParts.Add("ISNULL(a.contName,'') LIKE '%' + @painterName + '%'");
+                    p["@painterName"] = painterNameFilter.Trim();
+                }
+                if (startDate.HasValue)
+                {
+                    whereParts.Add("a.sampDate >= @start");
+                    p["@start"] = startDate.Value;
+                }
+                if (endDate.HasValue)
+                {
+                    // inclusive end-date (add one day then < next-day)
+                    whereParts.Add("a.sampDate < DATEADD(DAY,1,@end)");
+                    p["@end"] = endDate.Value;
+                }
+
+                // NOTE:
+                // catsamplead columns we saved earlier:
+                //   docuNumb, docuDate, areaCode, custName, contName, mobileNo,
+                //   concDist, sampDate, misdQnty, packSize, prodName
+                //
+                // Some fields your Flutter shows do not exist in DB. We’ll return defaults.
+                //
+                var sql = $@"
+SELECT TOP (@top)
+       a.docuNumb,
+       a.docuDate,
+       a.areaCode,
+       a.custName,             -- retailerName
+       ISNULL(d.cusRtlCd,'') AS retailerCode, -- retailer code from detail table
+       a.concDist,             -- distributor name
+       a.sampDate,             -- distribution date
+       a.contName,             -- painter name
+       a.mobileNo,             -- painter mobile
+       a.packSize,            
+       a.prodName,             -- product name
+       a.misdQnty,             -- missed quantity (string)
+       d.serialNo,             -- detail serial number
+       d.pouchCnt,             -- material quantity from detail table
+       d.sampCnCl              -- sample/cancel flag from detail table
+FROM dbo.catsamplead a WITH (NOLOCK)
+LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
+WHERE {string.Join(" AND ", whereParts)}
+ORDER BY a.docuDate DESC, d.serialNo;";
+
+                p["@top"] = top;
+
+                var rows = _db.WebSessBean(sql, p) as List<Dictionary<string, object>>;
+                var list = new List<SamplingDriveEntryDto>();
+
+                if (rows != null)
+                {
+                    foreach (var r in rows)
+                    {
+                        // doc number
+                        var docuNumb = r["docuNumb"]?.ToString();
+
+                        // names/codes
+                        var retailerNm = (r["custName"] ?? "").ToString();
+                        var retailerCd = (r.ContainsKey("retailerCode") && r["retailerCode"] != DBNull.Value ? r["retailerCode"] : "")?.ToString() ?? "";
+                        var distName = (r["concDist"] ?? "").ToString();
+                        var area = (r["areaCode"] ?? "").ToString();
+
+                        // dates
+                        var distDate = ToDate(r["sampDate"]) ?? DateTime.UtcNow;
+
+                        // painter
+                        var painterName = (r["contName"] ?? "").ToString();
+                        var painterMob = (r["mobileNo"] ?? "").ToString();
+
+                        // sku/pack
+                        var packSize = (r["packSize"] ?? "").ToString();
+                        var productName = (r["prodName"] ?? "").ToString();
+                        var skuLabel = PackSizeToLabel(packSize, productName); // e.g. "5 Kg"
+
+                        // quantities
+                        var missedQtyKg = ToDouble(r["misdQnty"]);       // what you saved as misdQnty
+                        var materialQty = r.ContainsKey("pouchCnt") && r["pouchCnt"] != DBNull.Value ? ToDouble(r["pouchCnt"]) : 0.0; // material quantity from detail table
+                        var qtyDistributedKg = materialQty;              // use pouchCnt as distributed quantity
+                        var effectiveDistributedKg = Math.Max(0.0, qtyDistributedKg - missedQtyKg);
+
+                        // totals — not in DB; return 0
+                        var totalReceivedKg = 0.0;
+                        var remainingKg = 0.0;
+
+                        // reimbursement — not in DB; return defaults
+                        var reimbMode = "";
+                        var reimbAmt = 0.0;
+
+                        // additional fields from detail table (handle nulls from LEFT JOIN)
+                        var serialNo = r.ContainsKey("serialNo") && r["serialNo"] != DBNull.Value ? (r["serialNo"]?.ToString() ?? "") : "";
+                        var sampleCancelFlag = r.ContainsKey("sampCnCl") && r["sampCnCl"] != DBNull.Value ? (r["sampCnCl"]?.ToString() ?? "") : "";
+
+                        list.Add(new SamplingDriveEntryDto
+                        {
+                            docuNumb = docuNumb,
+                            retailerName = retailerNm,
+                            retailerCode = retailerCd,
+                            distributorName = distName,
+                            area = area,
+                            distributionDate = distDate,
+                            painterName = painterName,
+                            painterMobile = painterMob,
+                            skuSizeLabel = skuLabel,
+                            qtyDistributedKg = qtyDistributedKg,
+                            missedQtyKg = missedQtyKg,
+                            effectiveDistributedKg = effectiveDistributedKg,
+                            totalReceivedKg = totalReceivedKg,
+                            remainingKg = remainingKg,
+                            reimbursementMode = reimbMode,
+                            reimbursementAmountAED = reimbAmt,
+                            photoImage = null,          // not stored; wire up later if you link image table
+                            serialNo = serialNo,
+                            materialQty = materialQty,
+                            sampleCancelFlag = sampleCancelFlag
+                        });
+                    }
+                }
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Get top 100 sampling drive entries without any search criteria
+        /// </summary>
+        [HttpGet("top100")]
+        public ActionResult<IEnumerable<SamplingDriveEntryDto>> GetTop100()
+        {
+            try
+            {
+                var sql = @"
+SELECT TOP 100
+       a.docuNumb,
+       a.docuDate,
+       a.areaCode,
+       a.custName,             -- retailerName
+       ISNULL(d.cusRtlCd,'') AS retailerCode, -- retailer code from detail table
+       a.concDist,             -- distributor name
+       a.sampDate,             -- distribution date
+       a.contName,             -- painter name
+       a.mobileNo,             -- painter mobile
+       a.packSize,
+       a.prodName,             -- product name
+       a.misdQnty,             -- missed quantity (string)
+       d.serialNo,             -- detail serial number
+       d.pouchCnt,             -- material quantity from detail table
+       d.sampCnCl              -- sample/cancel flag from detail table
+FROM dbo.catsamplead a WITH (NOLOCK)
+LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
+ORDER BY a.docuDate DESC, d.serialNo;";
+
+                var rows = _db.WebSessBean(sql, new Dictionary<string, object>()) as List<Dictionary<string, object>>;
+                var list = new List<SamplingDriveEntryDto>();
+
+                if (rows != null)
+                {
+                    foreach (var r in rows)
+                    {
+                        // doc number
+                        var docuNumb = r["docuNumb"]?.ToString();
+
+                        // names/codes
+                        var retailerNm = (r["custName"] ?? "").ToString();
+                        var retailerCd = (r.ContainsKey("retailerCode") && r["retailerCode"] != DBNull.Value ? r["retailerCode"] : "")?.ToString() ?? "";
+                        var distName = (r["concDist"] ?? "").ToString();
+                        var area = (r["areaCode"] ?? "").ToString();
+
+                        // dates
+                        var distDate = ToDate(r["sampDate"]) ?? DateTime.UtcNow;
+
+                        // painter
+                        var painterName = (r["contName"] ?? "").ToString();
+                        var painterMob = (r["mobileNo"] ?? "").ToString();
+
+                        // sku/pack
+                        var packSize = (r["packSize"] ?? "").ToString();
+                        var productName = (r["prodName"] ?? "").ToString();
+                        var skuLabel = PackSizeToLabel(packSize, productName); // e.g. "5 Kg"
+
+                        // quantities
+                        var missedQtyKg = ToDouble(r["misdQnty"]);       // what you saved as misdQnty
+                        var materialQty = r.ContainsKey("pouchCnt") && r["pouchCnt"] != DBNull.Value ? ToDouble(r["pouchCnt"]) : 0.0; // material quantity from detail table
+                        var qtyDistributedKg = materialQty;              // use pouchCnt as distributed quantity
+                        var effectiveDistributedKg = Math.Max(0.0, qtyDistributedKg - missedQtyKg);
+
+                        // totals — not in DB; return 0
+                        var totalReceivedKg = 0.0;
+                        var remainingKg = 0.0;
+
+                        // reimbursement — not in DB; return defaults
+                        var reimbMode = "";
+                        var reimbAmt = 0.0;
+
+                        // additional fields from detail table (handle nulls from LEFT JOIN)
+                        var serialNo = r.ContainsKey("serialNo") && r["serialNo"] != DBNull.Value ? (r["serialNo"]?.ToString() ?? "") : "";
+                        var sampleCancelFlag = r.ContainsKey("sampCnCl") && r["sampCnCl"] != DBNull.Value ? (r["sampCnCl"]?.ToString() ?? "") : "";
+
+                        list.Add(new SamplingDriveEntryDto
+                        {
+                            docuNumb = docuNumb,
+                            retailerName = retailerNm,
+                            retailerCode = retailerCd,
+                            distributorName = distName,
+                            area = area,
+                            distributionDate = distDate,
+                            painterName = painterName,
+                            painterMobile = painterMob,
+                            skuSizeLabel = skuLabel,
+                            qtyDistributedKg = qtyDistributedKg,
+                            missedQtyKg = missedQtyKg,
+                            effectiveDistributedKg = effectiveDistributedKg,
+                            totalReceivedKg = totalReceivedKg,
+                            remainingKg = remainingKg,
+                            reimbursementMode = reimbMode,
+                            reimbursementAmountAED = reimbAmt,
+                            photoImage = null,          // not stored; wire up later if you link image table
+                            serialNo = serialNo,
+                            materialQty = materialQty,
+                            sampleCancelFlag = sampleCancelFlag
+                        });
+                    }
+                }
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // -----------------------
+        // Helpers
+        // -----------------------
+        private static DateTime? TryParseDate(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            if (DateTime.TryParseExact(s.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                                       DateTimeStyles.None, out var dt))
+                return dt;
+            if (DateTime.TryParse(s, out var any)) return any;
+            return null;
+        }
+
+        private static DateTime? ToDate(object o)
+        {
+            if (o == null) return null;
+            if (o is DateTime dt) return dt;
+            var s = o.ToString();
+            return DateTime.TryParse(s, out var parsed) ? parsed : (DateTime?)null;
+        }
+
+        private static double ToDouble(object o)
+        {
+            if (o == null) return 0.0;
+            if (o is double d) return d;
+            if (o is decimal m) return (double)m;
+            if (o is float f) return f;
+            var s = o.ToString();
+            return double.TryParse(s, out var val) ? val : 0.0;
+        }
+
+        private static string PackSizeToLabel(string packSize, string productName)
+        {
+            // Your save uses "01K", "05K" etc. Convert to "1 Kg", "5 Kg".
+            if (string.IsNullOrWhiteSpace(packSize)) return productName ?? "";
+            var s = packSize.Trim().ToUpperInvariant();
+            if (s.EndsWith("K")) s = s.Substring(0, s.Length - 1);
+            if (s.StartsWith("0")) s = s.TrimStart('0');
+            if (string.IsNullOrWhiteSpace(s)) return productName ?? "";
+            return $"{s} Kg";
+        }
+    }
+
+    /// <summary>
+    /// DTO aligned with your Flutter SamplingDriveEntry
+    /// </summary>
+    public class SamplingDriveEntryDto
+    {
+        public string docuNumb { get; set; }
+        public string retailerName { get; set; }
+        public string retailerCode { get; set; }
+        public string distributorName { get; set; }
+        public string area { get; set; }
+        public DateTime distributionDate { get; set; }
+        public string painterName { get; set; }
+        public string painterMobile { get; set; }
+        public string skuSizeLabel { get; set; }
+        public double qtyDistributedKg { get; set; }
+        public double missedQtyKg { get; set; }
+        public double effectiveDistributedKg { get; set; }
+        public double totalReceivedKg { get; set; }
+        public double remainingKg { get; set; }
+        public string reimbursementMode { get; set; }
+        public double reimbursementAmountAED { get; set; }
+        public string photoImage { get; set; }
+        public string serialNo { get; set; }
+        public double materialQty { get; set; }
+        public string sampleCancelFlag { get; set; }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'dart:convert';
+import '../models/sampling_drive_models.dart';
+import '../utils/app_logger.dart';
+import 'api_service.dart';
+
+class SamplingExecutionService {
+  static final AppLogger _logger = AppLogger();
+
+  static Future<Map<String, dynamic>> searchSamplingDriveEntries({
+    String? retailerCode,
+    String? retailerName,
+    String? painterName,
+    String? start,
+    String? end,
+    int top = 200,
+  }) async {
+    try {
+      _logger.info('Searching sampling drive entries');
+
+      // Build query parameters
+      final queryParams = <String, String>{};
+
+      if (retailerCode != null && retailerCode.isNotEmpty) {
+        queryParams['retailerCode'] = retailerCode;
+      }
+
+      if (retailerName != null && retailerName.isNotEmpty) {
+        queryParams['retailerName'] = retailerName;
+      }
+
+      if (painterName != null && painterName.isNotEmpty) {
+        queryParams['painterNameFilter'] = painterName;
+      }
+
+      if (start != null && start.isNotEmpty) {
+        queryParams['start'] = start;
+      }
+
+      if (end != null && end.isNotEmpty) {
+        queryParams['end'] = end;
+      }
+
+      queryParams['top'] = top.toString();
+
+      // Build endpoint with query parameters
+      final queryString = queryParams.entries
+          .map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}')
+          .join('&');
+
+      final endpoint = '/api/SamplingExecutionEntry/search?$queryString';
+
+      _logger.info('Making request to: $endpoint');
+      _logger.info('Query params: $queryParams');
+
+      final result = await ApiService.makeRequest(
+        method: 'GET',
+        endpoint: endpoint,
+      );
+
+      _logger.info('API Response: $result');
+
+      if (result['success'] == true) {
+        final data = result['data'];
+        _logger.info('Raw API data type: ${data.runtimeType}');
+        _logger.info('Raw API data: $data');
+
+        // Handle different response structures
+        List<dynamic> itemList = [];
+
+        if (data is List) {
+          itemList = data;
+        } else if (data is Map && data.containsKey('raw')) {
+          // Handle case where response is wrapped
+          final rawData = data['raw'];
+          if (rawData is List) {
+            itemList = rawData;
+          } else if (rawData is String) {
+            try {
+              final parsed = jsonDecode(rawData);
+              if (parsed is List) {
+                itemList = parsed;
+              }
+            } catch (e) {
+              _logger.error('Failed to parse raw string data', e);
+            }
+          }
+        }
+
+        final entries = <SamplingDriveEntry>[];
+
+        for (var item in itemList) {
+          try {
+            final entry = SamplingDriveEntry.fromJson(item as Map<String, dynamic>);
+            entries.add(entry);
+            _logger.info('Successfully parsed entry: ${entry.docuNumb} - ${entry.retailerName}');
+          } catch (e) {
+            _logger.error('Failed to parse entry: $item', e);
+          }
+        }
+
+        return {
+          'success': true,
+          'data': entries,
+        };
+      } else {
+        return {
+          'success': false,
+          'error': result['error'] ?? 'Failed to search sampling drive entries',
+        };
+      }
+    } catch (e) {
+      _logger.error('Failed to search sampling drive entries', e);
+      return {
+        'success': false,
+        'error': 'Failed to search sampling drive entries: $e',
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> searchByRetailerCode(String retailerCode, {
+    String? start,
+    String? end,
+    int top = 200,
+  }) async {
+    return searchSamplingDriveEntries(
+      retailerCode: retailerCode,
+      start: start,
+      end: end,
+      top: top,
+    );
+  }
+
+  static Future<Map<String, dynamic>> searchByRetailerName(String retailerName, {
+    String? start,
+    String? end,
+    int top = 200,
+  }) async {
+    return searchSamplingDriveEntries(
+      retailerName: retailerName,
+      start: start,
+      end: end,
+      top: top,
+    );
+  }
+
+  static Future<Map<String, dynamic>> searchByDateRange({
+    required String start,
+    required String end,
+    String? retailerCode,
+    String? retailerName,
+    int top = 200,
+  }) async {
+    return searchSamplingDriveEntries(
+      retailerCode: retailerCode,
+      retailerName: retailerName,
+      start: start,
+      end: end,
+      top: top,
+    );
+  }
+
+  static Future<Map<String, dynamic>> getTop100SamplingDriveEntries() async {
+    try {
+      _logger.info('Fetching top 100 sampling drive entries');
+
+      final endpoint = '/api/SamplingExecutionEntry/top100';
+
+      _logger.info('Making request to: $endpoint');
+
+      final result = await ApiService.makeRequest(
+        method: 'GET',
+        endpoint: endpoint,
+      );
+
+      _logger.info('API Response: $result');
+
+      if (result['success'] == true) {
+        final data = result['data'];
+        _logger.info('Raw API data type: ${data.runtimeType}');
+        _logger.info('Raw API data: $data');
+
+        // Handle different response structures
+        List<dynamic> itemList = [];
+
+        if (data is List) {
+          itemList = data;
+        } else if (data is Map && data.containsKey('raw')) {
+          // Handle case where response is wrapped
+          final rawData = data['raw'];
+          if (rawData is List) {
+            itemList = rawData;
+          } else if (rawData is String) {
+            try {
+              final parsed = jsonDecode(rawData);
+              if (parsed is List) {
+                itemList = parsed;
+              }
+            } catch (e) {
+              _logger.error('Failed to parse raw string data', e);
+            }
+          }
+        }
+
+        final entries = <SamplingDriveEntry>[];
+
+        for (var item in itemList) {
+          try {
+            final entry = SamplingDriveEntry.fromJson(item as Map<String, dynamic>);
+            entries.add(entry);
+            _logger.info('Successfully parsed entry: ${entry.docuNumb} - ${entry.retailerName}');
+          } catch (e) {
+            _logger.error('Failed to parse entry: $item', e);
+          }
+        }
+
+        return {
+          'success': true,
+          'data': entries,
+        };
+      } else {
+        return {
+          'success': false,
+          'error': result['error'] ?? 'Failed to fetch top 100 sampling drive entries',
+        };
+      }
+    } catch (e) {
+      _logger.error('Failed to fetch top 100 sampling drive entries', e);
+      return {
+        'success': false,
+        'error': 'Failed to fetch top 100 sampling drive entries: $e',
+      };
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import '../../../core/models/sampling_drive_models.dart';
 import '../../../core/services/sampling_execution_service.dart';
 import '../../../core/services/contractor_service.dart';
@@ -145,10 +816,8 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
     });
 
     try {
-      // Load top 100 entries by searching with just a top limit
-      final result = await SamplingExecutionService.searchSamplingDriveEntries(
-        top: 100,
-      );
+      // Load top 100 entries using the dedicated endpoint
+      final result = await SamplingExecutionService.getTop100SamplingDriveEntries();
 
       if (result['success'] == true) {
         final entries = result['data'] as List<SamplingDriveEntry>;
@@ -1362,3 +2031,5 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
     }
   }
 }
+
+
