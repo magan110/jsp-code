@@ -1,1954 +1,948 @@
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
 
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:go_router/go_router.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:web/web.dart' as web;
-import 'dart:js_interop';
-import '../../../core/models/retailer_onboarding_models.dart';
-import '../../../core/services/retailer_onboarding_service.dart';
-import '../../../core/widgets/custom_back_button.dart';
+namespace RAKControllers.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class ContractorController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
 
-@JS()
-@staticInterop
-class WindowWithGeoLocation {}
-extension WindowGeoLocationExtension on WindowWithGeoLocation {
-  external JSPromise<JSAny?> requestGeoPosition();
-}
+        public ContractorController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(RetailerOnboardingApp());
-}
+        // POST: /api/Contractor/register
+        [HttpPost("register")]
+        [Consumes("application/json")]
+        public IActionResult Register([FromBody] ContractorRegistrationRequest? request = null)
+        {
+            try
+            {
+                request ??= new ContractorRegistrationRequest();
 
-class RetailerOnboardingApp extends StatelessWidget {
-  const RetailerOnboardingApp({super.key});
+                // --- Keys / defaults ---
+                var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant();       // char(2)
+                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();             // char(3) - use emirates code as area code
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Retailer Onboarding',
-      theme: ThemeData(primarySwatch: Colors.blue, fontFamily: 'Roboto'),
-      home: RetailerFormPage(),
-    );
-  }
-}
+                // Generate sequential inflCode = pure numeric in ascending order
+                string inflCode = GetNextInfluencerCode(inflType);
 
-class RetailerFormPage extends StatefulWidget {
-  const RetailerFormPage({super.key});
+                // Build names and enforce column sizes
+                var fullName = string.Join(" ",
+                    new[] { request.FirstName, request.MiddleName, request.LastName }
+                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
 
-  @override
-  RetailerFormPageState createState() => RetailerFormPageState();
-}
+                var inflName256 = Cut(fullName, 256); // inflName nvarchar(256)
+                var contName40  = Cut(fullName, 40);  // contName varchar(40)
 
-class RetailerFormPageState extends State<RetailerFormPage>
-    with TickerProviderStateMixin {
-  final _formKey = GlobalKey<FormState>();
-  bool _isVATRequired = false;
-  bool _isSubmitting = false;
-  bool _isGettingLocation = false;
+                // Address fields (NOT NULL: inflAdd3, district, inflPinC)
+                var inflAdd1_50 = Cut(request.Address, 50);
+                var inflAdd2_100 = "";            // not using; keep empty
+                var inflAdd3_30 = "";             // keep empty to avoid overflow (NOT NULL but "" is allowed)
+                var inflCity_255 = "";
 
-  // Document upload paths
-  String? _tradeLicensePath;
-  String? _vatCertificatePath;
-  bool _isVATConditional = true;
-  double? _annualTurnover;
+                // Phone and other short fields
+                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
 
-  // Controllers
-  final firmNameController = TextEditingController();
-  final taxRegNumberController = TextEditingController();
-  final registeredAddressController = TextEditingController();
-  final effectiveDateController = TextEditingController();
-  final licenseNumberController = TextEditingController();
-  final issuingAuthorityController = TextEditingController();
-  final establishmentDateController = TextEditingController();
-  final expiryDateController = TextEditingController();
-  final tradeNameController = TextEditingController();
-  final responsiblePersonController = TextEditingController();
-  final accountNameController = TextEditingController();
-  final ibanController = TextEditingController();
-  final bankNameController = TextEditingController();
-  final branchNameController = TextEditingController();
-  final branchAddressController = TextEditingController();
-  final latitudeController = TextEditingController();
-  final longitudeController = TextEditingController();
-  final annualTurnoverController = TextEditingController();
+                // Bank fields
+                var bankName100   = Cut(request.BankName, 100);
+                var branchName100 = Cut(request.BranchName, 100);
+                var acctHolder40  = Cut(request.AccountHolderName, 40);
 
-  // Animations
-  AnimationController? _mainController;
-  AnimationController? _fabController;
-  Animation<double>? _fadeAnimation;
-  Animation<Offset>? _slideAnimation;
-  Animation<double>? _scaleAnimation;
+                // New 255 columns (cut to 255 just in case)
+                var contrtyp255 = Cut(request.ContractorType, 255);
+                var frstname255 = Cut(request.FirstName, 255);
+                var middname255 = Cut(request.MiddleName, 255);
+                var lastname255 = Cut(request.LastName, 255);
+                var emirates255 = Cut(request.Emirates, 255);
 
-  @override
-  void initState() {
-    super.initState();
-    _mainController = AnimationController(
-      duration: const Duration(milliseconds: 1000),
-      vsync: this,
-    );
-    _fabController = AnimationController(
-      duration: const Duration(milliseconds: 400),
-      vsync: this,
-    );
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController!,
-        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
-      ),
-    );
-    _slideAnimation =
-        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-          CurvedAnimation(
-            parent: _mainController!,
-            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-          ),
-        );
-    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _mainController!,
-        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
-      ),
-    );
-    _mainController?.forward();
-    _fabController?.forward();
+                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
+                var vatfrmnm255 = Cut(request.FirmName, 255);
+                var vatraddr255 = Cut(request.VatAddress, 255);
+                var vattxreg255 = Cut(request.TaxRegistrationNumber, 255);
+                var vatefdt255  = Cut(request.VatEffectiveDate, 255);
+                var comlcnno255 = Cut(request.LicenseNumber, 255);
+                var comissau255 = Cut(request.IssuingAuthority, 255);
+                var comlctyp255 = Cut(request.LicenseType, 255);
+                var comestdt255 = Cut(request.EstablishmentDate, 255);
+                var comexpdt255 = Cut(request.LicenseExpiryDate, 255);
+                var comtrdnm255 = Cut(request.TradeName, 255);
+                var comrespn255 = Cut(request.ResponsiblePerson, 255);
+                var comraddr255 = Cut(request.LicenseAddress, 255);
+                var comeffdt255 = Cut(request.EffectiveDate, 255);
 
-    // Add listener to annual turnover field
-    annualTurnoverController.addListener(_checkVATRequirement);
+                // Build parameter bag: supply EVERYTHING used in INSERT
+                var p = new Dictionary<string, object?>
+                {
+                    // ==== Required legacy (NOT NULL) ====
+                    ["@inflCode"] = inflCode,                // char(8)
+                    ["@inflType"] = inflType,                // char(2)
+                    ["@inflName"] = inflName256,             // nvarchar(256)
+                    ["@contName"] = contName40,              // varchar(40)
 
-    // Auto-fill on load
-    _initLocation();
-  }
+                    // Address cluster
+                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
+                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
+                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
+                    ["@inflCity"] = inflCity_255,            // varchar(255)
+                    ["@district"] = "",                      // varchar(30)  NOT NULL
+                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
 
-  @override
-  void dispose() {
-    _mainController?.dispose();
-    _fabController?.dispose();
-    firmNameController.dispose();
-    taxRegNumberController.dispose();
-    registeredAddressController.dispose();
-    effectiveDateController.dispose();
-    licenseNumberController.dispose();
-    issuingAuthorityController.dispose();
-    establishmentDateController.dispose();
-    expiryDateController.dispose();
-    tradeNameController.dispose();
-    responsiblePersonController.dispose();
-    accountNameController.dispose();
-    ibanController.dispose();
-    bankNameController.dispose();
-    branchNameController.dispose();
-    branchAddressController.dispose();
-    latitudeController.dispose();
-    longitudeController.dispose();
-    annualTurnoverController.dispose();
-    super.dispose();
-  }
+                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
+                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
+                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
+                    ["@birthDat"] = DBNull.Value,            // smalldatetime NULL
+                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
+                    ["@expertis"] = "",                      // varchar(100) YES (send "")
+                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
+                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
+                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
+                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
+                    ["@isActive"] = "T",                     // char(1)      NOT NULL
+                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
+                    ["@updateId"] = DBNull.Value,            // varchar(10)  NULL
+                    ["@updateDt"] = DBNull.Value,            // smalldatetime NULL
+                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
+                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
+                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
 
-  // --- GEOLOCATION (using web JavaScript helper from index.html) ---
-  Future<void> _initLocation() async {
-    setState(() => _isGettingLocation = true);
-    try {
-      await _getWebLocation();
-    } catch (e) {
-      _toast('Could not fetch location: $e');
-    } finally {
-      if (mounted) setState(() => _isGettingLocation = false);
-    }
-  }
+                    // Tax IDs / misc
+                    ["@itxPanNo"] = "",                      // varchar(50)
+                    ["@locStxNo"] = "",                      // varchar(30)
 
-  Future<void> _getWebLocation() async {
-    try {
-      // First try to get from localStorage (cached values from index.html)
-      final lastLat = web.window.localStorage.getItem('lastLat');
-      final lastLng = web.window.localStorage.getItem('lastLng');
-      if (lastLat != null && lastLng != null && mounted) {
-        latitudeController.text = double.parse(lastLat).toStringAsFixed(6);
-        longitudeController.text = double.parse(lastLng).toStringAsFixed(6);
-      }
-      // Use the JavaScript geolocation helper from index.html
-      final jsWindow = web.window as WindowWithGeoLocation;
-      final result = await jsWindow.requestGeoPosition().toDart;
-      if (result != null) {
-        // Convert JSAny to proper Dart object
-        final resultDart = result.dartify();
-        if (resultDart is Map<String, dynamic>) {
-          if (resultDart['ok'] == true) {
-            if (mounted) {
-              final lat = resultDart['lat'] as num?;
-              final lng = resultDart['lng'] as num?;
-              if (lat != null && lng != null) {
-                latitudeController.text = lat.toStringAsFixed(6);
-                longitudeController.text = lng.toStringAsFixed(6);
-              }
+                    // Banking (legacy)
+                    ["@bankAcNo"] = "",                      // varchar(25)
+                    ["@bankBnNm"] = bankName100,             // varchar(100)
+                    ["@bankBnDs"] = branchName100,           // varchar(100)
+                    ["@bankBnNo"] = "",                      // varchar(20)
+                    ["@bankIFSC"] = "",                      // varchar(20)
+
+                    // KYC & misc
+                    ["@kycVerFl"] = "",
+                    ["@kycVerDt"] = DBNull.Value,
+                    ["@idCardTy"] = "",
+                    ["@idCardNo"] = "",
+                    ["@inDocCnt"] = DBNull.Value,
+                    ["@rjcRemrk"] = "",
+                    ["@entrBySg"] = "",
+                    ["@kycVrTyp"] = "",
+                    ["@adhrName"] = "",
+                    ["@panCName"] = "",
+                    ["@sapInsDt"] = DBNull.Value,
+                    ["@sapUpdDt"] = DBNull.Value,
+                    ["@urbRurFl"] = "",
+
+                    ["@bankApNm"] = acctHolder40,            // varchar(40)
+
+                    // Permanent/alt address
+                    ["@infAddP1"] = "",
+                    ["@infAddP2"] = "",
+                    ["@infAddP3"] = "",
+                    ["@infPCity"] = "",
+                    ["@distrctP"] = "",
+                    ["@infPinCP"] = "",
+
+                    ["@adhOtpFl"] = "",
+                    ["@concEmpl"] = "",
+                    ["@bnkKycFl"] = "",
+                    ["@bnkKycDt"] = DBNull.Value,
+                    ["@inflPinL"] = "",
+                    ["@adhCpUId"] = "",
+                    ["@adhCpUDt"] = DBNull.Value,
+                    ["@panCpUId"] = "",
+                    ["@panCpUDt"] = DBNull.Value,
+                    ["@bnkCpUId"] = "",
+                    ["@bnkCpUDt"] = DBNull.Value,
+                    ["@randNmSt"] = "",
+                    ["@kycStats"] = "",
+                    ["@inflTyOl"] = "",
+                    ["@kycAprBy"] = "",
+                    ["@blkStuts"] = "",
+                    ["@blkStDat"] = DBNull.Value,
+                    ["@cntrApFl"] = "",
+                    ["@frstScDt"] = DBNull.Value,
+                    ["@sourceCnt"] = "",
+                    ["@promoteNm"] = "",
+                    ["@pmobilen"] = "",
+                    ["@isTDSEli"] = "",
+                    ["@panAdhLk"] = "",
+                    ["@panVldIn"] = "",
+                    ["@panCatgF"] = "",
+
+                    // ==== New varchar(255) columns ====
+                    ["@contrtyp"] = contrtyp255,
+                    ["@frstname"] = frstname255,
+                    ["@middname"] = middname255,
+                    ["@lastname"] = lastname255,
+                    ["@emirates"] = emirates255,
+
+                    ["@ibannumb"] = ibannumb255,
+                    ["@vatfrmnm"] = vatfrmnm255,
+                    ["@vatraddr"] = vatraddr255,
+                    ["@vattxreg"] = vattxreg255,
+                    ["@vatefdt"]  = vatefdt255,
+                    ["@comlcnno"] = comlcnno255,
+                    ["@comissau"] = comissau255,
+                    ["@comlctyp"] = comlctyp255,
+                    ["@comestdt"] = comestdt255,
+                    ["@comexpdt"] = comexpdt255,
+                    ["@comtrdnm"] = comtrdnm255,
+                    ["@comrespn"] = comrespn255,
+                    ["@comraddr"] = comraddr255,
+                    ["@comeffdt"] = comeffdt255
+                };
+
+                var sql = @"
+INSERT INTO dbo.ctmInfluncr
+(
+    inflCode, inflType, inflName, contName,
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
+    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
+    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
+    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
+    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
+    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
+    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
+    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
+
+    contrtyp, frstname, middname, lastname, emirates,  ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt
+)
+VALUES
+(
+    @inflCode, @inflType, @inflName, @contName,
+    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
+    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
+    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
+    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
+    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
+    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
+    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
+    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
+    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
+    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
+
+    @contrtyp, @frstname, @middname, @lastname, @emirates,  @ibannumb,
+    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
+    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt
+);
+
+SELECT @inflCode AS InflCode;
+";
+
+                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Registration saved",
+                    influencerCode = savedCode,
+                    timestamp = DateTime.Now
+                });
             }
-          } else {
-            final error = resultDart['error']?.toString() ?? 'Unknown error';
-            _toast('Web geolocation failed: $error');
-          }
-        }
-      }
-    } catch (e) {
-      _toast('Web geolocation error: $e');
-    }
-  }
-
-  void _toast(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
-    );
-  }
-
-  Future<void> _saveData() async {
-    setState(() => _isSubmitting = true);
-    try {
-      // Create request object from form data - ensure non-empty strings or null
-      final request = RetailerOnboardingRequest(
-        firmName: _cleanString(firmNameController.text),
-        taxRegistrationNumber: _cleanString(taxRegNumberController.text),
-        registeredAddress: _cleanString(registeredAddressController.text),
-        effectiveRegistrationDate: _cleanString(effectiveDateController.text),
-        licenseNumber: _cleanString(licenseNumberController.text),
-        issuingAuthority: _cleanString(issuingAuthorityController.text),
-        establishmentDate: _cleanString(establishmentDateController.text),
-        expiryDate: _cleanString(expiryDateController.text),
-        tradeName: _cleanString(tradeNameController.text),
-        responsiblePerson: _cleanString(responsiblePersonController.text),
-        accountHolderName: _cleanString(accountNameController.text),
-        ibanNumber: _cleanString(ibanController.text),
-        bankName: _cleanString(bankNameController.text),
-        branchName: _cleanString(branchNameController.text),
-        branchAddress: _cleanString(branchAddressController.text),
-        latitude: _cleanString(latitudeController.text),
-        longitude: _cleanString(longitudeController.text),
-      );
-      print('DEBUG: About to submit request with data: ${request.toJson()}');
-      // Submit to API
-      print('DEBUG: Calling RetailerOnboardingService.registerRetailer...');
-      final response = await RetailerOnboardingService.registerRetailer(request);
-      print('DEBUG: Got response: success=${response.success}, message=${response.message}');
-      if (response.success) {
-        // Save to local storage as backup
-        await _saveToLocalStorage();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.check_circle, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Registration Successful!\nRetailer Code: ${response.retailerCode ?? 'N/A'}',
-                    ),
-                  ),
-                ],
-              ),
-              backgroundColor: Colors.green,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 5),
-            ),
-          );
-          // Navigate to success or show retailer code
-          _showSuccessDialog(response.retailerCode);
-        }
-      } else {
-        // Show error message
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.error, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Registration Failed: ${response.error ?? response.message}',
-                    ),
-                  ),
-                ],
-              ),
-              backgroundColor: Colors.red,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 5),
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.error, color: Colors.white, size: 20),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text('Network Error: $e'),
-                ),
-              ],
-            ),
-            backgroundColor: Colors.red,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 5),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _isSubmitting = false);
-      }
-    }
-  }
-
-  Future<void> _saveToLocalStorage() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('firmName', firmNameController.text);
-    await prefs.setString('taxRegNumber', taxRegNumberController.text);
-    await prefs.setString('registeredAddress', registeredAddressController.text);
-    await prefs.setString('effectiveDate', effectiveDateController.text);
-    await prefs.setString('licenseNumber', licenseNumberController.text);
-    await prefs.setString('issuingAuthority', issuingAuthorityController.text);
-    await prefs.setString('establishmentDate', establishmentDateController.text);
-    await prefs.setString('expiryDate', expiryDateController.text);
-    await prefs.setString('tradeName', tradeNameController.text);
-    await prefs.setString('responsiblePerson', responsiblePersonController.text);
-    await prefs.setString('accountName', accountNameController.text);
-    await prefs.setString('iban', ibanController.text);
-    await prefs.setString('bankName', bankNameController.text);
-    await prefs.setString('branchName', branchNameController.text);
-    await prefs.setString('branchAddress', branchAddressController.text);
-    await prefs.setString('latitude', latitudeController.text);
-    await prefs.setString('longitude', longitudeController.text);
-    await prefs.setString('annualTurnover', annualTurnoverController.text);
-  }
-
-  void _showSuccessDialog(String? retailerCode) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.check_circle,
-                size: 64,
-                color: Colors.green,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Registration Successful!',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 16),
-              if (retailerCode != null) ...[
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.green.shade50,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.green.shade200),
-                  ),
-                  child: Column(
-                    children: [
-                      const Text(
-                        'Your Retailer Code:',
-                        style: TextStyle(fontWeight: FontWeight.w500),
-                      ),
-                      const SizedBox(height: 4),
-                      SelectableText(
-                        retailerCode,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.green,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-              ],
-              const Text(
-                'Your registration has been submitted successfully. Please save your retailer code for future reference.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () {
-                    Navigator.pop(context);
-                    // You can navigate to a different screen here if needed
-                  },
-                  child: const Text('Continue'),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  String? _validateTaxRegNumber(String? value) {
-    if (!_isVATRequired && (value == null || value.isEmpty)) {
-      return null; // Optional if not required
-    }
-
-    if (_isVATRequired && (value == null || value.isEmpty)) {
-      return 'Tax Registration Number is required (Annual Turnover > AED 375,000)';
-    }
-
-    if (value != null && value.isNotEmpty) {
-      final cleaned = value.replaceAll(RegExp(r'[^\d]'), '');
-      if (cleaned.length != 15) {
-        return 'TRN must be exactly 15 digits (numeric only)';
-      }
-    }
-
-    return null;
-  }
-
-  String? _validateLicense(String? value) {
-    if (value == null || value.isEmpty) return 'Please enter License Number';
-
-    if (value.trim().length > 20) {
-      return 'License number must be max 20 characters (varies across Emirates)';
-    }
-
-    if (value.trim().length < 5) {
-      return 'License number must be at least 5 characters';
-    }
-
-    // Check for common UAE emirate patterns
-    final cleanedValue = value.trim().toUpperCase();
-    final emiratePatterns = [
-      RegExp(r'^DED'), // Dubai
-      RegExp(r'^RAK'), // Ras Al Khaimah
-      RegExp(r'^ADM'), // Abu Dhabi
-      RegExp(r'^SHJ'), // Sharjah
-      RegExp(r'^AJM'), // Ajman
-      RegExp(r'^UMQ'), // Umm Al Quwain
-      RegExp(r'^FUJ'), // Fujairah
-      RegExp(r'^\d{6,}'), // Numeric patterns
-    ];
-
-    final hasValidPattern = emiratePatterns.any((pattern) => pattern.hasMatch(cleanedValue));
-    if (!hasValidPattern) {
-      return 'Please verify license number format for your emirate';
-    }
-
-    return null;
-  }
-
-  String? _validateIBAN(String? value) {
-    if (value == null || value.isEmpty) return null;
-
-    final cleaned = value.replaceAll(' ', '').toUpperCase();
-    if (!cleaned.startsWith('AE')) {
-      return 'UAE IBAN must start with "AE"';
-    }
-
-    if (cleaned.length != 23) {
-      return 'UAE IBAN must be exactly 23 characters (AE + 21 digits)';
-    }
-
-    // Check that after AE, we have 21 digits
-    final digits = cleaned.substring(2);
-    if (!RegExp(r'^\d{21}$').hasMatch(digits)) {
-      return 'IBAN format: AE followed by 21 numeric digits';
-    }
-
-    return null;
-  }
-
-  String? _validateFirmName(String? value) {
-    return RetailerOnboardingService.validateFirmName(value);
-  }
-
-  String? _validateTradeName(String? value) {
-    return RetailerOnboardingService.validateTradeName(value);
-  }
-
-  String? _validateResponsiblePerson(String? value) {
-    return RetailerOnboardingService.validateResponsiblePerson(value);
-  }
-
-  String? _validateRegisteredAddress(String? value) {
-    return RetailerOnboardingService.validateRegisteredAddress(value);
-  }
-
-  String? _validateIssuingAuthority(String? value) {
-    return RetailerOnboardingService.validateIssuingAuthority(value);
-  }
-
-  String? _validateAccountHolderName(String? value) {
-    return RetailerOnboardingService.validateAccountHolderName(value);
-  }
-
-  String? _validateBankName(String? value) {
-    return RetailerOnboardingService.validateBankName(value);
-  }
-
-  String? _validateBranchName(String? value) {
-    return RetailerOnboardingService.validateBranchName(value);
-  }
-
-  String? _validateBranchAddress(String? value) {
-    return RetailerOnboardingService.validateBranchAddress(value);
-  }
-
-  String? _validateLatitude(String? value) {
-    return RetailerOnboardingService.validateLatitude(value);
-  }
-
-  String? _validateLongitude(String? value) {
-    return RetailerOnboardingService.validateLongitude(value);
-  }
-
-  String? _cleanString(String value) {
-    final cleaned = value.trim();
-    return cleaned.isEmpty ? null : cleaned;
-  }
-
-  void _checkVATRequirement() {
-    final turnoverText = annualTurnoverController.text;
-    if (turnoverText.isNotEmpty) {
-      final turnover = double.tryParse(turnoverText.replaceAll(',', '')) ?? 0;
-      setState(() {
-        _isVATRequired = turnover > 375000;
-        _annualTurnover = turnover;
-      });
-    } else {
-      setState(() {
-        _isVATRequired = false;
-        _annualTurnover = null;
-      });
-    }
-  }
-
-  Future<void> _uploadDocument(String docType) async {
-    // For now, show a placeholder dialog
-    // In production, implement file picker and upload logic
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Upload $docType'),
-        content: const Text(
-          'Document upload functionality will be implemented with file picker.\n\nRequired:\n• PDF format only\n• Clear, readable scanned copy\n• File size < 5MB'
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  bool _validateConsistency() {
-    // Check firm name consistency
-    final firmName = firmNameController.text.trim();
-    final tradeName = tradeNameController.text.trim();
-    final accountName = accountNameController.text.trim();
-
-    if (firmName.isNotEmpty && tradeName.isNotEmpty) {
-      if (firmName.toLowerCase() != tradeName.toLowerCase()) {
-        _toast('Warning: Firm Name and Trade Name should match for consistency');
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  void _showExpiryAlert() {
-    final expiryText = expiryDateController.text;
-    if (expiryText.isNotEmpty) {
-      final expiryDate = DateTime.tryParse(expiryText);
-      if (expiryDate != null) {
-        final daysUntilExpiry = expiryDate.difference(DateTime.now()).inDays;
-        if (daysUntilExpiry <= 90 && daysUntilExpiry >= 0) {
-          showDialog(
-            context: context,
-            builder: (context) => AlertDialog(
-              title: const Row(
-                children: [
-                  Icon(Icons.warning, color: Colors.orange),
-                  SizedBox(width: 8),
-                  Text('License Expiry Alert'),
-                ],
-              ),
-              content: Text(
-                'Trade License expires in $daysUntilExpiry days.\n\nPlease ensure renewal before expiry to avoid business interruption.',
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('OK'),
-                ),
-              ],
-            ),
-          );
-        }
-      }
-    }
-  }
-
-  PreferredSizeWidget _buildModernAppBar() {
-    return AppBar(
-      elevation: 0,
-      backgroundColor: Colors.transparent,
-      foregroundColor: Colors.blue.shade800,
-      systemOverlayStyle: const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-      ),
-      leading: CustomBackButton(
-        onPressed: () {
-          context.pop();
-        },
-      ),
-      title: const Text(
-        'Retailer Onboarding',
-        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
-      ),
-      actions: [
-        IconButton(
-          icon: const Icon(Icons.help_outline_rounded),
-          onPressed: _showHelpDialog,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAnimatedHeader() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(30),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.blue.shade700, Colors.blue.shade500],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.blue.withValues(alpha: 0.2),
-            blurRadius: 20,
-            offset: const Offset(0, 10),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: const [
-          _FadeSlide(text: 'Welcome!', big: true),
-          SizedBox(height: 8),
-          _FadeSlide(text: 'Complete your retailer registration'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildModernSection({
-    required String title,
-    required IconData icon,
-    required List<Widget> children,
-    bool isOptional = false,
-  }) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withValues(alpha: 0.1),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Header
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: Colors.blue.shade50,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(16),
-              ),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: const BoxDecoration(
-                    color: Colors.blue,
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(icon, color: Colors.white, size: 24),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.blue.shade800,
-                        ),
-                      ),
-                      if (isOptional)
-                        Text(
-                          'Optional',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade500,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-                if (title == 'Location Details')
-                  AnimatedOpacity(
-                    duration: const Duration(milliseconds: 250),
-                    opacity: _isGettingLocation ? 1 : 0,
-                    child: const Padding(
-                      padding: EdgeInsets.only(right: 6),
-                      child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          // Content
-          Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: children,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildModernTextField({
-    required TextEditingController controller,
-    required String label,
-    required IconData icon,
-    bool isRequired = true,
-    String? Function(String?)? validator,
-    Widget? suffix,
-  }) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      builder: (context, value, child) => Transform.translate(
-        offset: Offset(0, 20 * (1 - value)),
-        child: Opacity(opacity: value, child: child),
-      ),
-      child: TextFormField(
-        controller: controller,
-        decoration: InputDecoration(
-          labelText: isRequired ? '$label *' : label,
-          prefixIcon: Icon(icon, color: Colors.grey.shade600),
-          suffixIcon: suffix,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Colors.blue, width: 2),
-          ),
-          filled: true,
-          fillColor: Colors.grey.shade50,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 16,
-          ),
-        ),
-        validator: validator,
-      ),
-    );
-  }
-
-  Widget _buildModernDateField({
-    required TextEditingController controller,
-    required String label,
-    required IconData icon,
-    required BuildContext context,
-    bool isRequired = true,
-  }) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      builder: (context, value, child) => Transform.translate(
-        offset: Offset(0, 20 * (1 - value)),
-        child: Opacity(opacity: value, child: child),
-      ),
-      child: TextFormField(
-        controller: controller,
-        readOnly: true,
-        decoration: InputDecoration(
-          labelText: isRequired ? '$label *' : label,
-          prefixIcon: Icon(icon, color: Colors.grey.shade600),
-          suffixIcon: const Icon(
-            Icons.calendar_today_rounded,
-            color: Colors.grey,
-          ),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide(color: Colors.grey.shade300),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Colors.blue, width: 2),
-          ),
-          filled: true,
-          fillColor: Colors.grey.shade50,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 16,
-          ),
-        ),
-        onTap: () async {
-          final date = await showDatePicker(
-            context: context,
-            initialDate: DateTime.now(),
-            firstDate: DateTime(1900),
-            lastDate: DateTime(2100),
-            builder: (context, child) => Theme(
-              data: Theme.of(context).copyWith(
-                colorScheme: const ColorScheme.light(primary: Colors.blue),
-              ),
-              child: child!,
-            ),
-          );
-          if (date != null && mounted) {
-            controller.text = date.toString().split(' ').first;
-
-            // Check expiry alert for license expiry date
-            if (label.toLowerCase().contains('expiry')) {
-              Future.delayed(const Duration(milliseconds: 100), () {
-                _showExpiryAlert();
-              });
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
             }
-          }
-        },
-        validator: isRequired ? (v) {
-          if (v?.isEmpty == true) return 'Please enter $label';
+        }
 
-          // Additional validation for expiry date
-          if (label.toLowerCase().contains('expiry') && v != null && v.isNotEmpty) {
-            final expiryDate = DateTime.tryParse(v);
-            if (expiryDate != null && expiryDate.isBefore(DateTime.now())) {
-              return 'License has already expired. Please renew before registration.';
-            }
-          }
+        // Dropdowns to match Flutter UI
+        [HttpGet("contractor-types")]
+        public IActionResult ContractorTypes() => Ok(new
+        {
+            success = true,
+            data = new[] { "Maintenance Contractor", "Petty contractors" },
+            timestamp = DateTime.Now
+        });
 
-          return null;
-        } : null,
-      ),
-    );
-  }
+        [HttpGet("emirates-list")]
+        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
+        {
+            try
+            {
+                const string sql = @"
+SELECT areaCode, areaDesc
+FROM dbo.bkmAreaMast WITH (NOLOCK)
+WHERE (@onlyActive = 0 OR isActive = 'Y')
+ORDER BY areaDesc;";
 
-  Widget _buildAnimatedSubmitButton() {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 600),
-      curve: Curves.easeOutCubic,
-      builder: (context, value, child) =>
-          Transform.scale(scale: 0.8 + (0.2 * value), child: child),
-      child: SizedBox(
-        width: double.infinity,
-        height: 56,
-        child: ElevatedButton(
-          onPressed: _isSubmitting ? null : _submitForm,
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.blue.shade700,
-            foregroundColor: Colors.white,
-            elevation: 8,
-            shadowColor: Colors.blue.withValues(alpha: 0.3),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-            ),
-          ),
-          child: _isSubmitting
-              ? const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    ),
-                    SizedBox(width: 16),
-                    Text('Submitting...', style: TextStyle(fontSize: 16)),
-                  ],
-                )
-              : const Text(
-                  'Submit Registration',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                ),
-        ),
-      ),
-    );
-  }
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@onlyActive", onlyActive ? 1 : 0 }
+                };
 
-  void _showHelpDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.help_outline_rounded,
-                size: 48,
-                color: Colors.blue,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'Registration Help',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'RAK White Cement Retailer Onboarding:\n\n• Fill in all required fields marked with *\n• Upload Trade License (PDF, max 5MB)\n• VAT Registration required only if Annual Turnover > AED 375,000\n• License numbers vary across Emirates (max 20 chars)\n• IBAN format: 23 characters starting with "AE"\n• TRN format: 15 digits, numeric only\n\n30% of UAE retailers manage multiple branches under common head office.',
-                textAlign: TextAlign.left,
-                style: TextStyle(fontSize: 13),
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Got it'),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
+                var result = _db.WebSessBean(sql, parameters);
+                var list = new List<AreaItem>();
 
-  void _submitForm() async {
-    if (_formKey.currentState!.validate()) {
-      // Perform consistency checks
-      if (!_validateConsistency()) {
-        return;
-      }
-
-      // Check license expiry
-      _showExpiryAlert();
-
-      await _saveData();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final isDesktop = constraints.maxWidth > 1200;
-        final isTablet = constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
-        final isMobile = constraints.maxWidth <= 800;
-
-        return Scaffold(
-          backgroundColor: Colors.grey.shade50,
-          appBar: _buildModernAppBar(),
-          body: FadeTransition(
-            opacity: _fadeAnimation ?? const AlwaysStoppedAnimation(1.0),
-            child: SlideTransition(
-              position: _slideAnimation ?? const AlwaysStoppedAnimation(Offset.zero),
-              child: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.blue.shade50,
-                      Colors.white,
-                      Colors.grey.shade50,
-                    ],
-                  ),
-                ),
-                child: SingleChildScrollView(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
-                    vertical: 24,
-                  ),
-                  child: Center(
-                    child: ConstrainedBox(
-                      constraints: BoxConstraints(
-                        maxWidth: isDesktop ? 1400 : double.infinity,
-                      ),
-                      child: ScaleTransition(
-                        scale: _scaleAnimation ?? const AlwaysStoppedAnimation(1.0),
-                        child: Form(
-                          key: _formKey,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _buildAnimatedHeader(),
-                              const SizedBox(height: 32),
-                              // Main Content - Two columns on desktop
-                              if (isDesktop)
-                                _buildDesktopLayout()
-                              else
-                                _buildMobileLayout(),
-                              const SizedBox(height: 48),
-                              _buildAnimatedSubmitButton(),
-                              const SizedBox(height: 48),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildDesktopLayout() {
-    return Column(
-      children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Left Column
-            Expanded(
-              child: Column(
-                children: [
-                  // Trade License
-                  _buildModernSection(
-                    title: 'Trade License Details',
-                    icon: Icons.assignment_rounded,
-                    children: [
-                      _buildModernTextField(
-                        controller: licenseNumberController,
-                        label: 'License Number',
-                        icon: Icons.confirmation_number,
-                        validator: _validateLicense,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: issuingAuthorityController,
-                        label: 'Issuing Authority',
-                        icon: Icons.account_balance,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernDateField(
-                        controller: establishmentDateController,
-                        label: 'Establishment Date',
-                        icon: Icons.event,
-                        context: context,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernDateField(
-                        controller: expiryDateController,
-                        label: 'Expiry Date',
-                        icon: Icons.event_busy,
-                        context: context,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: tradeNameController,
-                        label: 'Trade Name',
-                        icon: Icons.store,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: responsiblePersonController,
-                        label: 'Responsible Person',
-                        icon: Icons.person,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: registeredAddressController,
-                        label: 'Registered Address',
-                        icon: Icons.location_on,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernDateField(
-                        controller: effectiveDateController,
-                        label: 'Effective Registration Date',
-                        icon: Icons.calendar_today,
-                        context: context,
-                      ),
-                      const SizedBox(height: 16),
-                      // Document Upload Section
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade50,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.grey.shade200),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Row(
-                              children: [
-                                Icon(Icons.upload_file, color: Colors.blue),
-                                SizedBox(width: 8),
-                                Text(
-                                  'Required Documents',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.blue,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 12),
-                            SizedBox(
-                              width: double.infinity,
-                              child: ElevatedButton.icon(
-                                onPressed: () => _uploadDocument('Trade License'),
-                                icon: const Icon(Icons.description),
-                                label: Text(
-                                  _tradeLicensePath != null
-                                      ? 'Trade License Uploaded'
-                                      : 'Upload Trade License (PDF) *',
-                                ),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: _tradeLicensePath != null
-                                      ? Colors.green
-                                      : Colors.blue.shade600,
-                                  foregroundColor: Colors.white,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            const Text(
-                              'Upload scanned copy of Trade License (PDF format, max 5MB)',
-                              style: TextStyle(fontSize: 12, color: Colors.grey),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Colors.blue.shade50,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.blue.shade200),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              Icons.info_outline,
-                              color: Colors.blue.shade700,
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'License Numbers vary across Emirates. (Max 20 Characters)',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.blue.shade700,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 24),
-                  // Bank Details
-                  _buildModernSection(
-                    title: 'Bank Details',
-                    icon: Icons.account_balance_outlined,
-                    isOptional: true,
-                    children: [
-                      _buildModernTextField(
-                        controller: accountNameController,
-                        label: 'Account Holder Name',
-                        icon: Icons.person_outline_rounded,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: ibanController,
-                        label: 'IBAN Number',
-                        icon: Icons.account_balance_wallet_outlined,
-                        isRequired: false,
-                        validator: _validateIBAN,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: bankNameController,
-                        label: 'Bank Name',
-                        icon: Icons.business_outlined,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: branchNameController,
-                        label: 'Branch Name',
-                        icon: Icons.location_on_outlined,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: branchAddressController,
-                        label: 'Branch Address',
-                        icon: Icons.location_city_outlined,
-                        isRequired: false,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 24),
-            // Right Column
-            Expanded(
-              child: Column(
-                children: [
-                  // Annual Turnover Section
-                  _buildModernSection(
-                    title: 'Business Information',
-                    icon: Icons.business_center,
-                    children: [
-                      _buildModernTextField(
-                        controller: annualTurnoverController,
-                        label: 'Annual Turnover (AED)',
-                        icon: Icons.monetization_on,
-                        validator: (value) {
-                          if (value == null || value.isEmpty) {
-                            return 'Please enter annual turnover';
-                          }
-                          final turnover = double.tryParse(value.replaceAll(',', ''));
-                          if (turnover == null || turnover < 0) {
-                            return 'Please enter a valid turnover amount';
-                          }
-                          return null;
-                        },
-                      ),
-                      const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: _isVATRequired ? Colors.orange.shade50 : Colors.blue.shade50,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
-                            color: _isVATRequired ? Colors.orange.shade200 : Colors.blue.shade200,
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              _isVATRequired ? Icons.warning : Icons.info_outline,
-                              color: _isVATRequired ? Colors.orange.shade700 : Colors.blue.shade700,
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                _isVATRequired
-                                    ? 'VAT Registration is required (Turnover > AED 375,000)'
-                                    : 'VAT Registration required only if Annual Turnover exceeds AED 375,000',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: _isVATRequired ? Colors.orange.shade700 : Colors.blue.shade700,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 24),
-                  // VAT Registration (conditionally shown)
-                  if (_isVATRequired)
-                    _buildModernSection(
-                      title: 'VAT Registration Details',
-                      icon: Icons.receipt_long,
-                      children: [
-                        _buildModernTextField(
-                          controller: taxRegNumberController,
-                          label: 'Tax Registration Number',
-                          icon: Icons.numbers,
-                          validator: _validateTaxRegNumber,
-                        suffix: IconButton(
-                          icon: const Icon(Icons.refresh),
-                          onPressed: _checkVATRequirement,
-                          tooltip: 'Check VAT requirement based on turnover',
-                        ),
-                        ),
-                        const SizedBox(height: 16),
-                        _buildModernTextField(
-                          controller: firmNameController,
-                          label: 'Firm Name',
-                          icon: Icons.business,
-                          validator: _validateFirmName,
-                        ),
-                        const SizedBox(height: 16),
-                        _buildModernDateField(
-                          controller: effectiveDateController,
-                          label: 'Effective Registration Date',
-                          icon: Icons.calendar_today,
-                          context: context,
-                        ),
-                        const SizedBox(height: 16),
-                        // VAT Document Upload
-                        Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.grey.shade50,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey.shade200),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Row(
-                                children: [
-                                  Icon(Icons.upload_file, color: Colors.orange),
-                                  SizedBox(width: 8),
-                                  Text(
-                                    'VAT Registration Document',
-                                    style: TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.orange,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 12),
-                              SizedBox(
-                                width: double.infinity,
-                                child: ElevatedButton.icon(
-                                  onPressed: () => _uploadDocument('VAT Certificate'),
-                                  icon: const Icon(Icons.receipt_long),
-                                  label: Text(
-                                    _vatCertificatePath != null
-                                        ? 'VAT Certificate Uploaded'
-                                        : 'Upload VAT Certificate (PDF) *',
-                                  ),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: _vatCertificatePath != null
-                                        ? Colors.green
-                                        : Colors.orange.shade600,
-                                    foregroundColor: Colors.white,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                'Upload scanned copy of VAT Registration Certificate',
-                                style: TextStyle(fontSize: 12, color: Colors.grey),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: Colors.orange.shade50,
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color: Colors.orange.shade200,
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.info_outline,
-                                color: Colors.orange.shade700,
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  'Tax Registration Number: 15 digits, numeric only. Firm name must be identical across all documents.',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: Colors.orange.shade700,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  if (_isVATRequired) const SizedBox(height: 24),
-                  // Location Details
-                  _buildModernSection(
-                    title: 'Location Details',
-                    icon: Icons.location_on_outlined,
-                    isOptional: true,
-                    children: [
-                      _buildModernTextField(
-                        controller: latitudeController,
-                        label: 'Latitude',
-                        icon: Icons.my_location,
-                        isRequired: false,
-                        validator: _validateLatitude,
-                        suffix: IconButton(
-                          tooltip: 'Refresh location',
-                          icon: const Icon(Icons.gps_fixed),
-                          onPressed: _isGettingLocation
-                              ? null
-                              : () async {
-                                  HapticFeedback.selectionClick();
-                                  await _initLocation();
-                                },
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      _buildModernTextField(
-                        controller: longitudeController,
-                        label: 'Longitude',
-                        icon: Icons.my_location,
-                        isRequired: false,
-                        validator: _validateLongitude,
-                        suffix: IconButton(
-                          tooltip: 'Refresh location',
-                          icon: const Icon(Icons.gps_fixed),
-                          onPressed: _isGettingLocation
-                              ? null
-                              : () async {
-                                  HapticFeedback.selectionClick();
-                                  await _initLocation();
-                                },
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          const Icon(
-                            Icons.info_outline,
-                            size: 16,
-                            color: Colors.grey,
-                          ),
-                          const SizedBox(width: 6),
-                          Expanded(
-                            child: Text(
-                              _isGettingLocation
-                                  ? 'Fetching GPS…'
-                                  : (latitudeController.text.isEmpty ||
-                                          longitudeController.text.isEmpty)
-                                      ? 'Tap the GPS icon if fields are empty.'
-                                      : 'Coordinates captured from your device GPS.',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey.shade700,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildMobileLayout() {
-    return Column(
-      children: [
-        // Trade License
-        _buildModernSection(
-          title: 'Trade License Details',
-          icon: Icons.assignment_rounded,
-          children: [
-            _buildModernTextField(
-              controller: licenseNumberController,
-              label: 'License Number',
-              icon: Icons.confirmation_number,
-              validator: _validateLicense,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: issuingAuthorityController,
-              label: 'Issuing Authority',
-              icon: Icons.account_balance,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: establishmentDateController,
-              label: 'Establishment Date',
-              icon: Icons.event,
-              context: context,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: expiryDateController,
-              label: 'Expiry Date',
-              icon: Icons.event_busy,
-              context: context,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: tradeNameController,
-              label: 'Trade Name',
-              icon: Icons.store,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: responsiblePersonController,
-              label: 'Responsible Person',
-              icon: Icons.person,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: registeredAddressController,
-              label: 'Registered Address',
-              icon: Icons.location_on,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: effectiveDateController,
-              label: 'Effective Registration Date',
-              icon: Icons.calendar_today,
-              context: context,
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.blue.shade50,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.blue.shade200),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.info_outline,
-                    color: Colors.blue.shade700,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'License Numbers vary across Emirates. (Max 20 Characters)',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.blue.shade700,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            // Document Upload Section for Mobile
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade50,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.shade200),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Row(
-                    children: [
-                      Icon(Icons.upload_file, color: Colors.blue),
-                      SizedBox(width: 8),
-                      Text(
-                        'Required Documents',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: Colors.blue,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed: () => _uploadDocument('Trade License'),
-                      icon: const Icon(Icons.description),
-                      label: Text(
-                        _tradeLicensePath != null
-                            ? 'Trade License Uploaded'
-                            : 'Upload Trade License (PDF) *',
-                      ),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: _tradeLicensePath != null
-                            ? Colors.green
-                            : Colors.blue.shade600,
-                        foregroundColor: Colors.white,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Upload scanned copy of Trade License (PDF format, max 5MB)',
-                    style: TextStyle(fontSize: 12, color: Colors.grey),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Annual Turnover Section for Mobile
-        _buildModernSection(
-          title: 'Business Information',
-          icon: Icons.business_center,
-          children: [
-            _buildModernTextField(
-              controller: annualTurnoverController,
-              label: 'Annual Turnover (AED)',
-              icon: Icons.monetization_on,
-              validator: (value) {
-                if (value == null || value.isEmpty) {
-                  return 'Please enter annual turnover';
+                if (result != null)
+                {
+                    foreach (var row in result)
+                    {
+                        list.Add(new AreaItem
+                        {
+                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
+                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
+                        });
+                    }
                 }
-                final turnover = double.tryParse(value.replaceAll(',', ''));
-                if (turnover == null || turnover < 0) {
-                  return 'Please enter a valid turnover amount';
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // ----------------- helpers -----------------
+        private string GetNextInfluencerCode(string inflType)
+        {
+            string newCode;
+            int attempts = 0;
+            const int maxAttempts = 100;
+
+            do
+            {
+                // Get the next sequential number for 2IK codes
+                int nextNumber = GetNextInfluencerSequence();
+                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
+                attempts++;
+
+                if (attempts >= maxAttempts)
+                {
+                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
                 }
-                return null;
-              },
-              suffix: IconButton(
-                icon: const Icon(Icons.refresh),
-                onPressed: _checkVATRequirement,
-                tooltip: 'Check VAT requirement',
-              ),
-            ),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: _isVATRequired ? Colors.orange.shade50 : Colors.blue.shade50,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: _isVATRequired ? Colors.orange.shade200 : Colors.blue.shade200,
-                ),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    _isVATRequired ? Icons.warning : Icons.info_outline,
-                    color: _isVATRequired ? Colors.orange.shade700 : Colors.blue.shade700,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _isVATRequired
-                          ? 'VAT Registration is required (Turnover > AED 375,000)'
-                          : 'VAT Registration required only if Annual Turnover exceeds AED 375,000',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: _isVATRequired ? Colors.orange.shade700 : Colors.blue.shade700,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // VAT Registration (conditionally shown)
-        if (_isVATRequired)
-          _buildModernSection(
-            title: 'VAT Registration Details',
-            icon: Icons.receipt_long,
-            isOptional: true,
-            children: [
-              _buildModernTextField(
-                controller: taxRegNumberController,
-                label: 'Tax Registration Number',
-                icon: Icons.numbers,
-                validator: _validateTaxRegNumber,
-              ),
-              const SizedBox(height: 16),
-              _buildModernTextField(
-                controller: firmNameController,
-                label: 'Firm Name',
-                icon: Icons.business,
-              ),
-              const SizedBox(height: 16),
-              _buildModernDateField(
-                controller: effectiveDateController,
-                label: 'Effective Registration Date',
-                icon: Icons.calendar_today,
-                context: context,
-              ),
-              const SizedBox(height: 16),
-              // VAT Document Upload for Mobile
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade50,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.grey.shade200),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Row(
-                      children: [
-                        Icon(Icons.upload_file, color: Colors.orange),
-                        SizedBox(width: 8),
-                        Text(
-                          'VAT Registration Document',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.orange,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        onPressed: () => _uploadDocument('VAT Certificate'),
-                        icon: const Icon(Icons.receipt_long),
-                        label: Text(
-                          _vatCertificatePath != null
-                              ? 'VAT Certificate Uploaded'
-                              : 'Upload VAT Certificate (PDF) *',
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _vatCertificatePath != null
-                              ? Colors.green
-                              : Colors.orange.shade600,
-                          foregroundColor: Colors.white,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Upload scanned copy of VAT Registration Certificate',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.orange.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: Colors.orange.shade200,
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.info_outline,
-                      color: Colors.orange.shade700,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Tax Registration Number: 15 digits, numeric only. Firm name must be identical across all documents.',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.orange.shade700,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        const SizedBox(height: 24),
-        // Bank Details
-        _buildModernSection(
-          title: 'Bank Details',
-          icon: Icons.account_balance_outlined,
-          isOptional: true,
-          children: [
-            _buildModernTextField(
-              controller: accountNameController,
-              label: 'Account Holder Name',
-              icon: Icons.person_outline_rounded,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: ibanController,
-              label: 'IBAN Number',
-              icon: Icons.account_balance_wallet_outlined,
-              isRequired: false,
-              validator: _validateIBAN,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: bankNameController,
-              label: 'Bank Name',
-              icon: Icons.business_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: branchNameController,
-              label: 'Branch Name',
-              icon: Icons.location_on_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: branchAddressController,
-              label: 'Branch Address',
-              icon: Icons.location_city_outlined,
-              isRequired: false,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Location Details
-        _buildModernSection(
-          title: 'Location Details',
-          icon: Icons.location_on_outlined,
-          isOptional: true,
-          children: [
-            _buildModernTextField(
-              controller: latitudeController,
-              label: 'Latitude',
-              icon: Icons.my_location,
-              isRequired: false,
-              suffix: IconButton(
-                tooltip: 'Refresh location',
-                icon: const Icon(Icons.gps_fixed),
-                onPressed: _isGettingLocation
-                    ? null
-                    : () async {
-                        HapticFeedback.selectionClick();
-                        await _initLocation();
-                      },
-              ),
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: longitudeController,
-              label: 'Longitude',
-              icon: Icons.my_location,
-              isRequired: false,
-              suffix: IconButton(
-                tooltip: 'Refresh location',
-                icon: const Icon(Icons.gps_fixed),
-                onPressed: _isGettingLocation
-                    ? null
-                    : () async {
-                        HapticFeedback.selectionClick();
-                        await _initLocation();
-                      },
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Icon(
-                  Icons.info_outline,
-                  size: 16,
-                  color: Colors.grey,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    _isGettingLocation
-                        ? 'Fetching GPS…'
-                        : (latitudeController.text.isEmpty ||
-                                longitudeController.text.isEmpty)
-                            ? 'Tap the GPS icon if fields are empty.'
-                            : 'Coordinates captured from your device GPS.',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Colors.grey.shade700,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ],
-    );
-  }
+
+            } while (IsInfluencerCodeExists(newCode));
+
+            return newCode;
+        }
+
+        private int GetNextInfluencerSequence()
+        {
+            var sql = @"
+                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
+                FROM dbo.ctmInfluncr
+                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
+
+            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
+            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
+
+            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
+        }
+
+        private bool IsInfluencerCodeExists(string influencerCode)
+        {
+            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
+            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
+
+            var result = _db.WebSessBean(sql, parameters);
+            var count = result?.FirstOrDefault()?["Count"];
+
+            return count != null && Convert.ToInt32(count) > 0;
+        }
+
+        private static string MakeFixed(int size, string input)
+        {
+            if (string.IsNullOrEmpty(input)) input = "";
+            return input.Length >= size ? input[..size]
+                   : input + new string('A', size - input.Length);
+        }
+
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // keep last 11 digits if user typed country code
+        private static string FormatMobile11(string? s)
+        {
+            var d = Digits(s);
+            if (d.Length <= 11) return d;
+            return d.Substring(d.Length - 11);
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+    }
+
+    // ----------------- request model (matches Flutter) -----------------
+    public class ContractorRegistrationRequest
+    {
+        // Personal
+        public string? ContractorType { get; set; }
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? ProfilePhoto { get; set; }
+
+        // Bank
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+
+        // VAT
+        public string? VatCertificate { get; set; }
+        public string? FirmName { get; set; }
+        public string? VatAddress { get; set; }
+        public string? TaxRegistrationNumber { get; set; }
+        public string? VatEffectiveDate { get; set; }
+
+        // License
+        public string? LicenseDocument { get; set; }
+        public string? LicenseNumber { get; set; }
+        public string? IssuingAuthority { get; set; }
+        public string? LicenseType { get; set; }
+        public string? EstablishmentDate { get; set; }
+        public string? LicenseExpiryDate { get; set; }
+        public string? TradeName { get; set; }
+        public string? ResponsiblePerson { get; set; }
+        public string? LicenseAddress { get; set; }
+        public string? EffectiveDate { get; set; }
+    }
 }
 
-class _FadeSlide extends StatelessWidget {
-  final String text;
-  final bool big;
-  const _FadeSlide({required this.text, this.big = false});
 
-  @override
-  Widget build(BuildContext context) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 800),
-      curve: Curves.easeOut,
-      builder: (context, value, child) => Transform.translate(
-        offset: Offset(0, 30 * (1 - value)),
-        child: Opacity(opacity: value, child: child),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: big ? 32 : 16,
-          fontWeight: big ? FontWeight.bold : FontWeight.normal,
-          color: big ? Colors.white : Colors.white70,
-        ),
-      ),
-    );
-  }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using RAKControllers.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+namespace RAKControllers.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class PainterController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public PainterController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        // POST: /api/Painter/register
+        [HttpPost("register")]
+        [Consumes("application/json")]
+        public IActionResult Register([FromBody] PainterRegistrationRequest? request = null)
+        {
+            try
+            {
+                request ??= new PainterRegistrationRequest();
+
+                // --- Keys / defaults ---
+                var inflType = "PN";                                                           // char(2) -> Painter
+                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();           // char(3) - use emirates code as area code
+
+                // NEW: Generate sequential inflCode = "PN" + 6-digit number (char(8))
+                string inflCode = GetNextInfluencerCode(inflType);
+
+                // Names
+                var fullName = string.Join(" ",
+                    new[] { request.FirstName, request.MiddleName, request.LastName }
+                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
+
+                var inflName256 = Cut(fullName, 256);  // inflName nvarchar(256)
+                var contName40 = Cut(fullName, 40);   // contName varchar(40)
+
+                // Address cluster (legacy)
+                var inflAdd1_50 = Cut(request.Address, 50);
+                var inflAdd2_100 = "";
+                var inflAdd3_30 = "";                // keep empty (NOT NULL but "" allowed)
+                var inflCity_255 = "";
+
+                // Mobile
+                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
+
+                // Bank (legacy)
+                var bankName100 = Cut(request.BankName, 100);
+                var branchName100 = Cut(request.BranchName, 100);
+                var acctHolder40 = Cut(request.AccountHolderName, 40);
+
+                // Painter extra (varchar 255 columns we added)
+                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
+                var idholder255 = Cut(request.IdName, 255);
+                var nationty255 = Cut(request.Nationality, 255);
+                var employer255 = Cut(request.CompanyDetails, 255);
+                var issudate255 = Cut(request.IssueDate, 255);
+                var expirydt255 = Cut(request.ExpiryDate, 255);
+                var occupatn255 = Cut(request.Occupation, 255);
+                var bankaddr255 = Cut(request.BankAddress, 255);
+
+                // Existing “new” 255 columns reused when relevant
+                var contrtyp255 = "Painter";                            // painter role label
+                var frstname255 = Cut(request.FirstName, 255);
+                var middname255 = Cut(request.MiddleName, 255);
+                var lastname255 = Cut(request.LastName, 255);
+                var emirates255 = Cut(request.Emirates, 255);
+                var referenc255 = Cut(request.Reference, 255);
+                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
+
+                // DOB -> map to legacy smalldatetime birthDat
+                var birthDat = SafeParseDate(request.DateOfBirth);
+
+                // Build parameter bag (EVERY param used in INSERT must exist)
+                var p = new Dictionary<string, object?>
+                {
+                    // ==== Required legacy (NOT NULL) ====
+                    ["@inflCode"] = inflCode,                // char(8) - sequential PN000001...
+                    ["@inflType"] = inflType,                // char(2)
+                    ["@inflName"] = inflName256,             // nvarchar(256)
+                    ["@contName"] = contName40,              // varchar(40)
+
+                    // Address cluster
+                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
+                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
+                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
+                    ["@inflCity"] = inflCity_255,            // varchar(255)
+                    ["@district"] = "",                      // varchar(30)  NOT NULL
+                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
+
+                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
+                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
+                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
+                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
+                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
+                    ["@expertis"] = "",                      // varchar(100) YES (send "")
+                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
+                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
+                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
+                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
+                    ["@isActive"] = "T",                     // char(1)      NOT NULL
+                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
+                    ["@updateId"] = DBNull.Value,
+                    ["@updateDt"] = DBNull.Value,
+                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
+                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
+                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
+
+                    // Tax IDs / misc
+                    ["@itxPanNo"] = "",
+                    ["@locStxNo"] = "",
+
+                    // Banking (legacy)
+                    ["@bankAcNo"] = "",
+                    ["@bankBnNm"] = bankName100,
+                    ["@bankBnDs"] = branchName100,
+                    ["@bankBnNo"] = "",
+                    ["@bankIFSC"] = "",
+
+                    // KYC & misc
+                    ["@kycVerFl"] = "",
+                    ["@kycVerDt"] = DBNull.Value,
+                    ["@idCardTy"] = "",
+                    ["@idCardNo"] = "",
+                    ["@inDocCnt"] = DBNull.Value,
+                    ["@rjcRemrk"] = "",
+                    ["@entrBySg"] = "",
+                    ["@kycVrTyp"] = "",
+                    ["@adhrName"] = "",
+                    ["@panCName"] = "",
+                    ["@sapInsDt"] = DBNull.Value,
+                    ["@sapUpdDt"] = DBNull.Value,
+                    ["@urbRurFl"] = "",
+
+                    ["@bankApNm"] = acctHolder40,            // varchar(40)
+
+                    // Permanent/alt address
+                    ["@infAddP1"] = "",
+                    ["@infAddP2"] = "",
+                    ["@infAddP3"] = "",
+                    ["@infPCity"] = "",
+                    ["@distrctP"] = "",
+                    ["@infPinCP"] = "",
+
+                    ["@adhOtpFl"] = "",
+                    ["@concEmpl"] = "",
+                    ["@bnkKycFl"] = "",
+                    ["@bnkKycDt"] = DBNull.Value,
+                    ["@inflPinL"] = "",
+                    ["@adhCpUId"] = "",
+                    ["@adhCpUDt"] = DBNull.Value,
+                    ["@panCpUId"] = "",
+                    ["@panCpUDt"] = DBNull.Value,
+                    ["@bnkCpUId"] = "",
+                    ["@bnkCpUDt"] = DBNull.Value,
+                    ["@randNmSt"] = "",
+                    ["@kycStats"] = "",
+                    ["@inflTyOl"] = "",
+                    ["@kycAprBy"] = "",
+                    ["@blkStuts"] = "",
+                    ["@blkStDat"] = DBNull.Value,
+                    ["@cntrApFl"] = "",
+                    ["@frstScDt"] = DBNull.Value,
+                    ["@sourceCnt"] = "",
+                    ["@promoteNm"] = "",
+                    ["@pmobilen"] = "",
+                    ["@isTDSEli"] = "",
+                    ["@panAdhLk"] = "",
+                    ["@panVldIn"] = "",
+                    ["@panCatgF"] = "",
+
+                    // ==== Existing 255s we reuse ====
+                    ["@contrtyp"] = "Painter",
+                    ["@frstname"] = frstname255,
+                    ["@middname"] = middname255,
+                    ["@lastname"] = lastname255,
+                    ["@emirates"] = emirates255,
+                    ["@referenc"] = referenc255,
+                    ["@ibannumb"] = ibannumb255,
+                    ["@vatfrmnm"] = "",
+                    ["@vatraddr"] = "",
+                    ["@vattxreg"] = "",
+                    ["@vatefdt"] = "",
+                    ["@comlcnno"] = "",
+                    ["@comissau"] = "",
+                    ["@comlctyp"] = "",
+                    ["@comestdt"] = "",
+                    ["@comexpdt"] = "",
+                    ["@comtrdnm"] = "",
+                    ["@comrespn"] = "",
+                    ["@comraddr"] = "",
+                    ["@comeffdt"] = "",
+
+                    // ==== Painter-specific 8-char columns ====
+                    ["@emiridno"] = emiridno255,
+                    ["@idholder"] = idholder255,
+                    ["@nationty"] = nationty255,
+                    ["@employer"] = employer255,
+                    ["@issudate"] = issudate255,
+                    ["@expirydt"] = expirydt255,
+                    ["@occupatn"] = occupatn255,
+                    ["@bankaddr"] = bankaddr255,
+                };
+
+                // INSERT (covers all required legacy + reused 255s + painter extras)
+                var sql = @"
+INSERT INTO dbo.ctmInfluncr
+(
+    inflCode, inflType, inflName, contName,
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
+    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
+    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
+    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
+    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
+    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
+    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
+    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
+
+    -- shared 255s
+    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
+
+    -- painter-specific 8-char name columns (varchar 255)
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
+)
+VALUES
+(
+    @inflCode, @inflType, @inflName, @contName,
+    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
+    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
+    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
+    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
+    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
+    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
+    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
+    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
+    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
+    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
+
+    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
+    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
+    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
+
+    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
+);
+
+SELECT @inflCode AS InflCode;
+";
+
+                var result = _db.WebSessBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Painter registration saved",
+                    influencerCode = savedCode,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // (Optional) dropdowns if you need them for painter UI
+        [HttpGet("emirates-list")]
+        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
+        {
+            try
+            {
+                const string sql = @"
+SELECT areaCode, areaDesc
+FROM dbo.bkmAreaMast WITH (NOLOCK)
+WHERE (@onlyActive = 0 OR isActive = 'Y')
+ORDER BY areaDesc;";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@onlyActive", onlyActive ? 1 : 0 }
+                };
+
+                var result = _db.WebSessBean(sql, parameters);
+                var list = new List<AreaItem>();
+
+                if (result != null)
+                {
+                    foreach (var row in result)
+                    {
+                        list.Add(new AreaItem
+                        {
+                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
+                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
+                        });
+                    }
+                }
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // ----------------- helpers -----------------
+        private string GetNextInfluencerCode(string inflType)
+        {
+            string newCode;
+            int attempts = 0;
+            const int maxAttempts = 100;
+
+            do
+            {
+                // Get the next sequential number for 2IK codes
+                int nextNumber = GetNextInfluencerSequence();
+                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
+                attempts++;
+
+                if (attempts >= maxAttempts)
+                {
+                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
+                }
+
+            } while (IsInfluencerCodeExists(newCode));
+
+            return newCode;
+        }
+
+        private int GetNextInfluencerSequence()
+        {
+            var sql = @"
+                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
+                FROM dbo.ctmInfluncr
+                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
+
+            var result = _db.WebSessBean(sql, new Dictionary<string, object?>());
+            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
+
+            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
+        }
+
+        private bool IsInfluencerCodeExists(string influencerCode)
+        {
+            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
+            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
+
+            var result = _db.WebSessBean(sql, parameters);
+            var count = result?.FirstOrDefault()?["Count"];
+
+            return count != null && Convert.ToInt32(count) > 0;
+        }
+
+        private static string MakeFixed(int size, string input)
+        {
+            if (string.IsNullOrEmpty(input)) input = "";
+            return input.Length >= size ? input[..size]
+                   : input + new string('A', size - input.Length);
+        }
+
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // keep last 11 digits if user typed country code
+        private static string FormatMobile11(string? s)
+        {
+            var d = Digits(s);
+            if (d.Length <= 11) return d;
+            return d.Substring(d.Length - 11);
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+
+        private static DateTime? SafeParseDate(string? dateString)
+        {
+            if (string.IsNullOrWhiteSpace(dateString)) return null;
+            var formats = new[] {
+                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
+                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
+            };
+            foreach (var f in formats)
+            {
+                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            if (DateTime.TryParse(dateString, out var any)) return any;
+            return null;
+        }
+    }
+
+    // -------- request model --------
+    public class PainterRegistrationRequest
+    {
+        // Personal
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? Reference { get; set; }
+
+        // Emirates ID Details
+        public string? EmiratesIdNumber { get; set; }
+        public string? IdName { get; set; }          // Name on ID
+        public string? DateOfBirth { get; set; }     // maps to birthDat
+        public string? Nationality { get; set; }
+        public string? CompanyDetails { get; set; }  // Employer
+        public string? IssueDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? Occupation { get; set; }
+
+        // Bank Details (optional)
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+    }
 }
+
