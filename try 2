@@ -1,75 +1,50 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:go_router/go_router.dart';
-import '../../../core/theme/theme.dart';
-import '../../../core/widgets/custom_back_button.dart';
-import '../../../core/widgets/file_upload_widget.dart';
-import '../../../core/services/uae_id_ocr_service.dart';
-import '../../../core/services/bank_details_ocr_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/widgets/modern_dropdown.dart';
-// NEW: API model + service
-import '../../../core/models/painter_models.dart';
+import '../../SAMPLING/sample_model.dart';
+import '../../../core/models/sample_distribution_models.dart';
+import '../../../core/services/sample_distribution_service.dart';
+import '../../../core/services/contractor_service.dart';
 import '../../../core/models/contractor_models.dart';
-import '../../../core/services/painter_service.dart';
 
-class PainterRegistrationScreen extends StatefulWidget {
-  const PainterRegistrationScreen({super.key});
-
+class SampleDistributEntry extends StatefulWidget {
   @override
-  State<PainterRegistrationScreen> createState() =>
-      _PainterRegistrationScreenState();
+  _SampleDistributEntryState createState() => _SampleDistributEntryState();
 }
 
-class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
+class _SampleDistributEntryState extends State<SampleDistributEntry>
     with TickerProviderStateMixin {
-  String? _emiratesIdFrontImage;
-  String? _emiratesIdBackImage;
-  String? _photoImage;
-  String? _bankDocumentImage;
+  // Controllers final missedQtyController = TextEditingController();
 
-  final _formKey = GlobalKey<FormState>();
-  final _firstNameController = TextEditingController();
-  final _middleNameController = TextEditingController();
-  final _lastNameController = TextEditingController();
-  final _mobileController = TextEditingController();
-  final _addressController = TextEditingController();
-  final _emiratesController = TextEditingController();
-
-  // API dropdown data
+  final emirateController = TextEditingController();
+  final retailerNameController = TextEditingController();
+  final retailerCodeController = TextEditingController();
+  final distributorController = TextEditingController();
+  final painterNameController = TextEditingController();
+  final painterMobileController = TextEditingController();
+  final materialQtyController = TextEditingController();
+  final distributionDateController = TextEditingController();
+  List<SupplyChainEntry> currentEntries = [];
   List<EmirateItem> _emirates = [];
+  List<String> _emirateDescriptions = [];
   EmirateItem? _selectedEmirate;
-  bool _isLoadingDropdowns = true;
-
-  // Emirates ID Details
-  final _emiratesIdController = TextEditingController();
-  final _idNameController = TextEditingController();
-  final _dobController = TextEditingController();
-  final _nationalityController = TextEditingController();
-  final _companyDetailsController = TextEditingController();
-  final _issueDateController = TextEditingController();
-  final _expiryDateController = TextEditingController();
-  final _occupationController = TextEditingController();
-
-  // Bank Details (Non-Mandatory)
-  final _accountHolderController = TextEditingController();
-  final _ibanController = TextEditingController();
-  final _bankNameController = TextEditingController();
-  final _branchNameController = TextEditingController();
-  final _bankAddressController = TextEditingController();
-
-  bool _isSubmitting = false;
-  bool _isProcessingEmiratesId = false;
-  bool _isProcessingBankDocument = false;
-
+  bool _isLoadingEmirates = false;
+  // Animation controllers
   late AnimationController _mainController;
   late AnimationController _fabController;
   late Animation<double> _fadeAnimation;
   late Animation<Offset> _slideAnimation;
   late Animation<double> _scaleAnimation;
 
+  bool _isSubmitting = false;
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+
   @override
   void initState() {
     super.initState();
+    _loadEmirates();
+    // Initialize animations
     _mainController = AnimationController(
       duration: const Duration(milliseconds: 1000),
       vsync: this,
@@ -99,17 +74,20 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
     );
     _mainController.forward();
     _fabController.forward();
-    _loadDropdownData();
   }
 
-  Future<void> _loadDropdownData() async {
+  Future<void> _loadEmirates() async {
+    setState(() {
+      _isLoadingEmirates = true;
+    });
     try {
-      final emirates = await PainterService.getEmiratesList();
+      final emirates = await ContractorService.getEmiratesList();
       setState(() {
         _emirates = emirates;
-        _isLoadingDropdowns = false;
+        _emirateDescriptions = emirates.map((e) => e.desc).toList();
+        _isLoadingEmirates = false;
       });
-    } catch (_) {
+    } catch (e) {
       setState(() {
         _emirates = [
           EmirateItem(code: 'DUB', desc: 'Dubai'),
@@ -120,313 +98,190 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
           EmirateItem(code: 'RAK', desc: 'Ras Al Khaimah'),
           EmirateItem(code: 'FUJ', desc: 'Fujairah'),
         ];
-        _isLoadingDropdowns = false;
+        _emirateDescriptions = _emirates.map((e) => e.desc).toList();
+        _isLoadingEmirates = false;
       });
-    }
-  }
-
-  // ---------- Emirates ID processing ----------
-  Future<void> _checkAndProcessEmiratesId() async {
-    if (_emiratesIdFrontImage == null ||
-        _emiratesIdFrontImage!.isEmpty ||
-        _emiratesIdBackImage == null ||
-        _emiratesIdBackImage!.isEmpty) {
-      return;
-    }
-    setState(() => _isProcessingEmiratesId = true);
-    try {
-      final frontData = await UAEIdOCRService.processUAEId(
-        _emiratesIdFrontImage!,
-      );
-      final backData = await UAEIdOCRService.processUAEId(
-        _emiratesIdBackImage!,
-      );
-      final combinedData = _combineEmiratesIdData(frontData, backData);
-      _fillEmiratesIdFields(combinedData);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white, size: 20),
-                SizedBox(width: 8),
-                Expanded(child: Text('Emirates ID processed successfully!')),
-              ],
-            ),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 4),
-          ),
-        );
-      }
-    } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.warning, color: Colors.white, size: 20),
-                const SizedBox(width: 8),
-                Expanded(child: Text('Failed to process Emirates ID: $e')),
-              ],
-            ),
-            backgroundColor: Colors.orange,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 4),
+            content: Text('Error loading emirates: $e'),
+            backgroundColor: Colors.red,
           ),
         );
       }
-    } finally {
-      if (mounted) setState(() => _isProcessingEmiratesId = false);
     }
-  }
-
-  UAEIdData _combineEmiratesIdData(UAEIdData frontData, UAEIdData backData) {
-    return UAEIdData(
-      name: frontData.name ?? backData.name,
-      idNumber: frontData.idNumber ?? backData.idNumber,
-      dateOfBirth: frontData.dateOfBirth ?? backData.dateOfBirth,
-      nationality: frontData.nationality ?? backData.nationality,
-      issuingDate: frontData.issuingDate ?? backData.issuingDate,
-      expiryDate: frontData.expiryDate ?? backData.expiryDate,
-      sex: frontData.sex ?? backData.sex,
-      signature: frontData.signature ?? backData.signature,
-      cardNumber: backData.cardNumber ?? frontData.cardNumber,
-      occupation: backData.occupation ?? frontData.occupation,
-      employer: backData.employer ?? frontData.employer,
-      issuingPlace: backData.issuingPlace ?? frontData.issuingPlace,
-    );
-  }
-
-  Color _getStatusColor() {
-    if (_isProcessingEmiratesId) return const Color(0xFF1E3A8A);
-    final frontUploaded =
-        _emiratesIdFrontImage != null && _emiratesIdFrontImage!.isNotEmpty;
-    final backUploaded =
-        _emiratesIdBackImage != null && _emiratesIdBackImage!.isNotEmpty;
-    if (frontUploaded && backUploaded) return Colors.green;
-    if (frontUploaded || backUploaded) return Colors.orange;
-    return Colors.grey;
-  }
-
-  IconData _getStatusIcon() {
-    final frontUploaded =
-        _emiratesIdFrontImage != null && _emiratesIdFrontImage!.isNotEmpty;
-    final backUploaded =
-        _emiratesIdBackImage != null && _emiratesIdBackImage!.isNotEmpty;
-    if (frontUploaded && backUploaded) return Icons.check_circle;
-    if (frontUploaded || backUploaded) return Icons.upload_file;
-    return Icons.info_outline;
-  }
-
-  String _getStatusMessage() {
-    if (_isProcessingEmiratesId) {
-      return 'Processing both sides of Emirates ID...';
-    }
-    final frontUploaded =
-        _emiratesIdFrontImage != null && _emiratesIdFrontImage!.isNotEmpty;
-    final backUploaded =
-        _emiratesIdBackImage != null && _emiratesIdBackImage!.isNotEmpty;
-    if (frontUploaded && backUploaded) {
-      return '✅ Both sides uploaded successfully!';
-    }
-    if (frontUploaded && !backUploaded) {
-      return 'Front side uploaded. Please upload the back side.';
-    }
-    if (!frontUploaded && backUploaded) {
-      return 'Back side uploaded. Please upload the front side.';
-    }
-    return 'Please upload both sides of your Emirates ID.';
-  }
-
-  // ---------- Bank doc OCR ----------
-  Color _getBankDocumentStatusColor() {
-    if (_isProcessingBankDocument) return const Color(0xFF1E3A8A);
-    final bankDocumentUploaded =
-        _bankDocumentImage != null && _bankDocumentImage!.isNotEmpty;
-    if (bankDocumentUploaded) return Colors.green;
-    return Colors.grey;
-  }
-
-  IconData _getBankDocumentStatusIcon() {
-    final bankDocumentUploaded =
-        _bankDocumentImage != null && _bankDocumentImage!.isNotEmpty;
-    if (bankDocumentUploaded) return Icons.check_circle;
-    return Icons.info_outline;
-  }
-
-  String _getBankDocumentStatusMessage() {
-    if (_isProcessingBankDocument) {
-      return 'Processing bank document...';
-    }
-    final bankDocumentUploaded =
-        _bankDocumentImage != null && _bankDocumentImage!.isNotEmpty;
-    if (bankDocumentUploaded) {
-      return '✅ Bank document uploaded successfully!';
-    }
-    return 'Upload a bank statement, cheque, or bank document.';
-  }
-
-  void _fillEmiratesIdFields(UAEIdData data, {bool mergeWithExisting = false}) {
-    final fieldMapping = UAEIdOCRService.getFormFieldMapping(data);
-    if (fieldMapping['firstName'] != null &&
-        (!mergeWithExisting || _firstNameController.text.isEmpty)) {
-      _firstNameController.text = fieldMapping['firstName']!;
-    }
-    if (fieldMapping['middleName'] != null &&
-        (!mergeWithExisting || _middleNameController.text.isEmpty)) {
-      _middleNameController.text = fieldMapping['middleName']!;
-    }
-    if (fieldMapping['lastName'] != null &&
-        (!mergeWithExisting || _lastNameController.text.isEmpty)) {
-      _lastNameController.text = fieldMapping['lastName']!;
-    }
-    if (fieldMapping['idName'] != null &&
-        (!mergeWithExisting || _idNameController.text.isEmpty)) {
-      _idNameController.text = fieldMapping['idName']!;
-    }
-    if (data.idNumber?.isNotEmpty == true &&
-        (!mergeWithExisting || _emiratesIdController.text.isEmpty)) {
-      _emiratesIdController.text = data.idNumber!;
-    }
-    if (data.dateOfBirth?.isNotEmpty == true &&
-        (!mergeWithExisting || _dobController.text.isEmpty)) {
-      _dobController.text = data.dateOfBirth!;
-    }
-    if (data.nationality?.isNotEmpty == true &&
-        (!mergeWithExisting || _nationalityController.text.isEmpty)) {
-      _nationalityController.text = data.nationality!;
-    }
-    if (data.issuingDate?.isNotEmpty == true &&
-        (!mergeWithExisting || _issueDateController.text.isEmpty)) {
-      _issueDateController.text = data.issuingDate!;
-    }
-    if (data.expiryDate?.isNotEmpty == true &&
-        (!mergeWithExisting || _expiryDateController.text.isEmpty)) {
-      _expiryDateController.text = data.expiryDate!;
-    }
-    if (data.occupation?.isNotEmpty == true &&
-        (!mergeWithExisting || _occupationController.text.isEmpty)) {
-      _occupationController.text = data.occupation!;
-    }
-    if (data.employer?.isNotEmpty == true &&
-        (!mergeWithExisting || _companyDetailsController.text.isEmpty)) {
-      _companyDetailsController.text = data.employer!;
-    }
-    if (data.issuingPlace?.isNotEmpty == true &&
-        (!mergeWithExisting || _emiratesController.text.isEmpty)) {
-      final emirates = [
-        'Dubai',
-        'Abu Dhabi',
-        'Sharjah',
-        'Ajman',
-        'Umm Al Quwain',
-        'Ras Al Khaimah',
-        'Fujairah',
-      ];
-      final matchingEmirate = emirates.firstWhere(
-        (e) =>
-            e.toLowerCase().contains(data.issuingPlace!.toLowerCase()) ||
-            data.issuingPlace!.toLowerCase().contains(e.toLowerCase()),
-        orElse: () => '',
-      );
-      if (matchingEmirate.isNotEmpty) {
-        _emiratesController.text = matchingEmirate;
-      }
-    }
-    setState(() {});
-  }
-
-  Future<void> _processBankDocument() async {
-    if (_bankDocumentImage == null || _bankDocumentImage!.isEmpty) return;
-    setState(() => _isProcessingBankDocument = true);
-    try {
-      final bankData = await BankDetailsOCRService.processBankDocument(
-        _bankDocumentImage!,
-      );
-      _fillBankDetailsFields(bankData);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white, size: 20),
-                SizedBox(width: 8),
-                Expanded(child: Text('Bank document processed successfully!')),
-              ],
-            ),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 4),
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.warning, color: Colors.white, size: 20),
-                const SizedBox(width: 8),
-                Expanded(child: Text('Failed to process bank document: $e')),
-              ],
-            ),
-            backgroundColor: Colors.orange,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 4),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _isProcessingBankDocument = false);
-    }
-  }
-
-  void _fillBankDetailsFields(BankDetailsData data) {
-    if (data.accountHolderName != null &&
-        _accountHolderController.text.isEmpty) {
-      _accountHolderController.text = data.accountHolderName!;
-    }
-    if (data.ibanNumber != null && _ibanController.text.isEmpty) {
-      _ibanController.text = data.ibanNumber!;
-    }
-    if (data.bankName != null && _bankNameController.text.isEmpty) {
-      _bankNameController.text = data.bankName!;
-    }
-    if (data.branchName != null && _branchNameController.text.isEmpty) {
-      _branchNameController.text = data.branchName!;
-    }
-    if (data.bankAddress != null && _bankAddressController.text.isEmpty) {
-      _bankAddressController.text = data.bankAddress!;
-    }
-    setState(() {});
   }
 
   @override
   void dispose() {
     _mainController.dispose();
     _fabController.dispose();
-    _firstNameController.dispose();
-    _middleNameController.dispose();
-    _lastNameController.dispose();
-    _mobileController.dispose();
-    _addressController.dispose();
-    _emiratesController.dispose();
-    _emiratesIdController.dispose();
-    _idNameController.dispose();
-    _dobController.dispose();
-    _nationalityController.dispose();
-    _companyDetailsController.dispose();
-    _issueDateController.dispose();
-    _expiryDateController.dispose();
-    _occupationController.dispose();
-    _accountHolderController.dispose();
-    _ibanController.dispose();
-    _bankNameController.dispose();
-    _branchNameController.dispose();
-    _bankAddressController.dispose();
+    emirateController.dispose();
+    retailerNameController.dispose();
+    retailerCodeController.dispose();
+    distributorController.dispose();
+    painterNameController.dispose();
+    painterMobileController.dispose();
+    materialQtyController.dispose();
+    distributionDateController.dispose();
     super.dispose();
+  }
+
+  void _submitForm() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() {
+        _isSubmitting = true;
+      });
+      try {
+        final prefs = await SharedPreferences.getInstance();
+
+        // Create request object
+        final request = SampleDistributionRequest(
+          emirate: emirateController.text,
+          retailerName: retailerNameController.text,
+          retailerCode: retailerCodeController.text.isEmpty
+              ? null
+              : retailerCodeController.text,
+          distributor: distributorController.text,
+          painterName: painterNameController.text,
+          painterMobile: painterMobileController.text.isEmpty
+              ? null
+              : painterMobileController.text,
+          materialQty: materialQtyController.text.isEmpty
+              ? null
+              : materialQtyController.text,
+          distributionDate: distributionDateController.text,
+        );
+
+        // Submit to API (loginId is automatically taken from AuthManager)
+        final response =
+            await SampleDistributionService.submitSampleDistribution(request);
+
+        if (response.success) {
+          // Save to local storage on success
+          await prefs.setString('Emirate', emirateController.text);
+          await prefs.setString('retailerName', retailerNameController.text);
+          await prefs.setString('retailerCode', retailerCodeController.text);
+          await prefs.setString('distributor', distributorController.text);
+          await prefs.setString('painterName', painterNameController.text);
+          await prefs.setString('painterMobile', painterMobileController.text);
+          await prefs.setString('materialQty', materialQtyController.text);
+          await prefs.setString(
+            'distributionDate',
+            distributionDateController.text,
+          );
+
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: [
+                    const Icon(
+                      Icons.check_circle,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '${response.message}${response.docuNumb != null ? ' (Doc: ${response.docuNumb})' : ''}',
+                      ),
+                    ),
+                  ],
+                ),
+                backgroundColor: Colors.green,
+                behavior: SnackBarBehavior.floating,
+                duration: const Duration(seconds: 4),
+              ),
+            );
+          }
+        } else {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: [
+                    const Icon(Icons.error, color: Colors.white, size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text(response.message)),
+                  ],
+                ),
+                backgroundColor: Colors.red,
+                behavior: SnackBarBehavior.floating,
+                duration: const Duration(seconds: 4),
+              ),
+            );
+          }
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.warning, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(child: Text('Error saving data: ${e.toString()}')),
+                ],
+              ),
+              backgroundColor: Colors.orange,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSubmitting = false;
+          });
+        }
+      }
+    }
+  }
+
+  final demoSupplyChain = SupplyChainData(
+    totalReceived: 500,
+    billedToDistributor: 400,
+    billedToRetailer: 350,
+    distributedToPainter: 280,
+  );
+
+  Widget buildSupplyChainTable(List<SupplyChainEntry> entries) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        headingRowColor: MaterialStateProperty.all(const Color(0xFF1E3A8A)),
+        headingTextStyle: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.bold,
+        ),
+        columns: const [
+          DataColumn(label: Text("Retailer")),
+          DataColumn(label: Text("Code")),
+          DataColumn(label: Text("Distributor")),
+          DataColumn(label: Text("Painter")),
+          DataColumn(label: Text("Mobile")),
+          DataColumn(label: Text("Distributed (Kg)")),
+          DataColumn(label: Text("Total Received (Kg)")),
+          DataColumn(label: Text("Remaining (Kg)")),
+        ],
+        rows: entries.map((entry) {
+          return DataRow(
+            cells: [
+              DataCell(Text(entry.retailerName)),
+              DataCell(Text(entry.retailerCode)),
+              DataCell(Text(entry.distributorName)),
+              DataCell(Text(entry.painterName)),
+              DataCell(Text(entry.painterMobile)),
+              DataCell(Text(entry.qtyDistributed.toString())),
+              DataCell(Text(entry.totalReceived.toString())),
+              DataCell(Text(entry.remaining.toString())),
+            ],
+          );
+        }).toList(),
+      ),
+    );
   }
 
   @override
@@ -439,7 +294,7 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
         final isMobile = constraints.maxWidth <= 800;
 
         return Scaffold(
-          backgroundColor: Colors.white,
+          backgroundColor: const Color(0xFFF8FAFC),
           appBar: _buildModernAppBar(),
           body: FadeTransition(
             opacity: _fadeAnimation,
@@ -464,6 +319,7 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
+                              // Header with animation
                               _buildAnimatedHeader(),
                               const SizedBox(height: 32),
                               // Main Content - Two columns on desktop
@@ -471,7 +327,14 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
                                 _buildDesktopLayout()
                               else
                                 _buildMobileLayout(),
-                              const SizedBox(height: 48),
+                              const SizedBox(height: 32),
+
+                              // Submit Button
+                              // In your build method (below Submit button)
+                              if (currentEntries.isNotEmpty)
+                                buildSupplyChainTable(currentEntries),
+
+                              const SizedBox(height: 20),
                               _buildAnimatedSubmitButton(),
                               const SizedBox(height: 48),
                             ],
@@ -497,75 +360,47 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
           children: [
             // Left Column
             Expanded(
-              child: Column(
+              child: _buildModernSection(
+                title: 'Retailer Details',
+                icon: Icons.store_rounded,
                 children: [
-                  // Personal Details
-                  _buildModernSection(
-                    title: 'Personal Details',
-                    icon: Icons.person_rounded,
-                    children: [
-                      _buildModernTextField(
-                        controller: _firstNameController,
-                        label: 'First Name',
-                        icon: Icons.person_outline_rounded,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _middleNameController,
-                        label: 'Middle Name',
-                        icon: Icons.person_outline_rounded,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _lastNameController,
-                        label: 'Last Name',
-                        icon: Icons.person_outline_rounded,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _mobileController,
-                        label: 'Mobile Number',
-                        icon: Icons.phone_outlined,
-                        isPhone: true,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _addressController,
-                        label: 'Address',
-                        icon: Icons.home_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      ModernDropdown(
-                        label: 'Emirates',
-                        icon: Icons.public_outlined,
-                        items: _emirates.map((e) => e.desc).toList(),
-                        value: _selectedEmirate?.desc,
-                        onChanged: (String? value) {
-                          if (!_isLoadingDropdowns && value != null) {
-                            setState(() {
-                              _selectedEmirate = _emirates.firstWhere(
-                                (e) => e.desc == value,
-                                orElse: () => _emirates.first,
-                              );
-                              _emiratesController.text = _selectedEmirate!.desc;
-                            });
-                          }
-                        },
-                      ),
-                      const SizedBox(height: 20),
-                      FileUploadWidget(
-                        label: 'Profile Photo',
-                        icon: Icons.camera_alt_outlined,
-                        onFileSelected: (value) {
-                          setState(() => _photoImage = value);
-                        },
-                        allowedExtensions: const ['*'],
-                        maxSizeInMB: 10.0,
-                        currentFilePath: _photoImage,
-                        formType: 'painter',
-                      ),
-                    ],
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Emirates',
+                    icon: Icons.location_on_outlined,
+                    items: _emirateDescriptions,
+                    value: _selectedEmirate?.desc,
+                    onChanged: (value) {
+                      if (value != null) {
+                        setState(() {
+                          _selectedEmirate = _emirates.firstWhere(
+                            (e) => e.desc == value,
+                            orElse: () => _emirates.first,
+                          );
+                          emirateController.text = _selectedEmirate!.desc;
+                        });
+                      }
+                    },
+                    isLoading: _isLoadingEmirates,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: retailerNameController,
+                    label: 'Retailer Name',
+                    icon: Icons.store_outlined,
+                  ),
+
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: retailerCodeController,
+                    label: 'Retailer Code',
+                    icon: Icons.qr_code_outlined,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: distributorController,
+                    label: 'Concern Distributor',
+                    icon: Icons.business_outlined,
                   ),
                 ],
               ),
@@ -573,240 +408,42 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
             const SizedBox(width: 24),
             // Right Column
             Expanded(
-              child: Column(
+              child: _buildModernSection(
+                title: 'Distribution Details',
+                icon: Icons.local_shipping_outlined,
                 children: [
-                  // Emirates ID
-                  _buildModernSection(
-                    title: 'Emirates ID',
-                    icon: Icons.badge_outlined,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: _getStatusColor().withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: _getStatusColor(),
-                            width: 1,
-                          ),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  _getStatusIcon(),
-                                  color: _getStatusColor(),
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    'Emirates ID Processing Status',
-                                    style: TextStyle(
-                                      fontWeight: FontWeight.w600,
-                                      color: _getStatusColor(),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              _getStatusMessage(),
-                              style: TextStyle(
-                                fontSize: 13,
-                                color: Colors.grey.shade700,
-                              ),
-                            ),
-                            if (_isProcessingEmiratesId) ...[
-                              const SizedBox(height: 12),
-                              const LinearProgressIndicator(),
-                            ],
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      FileUploadWidget(
-                        label: 'Emirates ID - Front Side',
-                        icon: Icons.credit_card_outlined,
-                        onFileSelected: (value) {
-                          setState(() => _emiratesIdFrontImage = value);
-                          _checkAndProcessEmiratesId();
-                        },
-                        allowedExtensions: const ['jpg', 'jpeg', 'png'],
-                        maxSizeInMB: 10.0,
-                        currentFilePath: _emiratesIdFrontImage,
-                        formType: 'painter',
-                      ),
-                      const SizedBox(height: 20),
-                      FileUploadWidget(
-                        label: 'Emirates ID - Back Side',
-                        icon: Icons.credit_card_outlined,
-                        onFileSelected: (value) {
-                          setState(() => _emiratesIdBackImage = value);
-                          _checkAndProcessEmiratesId();
-                        },
-                        allowedExtensions: const ['jpg', 'jpeg', 'png'],
-                        maxSizeInMB: 10.0,
-                        currentFilePath: _emiratesIdBackImage,
-                        formType: 'painter',
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _emiratesIdController,
-                        label: 'Emirates ID Number',
-                        icon: Icons.pin_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _idNameController,
-                        label: 'Name of Holder',
-                        icon: Icons.person_outline_rounded,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernDateField(
-                        controller: _dobController,
-                        label: 'Date of Birth',
-                        icon: Icons.cake_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _nationalityController,
-                        label: 'Nationality',
-                        icon: Icons.flag_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _companyDetailsController,
-                        label: 'Company Details / Sponsor Name',
-                        icon: Icons.business_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernDateField(
-                        controller: _issueDateController,
-                        label: 'Issue Date',
-                        icon: Icons.event_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernDateField(
-                        controller: _expiryDateController,
-                        label: 'Expiry Date',
-                        icon: Icons.event_available_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: _occupationController,
-                        label: 'Occupation',
-                        icon: Icons.work_outline,
-                      ),
+                  _buildModernTextField(
+                    controller: painterNameController,
+                    label: 'Name of Painter / Contractor',
+                    icon: Icons.person_outline_rounded,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: painterMobileController,
+                    label: 'Mobile no Painter / Contractor',
+                    icon: Icons.phone_outlined,
+                    isPhone: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: materialQtyController,
+                    label: 'Total Distribution Amount in Kg',
+                    icon: Icons.scale_outlined,
+                    keyboardType: TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
                     ],
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernDateField(
+                    controller: distributionDateController,
+                    label: 'Date of distribution',
+                    icon: Icons.event_available_outlined,
                   ),
                 ],
               ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Bank Details (Full width below the two columns)
-        _buildModernSection(
-          title: 'Bank Details',
-          icon: Icons.account_balance_outlined,
-          isOptional: true,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: _getBankDocumentStatusColor().withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: _getBankDocumentStatusColor(),
-                  width: 1,
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        _getBankDocumentStatusIcon(),
-                        color: _getBankDocumentStatusColor(),
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Bank Document OCR Status',
-                          style: TextStyle(
-                            fontWeight: FontWeight.w600,
-                            color: _getBankDocumentStatusColor(),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _getBankDocumentStatusMessage(),
-                    style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
-                  ),
-                  if (_isProcessingBankDocument) ...[
-                    const SizedBox(height: 12),
-                    const LinearProgressIndicator(),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            FileUploadWidget(
-              label: '',
-              icon: Icons.receipt_long_outlined,
-              onFileSelected: (value) {
-                setState(() => _bankDocumentImage = value);
-                _processBankDocument();
-              },
-              allowedExtensions: const ['jpg', 'jpeg', 'png', 'pdf'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _bankDocumentImage,
-              formType: 'painter',
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _accountHolderController,
-              label: 'Account Holder Name',
-              icon: Icons.person_outline_rounded,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _ibanController,
-              label: 'IBAN Number',
-              icon: Icons.account_balance_wallet_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _bankNameController,
-              label: 'Bank Name',
-              icon: Icons.business_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _branchNameController,
-              label: 'Branch Name',
-              icon: Icons.location_on_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _bankAddressController,
-              label: 'Bank Address',
-              icon: Icons.location_city_outlined,
-              isRequired: false,
             ),
           ],
         ),
@@ -817,296 +454,85 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
   Widget _buildMobileLayout() {
     return Column(
       children: [
-        // Personal Details
+        // Retailer Details Section
         _buildModernSection(
-          title: 'Personal Details',
-          icon: Icons.person_rounded,
+          title: 'Retailer Details',
+          icon: Icons.store_rounded,
           children: [
-            _buildModernTextField(
-              controller: _firstNameController,
-              label: 'First Name',
-              icon: Icons.person_outline_rounded,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _middleNameController,
-              label: 'Middle Name',
-              icon: Icons.person_outline_rounded,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _lastNameController,
-              label: 'Last Name',
-              icon: Icons.person_outline_rounded,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _mobileController,
-              label: 'Mobile Number',
-              icon: Icons.phone_outlined,
-              isPhone: true,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _addressController,
-              label: 'Address',
-              icon: Icons.home_outlined,
-            ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
             ModernDropdown(
-              label: 'Emirates',
-              icon: Icons.public_outlined,
-              items: _emirates.map((e) => e.desc).toList(),
+              label: 'Emirate',
+              icon: Icons.location_on_outlined,
+              items: _emirateDescriptions,
               value: _selectedEmirate?.desc,
-              onChanged: (String? value) {
-                if (!_isLoadingDropdowns && value != null) {
+              onChanged: (value) {
+                if (value != null) {
                   setState(() {
                     _selectedEmirate = _emirates.firstWhere(
                       (e) => e.desc == value,
                       orElse: () => _emirates.first,
                     );
-                    _emiratesController.text = _selectedEmirate!.desc;
+                    emirateController.text = _selectedEmirate!.desc;
                   });
                 }
               },
+              isLoading: _isLoadingEmirates,
             ),
-            const SizedBox(height: 20),
-            FileUploadWidget(
-              label: 'Profile Photo',
-              icon: Icons.camera_alt_outlined,
-              onFileSelected: (value) {
-                setState(() => _photoImage = value);
-              },
-              allowedExtensions: const ['*'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _photoImage,
-              formType: 'painter',
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: retailerNameController,
+              label: 'Retailer Name',
+              icon: Icons.store_outlined,
+            ),
+
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: retailerCodeController,
+              label: 'Retailer Code',
+              icon: Icons.qr_code_outlined,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: distributorController,
+              label: 'Concern Distributor',
+              icon: Icons.business_outlined,
             ),
           ],
         ),
         const SizedBox(height: 24),
-        // Emirates ID
+        // Distribution Details Section
         _buildModernSection(
-          title: 'Emirates ID',
-          icon: Icons.badge_outlined,
+          title: 'Distribution Details',
+          icon: Icons.local_shipping_outlined,
           children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: _getStatusColor().withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: _getStatusColor(), width: 1),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        _getStatusIcon(),
-                        color: _getStatusColor(),
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Emirates ID Processing Status',
-                          style: TextStyle(
-                            fontWeight: FontWeight.w600,
-                            color: _getStatusColor(),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _getStatusMessage(),
-                    style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
-                  ),
-                  if (_isProcessingEmiratesId) ...[
-                    const SizedBox(height: 12),
-                    const LinearProgressIndicator(),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            FileUploadWidget(
-              label: 'Emirates ID - Front Side',
-              icon: Icons.credit_card_outlined,
-              onFileSelected: (value) {
-                setState(() => _emiratesIdFrontImage = value);
-                _checkAndProcessEmiratesId();
-              },
-              allowedExtensions: const ['jpg', 'jpeg', 'png'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _emiratesIdFrontImage,
-              formType: 'painter',
-            ),
-            const SizedBox(height: 20),
-            FileUploadWidget(
-              label: 'Emirates ID - Back Side',
-              icon: Icons.credit_card_outlined,
-              onFileSelected: (value) {
-                setState(() => _emiratesIdBackImage = value);
-                _checkAndProcessEmiratesId();
-              },
-              allowedExtensions: const ['jpg', 'jpeg', 'png'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _emiratesIdBackImage,
-              formType: 'painter',
-            ),
-            const SizedBox(height: 20),
             _buildModernTextField(
-              controller: _emiratesIdController,
-              label: 'Emirates ID Number',
-              icon: Icons.pin_outlined,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _idNameController,
-              label: 'Name of Holder',
+              controller: painterNameController,
+              label: 'Name of Painter / Contractor',
               icon: Icons.person_outline_rounded,
             ),
-            const SizedBox(height: 20),
-            _buildModernDateField(
-              controller: _dobController,
-              label: 'Date of Birth',
-              icon: Icons.cake_outlined,
-            ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
             _buildModernTextField(
-              controller: _nationalityController,
-              label: 'Nationality',
-              icon: Icons.flag_outlined,
+              controller: painterMobileController,
+              label: 'Mobile no Painter / Contractor',
+              icon: Icons.phone_outlined,
+              isPhone: true,
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
             _buildModernTextField(
-              controller: _companyDetailsController,
-              label: 'Company Details / Sponsor Name',
-              icon: Icons.business_outlined,
+              controller: materialQtyController,
+              label: 'Total Distribution Amount in Kg',
+              icon: Icons.scale_outlined,
+              keyboardType: TextInputType.numberWithOptions(decimal: true),
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+              ],
             ),
-            const SizedBox(height: 20),
+
+            const SizedBox(height: 16),
             _buildModernDateField(
-              controller: _issueDateController,
-              label: 'Issue Date',
-              icon: Icons.event_outlined,
-            ),
-            const SizedBox(height: 20),
-            _buildModernDateField(
-              controller: _expiryDateController,
-              label: 'Expiry Date',
+              controller: distributionDateController,
+              label: 'Date of distribution',
               icon: Icons.event_available_outlined,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _occupationController,
-              label: 'Occupation',
-              icon: Icons.work_outline,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Bank Details
-        _buildModernSection(
-          title: 'Bank Details',
-          icon: Icons.account_balance_outlined,
-          isOptional: true,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: _getBankDocumentStatusColor().withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: _getBankDocumentStatusColor(),
-                  width: 1,
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        _getBankDocumentStatusIcon(),
-                        color: _getBankDocumentStatusColor(),
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Bank Document OCR Status',
-                          style: TextStyle(
-                            fontWeight: FontWeight.w600,
-                            color: _getBankDocumentStatusColor(),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _getBankDocumentStatusMessage(),
-                    style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
-                  ),
-                  if (_isProcessingBankDocument) ...[
-                    const SizedBox(height: 12),
-                    const LinearProgressIndicator(),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            FileUploadWidget(
-              label: '',
-              icon: Icons.receipt_long_outlined,
-              onFileSelected: (value) {
-                setState(() => _bankDocumentImage = value);
-                _processBankDocument();
-              },
-              allowedExtensions: const ['jpg', 'jpeg', 'png', 'pdf'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _bankDocumentImage,
-              formType: 'painter',
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _accountHolderController,
-              label: 'Account Holder Name',
-              icon: Icons.person_outline_rounded,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _ibanController,
-              label: 'IBAN Number',
-              icon: Icons.account_balance_wallet_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _bankNameController,
-              label: 'Bank Name',
-              icon: Icons.business_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _branchNameController,
-              label: 'Branch Name',
-              icon: Icons.location_on_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 20),
-            _buildModernTextField(
-              controller: _bankAddressController,
-              label: 'Bank Address',
-              icon: Icons.location_city_outlined,
-              isRequired: false,
             ),
           ],
         ),
@@ -1126,11 +552,14 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
       leading: Navigator.of(context).canPop()
           ? Padding(
               padding: const EdgeInsets.all(8.0),
-              child: CustomBackButton(animated: false, size: 36),
+              child: IconButton(
+                icon: const Icon(Icons.arrow_back, color: Color(0xFF1E3A8A)),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
             )
           : null,
       title: Text(
-        'Painter Registration',
+        'Sample Distribution Entry',
         style: TextStyle(
           fontWeight: FontWeight.w600,
           fontSize: 20,
@@ -1172,16 +601,16 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Welcome!',
+            'Sample Distribution Entry',
             style: TextStyle(
               fontSize: 32,
               fontWeight: FontWeight.bold,
               color: Colors.white,
             ),
           ),
-          const SizedBox(height: 12),
+          SizedBox(height: 12),
           Text(
-            'Complete your painter registration',
+            'Enter sample distribution details',
             style: TextStyle(fontSize: 18, color: Colors.white70),
           ),
         ],
@@ -1276,6 +705,8 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
     required IconData icon,
     bool isPhone = false,
     bool isRequired = true,
+    TextInputType? keyboardType,
+    List<TextInputFormatter>? inputFormatters,
   }) {
     return TextFormField(
       controller: controller,
@@ -1301,41 +732,17 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
           vertical: 16,
         ),
       ),
-      keyboardType: isPhone ? TextInputType.phone : TextInputType.text,
-      inputFormatters: isPhone
-          ? [FilteringTextInputFormatter.digitsOnly]
-          : null,
+      keyboardType:
+          keyboardType ?? (isPhone ? TextInputType.phone : TextInputType.text),
+      inputFormatters: inputFormatters,
       validator: (value) {
         if (isRequired && (value == null || value.trim().isEmpty)) {
           return 'Please enter $label';
         }
         if (isPhone && value != null && value.isNotEmpty) {
-          return PainterService.validateMobileNumber(value);
-        }
-        if (label.toLowerCase().contains('emirates id')) {
-          return PainterService.validateEmiratesId(value);
-        }
-        if (label.toLowerCase().contains('iban')) {
-          return PainterService.validateIban(value);
-        }
-        if (label.toLowerCase().contains('nationality')) {
-          return PainterService.validateNationality(value);
-        }
-        if (label.toLowerCase().contains('occupation')) {
-          return PainterService.validateOccupation(value);
-        }
-        if (label.toLowerCase().contains('name') &&
-            (label.toLowerCase().contains('first') ||
-                label.toLowerCase().contains('last') ||
-                label.toLowerCase().contains('holder')) &&
-            !label.toLowerCase().contains('account holder')) {
-          return PainterService.validateName(value, label);
-        }
-        // Optional account holder name validation (only if not empty)
-        if (label.toLowerCase().contains('account holder') &&
-            value != null &&
-            value.trim().isNotEmpty) {
-          return PainterService.validateName(value, label);
+          if (!RegExp(r'^[50|52|54|55|56|58]\d{7}$').hasMatch(value)) {
+            return 'Please enter valid UAE mobile number';
+          }
         }
         return null;
       },
@@ -1395,7 +802,7 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
           },
         );
         if (date != null) {
-          controller.text = date.toString().split(' ').first;
+          controller.text = date.toString().split(' ')[0];
         }
       },
       validator: (value) {
@@ -1438,7 +845,7 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
                 ],
               )
             : const Text(
-                'Submit Registration',
+                'Submit Distribution',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.bold,
@@ -1466,7 +873,7 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
               ),
               const SizedBox(height: 16),
               Text(
-                'Registration Help',
+                'Distribution Help',
                 style: TextStyle(
                   fontSize: 20,
                   fontWeight: FontWeight.bold,
@@ -1475,7 +882,8 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
               ),
               const SizedBox(height: 16),
               Text(
-                'Fill in all required fields marked with *. Bank details are optional but recommended for payments.',
+                'Fill in all required fields marked with *. '
+                'Ensure all distribution details are accurate before submission.',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.grey.shade600),
               ),
@@ -1483,7 +891,7 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
-                  onPressed: () => context.pop(),
+                  onPressed: () => Navigator.pop(context),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1E3A8A),
                     foregroundColor: Colors.white,
@@ -1499,96 +907,5 @@ class _PainterRegistrationScreenState extends State<PainterRegistrationScreen>
         ),
       ),
     );
-  }
-
-  // --------------------- SUBMIT ---------------------
-  Future<void> _submitForm() async {
-    if (_formKey.currentState!.validate()) {
-      setState(() => _isSubmitting = true);
-      try {
-        final req = PainterRegistrationRequest(
-          // Personal
-          firstName: _firstNameController.text.trim(),
-          middleName: _middleNameController.text.trim(),
-          lastName: _lastNameController.text.trim(),
-          mobileNumber: PainterService.formatMobileNumber(
-            _mobileController.text,
-          ),
-          address: _addressController.text.trim(),
-          area: _selectedEmirate?.code ?? '', // Pass emirate code as area
-          emirates: _selectedEmirate?.desc ?? '', // Pass emirate description
-          // Emirates ID
-          emiratesIdNumber: _emiratesIdController.text.trim(),
-          idName: _idNameController.text.trim(),
-          dateOfBirth: _dobController.text.trim(),
-          nationality: _nationalityController.text.trim(),
-          companyDetails: _companyDetailsController.text.trim(),
-          issueDate: _issueDateController.text.trim(),
-          expiryDate: _expiryDateController.text.trim(),
-          occupation: _occupationController.text.trim(),
-          // Bank
-          accountHolderName: _accountHolderController.text.trim(),
-          ibanNumber: PainterService.formatIban(_ibanController.text.trim()),
-          bankName: _bankNameController.text.trim(),
-          branchName: _branchNameController.text.trim(),
-          bankAddress: _bankAddressController.text.trim(),
-        );
-        final resp = await PainterService.registerPainter(req);
-        if (!mounted) return;
-        setState(() => _isSubmitting = false);
-        if (resp.success) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.check_circle, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text('Saved! ID: ${resp.influencerCode ?? 'N/A'}'),
-                  ),
-                ],
-              ),
-              backgroundColor: Colors.green,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 4),
-            ),
-          );
-          // Navigate to success screen
-          context.push('/success');
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.error, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(resp.message)),
-                ],
-              ),
-              backgroundColor: Colors.red,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 5),
-            ),
-          );
-        }
-      } catch (e) {
-        if (!mounted) return;
-        setState(() => _isSubmitting = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.error, color: Colors.white, size: 20),
-                const SizedBox(width: 8),
-                Expanded(child: Text('Registration failed: $e')),
-              ],
-            ),
-            backgroundColor: Colors.red,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 5),
-          ),
-        );
-      }
-    }
   }
 }
