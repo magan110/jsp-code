@@ -1,741 +1,113 @@
-using Microsoft.AspNetCore.Mvc;
-using RAKControllers.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-
-namespace RAKControllers.Controllers
-{
-    [ApiController]
-    [Route("api/[controller]")]
-    public class SamplingExecutionEntryController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-
-        public SamplingExecutionEntryController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
-
-        /// <summary>
-        /// Search sampling drive entries by retailerCode, retailerName, or painterName (any one),
-        /// with optional start/end dates (yyyy-MM-dd).
-        ///
-        /// Example:
-        /// GET api/SamplingDriveQuery/search?retailerCode=R001
-        /// GET api/SamplingDriveQuery/search?retailerName=Retailer%20A&start=2025-01-01&end=2025-02-28
-        /// GET api/SamplingDriveQuery/search?painterName=John%20Doe
-        /// </summary>
-        [HttpGet("search")]
-        public ActionResult<IEnumerable<SamplingDriveEntryDto>> Search(
-            [FromQuery] string retailerCode = null,
-            [FromQuery] string retailerName = null,
-            [FromQuery] string painterNameFilter = null,
-            [FromQuery] string start = null,
-            [FromQuery] string end = null,
-            [FromQuery] int top = 200)
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(retailerCode) && string.IsNullOrWhiteSpace(retailerName) && string.IsNullOrWhiteSpace(painterNameFilter))
-                {
-                    return BadRequest("Provide either retailerCode, retailerName, or painterName.");
-                }
-
-                // Parse dates if provided (yyyy-MM-dd)
-                DateTime? startDate = TryParseDate(start);
-                DateTime? endDate = TryParseDate(end);
-
-                // Build WHERE parts
-                var whereParts = new List<string> { "1 = 1" };
-                var p = new Dictionary<string, object>();
-
-                if (!string.IsNullOrWhiteSpace(retailerCode))
-                {
-                    // Search retailerCode in both custName (header) and cusRtlCd (detail) fields
-                    whereParts.Add("(ISNULL(d.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
-                    p["@retailerCode"] = retailerCode.Trim();
-                }
-                if (!string.IsNullOrWhiteSpace(retailerName))
-                {
-                    whereParts.Add("ISNULL(a.custName,'') LIKE '%' + @retailerName + '%'");
-                    p["@retailerName"] = retailerName.Trim();
-                }
-                if (!string.IsNullOrWhiteSpace(painterNameFilter))
-                {
-                    whereParts.Add("ISNULL(a.contName,'') LIKE '%' + @painterName + '%'");
-                    p["@painterName"] = painterNameFilter.Trim();
-                }
-                if (startDate.HasValue)
-                {
-                    whereParts.Add("a.sampDate >= @start");
-                    p["@start"] = startDate.Value;
-                }
-                if (endDate.HasValue)
-                {
-                    // inclusive end-date (add one day then < next-day)
-                    whereParts.Add("a.sampDate < DATEADD(DAY,1,@end)");
-                    p["@end"] = endDate.Value;
-                }
-
-                // NOTE:
-                // catsamplead columns we saved earlier:
-                //   docuNumb, docuDate, areaCode, custName, contName, mobileNo,
-                //   concDist, sampDate, misdQnty, packSize, prodName
-                //
-                // Some fields your Flutter shows do not exist in DB. We’ll return defaults.
-                //
-                var sql = $@"
-SELECT TOP (@top)
-       a.docuNumb,
-       a.docuDate,
-       a.areaCode,
-       a.custName,             -- retailerName
-       ISNULL(d.cusRtlCd,'') AS retailerCode, -- retailer code from detail table
-       a.concDist,             -- distributor name
-       a.sampDate,             -- distribution date
-       a.contName,             -- painter name
-       a.mobileNo,             -- painter mobile
-       a.packSize,            
-       a.prodName,             -- product name
-       a.misdQnty,             -- missed quantity (string)
-       d.serialNo,             -- detail serial number
-       d.pouchCnt,             -- material quantity from detail table
-       d.sampCnCl              -- sample/cancel flag from detail table
-FROM dbo.catsamplead a WITH (NOLOCK)
-LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
-WHERE {string.Join(" AND ", whereParts)}
-ORDER BY a.docuDate DESC, d.serialNo;";
-
-                p["@top"] = top;
-
-                var rows = _db.WebSessBean(sql, p) as List<Dictionary<string, object>>;
-                var list = new List<SamplingDriveEntryDto>();
-
-                if (rows != null)
-                {
-                    foreach (var r in rows)
-                    {
-                        // doc number
-                        var docuNumb = r["docuNumb"]?.ToString();
-
-                        // names/codes
-                        var retailerNm = (r["custName"] ?? "").ToString();
-                        var retailerCd = (r.ContainsKey("retailerCode") && r["retailerCode"] != DBNull.Value ? r["retailerCode"] : "")?.ToString() ?? "";
-                        var distName = (r["concDist"] ?? "").ToString();
-                        var area = (r["areaCode"] ?? "").ToString();
-
-                        // dates
-                        var distDate = ToDate(r["sampDate"]) ?? DateTime.UtcNow;
-
-                        // painter
-                        var painterName = (r["contName"] ?? "").ToString();
-                        var painterMob = (r["mobileNo"] ?? "").ToString();
-
-                        // sku/pack
-                        var packSize = (r["packSize"] ?? "").ToString();
-                        var productName = (r["prodName"] ?? "").ToString();
-                        var skuLabel = PackSizeToLabel(packSize, productName); // e.g. "5 Kg"
-
-                        // quantities
-                        var missedQtyKg = ToDouble(r["misdQnty"]);       // what you saved as misdQnty
-                        var materialQty = r.ContainsKey("pouchCnt") && r["pouchCnt"] != DBNull.Value ? ToDouble(r["pouchCnt"]) : 0.0; // material quantity from detail table
-                        var qtyDistributedKg = materialQty;              // use pouchCnt as distributed quantity
-                        var effectiveDistributedKg = Math.Max(0.0, qtyDistributedKg - missedQtyKg);
-
-                        // totals — not in DB; return 0
-                        var totalReceivedKg = 0.0;
-                        var remainingKg = 0.0;
-
-                        // reimbursement — not in DB; return defaults
-                        var reimbMode = "";
-                        var reimbAmt = 0.0;
-
-                        // additional fields from detail table (handle nulls from LEFT JOIN)
-                        var serialNo = r.ContainsKey("serialNo") && r["serialNo"] != DBNull.Value ? (r["serialNo"]?.ToString() ?? "") : "";
-                        var sampleCancelFlag = r.ContainsKey("sampCnCl") && r["sampCnCl"] != DBNull.Value ? (r["sampCnCl"]?.ToString() ?? "") : "";
-
-                        list.Add(new SamplingDriveEntryDto
-                        {
-                            docuNumb = docuNumb,
-                            retailerName = retailerNm,
-                            retailerCode = retailerCd,
-                            distributorName = distName,
-                            area = area,
-                            distributionDate = distDate,
-                            painterName = painterName,
-                            painterMobile = painterMob,
-                            skuSizeLabel = skuLabel,
-                            qtyDistributedKg = qtyDistributedKg,
-                            missedQtyKg = missedQtyKg,
-                            effectiveDistributedKg = effectiveDistributedKg,
-                            totalReceivedKg = totalReceivedKg,
-                            remainingKg = remainingKg,
-                            reimbursementMode = reimbMode,
-                            reimbursementAmountAED = reimbAmt,
-                            photoImage = null,          // not stored; wire up later if you link image table
-                            serialNo = serialNo,
-                            materialQty = materialQty,
-                            sampleCancelFlag = sampleCancelFlag
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        /// <summary>
-        /// Get top 100 sampling drive entries without any search criteria
-        /// </summary>
-        [HttpGet("top100")]
-        public ActionResult<IEnumerable<SamplingDriveEntryDto>> GetTop100()
-        {
-            try
-            {
-                var sql = @"
-SELECT TOP 100
-       a.docuNumb,
-       a.docuDate,
-       a.areaCode,
-       a.custName,             -- retailerName
-       ISNULL(d.cusRtlCd,'') AS retailerCode, -- retailer code from detail table
-       a.concDist,             -- distributor name
-       a.sampDate,             -- distribution date
-       a.contName,             -- painter name
-       a.mobileNo,             -- painter mobile
-       a.packSize,
-       a.prodName,             -- product name
-       a.misdQnty,             -- missed quantity (string)
-       d.serialNo,             -- detail serial number
-       d.pouchCnt,             -- material quantity from detail table
-       d.sampCnCl              -- sample/cancel flag from detail table
-FROM dbo.catsamplead a WITH (NOLOCK)
-LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
-ORDER BY a.docuDate DESC, d.serialNo;";
-
-                var rows = _db.WebSessBean(sql, new Dictionary<string, object>()) as List<Dictionary<string, object>>;
-                var list = new List<SamplingDriveEntryDto>();
-
-                if (rows != null)
-                {
-                    foreach (var r in rows)
-                    {
-                        // doc number
-                        var docuNumb = r["docuNumb"]?.ToString();
-
-                        // names/codes
-                        var retailerNm = (r["custName"] ?? "").ToString();
-                        var retailerCd = (r.ContainsKey("retailerCode") && r["retailerCode"] != DBNull.Value ? r["retailerCode"] : "")?.ToString() ?? "";
-                        var distName = (r["concDist"] ?? "").ToString();
-                        var area = (r["areaCode"] ?? "").ToString();
-
-                        // dates
-                        var distDate = ToDate(r["sampDate"]) ?? DateTime.UtcNow;
-
-                        // painter
-                        var painterName = (r["contName"] ?? "").ToString();
-                        var painterMob = (r["mobileNo"] ?? "").ToString();
-
-                        // sku/pack
-                        var packSize = (r["packSize"] ?? "").ToString();
-                        var productName = (r["prodName"] ?? "").ToString();
-                        var skuLabel = PackSizeToLabel(packSize, productName); // e.g. "5 Kg"
-
-                        // quantities
-                        var missedQtyKg = ToDouble(r["misdQnty"]);       // what you saved as misdQnty
-                        var materialQty = r.ContainsKey("pouchCnt") && r["pouchCnt"] != DBNull.Value ? ToDouble(r["pouchCnt"]) : 0.0; // material quantity from detail table
-                        var qtyDistributedKg = materialQty;              // use pouchCnt as distributed quantity
-                        var effectiveDistributedKg = Math.Max(0.0, qtyDistributedKg - missedQtyKg);
-
-                        // totals — not in DB; return 0
-                        var totalReceivedKg = 0.0;
-                        var remainingKg = 0.0;
-
-                        // reimbursement — not in DB; return defaults
-                        var reimbMode = "";
-                        var reimbAmt = 0.0;
-
-                        // additional fields from detail table (handle nulls from LEFT JOIN)
-                        var serialNo = r.ContainsKey("serialNo") && r["serialNo"] != DBNull.Value ? (r["serialNo"]?.ToString() ?? "") : "";
-                        var sampleCancelFlag = r.ContainsKey("sampCnCl") && r["sampCnCl"] != DBNull.Value ? (r["sampCnCl"]?.ToString() ?? "") : "";
-
-                        list.Add(new SamplingDriveEntryDto
-                        {
-                            docuNumb = docuNumb,
-                            retailerName = retailerNm,
-                            retailerCode = retailerCd,
-                            distributorName = distName,
-                            area = area,
-                            distributionDate = distDate,
-                            painterName = painterName,
-                            painterMobile = painterMob,
-                            skuSizeLabel = skuLabel,
-                            qtyDistributedKg = qtyDistributedKg,
-                            missedQtyKg = missedQtyKg,
-                            effectiveDistributedKg = effectiveDistributedKg,
-                            totalReceivedKg = totalReceivedKg,
-                            remainingKg = remainingKg,
-                            reimbursementMode = reimbMode,
-                            reimbursementAmountAED = reimbAmt,
-                            photoImage = null,          // not stored; wire up later if you link image table
-                            serialNo = serialNo,
-                            materialQty = materialQty,
-                            sampleCancelFlag = sampleCancelFlag
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        // -----------------------
-        // Helpers
-        // -----------------------
-        private static DateTime? TryParseDate(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            if (DateTime.TryParseExact(s.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture,
-                                       DateTimeStyles.None, out var dt))
-                return dt;
-            if (DateTime.TryParse(s, out var any)) return any;
-            return null;
-        }
-
-        private static DateTime? ToDate(object o)
-        {
-            if (o == null) return null;
-            if (o is DateTime dt) return dt;
-            var s = o.ToString();
-            return DateTime.TryParse(s, out var parsed) ? parsed : (DateTime?)null;
-        }
-
-        private static double ToDouble(object o)
-        {
-            if (o == null) return 0.0;
-            if (o is double d) return d;
-            if (o is decimal m) return (double)m;
-            if (o is float f) return f;
-            var s = o.ToString();
-            return double.TryParse(s, out var val) ? val : 0.0;
-        }
-
-        private static string PackSizeToLabel(string packSize, string productName)
-        {
-            // Your save uses "01K", "05K" etc. Convert to "1 Kg", "5 Kg".
-            if (string.IsNullOrWhiteSpace(packSize)) return productName ?? "";
-            var s = packSize.Trim().ToUpperInvariant();
-            if (s.EndsWith("K")) s = s.Substring(0, s.Length - 1);
-            if (s.StartsWith("0")) s = s.TrimStart('0');
-            if (string.IsNullOrWhiteSpace(s)) return productName ?? "";
-            return $"{s} Kg";
-        }
-    }
-
-    /// <summary>
-    /// DTO aligned with your Flutter SamplingDriveEntry
-    /// </summary>
-    public class SamplingDriveEntryDto
-    {
-        public string docuNumb { get; set; }
-        public string retailerName { get; set; }
-        public string retailerCode { get; set; }
-        public string distributorName { get; set; }
-        public string area { get; set; }
-        public DateTime distributionDate { get; set; }
-        public string painterName { get; set; }
-        public string painterMobile { get; set; }
-        public string skuSizeLabel { get; set; }
-        public double qtyDistributedKg { get; set; }
-        public double missedQtyKg { get; set; }
-        public double effectiveDistributedKg { get; set; }
-        public double totalReceivedKg { get; set; }
-        public double remainingKg { get; set; }
-        public string reimbursementMode { get; set; }
-        public double reimbursementAmountAED { get; set; }
-        public string photoImage { get; set; }
-        public string serialNo { get; set; }
-        public double materialQty { get; set; }
-        public string sampleCancelFlag { get; set; }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import 'dart:convert';
-import '../models/sampling_drive_models.dart';
-import '../utils/app_logger.dart';
-import 'api_service.dart';
-
-class SamplingExecutionService {
-  static final AppLogger _logger = AppLogger();
-
-  static Future<Map<String, dynamic>> searchSamplingDriveEntries({
-    String? retailerCode,
-    String? retailerName,
-    String? painterName,
-    String? start,
-    String? end,
-    int top = 200,
-  }) async {
-    try {
-      _logger.info('Searching sampling drive entries');
-
-      // Build query parameters
-      final queryParams = <String, String>{};
-
-      if (retailerCode != null && retailerCode.isNotEmpty) {
-        queryParams['retailerCode'] = retailerCode;
-      }
-
-      if (retailerName != null && retailerName.isNotEmpty) {
-        queryParams['retailerName'] = retailerName;
-      }
-
-      if (painterName != null && painterName.isNotEmpty) {
-        queryParams['painterNameFilter'] = painterName;
-      }
-
-      if (start != null && start.isNotEmpty) {
-        queryParams['start'] = start;
-      }
-
-      if (end != null && end.isNotEmpty) {
-        queryParams['end'] = end;
-      }
-
-      queryParams['top'] = top.toString();
-
-      // Build endpoint with query parameters
-      final queryString = queryParams.entries
-          .map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}')
-          .join('&');
-
-      final endpoint = '/api/SamplingExecutionEntry/search?$queryString';
-
-      _logger.info('Making request to: $endpoint');
-      _logger.info('Query params: $queryParams');
-
-      final result = await ApiService.makeRequest(
-        method: 'GET',
-        endpoint: endpoint,
-      );
-
-      _logger.info('API Response: $result');
-
-      if (result['success'] == true) {
-        final data = result['data'];
-        _logger.info('Raw API data type: ${data.runtimeType}');
-        _logger.info('Raw API data: $data');
-
-        // Handle different response structures
-        List<dynamic> itemList = [];
-
-        if (data is List) {
-          itemList = data;
-        } else if (data is Map && data.containsKey('raw')) {
-          // Handle case where response is wrapped
-          final rawData = data['raw'];
-          if (rawData is List) {
-            itemList = rawData;
-          } else if (rawData is String) {
-            try {
-              final parsed = jsonDecode(rawData);
-              if (parsed is List) {
-                itemList = parsed;
-              }
-            } catch (e) {
-              _logger.error('Failed to parse raw string data', e);
-            }
-          }
-        }
-
-        final entries = <SamplingDriveEntry>[];
-
-        for (var item in itemList) {
-          try {
-            final entry = SamplingDriveEntry.fromJson(item as Map<String, dynamic>);
-            entries.add(entry);
-            _logger.info('Successfully parsed entry: ${entry.docuNumb} - ${entry.retailerName}');
-          } catch (e) {
-            _logger.error('Failed to parse entry: $item', e);
-          }
-        }
-
-        return {
-          'success': true,
-          'data': entries,
-        };
-      } else {
-        return {
-          'success': false,
-          'error': result['error'] ?? 'Failed to search sampling drive entries',
-        };
-      }
-    } catch (e) {
-      _logger.error('Failed to search sampling drive entries', e);
-      return {
-        'success': false,
-        'error': 'Failed to search sampling drive entries: $e',
-      };
-    }
-  }
-
-  static Future<Map<String, dynamic>> searchByRetailerCode(String retailerCode, {
-    String? start,
-    String? end,
-    int top = 200,
-  }) async {
-    return searchSamplingDriveEntries(
-      retailerCode: retailerCode,
-      start: start,
-      end: end,
-      top: top,
-    );
-  }
-
-  static Future<Map<String, dynamic>> searchByRetailerName(String retailerName, {
-    String? start,
-    String? end,
-    int top = 200,
-  }) async {
-    return searchSamplingDriveEntries(
-      retailerName: retailerName,
-      start: start,
-      end: end,
-      top: top,
-    );
-  }
-
-  static Future<Map<String, dynamic>> searchByDateRange({
-    required String start,
-    required String end,
-    String? retailerCode,
-    String? retailerName,
-    int top = 200,
-  }) async {
-    return searchSamplingDriveEntries(
-      retailerCode: retailerCode,
-      retailerName: retailerName,
-      start: start,
-      end: end,
-      top: top,
-    );
-  }
-
-  static Future<Map<String, dynamic>> getTop100SamplingDriveEntries() async {
-    try {
-      _logger.info('Fetching top 100 sampling drive entries');
-
-      final endpoint = '/api/SamplingExecutionEntry/top100';
-
-      _logger.info('Making request to: $endpoint');
-
-      final result = await ApiService.makeRequest(
-        method: 'GET',
-        endpoint: endpoint,
-      );
-
-      _logger.info('API Response: $result');
-
-      if (result['success'] == true) {
-        final data = result['data'];
-        _logger.info('Raw API data type: ${data.runtimeType}');
-        _logger.info('Raw API data: $data');
-
-        // Handle different response structures
-        List<dynamic> itemList = [];
-
-        if (data is List) {
-          itemList = data;
-        } else if (data is Map && data.containsKey('raw')) {
-          // Handle case where response is wrapped
-          final rawData = data['raw'];
-          if (rawData is List) {
-            itemList = rawData;
-          } else if (rawData is String) {
-            try {
-              final parsed = jsonDecode(rawData);
-              if (parsed is List) {
-                itemList = parsed;
-              }
-            } catch (e) {
-              _logger.error('Failed to parse raw string data', e);
-            }
-          }
-        }
-
-        final entries = <SamplingDriveEntry>[];
-
-        for (var item in itemList) {
-          try {
-            final entry = SamplingDriveEntry.fromJson(item as Map<String, dynamic>);
-            entries.add(entry);
-            _logger.info('Successfully parsed entry: ${entry.docuNumb} - ${entry.retailerName}');
-          } catch (e) {
-            _logger.error('Failed to parse entry: $item', e);
-          }
-        }
-
-        return {
-          'success': true,
-          'data': entries,
-        };
-      } else {
-        return {
-          'success': false,
-          'error': result['error'] ?? 'Failed to fetch top 100 sampling drive entries',
-        };
-      }
-    } catch (e) {
-      _logger.error('Failed to fetch top 100 sampling drive entries', e);
-      return {
-        'success': false,
-        'error': 'Failed to fetch top 100 sampling drive entries: $e',
-      };
-    }
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import '../../../core/models/sampling_drive_models.dart';
-import '../../../core/services/sampling_execution_service.dart';
-import '../../../core/services/contractor_service.dart';
-import '../../../core/models/contractor_models.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:rak_web/features/auth/screens/login_screen_with_otp.dart';
-import '../../../core/widgets/file_upload_widget.dart';
+import 'package:web/web.dart' as web;
+import 'dart:js_interop';
 import '../../../core/widgets/modern_dropdown.dart';
 
-class SamplingDriveFormPage extends StatefulWidget {
-  @override
-  _SamplingDriveFormPageState createState() => _SamplingDriveFormPageState();
+@JS()
+@staticInterop
+class WindowWithGeoLocation {}
+
+extension WindowGeoLocationExtension on WindowWithGeoLocation {
+  external JSPromise<JSAny?> requestGeoPosition();
 }
 
-class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
+class ActivityEntryScreen extends StatefulWidget {
+  const ActivityEntryScreen({super.key});
+
+  @override
+  _ActivityEntryScreenState createState() => _ActivityEntryScreenState();
+}
+
+class _ActivityEntryScreenState extends State<ActivityEntryScreen>
     with TickerProviderStateMixin {
-  final _formKey = GlobalKey<FormState>();
-  String? _photoImage;
-
-  // Controllers for all fields
-  final retailerController = TextEditingController();
-  final retailerCodeController = TextEditingController();
-  final distributorController = TextEditingController();
+  // Controllers
+  final processTypeController = TextEditingController();
+  final activityController = TextEditingController();
+  final descriptionController = TextEditingController();
+  final objectiveController = TextEditingController();
+  final activityDateController = TextEditingController();
+  final meetingVenueController = TextEditingController();
   final areaController = TextEditingController();
-  final dateController = TextEditingController();
-  final painterController = TextEditingController();
-  final phoneController = TextEditingController();
-  final skuController = TextEditingController();
-  final missedQtyController = TextEditingController();
-  final siteAdController = TextEditingController();
-  final qtyController = TextEditingController();
-  final remarksController = TextEditingController();
-  final reimbursementModeController = TextEditingController();
-  final reimbursementAmtController = TextEditingController();
-  final searchRetailerCodeController = TextEditingController();
-  final startDateController = TextEditingController();
-  final endDateController = TextEditingController();
-  final emiratesController = TextEditingController();
-  final samplDateController = TextEditingController();
-  final prodController = TextEditingController();
+  final cityNameController = TextEditingController();
+  final districtController = TextEditingController();
+  final pinCodeController = TextEditingController();
 
-  List<SamplingDriveEntry> allRetailerEntries = [];
-  List<SamplingDriveEntry> filteredRetailerEntries = [];
-  bool _isSubmitting = false;
-  bool _isSearching = false;
-  bool _isLoadingInitialData = false;
-  String? _searchError;
+  final employeesCountController = TextEditingController();
+  final channelPartnerCountController = TextEditingController();
+  final influencersCountController = TextEditingController();
+  final totalParticipantsController = TextEditingController();
+ 
+ final prodController = TextEditingController();
+ 
+  final latitudeController = TextEditingController();
+  final longitudeController = TextEditingController();
+  
 
-  // Emirates dropdown data
-  List<EmirateItem> _emirates = [];
-  List<String> _emirateDescriptions = [];
-  EmirateItem? _selectedEmirate;
-  bool _isLoadingEmirates = true;
-
+  // Animation controllers
   late AnimationController _mainController;
   late AnimationController _fabController;
   late Animation<double> _fadeAnimation;
   late Animation<Offset> _slideAnimation;
   late Animation<double> _scaleAnimation;
 
-  final ScrollController _scrollController = ScrollController();
+  final List<ChannelPartnerRow> channelPartners = [];
+  List<PainterContractor> painterContractors = [];
+  List<ChannelPartner> channelPartnersData = [];
 
-  final ScrollController _horizontalScrollController = ScrollController();
+  void updatePartnerCount() {
+    channelPartnerCountController.text = channelPartners.length.toString();
+  }
+
+List<Map<String, dynamic>> painterList = [];
+
+// When adding
+void addPainterRow() {
+  setState(() {
+    painterList.add({
+      'typeController': TextEditingController(),
+      'mobileController': TextEditingController(),
+      'nameController': TextEditingController(),
+      'giftStatus': null,
+      'selectedType': null,
+    });
+  });
+}
+
+
+void deletePainterAt(int index) {
+  setState(() {
+    painterList.removeAt(index);
+  });
+}
+
+void addChannelPartner() {
+setState(() {
+      channelPartners.add(ChannelPartnerRow());
+      updatePartnerCount();
+ });
+  }
+
+  void deleteChannelPartner(int index) {
+    setState(() {
+    channelPartners.removeAt(index);
+      updatePartnerCount();
+     });
+  }
+
+  bool _isSubmitting = false;
+  bool _isGettingLocation = false;
+  String? _uploadedFileName;
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+
+  // Lists for tables
+  List<Map<String, String>> employeesList = [];
+  List<Map<String, String>> imagesList = [];
+
   @override
   void initState() {
     super.initState();
+    // Initialize animations
     _mainController = AnimationController(
       duration: const Duration(milliseconds: 1000),
       vsync: this,
@@ -763,537 +135,350 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
         curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
       ),
     );
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _mainController.forward();
-      _fabController.forward();
-    });
+    _mainController.forward();
+    _fabController.forward();
 
-    // Load initial data and emirates
-    _loadEmirates();
-    _loadInitialData();
-  }
-
-  Future<void> _loadEmirates() async {
-    setState(() {
-      _isLoadingEmirates = true;
-    });
-    try {
-      final emirates = await ContractorService.getEmiratesList();
-      setState(() {
-        _emirates = emirates;
-        _emirateDescriptions = emirates.map((e) => e.desc).toList();
-        _isLoadingEmirates = false;
-      });
-    } catch (e) {
-      setState(() {
-        _emirates = [
-          EmirateItem(code: 'DUB', desc: 'Dubai'),
-          EmirateItem(code: 'ABD', desc: 'Abu Dhabi'),
-          EmirateItem(code: 'SHJ', desc: 'Sharjah'),
-          EmirateItem(code: 'AJM', desc: 'Ajman'),
-          EmirateItem(code: 'UAQ', desc: 'Umm Al Quwain'),
-          EmirateItem(code: 'RAK', desc: 'Ras Al Khaimah'),
-          EmirateItem(code: 'FUJ', desc: 'Fujairah'),
-        ];
-        _emirateDescriptions = _emirates.map((e) => e.desc).toList();
-        _isLoadingEmirates = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error loading emirates: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
-
-  Future<void> _loadInitialData() async {
-    setState(() {
-      _isLoadingInitialData = true;
-      _searchError = null;
-    });
-
-    try {
-      // Load top 100 entries using the dedicated endpoint
-      final result = await SamplingExecutionService.getTop100SamplingDriveEntries();
-
-      if (result['success'] == true) {
-        final entries = result['data'] as List<SamplingDriveEntry>;
-        setState(() {
-          allRetailerEntries = entries;
-          filteredRetailerEntries = entries;
-          _isLoadingInitialData = false;
-        });
-      } else {
-        setState(() {
-          _searchError = result['error'] ?? 'Failed to load initial data';
-          _isLoadingInitialData = false;
-        });
-      }
-    } catch (e) {
-      setState(() {
-        _searchError = 'Failed to load initial data: $e';
-        _isLoadingInitialData = false;
-      });
-    }
+    // Auto-fill location on load
+    _initLocation();
   }
 
   @override
   void dispose() {
     _mainController.dispose();
     _fabController.dispose();
-    retailerController.dispose();
-    retailerCodeController.dispose();
-    distributorController.dispose();
+    processTypeController.dispose();
+    activityController.dispose();
+    descriptionController.dispose();
+    objectiveController.dispose();
+    activityDateController.dispose();
+    meetingVenueController.dispose();
     areaController.dispose();
-    dateController.dispose();
-    painterController.dispose();
-    phoneController.dispose();
-    skuController.dispose();
-    qtyController.dispose();
-    missedQtyController.dispose();
-    reimbursementModeController.dispose();
-    reimbursementAmtController.dispose();
-    _scrollController.dispose();
-    _horizontalScrollController.dispose();
+    cityNameController.dispose();
+    districtController.dispose();
+    pinCodeController.dispose();
+
+    employeesCountController.dispose();
+    channelPartnerCountController.dispose();
+    influencersCountController.dispose();
+    totalParticipantsController.dispose();
+
+    prodController.dispose();
+
+    latitudeController.dispose();
+    longitudeController.dispose();
     super.dispose();
   }
 
-  String reimbursementModeToText(String mode) {
-    return mode;
-  }
-
-  void populateControllers(SamplingDriveEntry entry) {
-    retailerController.text = entry.retailerName;
-    retailerCodeController.text = entry.retailerCode;
-    distributorController.text = entry.distributorName;
-    areaController.text = entry.area;
-    dateController.text =
-        "${entry.distributionDate.year}-${entry.distributionDate.month.toString().padLeft(2, '0')}-${entry.distributionDate.day.toString().padLeft(2, '0')}";
-    painterController.text = entry.painterName;
-    phoneController.text = entry.painterMobile;
-    skuController.text = entry.skuSizeLabel;
-    qtyController.text = entry.qtyDistributedKg.toStringAsFixed(1);
-    missedQtyController.text = entry.missedQtyKg.toStringAsFixed(1);
-    reimbursementModeController.text = reimbursementModeToText(
-      entry.reimbursementMode,
-    );
-    reimbursementAmtController.text = entry.reimbursementAmountAED
-        .toStringAsFixed(1);
-  }
-
-  Widget _buildSearchSection() {
-    return _buildModernSection(
-      title: 'Search Sampling Entries',
-      icon: Icons.search,
-      children: [
-        _buildModernTextField(
-          controller: searchRetailerCodeController,
-          label: 'Retailer Code / Retailer Name / Painter Name',
-          icon: Icons.search,
-          isRequired: false,
-        ),
-        const SizedBox(height: 16),
-        _buildModernDateField(
-          controller: startDateController,
-          label: 'Start Date',
-          icon: Icons.calendar_today,
-          isRequired: false,
-        ),
-        const SizedBox(height: 16),
-        _buildModernDateField(
-          controller: endDateController,
-          label: 'End Date',
-          icon: Icons.calendar_today,
-          isRequired: false,
-        ),
-        const SizedBox(height: 8),
-
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            TextButton.icon(
-              onPressed: () {
-                searchRetailerCodeController.clear();
-                startDateController.clear();
-                endDateController.clear();
-                setState(() {
-                  filteredRetailerEntries = allRetailerEntries;
-                });
-              },
-              icon: const Icon(Icons.clear_all),
-              label: const Text('Clear All'),
-            ),
-            TextButton.icon(
-              onPressed: () {
-                startDateController.clear();
-                endDateController.clear();
-              },
-              icon: const Icon(Icons.clear),
-              label: const Text('Clear Dates'),
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-        SizedBox(
-          width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: _isSearching ? null : _performSearch,
-            icon: _isSearching
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : const Icon(Icons.search),
-            label: Text(_isSearching ? 'Searching...' : 'Search'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1E3A8A),
-              foregroundColor: Colors.white,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  void _performSearch() async {
-    final searchText = searchRetailerCodeController.text.trim();
-    final startDate = startDateController.text.trim();
-    final endDate = endDateController.text.trim();
-
-    // If no search criteria provided, show all loaded entries
-    if (searchText.isEmpty && startDate.isEmpty && endDate.isEmpty) {
+  void _submitForm() async {
+    if (_formKey.currentState!.validate()) {
       setState(() {
-        filteredRetailerEntries = allRetailerEntries;
+        _isSubmitting = true;
       });
-      return;
-    }
+      try {
+        // Here you would create and submit the activity entry
+        // For now, we'll just show a success message
 
-    setState(() {
-      _isSearching = true;
-      _searchError = null;
-    });
-
-    try {
-      // Filter from loaded entries instead of making API calls
-      List<SamplingDriveEntry> filtered = allRetailerEntries.where((entry) {
-        bool matchesText = true;
-        bool matchesDate = true;
-
-        // Check text search (retailer code, retailer name, or painter name)
-        if (searchText.isNotEmpty) {
-          final searchLower = searchText.toLowerCase();
-          matchesText = entry.retailerCode.toLowerCase().contains(searchLower) ||
-                       entry.retailerName.toLowerCase().contains(searchLower) ||
-                       entry.painterName.toLowerCase().contains(searchLower);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.check_circle, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Activity entry submitted successfully'),
+                  ),
+                ],
+              ),
+              backgroundColor: Colors.green,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 5),
+            ),
+          );
         }
-
-        // Check date range
-        if (startDate.isNotEmpty || endDate.isNotEmpty) {
-          final entryDate = entry.distributionDate;
-
-          if (startDate.isNotEmpty) {
-            final start = DateTime.tryParse(startDate);
-            if (start != null && entryDate.isBefore(start)) {
-              matchesDate = false;
-            }
-          }
-
-          if (endDate.isNotEmpty) {
-            final end = DateTime.tryParse(endDate);
-            if (end != null && entryDate.isAfter(end.add(const Duration(days: 1)))) {
-              matchesDate = false;
-            }
-          }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  Icon(Icons.warning, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(child: Text('Unexpected error: ${e.toString()}')),
+                ],
+              ),
+              backgroundColor: Colors.orange,
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 4),
+            ),
+          );
         }
-
-        return matchesText && matchesDate;
-      }).toList();
-
-      setState(() {
-        filteredRetailerEntries = filtered;
-        _isSearching = false;
-      });
-
-      if (filtered.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No entries found for the given criteria'),
-            backgroundColor: Colors.orange,
-          ),
-        );
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSubmitting = false;
+          });
+        }
       }
-    } catch (e) {
-      setState(() {
-        _searchError = 'Filter error: $e';
-        _isSearching = false;
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Filter error: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
     }
   }
 
-  Widget buildSupplyChainTableExtended(
-    List<SamplingDriveEntry> retailerData,
-    ScrollController scrollController,
-  ) {
-    Widget numCell(double v) => Align(
-      alignment: Alignment.centerRight,
-      child: Text(v.toStringAsFixed(1)),
-    );
-
-    String dateText(DateTime d) =>
-        "${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}";
-
-    return Scrollbar(
-      controller: scrollController,
-      thumbVisibility: true,
-      child: SingleChildScrollView(
-        controller: scrollController,
-        scrollDirection: Axis.horizontal,
-        child: DataTable(
-          showCheckboxColumn: false,
-          columns: const [
-            DataColumn(label: Text("DocuNumb")),
-            DataColumn(label: Text("Retailer")),
-            DataColumn(label: Text("Code")),
-            DataColumn(label: Text("Distributor")),
-            DataColumn(label: Text("Area")),
-            DataColumn(label: Text("Date")),
-            DataColumn(label: Text("Painter")),
-            DataColumn(label: Text("Mobile")),
-            DataColumn(label: Text("Distributed (Kg)")),
+  void _saveAsDraft() {
+    // Save form data to SharedPreferences
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(Icons.save, color: Colors.white, size: 20),
+            SizedBox(width: 8),
+            Expanded(child: Text('Draft saved successfully')),
           ],
-          rows: retailerData.map((entry) {
-            return DataRow(
-              cells: [
-                DataCell(Text(entry.docuNumb ?? '')),
-                DataCell(Text(entry.retailerName)),
-                DataCell(Text(entry.retailerCode)),
-                DataCell(Text(entry.distributorName)),
-                DataCell(Text(entry.area)),
-                DataCell(Text(dateText(entry.distributionDate))),
-                DataCell(Text(entry.painterName)),
-                DataCell(Text(entry.painterMobile)),
-                DataCell(numCell(entry.qtyDistributedKg)),
-              ],
-              onSelectChanged: (_) {
-                populateControllers(entry);
-              },
-            );
-          }).toList(),
         ),
+        backgroundColor: Colors.blue,
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 4),
       ),
     );
   }
 
+  // --- GEOLOCATION (using web JavaScript helper from index.html) ---
+  Future<void> _initLocation() async {
+    setState(() => _isGettingLocation = true);
+    try {
+      await _getWebLocation();
+    } catch (e) {
+      _toast('Could not fetch location: $e');
+    } finally {
+      if (mounted) setState(() => _isGettingLocation = false);
+    }
+  }
+
+  Future<void> _getWebLocation() async {
+    try {
+      // First try to get from localStorage (cached values from index.html)
+      final lastLat = web.window.localStorage.getItem('lastLat');
+      final lastLng = web.window.localStorage.getItem('lastLng');
+      if (lastLat != null && lastLng != null && mounted) {
+        latitudeController.text = double.parse(lastLat).toStringAsFixed(6);
+        longitudeController.text = double.parse(lastLng).toStringAsFixed(6);
+      }
+
+      // Use the JavaScript geolocation helper from index.html
+      final jsWindow = web.window as WindowWithGeoLocation;
+      final result = await jsWindow.requestGeoPosition().toDart;
+      if (result != null) {
+        // Convert JSAny to proper Dart object
+        final resultDart = result.dartify();
+        if (resultDart is Map<String, dynamic>) {
+          if (resultDart['ok'] == true) {
+            if (mounted) {
+              final lat = resultDart['lat'] as num?;
+              final lng = resultDart['lng'] as num?;
+              if (lat != null && lng != null) {
+                latitudeController.text = lat.toStringAsFixed(6);
+                longitudeController.text = lng.toStringAsFixed(6);
+              }
+            }
+          } else {
+            final error = resultDart['error']?.toString() ?? 'Unknown error';
+            _toast('Web geolocation failed: $error');
+          }
+        }
+      }
+    } catch (e) {
+      _toast('Web geolocation error: $e');
+    }
+  }
+
+  void _captureLocation() {
+    // Location capture logic - now calls the web location
+    _initLocation();
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  void _addEmployee() {
+    // Add a new empty employee to the list
+    setState(() {
+      employeesList.add({'employeeCode': '', 'name': ''});
+    });
+  }
+
+  void _deleteEmployee(int index) {
+    // Remove an employee from the list
+    setState(() {
+      employeesList.removeAt(index);
+    });
+  }
+
+  void _addImage() {
+    // Add a new empty image to the list
+    setState(() {
+      imagesList.add({'type': 'Select', 'path': ''});
+    });
+  }
+
+  void _deleteImage(int index) {
+    // Remove an image from the list
+    setState(() {
+      imagesList.removeAt(index);
+    });
+  }
+
+ Widget buildChannelPartnerSection() {
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      buildModernTextField(
+        controller: channelPartnerCountController,
+        label: 'No. of Channel Partners',
+        icon: Icons.people_outline,
+        isRequired: false,
+        isNumeric: true,
+      ),
+      const SizedBox(height: 16),
+      const Text(
+        "List of Channel Partners",
+        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+      ),
+      const SizedBox(height: 16),
+      ...List.generate(channelPartners.length, (index) {
+        final row = channelPartners[index];
+        return Card(
+          margin: const EdgeInsets.symmetric(vertical: 8),
+          elevation: 2,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Wrap(
+              spacing: 16,
+              runSpacing: 16,
+              children: [
+               ModernDropdown(
+                    label: 'Type ',
+                    icon: Icons.event_outlined,
+                    items: const [ 'Authorsied dealer', 'Direct Dealer', 'Principal Rural Distributors','Retailer', 'Stockist', 'Ultra tech Retailer'],
+                    value: row.selectedType,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        row.selectedType = newValue ?? '';
+                        row.typeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                buildModernTextField(
+                  controller: row.purchaserCodeController,
+                  label: "Purchaser Code",
+                  icon: Icons.code,
+                ),
+                buildModernTextField(
+                  controller: row.mobileController,
+                  label: "Mobile No",
+                  icon: Icons.phone,
+                  isPhone: true,
+                ),
+                buildModernTextField(
+                  controller: row.nameController,
+                  label: "Name",
+                  icon: Icons.person,
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => deleteChannelPartner(index),
+                  icon: const Icon(Icons.delete, color: Colors.red),
+                  label: const Text("Del", style: TextStyle(color: Colors.red)),
+                ),
+              ],
+            ),
+          ),
+        );
+      }),
+      const SizedBox(height: 12),
+      Align(
+        alignment: Alignment.centerRight,
+        child: ElevatedButton.icon(
+          onPressed: addChannelPartner,
+          icon: const Icon(Icons.add),
+          label: const Text("Add Channel Partner"),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFF1E3A8A),
+          ),
+        ),
+      ),
+    ],
+  );
+}
+
+
   @override
   Widget build(BuildContext context) {
-    final isDesktop = MediaQuery.of(context).size.width >= 1200;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isDesktop = constraints.maxWidth > 1200;
+        final isTablet =
+            constraints.maxWidth > 800 && constraints.maxWidth <= 1200;
+        final isMobile = constraints.maxWidth <= 800;
 
-    return Scaffold(
-      appBar: _buildModernAppBar(),
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (ctx, constraints) {
-            return SingleChildScrollView(
-              // only ONE vertical scroller
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxWidth: isDesktop ? 1800 : double.infinity,
+        return Scaffold(
+          backgroundColor: const Color(0xFFF8FAFC),
+          appBar: _buildModernAppBar(),
+          body: FadeTransition(
+            opacity: _fadeAnimation,
+            child: SlideTransition(
+              position: _slideAnimation,
+              child: Container(
+                decoration: const BoxDecoration(color: Color(0xFFF8FAFC)),
+                child: SingleChildScrollView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isDesktop ? 48 : (isTablet ? 32 : 24),
+                    vertical: 24,
                   ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(6),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        // 1) Header - Always show
-                        _buildAnimatedHeader(),
-                        const SizedBox(height: 32),
-
-                        // 2) Search - Always show
-                        _buildSearchSection(),
-                        const SizedBox(height: 32),
-
-                        // 3) Table/List section - Show loading, data, or error states
-                        if (_isLoadingInitialData) ...[
-                          // Show loading indicator for initial data
-                          Container(
-                            padding: const EdgeInsets.all(48),
-                            decoration: BoxDecoration(
-                              color: Colors.blue.shade50,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.blue.shade200),
-                            ),
-                            child: const Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                ),
-                                SizedBox(width: 16),
-                                Text(
-                                  'Loading top 100 entries...',
-                                  style: TextStyle(fontSize: 16),
-                                ),
-                              ],
-                            ),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: isDesktop ? 1400 : double.infinity,
+                      ),
+                      child: ScaleTransition(
+                        scale: _scaleAnimation,
+                        child: Form(
+                          key: _formKey,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // Header with animation
+                              _buildAnimatedHeader(),
+                              const SizedBox(height: 32),
+                              // Main Content - Two columns on desktop
+                              if (isDesktop)
+                                _buildDesktopLayout()
+                              else
+                                _buildMobileLayout(),
+                              const SizedBox(height: 48),
+                              // Submit and Save as Draft Buttons
+                              const SizedBox(height: 24),
+                              _buildActionButtons(),
+                              const SizedBox(height: 48),
+                            ],
                           ),
-                          const SizedBox(height: 24),
-                        ] else if (filteredRetailerEntries.isNotEmpty) ...[
-                          // Show count of displayed entries
-                          Container(
-                            padding: const EdgeInsets.all(16),
-                            decoration: BoxDecoration(
-                              color: Colors.green.shade50,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.green.shade200),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.info_outline,
-                                  color: Colors.green.shade600,
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Showing ${filteredRetailerEntries.length} of ${allRetailerEntries.length} entries',
-                                  style: TextStyle(
-                                    color: Colors.green.shade700,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 16),
-                          buildSupplyChainTableExtended(
-                            filteredRetailerEntries,
-                            _horizontalScrollController,
-                          ),
-                          const SizedBox(height: 20),
-                        ] else if (_searchError != null) ...[
-                          // Show error message if search failed
-                          Container(
-                            padding: const EdgeInsets.all(24),
-                            decoration: BoxDecoration(
-                              color: Colors.red.shade50,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.red.shade200),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.error_outline,
-                                  color: Colors.red.shade600,
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Text(
-                                    'Error: $_searchError',
-                                    style: TextStyle(
-                                      color: Colors.red.shade700,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                        ] else if (allRetailerEntries.isNotEmpty) ...[
-                          // Show message when filter returns no results
-                          Container(
-                            padding: const EdgeInsets.all(24),
-                            decoration: BoxDecoration(
-                              color: Colors.orange.shade50,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.orange.shade200),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.search_off,
-                                  color: Colors.orange.shade600,
-                                ),
-                                const SizedBox(width: 12),
-                                const Expanded(
-                                  child: Text(
-                                    'No entries match your search criteria. Try different search terms or clear the search to see all entries.',
-                                    style: TextStyle(fontSize: 16),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                        ] else ...[
-                          // Show empty state (shouldn't normally happen)
-                          Container(
-                            padding: const EdgeInsets.all(24),
-                            decoration: BoxDecoration(
-                              color: Colors.grey.shade50,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.grey.shade200),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.inbox_outlined,
-                                  color: Colors.grey.shade600,
-                                ),
-                                const SizedBox(width: 12),
-                                const Expanded(
-                                  child: Text(
-                                    'No sampling entries available.',
-                                    style: TextStyle(fontSize: 16),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                        ],
-
-                        // 4) Form fields - Always show
-                        const SizedBox(height: 48),
-                        if (isDesktop)
-                          buildDesktopLayout()
-                        else
-                          buildMobileLayout(),
-
-                        const SizedBox(height: 48),
-                        _buildAnimatedSubmitButton(),
-                        const SizedBox(height: 48),
-                      ],
+                        ),
+                      ),
                     ),
                   ),
                 ),
               ),
-            );
-          },
-        ),
-      ),
+            ),
+          ),
+        );
+      },
     );
   }
 
-  Widget buildDesktopLayout() {
+  Widget _buildDesktopLayout() {
     return Column(
       children: [
         Row(
@@ -1301,167 +486,341 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
           children: [
             // Left Column
             Expanded(
-              child: Column(
+              child: _buildModernSection(
+                title: 'Activity Details',
+                icon: Icons.event_note_rounded,
                 children: [
-                  _buildModernSection(
-                    title: 'Sample Material Distribution',
-                    icon: Icons.inventory_2_outlined,
+                  ModernDropdown(
+                    label: 'Process Type',
+                    icon: Icons.category_outlined,
+                    items: const ['Add', 'Update'],
+                    value: processTypeController.text.isEmpty
+                        ? null
+                        : processTypeController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        processTypeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Activity',
+                    icon: Icons.event_outlined,
+                     items: [ 'Painter Meet', 'Contractor Meet', 'Applicator Meet'],
+                    value: activityController.text.isEmpty
+                        ? null
+                        : activityController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        activityController.text = newValue ?? '';
+                        if (newValue!.isNotEmpty ) {
+                          if (painterList.isEmpty) addPainterRow();
+                        } else {
+                          painterList.clear();
+                        }
+                      });
+                    },
+
+                    isRequired: true,
+                  ),
+
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: descriptionController,
+                    label: 'Description',
+                    icon: Icons.description_outlined,
+                    isRequired: false,
+                    isMultiline: true,
+                  ),
+              
+                  const SizedBox(height: 20),
+                  _buildModernDateField(
+                    controller: activityDateController,
+                    label: 'Activity Date',
+                    icon: Icons.calendar_today_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: meetingVenueController,
+                    label: 'Meeting Venue(Enter Address)',
+                    icon: Icons.location_on_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: cityNameController,
+                    label: 'City Name',
+                    icon: Icons.location_city_outlined,
+                    isRequired: true,
+                  ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Emirates',
+                    icon: Icons.location_city_outlined,
+                    items: ['Dubai',
+                      'Abu Dhabi',
+                      'Sharjah',
+                      'Ajman',
+                      'Umm Al Quwain',
+                      'Ras Al Khaimah',
+                      'Fujairah',],
+                    value: districtController.text.isEmpty
+                        ? null
+                        : districtController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        districtController.text = newValue ?? '';
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                   ModernDropdown(
+                        label: 'Product',
+                        icon: Icons.production_quantity_limits_sharp,
+                        items: const ['Wall Care Putty'],
+                        value: prodController.text.isEmpty
+                            ? null
+                            : prodController.text,
+                        onChanged: (value) =>
+                            setState(() => prodController.text = value ?? ''),
+                          ),
+                  const SizedBox(height: 20),
+                  ModernDropdown(
+                    label: 'Pin Code',
+                    icon: Icons.pin_outlined,
+                    items: ['Select', 'Pin 2', 'Pin 3'],
+                    value: pinCodeController.text.isEmpty
+                        ? null
+                        : pinCodeController.text,
+                    onChanged: (String? newValue) {
+                      setState(() {
+                        pinCodeController.text = newValue ?? '';
+                      });
+                    },
+                    isRequired: true,
+                  ),
+                  
+                  const SizedBox(height: 20),
+                  _buildModernTextField(
+                    controller: employeesCountController,
+                    label: 'No. of Employees',
+                    icon: Icons.people_outline,
+                    isRequired: false,
+                    isNumeric: true,
+                  ),
+                  const SizedBox(height: 20),
+          
+                  
+                  Column(
                     children: [
                       _buildModernTextField(
-                        controller: retailerController,
-                        label: 'Retailer Name',
-                        icon: Icons.storefront,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: retailerCodeController,
-                        label: 'Retailer Code',
-                        icon: Icons.qr_code_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: distributorController,
-                        label: 'Concern Distributor',
-                        icon: Icons.business_outlined,
-                      ),
-                      const SizedBox(height: 20),
-                      ModernDropdown(
-                        label: 'Emirates',
-                        icon: Icons.location_on_outlined,
-                        items: _emirateDescriptions,
-                        value: _selectedEmirate?.desc,
-                        onChanged: (value) {
-                          if (value != null) {
-                            setState(() {
-                              _selectedEmirate = _emirates.firstWhere(
-                                (e) => e.desc == value,
-                                orElse: () => _emirates.first,
-                              );
-                              emiratesController.text = _selectedEmirate!.desc;
-                            });
-                          }
-                        },
-                        isLoading: _isLoadingEmirates,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernDateField(
-                        controller: dateController,
-                        label: 'Date of Distribution',
-                        icon: Icons.calendar_today_outlined,
+                        controller: latitudeController,
+                        label: 'Latitude',
+                        icon: Icons.my_location_outlined,
+                        isRequired: false,
+                        suffix: IconButton(
+                          tooltip: 'Refresh location',
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _isGettingLocation
+                              ? null
+                              : () async {
+                                  HapticFeedback.selectionClick();
+                                  await _initLocation();
+                                },
+                        ),
                       ),
                       const SizedBox(height: 24),
-                      _buildModernSection(
-                        title: 'Sample Proof',
-                        icon: Icons.photo_camera_outlined,
+                      _buildModernTextField(
+                        controller: longitudeController,
+                        label: 'Longitude',
+                        icon: Icons.my_location_outlined,
+                        isRequired: false,
+                        suffix: IconButton(
+                          tooltip: 'Refresh location',
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _isGettingLocation
+                              ? null
+                              : () async {
+                                  HapticFeedback.selectionClick();
+                                  await _initLocation();
+                                },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.info_outline,
+                        size: 16,
+                        color: Colors.grey,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _isGettingLocation
+                              ? 'Fetching GPS…'
+                              : (latitudeController.text.isEmpty ||
+                                    longitudeController.text.isEmpty)
+                              ? 'Tap the GPS icon if fields are empty.'
+                              : 'Coordinates captured from your device GPS.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey.shade700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                 if (activityController.text.isNotEmpty) ...[
+
+                _buildModernSection(
+                    title:  "List of Painters/ Contractors/ Applicators",
+                    icon: Icons.handshake_outlined,
+                    children: [
+                  
+                // Show painter row table, using AddPainterRowWidget for each painter in painterList
+                ...List.generate(painterList.length, (index) {
+                final row = painterList[index];
+                
+                return AddPainterRowWidget(
+                  typeController: TextEditingController(text: row['typeController']?.text ?? ''),
+                  mobileController: TextEditingController(text: row['mobileController']?.text ?? ''),
+                  nameController: TextEditingController(text: row['nameController']?.text ?? ''),
+                  giftStatus: row['giftStatus'],
+                  selectedType: row['selectedType'],
+                  onAdd: addPainterRow,
+                  onDelete: () => deletePainterAt(index),
+                  onGiftStatusChanged: (val) { setState(() { row['giftStatus'] = val; }); },
+                  onTypeChanged: (val) { setState(() { row['selectedType'] = val; row['typeController'].text = val ?? ''; }); },
+                );
+              }),
+              Align(
+                alignment: Alignment.centerRight,
+                child: ElevatedButton.icon(
+                  onPressed: addPainterRow,
+                  icon: const Icon(Icons.add),
+                  label: const Text("Add Painter"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E3A8A),
+                  ),
+                ),
+              ),
+                  ],
+                  ),  
+                ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 24),
+            Expanded(
+              child: Column(
+                children: [
+                  // BW Employees Present Table
+                  _buildModernSection(
+                    title: 'Employees Present',
+                    icon: Icons.people_outline,
+                    children: [
+                      _buildEmployeesTable(),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.start,
                         children: [
-                          _buildModernDateField(
-                            controller: samplDateController,
-                            label: 'Sample Date',
-                            icon: Icons.calendar_today_outlined,
-                            isRequired: false,
+                          ElevatedButton(
+                            onPressed: _addEmployee,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.grey.shade200,
+                              foregroundColor: Colors.black87,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Add'),
                           ),
-                          const SizedBox(height: 20),
-                          ModernDropdown(
-                            label: 'Product',
-                            icon: Icons.palette_outlined,
-                            items: const ['Wallcare Putty'],
-                            value: prodController.text.isEmpty
+                          const SizedBox(width: 16),
+                          ElevatedButton(
+                            onPressed: employeesList.isEmpty
                                 ? null
-                                : prodController.text,
-                            onChanged: (value) {
-                              setState(() {
-                                prodController.text = value ?? '';
-                              });
-                            },
-                          ),
-                          const SizedBox(height: 20),
-                          FileUploadWidget(
-                            label: 'Sample Photograph',
-                            icon: Icons.camera_alt_outlined,
-                            onFileSelected: (value) {
-                              setState(() => _photoImage = value);
-                            },
-                            allowedExtensions: const ['jpg', 'jpeg', 'png'],
-                            maxSizeInMB: 10.0,
-                            currentFilePath: _photoImage,
-                            formType: 'sampling',
+                                : () {
+                                    if (employeesList.isNotEmpty) {
+                                      _deleteEmployee(employeesList.length - 1);
+                                    }
+                                  },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade400,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Delete'),
                           ),
                         ],
                       ),
                     ],
                   ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 24),
-            // Right Column
-            Expanded(
-              child: Column(
-                children: [
+                  const SizedBox(height: 24),
+                  if (activityController.text.isNotEmpty)...[
+                  // Channel Partner Section
                   _buildModernSection(
-                    title: 'Execution Details',
-                    icon: Icons.engineering_outlined,
+                    title: 'Channel Partners',
+                    icon: Icons.handshake_outlined,
                     children: [
-                      _buildModernTextField(
-                        controller: painterController,
-                        label: 'Painter/Contractor Name',
-                        icon: Icons.person_outline_rounded,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: phoneController,
-                        label: 'Contact Number',
-                        icon: Icons.phone_outlined,
-                        isPhone: true,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: qtyController,
-                        label: 'Material Qty Distributed (Kg)',
-                        icon: Icons.inventory_outlined,
-                        isNumeric: true,
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: siteAdController,
-                        label: 'Site Address',
-                        icon: Icons.location_on_outlined,
-                        isRequired: false,
-                      ),
-                      const SizedBox(height: 20),
+                      buildChannelPartnerSection(),
                     ],
                   ),
-                  const SizedBox(height: 24),
+                  ],
+                  const SizedBox(height: 32),
+                  // Image Upload Section
                   _buildModernSection(
-                    title: 'Reimbursement',
-                    icon: Icons.payments_outlined,
+                    title: 'Image Upload',
+                    icon: Icons.image_outlined,
                     children: [
-                      ModernDropdown(
-                        label: 'Reimbursement Mode',
-                        icon: Icons.monetization_on_outlined,
-                        items: ['0 AED (No Reimbursement)', 'Max 150 AED '],
-                        value: reimbursementModeController.text.isEmpty
-                            ? null
-                            : reimbursementModeController.text,
-                        onChanged: (String? value) {
-                          setState(() {
-                            reimbursementModeController.text = value ?? '';
-                            if (value != null) {
-                              if (value.contains('Max 150 AED')) {
-                                reimbursementAmtController.text = '150';
-                              } else if (value.contains('0')) {
-                                reimbursementAmtController.text = '0';
-                              }
-                            }
-                          });
-                        },
-                      ),
-                      const SizedBox(height: 20),
-                      _buildModernTextField(
-                        controller: reimbursementAmtController,
-                        label: 'Amount Reimbursed',
-                        icon: Icons.attach_money_outlined,
-                        isNumeric: true,
+                      _buildImageUploadTable(),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.start,
+                        children: [
+                          ElevatedButton(
+                            onPressed: _addImage,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.grey.shade200,
+                              foregroundColor: Colors.black87,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Add'),
+                          ),
+                          const SizedBox(width: 16),
+                          ElevatedButton(
+                            onPressed: imagesList.isEmpty
+                                ? null
+                                : () {
+                                    if (imagesList.isNotEmpty) {
+                                      _deleteImage(imagesList.length - 1);
+                                    }
+                                  },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade400,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            child: const Text('Delete'),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -1474,166 +833,611 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
     );
   }
 
-  Widget buildMobileLayout() {
+  Widget _buildMobileLayout() {
     return Column(
       children: [
-        // Sample Material Distribution
+        // Activity Details Section
         _buildModernSection(
-          title: 'Sample Material Distribution',
-          icon: Icons.inventory_2_outlined,
+          title: 'Activity Details',
+          icon: Icons.event_note_rounded,
           children: [
-            _buildModernTextField(
-              controller: retailerController,
-              label: 'Retailer Name',
-              icon: Icons.storefront,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: retailerCodeController,
-              label: 'Retailer Code',
-              icon: Icons.qr_code_outlined,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: distributorController,
-              label: 'Concern Distributor',
-              icon: Icons.business_outlined,
-            ),
-            const SizedBox(height: 16),
             ModernDropdown(
-              label: 'Emirates',
-              icon: Icons.location_on_outlined,
-              items: _emirateDescriptions,
-              value: _selectedEmirate?.desc,
-              onChanged: (value) {
-                if (value != null) {
-                  setState(() {
-                    _selectedEmirate = _emirates.firstWhere(
-                      (e) => e.desc == value,
-                      orElse: () => _emirates.first,
-                    );
-                    emiratesController.text = _selectedEmirate!.desc;
-                  });
-                }
-              },
-              isLoading: _isLoadingEmirates,
-            ),
-            const SizedBox(height: 16),
-            _buildModernDateField(
-              controller: dateController,
-              label: 'Date of Distribution',
-              icon: Icons.calendar_today_outlined,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Execution Details
-        _buildModernSection(
-          title: 'Execution Details',
-          icon: Icons.engineering_outlined,
-          children: [
-            _buildModernTextField(
-              controller: painterController,
-              label: 'Painter/Contractor Name',
-              icon: Icons.person_outline_rounded,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: phoneController,
-              label: 'Contact Number',
-              icon: Icons.phone_outlined,
-              isPhone: true,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: qtyController,
-              label: 'Material Qty Distributed (Kg)',
-              icon: Icons.inventory_outlined,
-              isNumeric: true,
-            ),
-            const SizedBox(height: 16),
-            _buildModernTextField(
-              controller: siteAdController,
-              label: 'Site Address',
-              icon: Icons.location_on_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Sample Proof
-        _buildModernSection(
-          title: 'Sample Proof',
-          icon: Icons.photo_camera_outlined,
-          children: [
-            _buildModernDateField(
-              controller: samplDateController,
-              label: 'Sample Date',
-              icon: Icons.calendar_today_outlined,
-              isRequired: false,
-            ),
-            const SizedBox(height: 16),
-            ModernDropdown(
-              label: 'Product',
-              icon: Icons.palette_outlined,
-              items: const ['Wallcare Putty'],
-              value: prodController.text.isEmpty ? null : prodController.text,
-              onChanged: (value) {
+              label: 'Process Type',
+              icon: Icons.category_outlined,
+              items: const ['Add', 'Update'],
+              value: processTypeController.text.isEmpty
+                  ? null
+                  : processTypeController.text,
+              onChanged: (String? newValue) {
                 setState(() {
-                  prodController.text = value ?? '';
+                  processTypeController.text = newValue ?? '';
                 });
               },
+              isRequired: true,
             ),
             const SizedBox(height: 16),
-            FileUploadWidget(
-              label: 'Sample Photograph',
-              icon: Icons.camera_alt_outlined,
-              onFileSelected: (value) {
-                setState(() => _photoImage = value);
-              },
-              allowedExtensions: const ['jpg', 'jpeg', 'png'],
-              maxSizeInMB: 10.0,
-              currentFilePath: _photoImage,
-              formType: 'sampling',
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        // Reimbursement
-        _buildModernSection(
-          title: 'Reimbursement',
-          icon: Icons.payments_outlined,
-          children: [
             ModernDropdown(
-              label: 'Reimbursement Mode',
-              icon: Icons.monetization_on_outlined,
-              items: ['0 AED (No Reimbursement)', 'Max 150 AED '],
-              value: reimbursementModeController.text.isEmpty
+              label: 'Activity',
+              icon: Icons.event_outlined,
+              items: [ 'Painter Meet', 'Contractor Meet', 'Applicator Meet'],
+              value: activityController.text.isEmpty
                   ? null
-                  : reimbursementModeController.text,
-              onChanged: (String? value) {
+                  : activityController.text,
+              onChanged: (String? newValue) {
                 setState(() {
-                  reimbursementModeController.text = value ?? '';
-                  // Auto-fill amount based on selection
-                  if (value != null) {
-                    if (value.contains('Max 150 AED')) {
-                      reimbursementAmtController.text = '150';
-                    } else if (value.contains('0')) {
-                      reimbursementAmtController.text = '0';
-                    }
+                  activityController.text = newValue ?? '';
+                  // Show painter row table if selecting "Painter Meet", otherwise clear
+                  if (newValue!.isNotEmpty ) {  //&& newValue == 'Painter Meet'
+                    if (painterList.isEmpty) addPainterRow();
+                  } else {
+                    painterList.clear();
                   }
                 });
               },
+              isRequired: true,
             ),
             const SizedBox(height: 16),
             _buildModernTextField(
-              controller: reimbursementAmtController,
-              label: 'Amount Reimbursed',
-              icon: Icons.attach_money_outlined,
+              controller: descriptionController,
+              label: 'Description',
+              icon: Icons.description_outlined,
+              isRequired: false,
+              isMultiline: true,
+            ),
+          
+            const SizedBox(height: 16),
+            _buildModernDateField(
+              controller: activityDateController,
+              label: 'Activity Date',
+              icon: Icons.calendar_today_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: meetingVenueController,
+              label: 'Meeting Venue(Enter Address)',
+              icon: Icons.location_on_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: cityNameController,
+              label: 'City Name',
+              icon: Icons.location_city_outlined,
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            ModernDropdown(
+                  label: 'Product',
+                icon: Icons.production_quantity_limits_sharp,
+                  items: const ['Wall Care Putty'],
+                value: prodController.text.isEmpty
+                        ? null
+                          : prodController.text,
+                  onChanged: (value) =>
+                  setState(() => prodController.text = value ?? ''),
+                ),
+
+            const SizedBox(height: 16),
+            ModernDropdown(
+              label: 'Pin Code',
+              icon: Icons.pin_outlined,
+              items: ['Select', 'Pin 2', 'Pin 3'],
+              value: pinCodeController.text.isEmpty
+                  ? null
+                  : pinCodeController.text,
+              onChanged: (String? newValue) {
+                setState(() {
+                  pinCodeController.text = newValue ?? '';
+                });
+              },
+              isRequired: true,
+            ),
+            const SizedBox(height: 16),
+            _buildModernTextField(
+              controller: employeesCountController,
+              label: 'No. of Employees',
+              icon: Icons.people_outline,
+              isRequired: false,
               isNumeric: true,
             ),
+            const SizedBox(height: 16),
+            
+            Column(
+              children: [
+                _buildModernTextField(
+                  controller: latitudeController,
+                  label: 'Latitude',
+                  icon: Icons.my_location_outlined,
+                  isRequired: false,
+                  suffix: IconButton(
+                    tooltip: 'Refresh location',
+                    icon: const Icon(Icons.gps_fixed),
+                    onPressed: _isGettingLocation
+                        ? null
+                        : () async {
+                            HapticFeedback.selectionClick();
+                            await _initLocation();
+                          },
+                  ),
+                ),
+                const SizedBox(height: 24),
+                _buildModernTextField(
+                  controller: longitudeController,
+                  label: 'Longitude',
+                  icon: Icons.my_location_outlined,
+                  isRequired: false,
+                  suffix: IconButton(
+                    tooltip: 'Refresh location',
+                    icon: const Icon(Icons.gps_fixed),
+                    onPressed: _isGettingLocation
+                        ? null
+                        : () async {
+                            HapticFeedback.selectionClick();
+                            await _initLocation();
+                          },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Icon(Icons.info_outline, size: 16, color: Colors.grey),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    _isGettingLocation
+                        ? 'Fetching GPS…'
+                        : (latitudeController.text.isEmpty ||
+                              longitudeController.text.isEmpty)
+                        ? 'Tap the GPS icon if fields are empty.'
+                        : 'Coordinates captured from your device GPS.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                ),
+              ],
+            ),
+
+                 if (activityController.text.isNotEmpty) ...[
+                // Show painter row table, using AddPainterRowWidget for each painter in painterList
+                const SizedBox(height: 16),
+                  const Text(
+                    "List of Painters/ Contractors/ Applicators",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 16),
+                ...List.generate(painterList.length, (index) {
+                final row = painterList[index];
+                return AddPainterRowWidget(
+                  typeController: TextEditingController(text: row['typeController']?.text ?? ''),
+                  mobileController: TextEditingController(text: row['mobileController']?.text ?? ''),
+                  nameController: TextEditingController(text: row['nameController']?.text ?? ''),
+                  giftStatus: row['giftStatus'],
+                  selectedType: row['selectedType'],
+                  onAdd: addPainterRow,
+                  onDelete: () => deletePainterAt(index),
+                  onGiftStatusChanged: (val) { setState(() { row['giftStatus'] = val; }); },
+                  onTypeChanged: (val) { setState(() { row['selectedType'] = val; row['typeController'].text = val ?? ''; }); },
+                );
+              }),
+              Align(
+                alignment: Alignment.centerRight,
+                child: ElevatedButton.icon(
+                  onPressed: addPainterRow,
+                  icon: const Icon(Icons.add),
+                  label: const Text("Add Painter"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E3A8A),
+                  ),
+                ),
+              ),
+                 ]
           ],
+        ),
+        const SizedBox(height: 24),
+        // BW Employees Present Table
+        _buildModernSection(
+          title: 'Employees Present',
+          icon: Icons.people_outline,
+          children: [
+            _buildEmployeesTable(),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.start,
+              children: [
+                ElevatedButton(
+                  onPressed: _addEmployee,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.grey.shade200,
+                    foregroundColor: Colors.black87,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Add'),
+                ),
+                const SizedBox(width: 16),
+                ElevatedButton(
+                  onPressed: employeesList.isEmpty
+                      ? null
+                      : () {
+                          if (employeesList.isNotEmpty) {
+                            _deleteEmployee(employeesList.length - 1);
+                          }
+                        },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade400,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Delete'),
+                ),
+              ],
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        // Image Upload Section
+                  
+                  if (activityController.text.isNotEmpty)...[
+                  // Channel Partner Section
+                  _buildModernSection(
+                    title: 'Channel Partners',
+                    icon: Icons.handshake_outlined,
+                    children: [
+                      buildChannelPartnerSection(),
+                    ],
+                  ),
+                  ],
+const SizedBox(height: 24),
+        _buildModernSection(
+          title: 'Image Upload',
+          icon: Icons.image_outlined,
+          children: [
+            _buildImageUploadTable(),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.start,
+              children: [
+                ElevatedButton(
+                  onPressed: _addImage,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.grey.shade200,
+                    foregroundColor: Colors.black87,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Add'),
+                ),
+                const SizedBox(width: 16),
+                ElevatedButton(
+                  onPressed: imagesList.isEmpty
+                      ? null
+                      : () {
+                          if (imagesList.isNotEmpty) {
+                            _deleteImage(imagesList.length - 1);
+                          }
+                        },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade400,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text('Delete'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEmployeesTable() {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        children: [
+          // Table Header
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                topRight: Radius.circular(8),
+              ),
+            ),
+            child: Row(
+              children: [
+                _buildTableHeaderCell('Del', flex: 1),
+                _buildTableHeaderCell('Employees Present', flex: 3),
+                _buildTableHeaderCell('Employee Code', flex: 3),
+                _buildTableHeaderCell('Name', flex: 5),
+              ],
+            ),
+          ),
+          // Table Rows
+          if (employeesList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No employees added yet. Click "Add" to add an employee.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          else
+            ...employeesList.asMap().entries.map((entry) {
+              final index = entry.key;
+              final employee = entry.value;
+              return Row(
+                children: [
+                  _buildTableCell(
+                    Checkbox(
+                      value: false,
+                      onChanged: (value) {
+                        if (value == true) {
+                          _deleteEmployee(index);
+                        }
+                      },
+                    ),
+                    flex: 1,
+                  ),
+                  _buildTableCell(Text('Employee ${index + 1}'), flex: 3),
+                  _buildTableCell(
+                    TextField(
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Enter code',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          employeesList[index]['employeeCode'] = value;
+                        });
+                      },
+                    ),
+                    flex: 3,
+                  ),
+                  _buildTableCell(
+                    TextField(
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Enter name',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          employeesList[index]['name'] = value;
+                        });
+                      },
+                    ),
+                    flex: 5,
+                  ),
+                ],
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildImageUploadTable() {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        children: [
+          // Table Header
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                topRight: Radius.circular(8),
+              ),
+            ),
+            child: Row(
+              children: [
+                _buildTableHeaderCell('Del', flex: 1),
+                _buildTableHeaderCell('Upload Supporting', flex: 5),
+                _buildTableHeaderCell('View', flex: 5),
+              ],
+            ),
+          ),
+          // Table Rows
+          if (imagesList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                'No images added yet. Click "Add" to add an image.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            )
+          else
+            ...imagesList.asMap().entries.map((entry) {
+              final index = entry.key;
+              final image = entry.value;
+              return Row(
+                children: [
+                  _buildTableCell(
+                    Checkbox(
+                      value: false,
+                      onChanged: (value) {
+                        if (value == true) {
+                          _deleteImage(index);
+                        }
+                      },
+                    ),
+                    flex: 1,
+                  ),
+                  _buildTableCell(
+                    ModernDropdown(
+                      label: '',
+                      icon: Icons.category_outlined,
+                      items: ['Select', 'Image', 'Document'],
+                      value: image['type'],
+                      onChanged: (String? newValue) {
+                        setState(() {
+                          imagesList[index]['type'] = newValue ?? 'Select';
+                        });
+                      },
+                      isRequired: false,
+                    ),
+                    flex: 5,
+                  ),
+                  _buildTableCell(
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ElevatedButton(
+                          onPressed: () {
+                            // Upload image logic
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue,
+                            foregroundColor: Colors.white,
+                          ),
+                          child: Text('Upload Image'),
+                        ),
+                        SizedBox(width: 8),
+                        ElevatedButton(
+                          onPressed: image['path']!.isEmpty
+                              ? null
+                              : () {
+                                  // View image logic
+                                },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue,
+                            foregroundColor: Colors.white,
+                          ),
+                          child: Text('View Image'),
+                        ),
+                      ],
+                    ),
+                    flex: 5,
+                  ),
+                ],
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTableHeaderCell(String text, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: Colors.grey.shade300),
+            bottom: BorderSide(color: Colors.grey.shade300),
+          ),
+        ),
+        child: Text(text, style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+    );
+  }
+
+  Widget _buildTableCell(Widget child, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        padding: EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            right: BorderSide(color: Colors.grey.shade300),
+            bottom: BorderSide(color: Colors.grey.shade300),
+          ),
+        ),
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildActionButtons() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        SizedBox(
+          width: 200,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: _saveAsDraft,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            child: const Text(
+              'Save as Draft',
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 24),
+        SizedBox(
+          width: 200,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: _isSubmitting ? null : _submitForm,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1E3A8A),
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            child: _isSubmitting
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(width: 16),
+                      Text(
+                        'Submitting...',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                    ],
+                  )
+                : const Text(
+                    'Submit',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+          ),
         ),
       ],
     );
@@ -1648,8 +1452,17 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
         statusBarColor: Colors.transparent,
         statusBarIconBrightness: Brightness.dark,
       ),
+      leading: Navigator.of(context).canPop()
+          ? Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: IconButton(
+                icon: const Icon(Icons.arrow_back, color: Color(0xFF1E3A8A)),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            )
+          : null,
       title: Text(
-        'Sample Execution Entry',
+        'Promotion Activity Entry',
         style: TextStyle(
           fontWeight: FontWeight.w600,
           fontSize: 20,
@@ -1658,11 +1471,10 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
       ),
       actions: [
         IconButton(
-          icon: const Icon(
-            Icons.help_outline_rounded,
-            color: Color(0xFF1E3A8A),
-          ),
-          onPressed: () => _showHelpDialog(),
+          icon: const Icon(Icons.home, color: Color(0xFF1E3A8A)),
+          onPressed: () {
+            // Navigate to home
+          },
         ),
       ],
     );
@@ -1691,7 +1503,7 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Sample Execution Entry',
+            'Promotion Activity Entry',
             style: TextStyle(
               fontSize: 32,
               fontWeight: FontWeight.bold,
@@ -1700,7 +1512,7 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
           ),
           SizedBox(height: 12),
           Text(
-            'Sample Execution Entry',
+            'Enter activity details and capture location',
             style: TextStyle(fontSize: 18, color: Colors.white70),
           ),
         ],
@@ -1731,7 +1543,7 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
         children: [
           // Section Header
           Container(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
               color: const Color(0xFFF8FAFC),
               borderRadius: const BorderRadius.vertical(
@@ -1795,13 +1607,16 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
     required IconData icon,
     bool isPhone = false,
     bool isNumeric = false,
+    bool isMultiline = false,
     bool isRequired = true,
+    Widget? suffix,
   }) {
     return TextFormField(
       controller: controller,
       decoration: InputDecoration(
         labelText: isRequired ? '$label *' : label,
         prefixIcon: Icon(icon, color: Colors.grey.shade600),
+        suffixIcon: suffix,
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(12),
           borderSide: BorderSide(color: Colors.grey.shade300),
@@ -1825,14 +1640,22 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
           ? TextInputType.phone
           : isNumeric
           ? TextInputType.number
+          : isMultiline
+          ? TextInputType.multiline
           : TextInputType.text,
+      maxLines: isMultiline ? 3 : 1,
       validator: (value) {
         if (isRequired && (value == null || value.trim().isEmpty)) {
           return 'Please enter $label';
         }
         if (isPhone && value != null && value.isNotEmpty) {
-          if (!RegExp(r'^[50|52|54|55|56|58]\d{7}$').hasMatch(value)) {
-            return 'Please enter valid UAE mobile number';
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
+          }
+        }
+        if (isNumeric && value != null && value.isNotEmpty) {
+          if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+            return 'Please enter valid number';
           }
         }
         return null;
@@ -1904,132 +1727,234 @@ class _SamplingDriveFormPageState extends State<SamplingDriveFormPage>
       },
     );
   }
-
-  Widget _buildAnimatedSubmitButton() {
-    return SizedBox(
-      width: double.infinity,
-      height: 56,
-      child: ElevatedButton(
-        onPressed: _isSubmitting ? null : _submitForm,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF1E3A8A),
-          foregroundColor: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-        ),
-        child: _isSubmitting
-            ? const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  ),
-                  SizedBox(width: 16),
-                  Text('Submitting...', style: TextStyle(color: Colors.white)),
-                ],
-              )
-            : Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.save, size: 20),
-                  const SizedBox(width: 12),
-                  const Text(
-                    'Submit',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                ],
-              ),
-      ),
-    );
-  }
-
-  void _showHelpDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.help_outline_rounded,
-                size: 48,
-                color: Color(0xFF1E3A8A),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Sampling Drive Help',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: const Color(0xFF1F2937),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Fill in all required fields marked with *. '
-                'Reimbursement amount will be auto-filled based on the selected mode.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.grey.shade600),
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF1E3A8A),
-                    foregroundColor: Colors.white,
-                  ),
-                  child: const Text(
-                    'Got it',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _submitForm() async {
-    if (_formKey.currentState!.validate()) {
-      setState(() {
-        _isSubmitting = true;
-      });
-      // Simulate API call
-      await Future.delayed(const Duration(seconds: 2));
-      setState(() {
-        _isSubmitting = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Row(
-              children: [
-                Icon(Icons.check_circle, color: Colors.white, size: 20),
-                SizedBox(width: 8),
-                Expanded(child: Text('Sampling Entry Saved Successfully!')),
-              ],
-            ),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
-    }
-  }
 }
 
 
+
+
+
+class PainterContractor {
+  String type;
+  String mobile;
+  String name;
+  String gift;
+
+  PainterContractor({
+    required this.type,
+    required this.mobile,
+    required this.name,
+    required this.gift,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'type': type,
+    'mobile': mobile,
+    'name': name,
+    'gift': gift,
+  };
+}
+
+class ChannelPartner {
+  String type;
+  String purchaserCode;
+  String mobile;
+  String name;
+
+  ChannelPartner({
+    required this.type,
+    required this.purchaserCode,
+    required this.mobile,
+    required this.name,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'type': type,
+    'purchaserCode': purchaserCode,
+    'mobile': mobile,
+    'name': name,
+  };
+}
+
+
+class RowData {
+  final typeController = TextEditingController();
+  final mobileController = TextEditingController();
+  final nameController = TextEditingController();
+  String? giftStatus;
+}
+
+class ChannelPartnerRow {
+  final typeController = TextEditingController();
+  final purchaserCodeController = TextEditingController();
+  final mobileController = TextEditingController();
+  final nameController = TextEditingController();
+
+  String? selectedType;
+}
+
+class AddPainterRowWidget extends StatelessWidget {
+  final TextEditingController typeController;
+  final TextEditingController mobileController;
+  final TextEditingController nameController;
+  final String? giftStatus;
+  final String? selectedType; // Add this for dropdown value
+  final VoidCallback onAdd;
+  final VoidCallback onDelete;
+  final Function(String?) onGiftStatusChanged;
+  final Function(String?) onTypeChanged;
+
+  const AddPainterRowWidget({
+    super.key,
+    required this.typeController,
+    required this.mobileController,
+    required this.nameController,
+    required this.giftStatus,
+    required this.selectedType,
+    required this.onAdd,
+    required this.onDelete,
+    required this.onGiftStatusChanged,
+    required this.onTypeChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Wrap(
+          spacing: 16,
+          runSpacing: 16,
+          children: [
+            ModernDropdown(
+              label: 'Type',
+              icon: Icons.event_outlined,
+              items: const [
+                'Painter',
+                'Contractor',
+                'Applicator'
+              ],
+              value: selectedType,
+              onChanged: (String? newValue) {
+                onTypeChanged(newValue);
+                typeController.text = newValue ?? '';
+              },
+              isRequired: true,
+            ),
+            buildModernTextField(
+              controller: mobileController,
+              label: "Mobile No",
+              icon: Icons.phone,
+              isPhone: true,
+            ),
+            buildModernTextField(
+              controller: nameController,
+              label: "Name",
+              icon: Icons.person,
+            ),
+            _buildRadioGroup(
+              label: "Gift",
+              value: giftStatus,
+              options: ["Yes", "No"],
+              onChanged: onGiftStatusChanged,
+            ),
+            OutlinedButton.icon(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete, color: Colors.red),
+              label: const Text("Del", style: TextStyle(color: Colors.red)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+  Widget buildModernTextField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    bool isPhone = false,
+    bool isNumeric = false,
+    bool isMultiline = false,
+    bool isRequired = true,
+    Widget? suffix,
+  }) {
+    return SizedBox(
+      width: 250,
+      child: TextFormField(
+        controller: controller,
+        decoration: InputDecoration(
+          labelText: isRequired ? '$label *' : label,
+          prefixIcon: Icon(icon, color: Colors.grey.shade600),
+          suffixIcon: suffix,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: Colors.grey.shade300),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: Colors.grey.shade300),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(color: Color(0xFF1E3A8A), width: 2),
+          ),
+          filled: true,
+          fillColor: const Color(0xFFF8FAFC),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+        ),
+        keyboardType: isPhone
+            ? TextInputType.phone
+            : isNumeric
+                ? TextInputType.number
+                : isMultiline
+                    ? TextInputType.multiline
+                    : TextInputType.text,
+        maxLines: isMultiline ? 3 : 1,
+        validator: (value) {
+          if (isRequired && (value == null || value.trim().isEmpty)) {
+            return 'Please enter $label';
+          }
+          if ((isPhone || isNumeric) && value != null && value.isNotEmpty) {
+            if (!RegExp(r'^[0-9]+$').hasMatch(value)) {
+              return 'Please enter valid number';
+            }
+          }
+          return null;
+        },
+      ),
+    );
+  }
+
+  Widget _buildRadioGroup({
+    required String label,
+    required String? value,
+    required List<String> options,
+    required Function(String?) onChanged,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+        Wrap(
+          spacing: 10,
+          children: options.map((option) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Radio<String>(
+                  value: option,
+                  groupValue: value,
+                  onChanged: onChanged,
+                ),
+                Text(option),
+              ],
+            );
+          }).toList(),
+        ),
+      ],
+    );
+  }
