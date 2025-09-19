@@ -29,9 +29,11 @@ namespace RAKControllers.Controllers
                 request ??= new ContractorRegistrationRequest();
 
                 // --- Keys / defaults ---
-                var inflCode = MakeFixed(8, Guid.NewGuid().ToString("N").ToUpperInvariant());   // char(8)
                 var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant();       // char(2)
                 var areaCode = (Left(request.Area, 3) ?? "").ToUpperInvariant();                 // char(3)
+
+                // Generate sequential inflCode = pure numeric in ascending order
+                string inflCode = GetNextInfluencerCode(inflType);
 
                 // Build names and enforce column sizes
                 var fullName = string.Join(" ",
@@ -282,6 +284,35 @@ SELECT @inflCode AS InflCode;
         });
 
         // ----------------- helpers -----------------
+        private string GetNextInfluencerCode(string inflType)
+        {
+            // Atomic next-number fetch for this inflType, pure numeric ascending order
+            const string nextSql = @"
+DECLARE @n int;
+
+-- Lock the influencer table rowset during MAX() to avoid race conditions
+-- Get max numeric inflCode for this inflType
+SELECT @n = ISNULL(MAX(
+    CASE
+        WHEN ISNUMERIC(inflCode) = 1
+        THEN CAST(inflCode AS int)
+        ELSE 0
+    END
+), 0) + 1
+FROM dbo.ctmInfluncr WITH (UPDLOCK, HOLDLOCK)
+WHERE inflType = @inflType;
+
+SELECT RIGHT('00000000' + CAST(@n AS varchar(8)), 8) AS nxt;
+";
+            var rows = _db.WebSessBean(nextSql, new Dictionary<string, object> { ["@inflType"] = inflType })
+                       as List<Dictionary<string, object>>;
+
+            var num = rows?.FirstOrDefault()?.Values?.FirstOrDefault()?.ToString();
+            if (string.IsNullOrWhiteSpace(num)) num = "00000001";
+
+            return num; // 8-digit pure numeric
+        }
+
         private static string MakeFixed(int size, string input)
         {
             if (string.IsNullOrEmpty(input)) input = "";
@@ -366,10 +397,6 @@ SELECT @inflCode AS InflCode;
         public string? EffectiveDate { get; set; }
     }
 }
-
-
-
-
 
 
 
@@ -703,25 +730,31 @@ SELECT @inflCode AS InflCode;
         // ----------------- helpers -----------------
         private string GetNextInfluencerCode(string inflType)
         {
-            // Atomic next-number fetch for this inflType, e.g., PN000001 → PN000002
+            // Atomic next-number fetch for this inflType, pure numeric ascending order
             const string nextSql = @"
 DECLARE @n int;
 
 -- Lock the influencer table rowset during MAX() to avoid race conditions
-SELECT @n = ISNULL(MAX(CAST(SUBSTRING(inflCode, 3, 6) AS int)), 0) + 1
+-- Get max numeric inflCode for this inflType
+SELECT @n = ISNULL(MAX(
+    CASE
+        WHEN ISNUMERIC(inflCode) = 1
+        THEN CAST(inflCode AS int)
+        ELSE 0
+    END
+), 0) + 1
 FROM dbo.ctmInfluncr WITH (UPDLOCK, HOLDLOCK)
-WHERE inflType = @inflType
-  AND inflCode LIKE 'PN[0-9][0-9][0-9][0-9][0-9][0-9]';
+WHERE inflType = @inflType;
 
-SELECT RIGHT('000000' + CAST(@n AS varchar(6)), 6) AS nxt;
+SELECT RIGHT('00000000' + CAST(@n AS varchar(8)), 8) AS nxt;
 ";
             var rows = _db.WebSessBean(nextSql, new Dictionary<string, object> { ["@inflType"] = inflType })
                        as List<Dictionary<string, object>>;
 
             var num = rows?.FirstOrDefault()?.Values?.FirstOrDefault()?.ToString();
-            if (string.IsNullOrWhiteSpace(num)) num = "000001";
+            if (string.IsNullOrWhiteSpace(num)) num = "00000001";
 
-            return "PN" + num; // 8 chars total
+            return num; // 8-digit pure numeric
         }
 
         private static string MakeFixed(int size, string input)
