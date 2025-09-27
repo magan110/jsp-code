@@ -1,3 +1,735 @@
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import 'dart:js' as js;
+import '../models/auth_models.dart';
+import '../utils/app_logger.dart';
+
+class AuthService {
+  static final AppLogger _logger = AppLogger();
+  static const Duration _defaultTimeout = Duration(seconds: 30);
+
+  static const String baseUrl = 'https://qa.birlawhite.com:55232';
+  static const String authEndpoint = '/api/Auth/execute';
+
+  static Future<Map<String, dynamic>> authenticateUser({
+    required String userID,
+    required String password,
+    String? appRegId,
+  }) async {
+    try {
+      _logger.info('Authenticating user: $userID');
+
+      final loginRequest = LoginRequest(
+        userID: userID,
+        password: password,
+        appRegId:
+            appRegId ?? 'mobile_app_${DateTime.now().millisecondsSinceEpoch}',
+      );
+
+      final uri = Uri.parse('$baseUrl$authEndpoint');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final requestBody = jsonEncode(loginRequest.toJson());
+
+      _logger.debug('Making POST request to: $uri');
+      _logger.debug('Request headers: $requestHeaders');
+      _logger.debug('Request body: $requestBody');
+
+      final request = http.Request('POST', uri);
+      request.headers.addAll(requestHeaders);
+      request.body = requestBody;
+
+      final client = http.Client();
+      final streamedResponse = await client.send(request).timeout(_defaultTimeout);
+      final response = await http.Response.fromStream(streamedResponse);
+
+      // Extract cookies from response headers for future requests
+      final cookieHeader = response.headers['set-cookie'];
+      if (cookieHeader != null) {
+        _logger.debug('Received cookies: $cookieHeader');
+      }
+
+      _logger.debug('Response status: ${response.statusCode}');
+      _logger.debug('Response headers: ${response.headers}');
+      _logger.debug('Response body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        try {
+          final loginResponse = LoginResponse.fromJson(responseData);
+          _logger.info('Authentication successful for user: $userID');
+
+          return {
+            'success': true,
+            'data': loginResponse,
+            'statusCode': response.statusCode,
+          };
+        } catch (e) {
+          _logger.error('Failed to parse login response', e);
+          return {
+            'success': false,
+            'error': 'Invalid response format from server',
+            'statusCode': response.statusCode,
+          };
+        }
+      } else if (response.statusCode == 401) {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? 'Authentication failed';
+
+        _logger.warning(
+          'Authentication failed for user: $userID - $errorMessage',
+        );
+
+        return {
+          'success': false,
+          'error': errorMessage,
+          'statusCode': response.statusCode,
+        };
+      } else if (response.statusCode == 400) {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? response.body.isNotEmpty
+            ? response.body
+            : 'Invalid request parameters';
+
+        _logger.warning('Bad request for user: $userID - $errorMessage');
+        _logger.warning('Request was: $requestBody');
+
+        return {
+          'success': false,
+          'error': 'Bad Request: $errorMessage',
+          'statusCode': response.statusCode,
+          'raw_response': response.body,
+        };
+      } else {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? 'Server error occurred';
+
+        _logger.error(
+          'Server error during authentication: ${response.statusCode} - $errorMessage',
+        );
+
+        return {
+          'success': false,
+          'error': errorMessage,
+          'statusCode': response.statusCode,
+        };
+      }
+    } on http.ClientException catch (e) {
+      _logger.error('Network error during authentication', e);
+      return {
+        'success': false,
+        'error':
+            'Network connection failed. Please check your internet connection.',
+        'statusCode': 0,
+      };
+    } on FormatException catch (e) {
+      _logger.error('JSON parsing error during authentication', e);
+      return {
+        'success': false,
+        'error': 'Invalid response from server',
+        'statusCode': 0,
+      };
+    } catch (e) {
+      _logger.error('Unexpected error during authentication', e);
+      return {
+        'success': false,
+        'error': 'An unexpected error occurred: ${e.toString()}',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  static Future<bool> login(String userId, String password) async {
+    try {
+      print('🔐 Starting Firebase-only login for userId: "$userId"');
+
+      // First authenticate with backend to get user data
+      final result = await authenticateUser(userID: userId, password: password);
+      if (result['success'] == true) {
+        final loginResponse = result['data'] as LoginResponse;
+
+        print('📊 Backend login successful, proceeding with Firebase auth...');
+
+        // Create user data
+        final userDataWithId = UserData(
+          emplName: loginResponse.data.emplName,
+          areaCode: loginResponse.data.areaCode,
+          roles: loginResponse.data.roles,
+          pages: loginResponse.data.pages,
+          userID: userId,
+        );
+
+        // Firebase Authentication for web
+        if (kIsWeb) {
+          final firebaseResult = await _firebaseCustomAuth(userId, password, userDataWithId);
+          if (firebaseResult['success'] == true) {
+            print('✅ Firebase authentication successful');
+
+            // Set user in AuthManager after Firebase auth succeeds
+            AuthManager.setUser(userDataWithId);
+            return true;
+          } else {
+            print('❌ Firebase authentication failed: ${firebaseResult['error']}');
+            return false;
+          }
+        } else {
+          // For non-web platforms, just use AuthManager
+          AuthManager.setUser(userDataWithId);
+          return true;
+        }
+      } else {
+        print('❌ Backend authentication failed: ${result['error']}');
+      }
+      return false;
+    } catch (e) {
+      _logger.error('Login error', e);
+      return false;
+    }
+  }
+
+  static Future<bool> loginWithOtp(String mobile, String otp) async {
+    await Future.delayed(const Duration(seconds: 1));
+    return mobile.isNotEmpty && otp.isNotEmpty;
+  }
+
+  static Future<bool> sendOtp(String mobile) async {
+    await Future.delayed(const Duration(seconds: 1));
+    return mobile.isNotEmpty;
+  }
+
+  static Future<void> logout() async {
+    // Firebase sign out first
+    if (kIsWeb) {
+      await _firebaseSignOut();
+    }
+
+    // Try to logout from server
+    final serverLogout = await logoutFromServer();
+    if (!serverLogout['success']) {
+      _logger.warning('Server logout failed, clearing local session anyway');
+    }
+
+    AuthManager.clearUser();
+    await Future.delayed(const Duration(milliseconds: 500));
+  }
+
+  static Future<Map<String, dynamic>> testConnection() async {
+    try {
+      _logger.info('Testing connection to auth server');
+
+      final uri = Uri.parse('$baseUrl/health');
+      final response = await http
+          .get(uri, headers: {'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Health check response: ${response.statusCode}');
+
+      return {
+        'success': response.statusCode == 200,
+        'statusCode': response.statusCode,
+        'message': response.statusCode == 200
+            ? 'Connection successful'
+            : 'Server responded with status ${response.statusCode}',
+      };
+    } catch (e) {
+      _logger.error('Connection test failed', e);
+      return {
+        'success': false,
+        'statusCode': 0,
+        'message': 'Connection failed: ${e.toString()}',
+      };
+    }
+  }
+
+  static Map<String, dynamic> _safeJsonDecode(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      return decoded is Map<String, dynamic>
+          ? decoded
+          : {'raw': decoded.toString()};
+    } catch (_) {
+      return {'raw': body};
+    }
+  }
+
+  // Session validation endpoint
+  static Future<Map<String, dynamic>> validateSession() async {
+    try {
+      _logger.info('Validating user session');
+
+      final uri = Uri.parse('$baseUrl/auth/me');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final response = await http
+          .get(uri, headers: requestHeaders)
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Session validation response: ${response.statusCode}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        return {
+          'success': true,
+          'data': responseData,
+          'statusCode': response.statusCode,
+        };
+      } else {
+        return {
+          'success': false,
+          'error': 'Session validation failed',
+          'statusCode': response.statusCode,
+        };
+      }
+    } catch (e) {
+      _logger.error('Session validation error', e);
+      return {
+        'success': false,
+        'error': 'Network error during session validation',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  // Token refresh endpoint
+  static Future<Map<String, dynamic>> refreshToken() async {
+    try {
+      _logger.info('Refreshing access token');
+
+      final uri = Uri.parse('$baseUrl/auth/refresh');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final response = await http
+          .post(uri, headers: requestHeaders)
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Token refresh response: ${response.statusCode}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        return {
+          'success': true,
+          'data': responseData,
+          'statusCode': response.statusCode,
+        };
+      } else {
+        return {
+          'success': false,
+          'error': 'Token refresh failed',
+          'statusCode': response.statusCode,
+        };
+      }
+    } catch (e) {
+      _logger.error('Token refresh error', e);
+      return {
+        'success': false,
+        'error': 'Network error during token refresh',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  // Enhanced logout with server-side session clearing
+  static Future<Map<String, dynamic>> logoutFromServer() async {
+    try {
+      _logger.info('Logging out from server');
+
+      final uri = Uri.parse('$baseUrl/auth/logout');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final response = await http
+          .post(uri, headers: requestHeaders)
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Server logout response: ${response.statusCode}');
+
+      return {
+        'success': response.statusCode == 200,
+        'statusCode': response.statusCode,
+      };
+    } catch (e) {
+      _logger.error('Server logout error', e);
+      return {
+        'success': false,
+        'error': 'Network error during logout',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  // Firebase Custom Authentication for any userID/email input
+  static Future<Map<String, dynamic>> _firebaseCustomAuth(String userID, String password, UserData userData) async {
+    if (!kIsWeb) {
+      return {'success': false, 'error': 'Firebase auth only available on web'};
+    }
+
+    try {
+      print('🔐 Attempting Firebase custom auth for input: $userID');
+
+      final result = await js.context.callMethod('eval', ['''
+        (async function() {
+          if (window.FirebaseCustomAuth) {
+            return await window.FirebaseCustomAuth.signInWithUserID('$userID', '$password');
+          }
+          return { success: false, error: 'FirebaseCustomAuth not available' };
+        })()
+      ''']);
+
+      if (result != null && result['success'] == true) {
+        print('✅ Firebase custom auth successful for input: $userID');
+
+        // Store user data in Firebase user profile or custom claims
+        await _storeUserDataInFirebase(userData);
+
+        return {'success': true, 'user': result['user']};
+      } else {
+        final error = result?['error'] ?? 'Unknown Firebase error';
+        print('❌ Firebase custom auth failed: $error');
+        return {'success': false, 'error': error};
+      }
+    } catch (e) {
+      print('❌ Firebase custom auth error: $e');
+      return {'success': false, 'error': 'Firebase authentication failed: $e'};
+    }
+  }
+
+  // Store user data in Firebase user profile
+  static Future<void> _storeUserDataInFirebase(UserData userData) async {
+    try {
+      await js.context.callMethod('eval', ['''
+        (async function() {
+          const user = firebase.auth().currentUser;
+          if (user) {
+            // Store user data in Firebase user profile
+            await user.updateProfile({
+              displayName: "${userData.emplName}",
+            });
+
+            console.log('📊 User data stored in Firebase profile');
+          }
+        })()
+      ''']);
+    } catch (e) {
+      print('❌ Failed to store user data in Firebase: $e');
+    }
+  }
+
+  // Firebase Authentication Helper Methods
+  static Future<Map<String, dynamic>> _firebaseSignIn(String email, String password) async {
+    if (!kIsWeb) {
+      return {'success': false, 'error': 'Firebase auth only available on web'};
+    }
+
+    try {
+      _logger.info('Attempting Firebase sign in for: $email');
+
+      final result = await js.context.callMethod('eval', ['''
+        (async function() {
+          if (window.FirebaseAuthManager) {
+            return await window.FirebaseAuthManager.signInWithEmailAndPassword('$email', '$password');
+          }
+          return { success: false, error: 'Firebase not initialized' };
+        })()
+      ''']);
+
+      if (result != null && result['success'] == true) {
+        _logger.info('Firebase sign in successful');
+        return {'success': true, 'user': result['user']};
+      } else {
+        final error = result?['error'] ?? 'Unknown Firebase error';
+        _logger.warning('Firebase sign in failed: $error');
+        return {'success': false, 'error': error};
+      }
+    } catch (e) {
+      _logger.error('Firebase sign in error', e);
+      return {'success': false, 'error': 'Firebase authentication failed: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> _firebaseSignOut() async {
+    if (!kIsWeb) {
+      return {'success': false, 'error': 'Firebase auth only available on web'};
+    }
+
+    try {
+      _logger.info('Signing out from Firebase');
+
+      final result = await js.context.callMethod('eval', ['''
+        (async function() {
+          if (window.FirebaseAuthManager) {
+            return await window.FirebaseAuthManager.signOut();
+          }
+          return { success: false, error: 'Firebase not initialized' };
+        })()
+      ''']);
+
+      if (result != null && result['success'] == true) {
+        _logger.info('Firebase sign out successful');
+        return {'success': true};
+      } else {
+        final error = result?['error'] ?? 'Unknown Firebase error';
+        _logger.warning('Firebase sign out failed: $error');
+        return {'success': false, 'error': error};
+      }
+    } catch (e) {
+      _logger.error('Firebase sign out error', e);
+      return {'success': false, 'error': 'Firebase sign out failed: $e'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> firebaseSignInWithPhone(String phoneNumber) async {
+    if (!kIsWeb) {
+      return {'success': false, 'error': 'Firebase auth only available on web'};
+    }
+
+    try {
+      _logger.info('Attempting Firebase phone sign in for: $phoneNumber');
+
+      final result = await js.context.callMethod('eval', ['''
+        (async function() {
+          if (window.FirebaseAuthManager) {
+            // Note: Phone auth requires reCAPTCHA setup in production
+            // For now, this is a placeholder for future implementation
+            return { success: false, error: 'Phone authentication not configured' };
+          }
+          return { success: false, error: 'Firebase not initialized' };
+        })()
+      ''']);
+
+      if (result != null && result['success'] == true) {
+        _logger.info('Firebase phone sign in successful');
+        return {'success': true, 'confirmationResult': result['confirmationResult']};
+      } else {
+        final error = result?['error'] ?? 'Unknown Firebase error';
+        _logger.warning('Firebase phone sign in failed: $error');
+        return {'success': false, 'error': error};
+      }
+    } catch (e) {
+      _logger.error('Firebase phone sign in error', e);
+      return {'success': false, 'error': 'Firebase phone authentication failed: $e'};
+    }
+  }
+
+  // Helper method to validate email format
+  static bool _isValidEmail(String email) {
+    return RegExp(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$').hasMatch(email);
+  }
+}
+
+class AuthManager {
+  static UserData? _currentUser;
+  static String? _authToken;
+  static final _authChangeNotifier = ValueNotifier<int>(0);
+  static bool _firebaseInitialized = false;
+
+  static UserData? get currentUser => _currentUser;
+  static String? get authToken => _authToken;
+  static bool get isLoggedIn => _currentUser != null;
+  static ValueNotifier<int> get authChangeNotifier => _authChangeNotifier;
+
+  // Initialize Firebase auth state sync
+  static Future<void> initializeFirebaseSync() async {
+    if (!kIsWeb || _firebaseInitialized) return;
+
+    try {
+      // Set up Firebase auth state listener
+      js.context.callMethod('eval', ['''
+        if (window.FirebaseAuthManager) {
+          window.FirebaseAuthManager.onAuthStateChanged((user) => {
+            console.log('Firebase auth state changed:', user ? 'signed in' : 'signed out');
+
+            // Communicate with Flutter
+            if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
+              window.flutter_inappwebview.callHandler('firebase_auth_changed', {
+                isSignedIn: !!user,
+                uid: user ? user.uid : null,
+                email: user ? user.email : null
+              });
+            } else {
+              // For regular browser, use custom event
+              window.dispatchEvent(new CustomEvent('firebaseAuthChanged', {
+                detail: {
+                  isSignedIn: !!user,
+                  uid: user ? user.uid : null,
+                  email: user ? user.email : null
+                }
+              }));
+            }
+          });
+        }
+      ''']);
+
+      _firebaseInitialized = true;
+    } catch (e) {
+      print('Failed to initialize Firebase sync: $e');
+    }
+  }
+
+  static void setUser(UserData userData, {String? token}) {
+    _currentUser = userData;
+    _authToken = token;
+
+    print('👤 User set in AuthManager: ${userData.userID}');
+    _notifyAuthChanged();
+  }
+
+  static void clearUser() {
+    _currentUser = null;
+    _authToken = null;
+
+    print('🗑️ User cleared from AuthManager');
+    _notifyAuthChanged();
+  }
+
+  // Restore user session from Firebase auth state
+  static Future<bool> restoreUserFromFirebase() async {
+    if (!kIsWeb) return false;
+
+    try {
+      print('🔄 Checking Firebase auth state for session restoration...');
+
+      final firebaseUser = js.context.callMethod('eval', ['''
+        window.FirebaseAuthManager ? window.FirebaseAuthManager.getCurrentUser() : null
+      ''']);
+
+      if (firebaseUser != null) {
+        print('✅ Firebase user found, restoring session from Firebase profile');
+
+        // Get user data from Firebase profile
+        final displayName = js.context.callMethod('eval', ['''
+          firebase.auth().currentUser?.displayName || 'User'
+        ''']);
+
+        final email = js.context.callMethod('eval', ['''
+          firebase.auth().currentUser?.email || ''
+        ''']);
+
+        // Extract original userID from Firebase email (remove @temp.rakauth.com)
+        final originalUserID = email.toString().replaceAll('@temp.rakauth.com', '');
+
+        // Create basic user data (roles and pages would need to be stored in Firebase custom claims)
+        final userData = UserData(
+          emplName: displayName.toString(),
+          areaCode: '', // Store in Firebase custom claims for full functionality
+          roles: ['user'], // Store in Firebase custom claims for full functionality
+          pages: [], // Store in Firebase custom claims for full functionality
+          userID: originalUserID,
+        );
+
+        _currentUser = userData;
+        _notifyAuthChanged();
+
+        print('✅ User session restored from Firebase: ${userData.userID}');
+        return true;
+      } else {
+        print('❌ No Firebase user found');
+      }
+    } catch (e) {
+      print('❌ Failed to restore user from Firebase: $e');
+    }
+
+    return false;
+  }
+
+
+
+
+  static void Function()? _authChangeCallback;
+
+  static void setAuthChangeCallback(void Function() callback) {
+    _authChangeCallback = callback;
+  }
+
+  static void _notifyAuthChanged() {
+    _authChangeCallback?.call();
+    _authChangeNotifier.value++;
+  }
+
+  static bool hasRole(String role) {
+    return _currentUser?.hasRole(role) ?? false;
+  }
+
+  static bool hasPage(String page) {
+    return _currentUser?.hasPage(page) ?? false;
+  }
+
+  static bool hasAnyRole(List<String> roles) {
+    return _currentUser?.hasAnyRole(roles) ?? false;
+  }
+
+  static bool hasAnyPage(List<String> pages) {
+    return _currentUser?.hasAnyPage(pages) ?? false;
+  }
+
+  static List<String> getUserRoles() {
+    return _currentUser?.roles ?? [];
+  }
+
+  static List<String> getUserPages() {
+    return _currentUser?.pages ?? [];
+  }
+
+  static String getUserName() {
+    return _currentUser?.emplName ?? '';
+  }
+
+  static String getUserAreaCode() {
+    return _currentUser?.areaCode ?? '';
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -255,39 +987,84 @@
       }
     };
 
-    // Firebase Custom Auth Helper for non-email userIDs
+    // Firebase Custom Auth Helper for email and userID inputs
     window.FirebaseCustomAuth = {
-      // Create a temporary email format for non-email userIDs
+      // Check if input is a valid email format
+      isValidEmail(input) {
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input);
+      },
+
+      // Create a temporary email format for non-email userIDs (fallback only)
       createFirebaseEmail(userID) {
-        // Convert userID to a valid email format for Firebase
         return `${userID}@temp.rakauth.com`;
       },
 
-      // Sign in with custom userID (converts to email format)
-      async signInWithUserID(userID, password) {
+      // Sign in with email or userID
+      async signInWithUserID(input, password) {
         try {
-          const firebaseEmail = this.createFirebaseEmail(userID);
-          console.log(`🔐 Converting userID "${userID}" to Firebase email: ${firebaseEmail}`);
+          // Validate input
+          if (!input || input.trim() === '') {
+            throw new Error('Email/UserID cannot be empty');
+          }
+
+          const trimmedInput = input.trim();
+          let firebaseEmail;
+
+          // Use actual email if provided, otherwise convert userID to email format
+          if (this.isValidEmail(trimmedInput)) {
+            firebaseEmail = trimmedInput;
+            console.log(`🔐 Using provided email: ${firebaseEmail}`);
+          } else {
+            firebaseEmail = this.createFirebaseEmail(trimmedInput);
+            console.log(`🔐 Converting userID "${trimmedInput}" to Firebase email: ${firebaseEmail}`);
+          }
 
           // Try to sign in first
           try {
             const result = await window.FirebaseAuthManager.signInWithEmailAndPassword(firebaseEmail, password);
             console.log('✅ Firebase sign in successful with existing account');
-            return result;
+            return { success: true, user: result.user };
           } catch (signInError) {
-            // If sign in fails, try to create account
-            if (signInError.code === 'auth/user-not-found') {
-              console.log('📝 Creating new Firebase account for userID:', userID);
-              const createResult = await window.FirebaseAuthManager.createUserWithEmailAndPassword(firebaseEmail, password);
-              console.log('✅ Firebase account created and signed in');
-              return createResult;
+            console.log('🔍 Sign in failed, checking error:', signInError.code, signInError.message);
+
+            // Only try to create account for userID-converted emails, not real emails
+            if (!this.isValidEmail(trimmedInput) &&
+                (signInError.code === 'auth/user-not-found' ||
+                 signInError.code === 'auth/invalid-email' ||
+                 signInError.code === 'auth/wrong-password' ||
+                 signInError.code === 'auth/invalid-credential')) {
+
+              console.log('📝 Creating new Firebase account for userID:', trimmedInput);
+              try {
+                const createResult = await window.FirebaseAuthManager.createUserWithEmailAndPassword(firebaseEmail, password);
+                console.log('✅ Firebase account created and signed in');
+                return { success: true, user: createResult.user };
+              } catch (createError) {
+                console.error('❌ Failed to create Firebase account:', createError.code, createError.message);
+
+                // If account already exists, try signing in again
+                if (createError.code === 'auth/email-already-in-use') {
+                  console.log('🔄 Account exists, retrying sign in...');
+                  try {
+                    const retryResult = await window.FirebaseAuthManager.signInWithEmailAndPassword(firebaseEmail, password);
+                    console.log('✅ Retry sign in successful');
+                    return { success: true, user: retryResult.user };
+                  } catch (retryError) {
+                    console.error('❌ Retry sign in failed:', retryError);
+                    return { success: false, error: `Sign in failed: ${retryError.message}` };
+                  }
+                } else {
+                  return { success: false, error: `Account creation failed: ${createError.message}` };
+                }
+              }
             } else {
-              throw signInError;
+              console.error('❌ Firebase sign in failed:', signInError);
+              return { success: false, error: `Authentication failed: ${signInError.message}` };
             }
           }
         } catch (error) {
           console.error('❌ Firebase custom auth error:', error);
-          return { success: false, error: error.message };
+          return { success: false, error: `Firebase authentication error: ${error.message}` };
         }
       }
     };
@@ -558,1363 +1335,3 @@
   <script defer src="flutter_bootstrap.js"></script>
 </body>
 </html>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import 'dart:convert';
-import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-import 'dart:js' as js;
-import '../models/auth_models.dart';
-import '../utils/app_logger.dart';
-
-class AuthService {
-  static final AppLogger _logger = AppLogger();
-  static const Duration _defaultTimeout = Duration(seconds: 30);
-
-  static const String baseUrl = 'https://qa.birlawhite.com:55232';
-  static const String authEndpoint = '/api/Auth/execute';
-
-  static Future<Map<String, dynamic>> authenticateUser({
-    required String userID,
-    required String password,
-    String? appRegId,
-  }) async {
-    try {
-      _logger.info('Authenticating user: $userID');
-
-      final loginRequest = LoginRequest(
-        userID: userID,
-        password: password,
-        appRegId:
-            appRegId ?? 'mobile_app_${DateTime.now().millisecondsSinceEpoch}',
-      );
-
-      final uri = Uri.parse('$baseUrl$authEndpoint');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final requestBody = jsonEncode(loginRequest.toJson());
-
-      _logger.debug('Making POST request to: $uri');
-      _logger.debug('Request headers: $requestHeaders');
-      _logger.debug('Request body: $requestBody');
-
-      final request = http.Request('POST', uri);
-      request.headers.addAll(requestHeaders);
-      request.body = requestBody;
-
-      final client = http.Client();
-      final streamedResponse = await client.send(request).timeout(_defaultTimeout);
-      final response = await http.Response.fromStream(streamedResponse);
-
-      // Extract cookies from response headers for future requests
-      final cookieHeader = response.headers['set-cookie'];
-      if (cookieHeader != null) {
-        _logger.debug('Received cookies: $cookieHeader');
-      }
-
-      _logger.debug('Response status: ${response.statusCode}');
-      _logger.debug('Response headers: ${response.headers}');
-      _logger.debug('Response body: ${response.body}');
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
-
-        try {
-          final loginResponse = LoginResponse.fromJson(responseData);
-          _logger.info('Authentication successful for user: $userID');
-
-          return {
-            'success': true,
-            'data': loginResponse,
-            'statusCode': response.statusCode,
-          };
-        } catch (e) {
-          _logger.error('Failed to parse login response', e);
-          return {
-            'success': false,
-            'error': 'Invalid response format from server',
-            'statusCode': response.statusCode,
-          };
-        }
-      } else if (response.statusCode == 401) {
-        final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? 'Authentication failed';
-
-        _logger.warning(
-          'Authentication failed for user: $userID - $errorMessage',
-        );
-
-        return {
-          'success': false,
-          'error': errorMessage,
-          'statusCode': response.statusCode,
-        };
-      } else if (response.statusCode == 400) {
-        final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? response.body.isNotEmpty
-            ? response.body
-            : 'Invalid request parameters';
-
-        _logger.warning('Bad request for user: $userID - $errorMessage');
-        _logger.warning('Request was: $requestBody');
-
-        return {
-          'success': false,
-          'error': 'Bad Request: $errorMessage',
-          'statusCode': response.statusCode,
-          'raw_response': response.body,
-        };
-      } else {
-        final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? 'Server error occurred';
-
-        _logger.error(
-          'Server error during authentication: ${response.statusCode} - $errorMessage',
-        );
-
-        return {
-          'success': false,
-          'error': errorMessage,
-          'statusCode': response.statusCode,
-        };
-      }
-    } on http.ClientException catch (e) {
-      _logger.error('Network error during authentication', e);
-      return {
-        'success': false,
-        'error':
-            'Network connection failed. Please check your internet connection.',
-        'statusCode': 0,
-      };
-    } on FormatException catch (e) {
-      _logger.error('JSON parsing error during authentication', e);
-      return {
-        'success': false,
-        'error': 'Invalid response from server',
-        'statusCode': 0,
-      };
-    } catch (e) {
-      _logger.error('Unexpected error during authentication', e);
-      return {
-        'success': false,
-        'error': 'An unexpected error occurred: ${e.toString()}',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  static Future<bool> login(String userId, String password) async {
-    try {
-      print('🔐 Starting Firebase-only login for userId: "$userId"');
-
-      // First authenticate with backend to get user data
-      final result = await authenticateUser(userID: userId, password: password);
-      if (result['success'] == true) {
-        final loginResponse = result['data'] as LoginResponse;
-
-        print('📊 Backend login successful, proceeding with Firebase auth...');
-
-        // Create user data for temporary storage in AuthManager
-        final userDataWithId = UserData(
-          emplName: loginResponse.data.emplName,
-          areaCode: loginResponse.data.areaCode,
-          roles: loginResponse.data.roles,
-          pages: loginResponse.data.pages,
-          userID: userId,
-        );
-
-        // Store user data in Firebase custom claims or use Firebase Authentication
-        if (kIsWeb) {
-          final firebaseResult = await _firebaseCustomAuth(userId, password, userDataWithId);
-          if (firebaseResult['success'] == true) {
-            print('✅ Firebase authentication successful');
-
-            // Set user in AuthManager after Firebase auth succeeds
-            AuthManager.setUser(userDataWithId);
-            return true;
-          } else {
-            print('❌ Firebase authentication failed: ${firebaseResult['error']}');
-            return false;
-          }
-        } else {
-          // For non-web platforms, just use AuthManager
-          AuthManager.setUser(userDataWithId);
-          return true;
-        }
-      } else {
-        print('❌ Backend authentication failed: ${result['error']}');
-      }
-      return false;
-    } catch (e) {
-      _logger.error('Login error', e);
-      return false;
-    }
-  }
-
-  static Future<bool> loginWithOtp(String mobile, String otp) async {
-    await Future.delayed(const Duration(seconds: 1));
-    return mobile.isNotEmpty && otp.isNotEmpty;
-  }
-
-  static Future<bool> sendOtp(String mobile) async {
-    await Future.delayed(const Duration(seconds: 1));
-    return mobile.isNotEmpty;
-  }
-
-  static Future<void> logout() async {
-    // Firebase sign out first
-    if (kIsWeb) {
-      await _firebaseSignOut();
-    }
-
-    // Try to logout from server
-    final serverLogout = await logoutFromServer();
-    if (!serverLogout['success']) {
-      _logger.warning('Server logout failed, clearing local session anyway');
-    }
-
-    AuthManager.clearUser();
-    await Future.delayed(const Duration(milliseconds: 500));
-  }
-
-  static Future<Map<String, dynamic>> testConnection() async {
-    try {
-      _logger.info('Testing connection to auth server');
-
-      final uri = Uri.parse('$baseUrl/health');
-      final response = await http
-          .get(uri, headers: {'Accept': 'application/json'})
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Health check response: ${response.statusCode}');
-
-      return {
-        'success': response.statusCode == 200,
-        'statusCode': response.statusCode,
-        'message': response.statusCode == 200
-            ? 'Connection successful'
-            : 'Server responded with status ${response.statusCode}',
-      };
-    } catch (e) {
-      _logger.error('Connection test failed', e);
-      return {
-        'success': false,
-        'statusCode': 0,
-        'message': 'Connection failed: ${e.toString()}',
-      };
-    }
-  }
-
-  static Map<String, dynamic> _safeJsonDecode(String body) {
-    try {
-      final decoded = jsonDecode(body);
-      return decoded is Map<String, dynamic>
-          ? decoded
-          : {'raw': decoded.toString()};
-    } catch (_) {
-      return {'raw': body};
-    }
-  }
-
-  // Session validation endpoint
-  static Future<Map<String, dynamic>> validateSession() async {
-    try {
-      _logger.info('Validating user session');
-
-      final uri = Uri.parse('$baseUrl/auth/me');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final response = await http
-          .get(uri, headers: requestHeaders)
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Session validation response: ${response.statusCode}');
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
-
-        return {
-          'success': true,
-          'data': responseData,
-          'statusCode': response.statusCode,
-        };
-      } else {
-        return {
-          'success': false,
-          'error': 'Session validation failed',
-          'statusCode': response.statusCode,
-        };
-      }
-    } catch (e) {
-      _logger.error('Session validation error', e);
-      return {
-        'success': false,
-        'error': 'Network error during session validation',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  // Token refresh endpoint
-  static Future<Map<String, dynamic>> refreshToken() async {
-    try {
-      _logger.info('Refreshing access token');
-
-      final uri = Uri.parse('$baseUrl/auth/refresh');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final response = await http
-          .post(uri, headers: requestHeaders)
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Token refresh response: ${response.statusCode}');
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
-
-        return {
-          'success': true,
-          'data': responseData,
-          'statusCode': response.statusCode,
-        };
-      } else {
-        return {
-          'success': false,
-          'error': 'Token refresh failed',
-          'statusCode': response.statusCode,
-        };
-      }
-    } catch (e) {
-      _logger.error('Token refresh error', e);
-      return {
-        'success': false,
-        'error': 'Network error during token refresh',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  // Enhanced logout with server-side session clearing
-  static Future<Map<String, dynamic>> logoutFromServer() async {
-    try {
-      _logger.info('Logging out from server');
-
-      final uri = Uri.parse('$baseUrl/auth/logout');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final response = await http
-          .post(uri, headers: requestHeaders)
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Server logout response: ${response.statusCode}');
-
-      return {
-        'success': response.statusCode == 200,
-        'statusCode': response.statusCode,
-      };
-    } catch (e) {
-      _logger.error('Server logout error', e);
-      return {
-        'success': false,
-        'error': 'Network error during logout',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  // Firebase Custom Authentication for non-email userIDs
-  static Future<Map<String, dynamic>> _firebaseCustomAuth(String userID, String password, UserData userData) async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      print('🔐 Attempting Firebase custom auth for userID: $userID');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseCustomAuth) {
-            return await window.FirebaseCustomAuth.signInWithUserID('$userID', '$password');
-          }
-          return { success: false, error: 'FirebaseCustomAuth not available' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        print('✅ Firebase custom auth successful for userID: $userID');
-
-        // Store user data in Firebase user profile or custom claims
-        await _storeUserDataInFirebase(userData);
-
-        return {'success': true, 'user': result['user']};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        print('❌ Firebase custom auth failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      print('❌ Firebase custom auth error: $e');
-      return {'success': false, 'error': 'Firebase authentication failed: $e'};
-    }
-  }
-
-  // Store user data in Firebase user profile
-  static Future<void> _storeUserDataInFirebase(UserData userData) async {
-    try {
-      await js.context.callMethod('eval', ['''
-        (async function() {
-          const user = firebase.auth().currentUser;
-          if (user) {
-            // Store user data in Firebase user profile
-            await user.updateProfile({
-              displayName: "${userData.emplName}",
-            });
-
-            console.log('📊 User data stored in Firebase profile');
-          }
-        })()
-      ''']);
-    } catch (e) {
-      print('❌ Failed to store user data in Firebase: $e');
-    }
-  }
-
-  // Firebase Authentication Helper Methods
-  static Future<Map<String, dynamic>> _firebaseSignIn(String email, String password) async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      _logger.info('Attempting Firebase sign in for: $email');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseAuthManager) {
-            return await window.FirebaseAuthManager.signInWithEmailAndPassword('$email', '$password');
-          }
-          return { success: false, error: 'Firebase not initialized' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        _logger.info('Firebase sign in successful');
-        return {'success': true, 'user': result['user']};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        _logger.warning('Firebase sign in failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      _logger.error('Firebase sign in error', e);
-      return {'success': false, 'error': 'Firebase authentication failed: $e'};
-    }
-  }
-
-  static Future<Map<String, dynamic>> _firebaseSignOut() async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      _logger.info('Signing out from Firebase');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseAuthManager) {
-            return await window.FirebaseAuthManager.signOut();
-          }
-          return { success: false, error: 'Firebase not initialized' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        _logger.info('Firebase sign out successful');
-        return {'success': true};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        _logger.warning('Firebase sign out failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      _logger.error('Firebase sign out error', e);
-      return {'success': false, 'error': 'Firebase sign out failed: $e'};
-    }
-  }
-
-  static Future<Map<String, dynamic>> firebaseSignInWithPhone(String phoneNumber) async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      _logger.info('Attempting Firebase phone sign in for: $phoneNumber');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseAuthManager) {
-            // Note: Phone auth requires reCAPTCHA setup in production
-            // For now, this is a placeholder for future implementation
-            return { success: false, error: 'Phone authentication not configured' };
-          }
-          return { success: false, error: 'Firebase not initialized' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        _logger.info('Firebase phone sign in successful');
-        return {'success': true, 'confirmationResult': result['confirmationResult']};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        _logger.warning('Firebase phone sign in failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      _logger.error('Firebase phone sign in error', e);
-      return {'success': false, 'error': 'Firebase phone authentication failed: $e'};
-    }
-  }
-
-  // Helper method to validate email format
-  static bool _isValidEmail(String email) {
-    return RegExp(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$').hasMatch(email);
-  }
-}
-
-class AuthManager {
-  static UserData? _currentUser;
-  static String? _authToken;
-  static final _authChangeNotifier = ValueNotifier<int>(0);
-  static bool _firebaseInitialized = false;
-
-  static UserData? get currentUser => _currentUser;
-  static String? get authToken => _authToken;
-  static bool get isLoggedIn => _currentUser != null;
-  static ValueNotifier<int> get authChangeNotifier => _authChangeNotifier;
-
-  // Initialize Firebase auth state sync
-  static Future<void> initializeFirebaseSync() async {
-    if (!kIsWeb || _firebaseInitialized) return;
-
-    try {
-      // Set up Firebase auth state listener
-      js.context.callMethod('eval', ['''
-        if (window.FirebaseAuthManager) {
-          window.FirebaseAuthManager.onAuthStateChanged((user) => {
-            console.log('Firebase auth state changed:', user ? 'signed in' : 'signed out');
-
-            // Communicate with Flutter
-            if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
-              window.flutter_inappwebview.callHandler('firebase_auth_changed', {
-                isSignedIn: !!user,
-                uid: user ? user.uid : null,
-                email: user ? user.email : null
-              });
-            } else {
-              // For regular browser, use custom event
-              window.dispatchEvent(new CustomEvent('firebaseAuthChanged', {
-                detail: {
-                  isSignedIn: !!user,
-                  uid: user ? user.uid : null,
-                  email: user ? user.email : null
-                }
-              }));
-            }
-          });
-        }
-      ''']);
-
-      _firebaseInitialized = true;
-    } catch (e) {
-      print('Failed to initialize Firebase sync: $e');
-    }
-  }
-
-  static void setUser(UserData userData, {String? token}) {
-    _currentUser = userData;
-    _authToken = token;
-
-    print('👤 User set in AuthManager: ${userData.userID}');
-    _notifyAuthChanged();
-  }
-
-  static void clearUser() {
-    _currentUser = null;
-    _authToken = null;
-
-    print('🗑️ User cleared from AuthManager');
-    _notifyAuthChanged();
-  }
-
-  // Restore user session from Firebase auth state
-  static Future<bool> restoreUserFromFirebase() async {
-    if (!kIsWeb) return false;
-
-    try {
-      print('🔄 Checking Firebase auth state for session restoration...');
-
-      final firebaseUser = js.context.callMethod('eval', ['''
-        window.FirebaseAuthManager ? window.FirebaseAuthManager.getCurrentUser() : null
-      ''']);
-
-      if (firebaseUser != null) {
-        print('✅ Firebase user found, restoring session from Firebase profile');
-
-        // Get user data from Firebase profile
-        final displayName = js.context.callMethod('eval', ['''
-          firebase.auth().currentUser?.displayName || 'User'
-        ''']);
-
-        final email = js.context.callMethod('eval', ['''
-          firebase.auth().currentUser?.email || ''
-        ''']);
-
-        // Extract original userID from Firebase email (remove @temp.rakauth.com)
-        final originalUserID = email.toString().replaceAll('@temp.rakauth.com', '');
-
-        // Create basic user data (roles and pages would need to be stored in Firebase custom claims)
-        final userData = UserData(
-          emplName: displayName.toString(),
-          areaCode: '', // Store in Firebase custom claims for full functionality
-          roles: ['user'], // Store in Firebase custom claims for full functionality
-          pages: [], // Store in Firebase custom claims for full functionality
-          userID: originalUserID,
-        );
-
-        _currentUser = userData;
-        _notifyAuthChanged();
-
-        print('✅ User session restored from Firebase: ${userData.userID}');
-        return true;
-      } else {
-        print('❌ No Firebase user found');
-      }
-    } catch (e) {
-      print('❌ Failed to restore user from Firebase: $e');
-    }
-
-    return false;
-  }
-
-  // Try to restore user session on app startup
-  static Future<bool> restoreUserSession() async {
-    if (!kIsWeb) {
-      print('📱 Not web platform, skipping session restoration');
-      return false;
-    }
-
-    try {
-      print('🔄 Calling SessionManager.restoreUserSession()...');
-
-      // Check if SessionManager exists first
-      final sessionManagerExists = js.context.callMethod('eval', ['''
-        typeof window.SessionManager !== 'undefined'
-      ''']);
-
-      if (!sessionManagerExists) {
-        print('❌ SessionManager not available');
-        return false;
-      }
-
-      final sessionData = js.context.callMethod('eval', ['''
-        window.SessionManager.restoreUserSession()
-      ''']);
-
-      print('📊 Session data received: $sessionData');
-      print('📊 Session data type: ${sessionData.runtimeType}');
-
-      if (sessionData != null) {
-        // Convert JavaScript object to Dart Map
-        final Map<String, dynamic> dataMap = {};
-
-        try {
-          dataMap['emplName'] = js.context.callMethod('eval', ['''
-            window.SessionManager.restoreUserSession()?.emplName || ''
-          ''']);
-          dataMap['areaCode'] = js.context.callMethod('eval', ['''
-            window.SessionManager.restoreUserSession()?.areaCode || ''
-          ''']);
-          dataMap['userID'] = js.context.callMethod('eval', ['''
-            window.SessionManager.restoreUserSession()?.userID || ''
-          ''']);
-
-          final rolesData = js.context.callMethod('eval', ['''
-            JSON.stringify(window.SessionManager.restoreUserSession()?.roles || [])
-          ''']);
-          final pagesData = js.context.callMethod('eval', ['''
-            JSON.stringify(window.SessionManager.restoreUserSession()?.pages || [])
-          ''']);
-
-          dataMap['roles'] = jsonDecode(rolesData.toString());
-          dataMap['pages'] = jsonDecode(pagesData.toString());
-
-          print('📊 Parsed data: $dataMap');
-
-          final restoredUserID = dataMap['userID']?.toString();
-          if (restoredUserID != null && restoredUserID.isNotEmpty && restoredUserID != 'null') {
-            final userData = UserData(
-              emplName: dataMap['emplName']?.toString() ?? '',
-              areaCode: dataMap['areaCode']?.toString() ?? '',
-              roles: List<String>.from(dataMap['roles'] ?? []),
-              pages: List<String>.from(dataMap['pages'] ?? []),
-              userID: restoredUserID,
-            );
-
-            _currentUser = userData;
-            _notifyAuthChanged();
-
-            print('✅ User session restored successfully: $restoredUserID');
-            return true;
-          } else {
-            print('❌ Invalid session data - missing or invalid userID: $restoredUserID');
-          }
-        } catch (parseError) {
-          print('❌ Failed to parse session data: $parseError');
-        }
-      } else {
-        print('❌ No session data found');
-      }
-    } catch (e) {
-      print('❌ Failed to restore user session: $e');
-    }
-
-    return false;
-  }
-
-  static void _saveUserSession(UserData userData) {
-    try {
-      // Validate userID before saving
-      final userID = userData.userID;
-      if (userID == null || userID.isEmpty) {
-        print('❌ Cannot save session: userID is null or empty');
-        return;
-      }
-
-      print('💾 Saving user session for: $userID');
-
-      // Create safe data object
-      final sessionData = {
-        'emplName': userData.emplName,
-        'areaCode': userData.areaCode,
-        'roles': userData.roles,
-        'pages': userData.pages,
-        'userID': userID, // Use the validated userID
-      };
-
-      print('💾 Session data to save: $sessionData');
-
-      js.context.callMethod('eval', ['''
-        if (window.SessionManager) {
-          window.SessionManager.saveUserSession(${jsonEncode(sessionData)});
-        } else {
-          console.error('❌ SessionManager not available');
-        }
-      ''']);
-    } catch (e) {
-      print('❌ Failed to save user session: $e');
-    }
-  }
-
-  static void _clearUserSession() {
-    try {
-      js.context.callMethod('eval', ['''
-        if (window.SessionManager) {
-          window.SessionManager.clearUserSession();
-        }
-      ''']);
-    } catch (e) {
-      print('Failed to clear user session: $e');
-    }
-  }
-
-  static void Function()? _authChangeCallback;
-
-  static void setAuthChangeCallback(void Function() callback) {
-    _authChangeCallback = callback;
-  }
-
-  static void _notifyAuthChanged() {
-    _authChangeCallback?.call();
-    _authChangeNotifier.value++;
-  }
-
-  static bool hasRole(String role) {
-    return _currentUser?.hasRole(role) ?? false;
-  }
-
-  static bool hasPage(String page) {
-    return _currentUser?.hasPage(page) ?? false;
-  }
-
-  static bool hasAnyRole(List<String> roles) {
-    return _currentUser?.hasAnyRole(roles) ?? false;
-  }
-
-  static bool hasAnyPage(List<String> pages) {
-    return _currentUser?.hasAnyPage(pages) ?? false;
-  }
-
-  static List<String> getUserRoles() {
-    return _currentUser?.roles ?? [];
-  }
-
-  static List<String> getUserPages() {
-    return _currentUser?.pages ?? [];
-  }
-
-  static String getUserName() {
-    return _currentUser?.emplName ?? '';
-  }
-
-  static String getUserAreaCode() {
-    return _currentUser?.areaCode ?? '';
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-import 'package:flutter/foundation.dart';
-import 'dart:async';
-import 'dart:js' as js;
-import '../core/services/auth_service.dart';
-
-class SplashScreen extends StatefulWidget {
-  const SplashScreen({super.key});
-
-  @override
-  State<SplashScreen> createState() => _SplashScreenState();
-}
-
-class _SplashScreenState extends State<SplashScreen>
-    with TickerProviderStateMixin {
-  late AnimationController _fadeController;
-  late AnimationController _scaleController;
-  late AnimationController _slideController;
-  late Animation<double> _fadeAnimation;
-  late Animation<double> _scaleAnimation;
-  late Animation<Offset> _slideAnimation;
-  late AnimationController _particleController;
-  late Animation<double> _particleAnimation;
-
-  @override
-  void initState() {
-    super.initState();
-
-    // Initialize animation controllers
-    _fadeController = AnimationController(
-      duration: const Duration(milliseconds: 1500),
-      vsync: this,
-    );
-
-    _scaleController = AnimationController(
-      duration: const Duration(milliseconds: 1000),
-      vsync: this,
-    );
-
-    _slideController = AnimationController(
-      duration: const Duration(milliseconds: 1200),
-      vsync: this,
-    );
-
-    _particleController = AnimationController(
-      duration: const Duration(milliseconds: 3000),
-      vsync: this,
-    );
-
-    // Define animations
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut),
-    );
-
-    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
-      CurvedAnimation(parent: _scaleController, curve: Curves.elasticOut),
-    );
-
-    _slideAnimation =
-        Tween<Offset>(begin: const Offset(0, 0.5), end: Offset.zero).animate(
-          CurvedAnimation(parent: _slideController, curve: Curves.easeOutCubic),
-        );
-
-    _particleAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(parent: _particleController, curve: Curves.easeInOut),
-    );
-
-    // Start animations
-    _fadeController.forward();
-    _scaleController.forward();
-    _slideController.forward();
-    _particleController.repeat();
-
-    // Initialize Firebase Auth state listener for routing
-    _initializeFirebaseAuthRouting();
-  }
-
-  void _initializeFirebaseAuthRouting() {
-    if (kIsWeb) {
-      // First, try to restore user session from localStorage
-      Timer(const Duration(milliseconds: 1000), () async {
-        if (!mounted) return;
-
-        try {
-          print('🔄 Attempting to restore user session from Firebase...');
-          final sessionRestored = await AuthManager.restoreUserFromFirebase();
-          if (sessionRestored) {
-            print('✅ Session restored from Firebase');
-
-            // Session restored successfully, navigate to home
-            await Future.delayed(const Duration(milliseconds: 500));
-            if (mounted && AuthManager.isLoggedIn) {
-              print('✅ Firebase session restored and user logged in, navigating to home');
-              _navigateToHome();
-              return;
-            }
-          } else {
-            print('❌ No Firebase session to restore');
-          }
-
-          // Check Firebase state again if needed
-          _checkFirebaseAuthState();
-        } catch (e) {
-          print('❌ Firebase session restoration failed: $e');
-          _checkFirebaseAuthState();
-        }
-      });
-    } else {
-      // Non-web platforms - check Flutter auth state
-      Timer(const Duration(milliseconds: 1500), () {
-        if (mounted) {
-          if (AuthManager.isLoggedIn) {
-            _navigateToHome();
-          } else {
-            _navigateToLogin();
-          }
-        }
-      });
-    }
-  }
-
-  void _checkFirebaseAuthState() {
-    // Check both Firebase and Flutter auth state
-    Timer.periodic(const Duration(milliseconds: 500), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-
-      try {
-        // Check if Firebase is initialized
-        final firebaseReady = js.context['FirebaseAuthManager'] != null;
-
-        if (firebaseReady) {
-          timer.cancel();
-
-          // Check Firebase auth state
-          final currentUser = js.context.callMethod('eval', ['''
-            window.FirebaseAuthManager.getCurrentUser()
-          ''']);
-
-          // If Firebase has a user, check Flutter auth state
-          if (currentUser != null) {
-            print('🔥 Firebase user found, checking Flutter auth state');
-            print('📱 Flutter isLoggedIn: ${AuthManager.isLoggedIn}');
-
-            // Check if Flutter also has user data
-            if (AuthManager.isLoggedIn) {
-              print('✅ Both Firebase and Flutter have user, navigating to home');
-              _navigateToHome();
-            } else {
-              print('❌ Firebase user but no Flutter user data, navigating to login');
-              _navigateToLogin();
-            }
-          } else {
-            print('❌ No Firebase user, checking Flutter auth state');
-            print('📱 Flutter isLoggedIn: ${AuthManager.isLoggedIn}');
-
-            // No Firebase user, but check if Flutter has cached user data
-            if (AuthManager.isLoggedIn) {
-              print('📱 Flutter has cached user data, navigating to home');
-              _navigateToHome();
-            } else {
-              print('❌ No user data, navigating to login');
-              _navigateToLogin();
-            }
-          }
-        } else if (timer.tick > 8) { // 4 seconds timeout
-          timer.cancel();
-          print('Firebase timeout, checking Flutter auth state');
-
-          // Fallback to Flutter auth state
-          if (AuthManager.isLoggedIn) {
-            _navigateToHome();
-          } else {
-            _navigateToLogin();
-          }
-        }
-      } catch (e) {
-        timer.cancel();
-        print('Firebase Auth routing error: \$e');
-
-        // Fallback to Flutter auth state
-        if (AuthManager.isLoggedIn) {
-          _navigateToHome();
-        } else {
-          _navigateToLogin();
-        }
-      }
-    });
-  }
-
-  void _navigateToLogin() {
-    if (mounted) {
-      context.go('/login-password');
-    }
-  }
-
-  void _navigateToHome() {
-    if (mounted) {
-      context.go('/home');
-    }
-  }
-
-  @override
-  void dispose() {
-    _fadeController.dispose();
-    _scaleController.dispose();
-    _slideController.dispose();
-    _particleController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF8F9FA),
-      body: Stack(
-        children: [
-          // Background gradient
-          Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  const Color(0xFFFFFFFF),
-                  const Color(0xFFF5F7FA),
-                  const Color(0xFFE9ECEF),
-                ],
-              ),
-            ),
-          ),
-
-          // Animated particles background
-          AnimatedBuilder(
-            animation: _particleAnimation,
-            builder: (context, child) {
-              return CustomPaint(
-                painter: ParticlePainter(_particleAnimation.value),
-                size: Size.infinite,
-              );
-            },
-          ),
-
-          // Main content
-          Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                // Logo/Icon container
-                // Logo/Icon container
-                FadeTransition(
-                  opacity: _fadeAnimation,
-                  child: ScaleTransition(
-                    scale: _scaleAnimation,
-                    child: Container(
-                      width: 140,
-                      height: 140,
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                          colors: [
-                            const Color(0xFF2C5282),
-                            const Color(0xFF2B6CB0),
-                            const Color(0xFF3182CE),
-                          ],
-                        ),
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.3),
-                            blurRadius: 20,
-                            offset: const Offset(0, 10),
-                          ),
-                          BoxShadow(
-                            color: const Color(0xFF3182CE).withOpacity(0.4),
-                            blurRadius: 25,
-                            offset: const Offset(0, 5),
-                          ),
-                        ],
-                      ),
-                      padding: const EdgeInsets.all(8),
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          shape: BoxShape.circle,
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.1),
-                              blurRadius: 8,
-                              offset: const Offset(0, 3),
-                            ),
-                          ],
-                        ),
-                        child: ClipOval(
-                          child: Image.asset(
-                            "assets/images/rak_logo.jpg",
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) {
-                              return const Icon(
-                                Icons.business,
-                                color: Color(0xFF2C5282),
-                                size: 60,
-                              );
-                            },
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-
-                const SizedBox(height: 40),
-
-                // Company name
-                FadeTransition(
-                  opacity: _fadeAnimation,
-                  child: SlideTransition(
-                    position: _slideAnimation,
-                    child: Column(
-                      children: [
-                        Text(
-                          'RAK',
-                          style: TextStyle(
-                            fontSize: 48,
-                            fontWeight: FontWeight.bold,
-                            color: const Color(0xFF2C5282),
-                            letterSpacing: 3,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'WHITE CEMENT',
-                          style: TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.w600,
-                            color: const Color(0xFF4A5568),
-                            letterSpacing: 2,
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Container(
-                          width: 60,
-                          height: 3,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              colors: [
-                                const Color(0xFF3182CE),
-                                const Color(0xFF2B6CB0),
-                              ],
-                            ),
-                            borderRadius: BorderRadius.circular(2),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'Construction Materials',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w400,
-                            color: const Color(0xFF718096),
-                            letterSpacing: 1,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-
-                const SizedBox(height: 60),
-
-                // Loading indicator
-                FadeTransition(
-                  opacity: _fadeAnimation,
-                  child: Column(
-                    children: [
-                      SizedBox(
-                        width: 40,
-                        height: 40,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 3,
-                          valueColor: AlwaysStoppedAnimation<Color>(
-                            const Color(0xFF3182CE),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      Text(
-                        'Loading...',
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: const Color(0xFF718096),
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // Bottom footer
-          Positioned(
-            bottom: 30,
-            left: 0,
-            right: 0,
-            child: FadeTransition(
-              opacity: _fadeAnimation,
-              child: Column(
-                children: [
-                  Text(
-                    'Est. 1980',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: const Color(0xFFA0AEC0),
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Ras Al Khaimah, United Arab Emirates',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: const Color(0xFFA0AEC0),
-                      fontWeight: FontWeight.w400,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class ParticlePainter extends CustomPainter {
-  final double animationValue;
-
-  ParticlePainter(this.animationValue);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = Colors.blue.withOpacity(0.1);
-
-    // Create floating particles
-    for (int i = 0; i < 20; i++) {
-      final x = (size.width / 20) * i + (animationValue * 50) % size.width;
-      final y =
-          size.height * 0.5 +
-          (animationValue * 100 + i * 30) % size.height -
-          size.height * 0.25;
-
-      canvas.drawCircle(Offset(x, y), 2 + (animationValue * 2) % 3, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
-}
-
-
-  
