@@ -1,717 +1,1943 @@
-import 'dart:convert';
-import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-import 'dart:js' as js;
-import '../models/auth_models.dart';
-import '../utils/app_logger.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:go_router/go_router.dart';
+import '../../../core/theme/theme.dart';
+import '../../../core/widgets/custom_back_button.dart';
+import '../../../core/services/auth_service.dart';
 
-class AuthService {
-  static final AppLogger _logger = AppLogger();
-  static const Duration _defaultTimeout = Duration(seconds: 30);
+class LoginWithPasswordScreen extends StatefulWidget {
+  const LoginWithPasswordScreen({super.key});
 
-  static const String baseUrl = 'https://qa.birlawhite.com:55232';
-  static const String authEndpoint = '/api/Auth/execute';
+  @override
+  State<LoginWithPasswordScreen> createState() =>
+      _LoginWithPasswordScreenState();
+}
 
-  static Future<Map<String, dynamic>> authenticateUser({
-    required String userID,
-    required String password,
-    String? appRegId,
-  }) async {
+class _LoginWithPasswordScreenState extends State<LoginWithPasswordScreen>
+    with SingleTickerProviderStateMixin {
+  final _formKey = GlobalKey<FormState>();
+  final _userIdController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _isLoading = false;
+  final bool _isDarkMode = false;
+  bool _rememberMe = false;
+
+  late AnimationController _animationController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeAnimations();
+    _animationController.forward();
+  }
+
+  void _initializeAnimations() {
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    );
+
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _animationController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _userIdController.dispose();
+    _passwordController.dispose();
+    _animationController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _handleLogin() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      _isLoading = true;
+    });
+
     try {
-      _logger.info('Authenticating user: $userID');
+      // Trim input values to remove any whitespace
+      final userID = _userIdController.text.trim();
+      final password = _passwordController.text.trim();
 
-      final loginRequest = LoginRequest(
-        userID: userID,
-        password: password,
-        appRegId:
-            appRegId ?? 'mobile_app_${DateTime.now().millisecondsSinceEpoch}',
-      );
+      // Use AuthService.login method which includes Firebase integration
+      final success = await AuthService.login(userID, password);
 
-      final uri = Uri.parse('$baseUrl$authEndpoint');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
 
-      final requestBody = jsonEncode(loginRequest.toJson());
-
-      _logger.debug('Making POST request to: $uri');
-      _logger.debug('Request headers: $requestHeaders');
-      _logger.debug('Request body: $requestBody');
-
-      final request = http.Request('POST', uri);
-      request.headers.addAll(requestHeaders);
-      request.body = requestBody;
-
-      final client = http.Client();
-      final streamedResponse = await client.send(request).timeout(_defaultTimeout);
-      final response = await http.Response.fromStream(streamedResponse);
-
-      // Extract cookies from response headers for future requests
-      final cookieHeader = response.headers['set-cookie'];
-      if (cookieHeader != null) {
-        _logger.debug('Received cookies: $cookieHeader');
-      }
-
-      _logger.debug('Response status: ${response.statusCode}');
-      _logger.debug('Response headers: ${response.headers}');
-      _logger.debug('Response body: ${response.body}');
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
-
-        try {
-          final loginResponse = LoginResponse.fromJson(responseData);
-          _logger.info('Authentication successful for user: $userID');
-
-          return {
-            'success': true,
-            'data': loginResponse,
-            'statusCode': response.statusCode,
-          };
-        } catch (e) {
-          _logger.error('Failed to parse login response', e);
-          return {
-            'success': false,
-            'error': 'Invalid response format from server',
-            'statusCode': response.statusCode,
-          };
+        if (success) {
+          // Get the user data that was set by AuthService.login
+          final userData = AuthManager.currentUser;
+          if (userData != null) {
+            // Navigate based on user roles and pages
+            _navigateBasedOnRole(userData);
+          } else {
+            _showErrorSnackBar('Login successful but user data not found.');
+          }
+        } else {
+          _showErrorSnackBar('Login failed. Please check your credentials and try again.');
         }
-      } else if (response.statusCode == 401) {
-        final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? 'Authentication failed';
-
-        _logger.warning(
-          'Authentication failed for user: $userID - $errorMessage',
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+        _showErrorSnackBar(
+          'Network error. Please check your connection and try again.',
         );
+      }
+    }
+  }
 
-        return {
-          'success': false,
-          'error': errorMessage,
-          'statusCode': response.statusCode,
-        };
-      } else if (response.statusCode == 400) {
-        final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? response.body.isNotEmpty
-            ? response.body
-            : 'Invalid request parameters';
+  void _navigateBasedOnRole(userData) {
+    // Check user's pages to determine which screen to navigate to
+    final userPages = userData.pages as List<String>;
+    final userRoles = userData.roles as List<String>;
 
-        _logger.warning('Bad request for user: $userID - $errorMessage');
-        _logger.warning('Request was: $requestBody');
+    // Navigate to the appropriate screen based on user's access
+    if (userPages.contains('DASHBOARD') || userRoles.contains('ADMIN')) {
+      context.go('/dashboard');
+    } else if (userPages.contains('QUALITY_CONTROL') ||
+        userRoles.contains('QC_MANAGER')) {
+      context.go('/approval-dashboard');
+    } else if (userPages.contains('PRODUCTS') ||
+        userRoles.contains('PRODUCT_MANAGER')) {
+      context.go('/new-product-entry');
+    } else if (userPages.contains('REGISTRATION') ||
+        userRoles.contains('REGISTRAR')) {
+      context.go('/registration-type');
+    } else {
+      // Default to main dashboard/home if no specific role matches
+      context.go('/home');
+    }
+  }
 
-        return {
-          'success': false,
-          'error': 'Bad Request: $errorMessage',
-          'statusCode': response.statusCode,
-          'raw_response': response.body,
-        };
-      } else {
-        final errorData = _safeJsonDecode(response.body);
-        final errorMessage = errorData['error'] ?? 'Server error occurred';
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
 
-        _logger.error(
-          'Server error during authentication: ${response.statusCode} - $errorMessage',
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = _isDarkMode;
+
+    SystemChrome.setSystemUIOverlayStyle(
+      SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: isDark ? Brightness.light : Brightness.dark,
+        statusBarBrightness: isDark ? Brightness.dark : Brightness.light,
+      ),
+    );
+
+    return Scaffold(
+      backgroundColor: isDark ? const Color(0xFF0A0A0A) : Colors.white,
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final isMobile = constraints.maxWidth < 600;
+          final isTablet =
+              constraints.maxWidth >= 600 && constraints.maxWidth < 1200;
+          final isDesktop = constraints.maxWidth >= 1200;
+
+          return Container(
+            width: double.infinity,
+            height: double.infinity,
+            decoration: BoxDecoration(
+              gradient: isDark
+                  ? const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFF0A0A0A),
+                        Color(0xFF1A1A2E),
+                        Color(0xFF16213E),
+                      ],
+                    )
+                  : const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFFf8f9ff),
+                        Color(0xFFe3f2fd),
+                        Color(0xFFffffff),
+                      ],
+                    ),
+            ),
+            child: Stack(
+              children: [
+                if (Navigator.of(context).canPop())
+                  const Positioned(
+                    top: 50,
+                    left: 20,
+                    child: CustomBackButton(),
+                  ),
+                isMobile
+                    ? _buildMobileLayout(isDark)
+                    : _buildWebLayout(isDark, isTablet, isDesktop),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildAnimatedLogo() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Transform.scale(
+          scale: 0.8 + (0.2 * value),
+          child: Container(
+            height: 120,
+            width: 120,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blue.withOpacity(0.2),
+                  blurRadius: 15,
+                  spreadRadius: 3,
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: ClipOval(
+                child: Image.asset(
+                  'assets/images/rak_logo.jpg',
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) {
+                    // Fallback with RAK text logo if image fails to load
+                    return Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [Colors.blue.shade700, Colors.blue.shade500],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Center(
+                        child: Text(
+                          'RAK',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
         );
-
-        return {
-          'success': false,
-          'error': errorMessage,
-          'statusCode': response.statusCode,
-        };
-      }
-    } on http.ClientException catch (e) {
-      _logger.error('Network error during authentication', e);
-      return {
-        'success': false,
-        'error':
-            'Network connection failed. Please check your internet connection.',
-        'statusCode': 0,
-      };
-    } on FormatException catch (e) {
-      _logger.error('JSON parsing error during authentication', e);
-      return {
-        'success': false,
-        'error': 'Invalid response from server',
-        'statusCode': 0,
-      };
-    } catch (e) {
-      _logger.error('Unexpected error during authentication', e);
-      return {
-        'success': false,
-        'error': 'An unexpected error occurred: ${e.toString()}',
-        'statusCode': 0,
-      };
-    }
+      },
+    );
   }
 
-  static Future<bool> login(String userId, String password) async {
-    try {
-      print('🔐 Starting login for userId: "$userId"');
+  Widget _buildMobileLayout(bool isDark) {
+    return Center(
+      child: SingleChildScrollView(
+        child: FadeTransition(
+          opacity: _fadeAnimation,
+          child: SlideTransition(
+            position: _slideAnimation,
+            child: ScaleTransition(
+              scale: _scaleAnimation,
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 420),
+                margin: const EdgeInsets.symmetric(horizontal: 24),
+                child: Card(
+                  elevation: isDark ? 0 : 24,
+                  shadowColor: isDark
+                      ? Colors.transparent
+                      : Colors.blue.withOpacity(0.15),
+                  color: isDark
+                      ? const Color(0xFF1E1E1E).withOpacity(0.95)
+                      : Colors.white.withOpacity(0.98),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(28),
+                    side: isDark
+                        ? BorderSide(
+                            color: Colors.white.withOpacity(0.1),
+                            width: 1,
+                          )
+                        : BorderSide.none,
+                  ),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    padding: const EdgeInsets.all(40),
+                    child: _buildLoginForm(isDark),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
-      // First authenticate with backend to get user data
-      final result = await authenticateUser(userID: userId, password: password);
-      if (result['success'] == true) {
-        final loginResponse = result['data'] as LoginResponse;
+  Widget _buildWebLayout(bool isDark, bool isTablet, bool isDesktop) {
+    return Row(
+      children: [
+        // Left side - Branding/Info
+        Expanded(
+          flex: isDesktop ? 3 : 2,
+          child: Container(
+            padding: EdgeInsets.all(isDesktop ? 80 : 60),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildAnimatedLogo(),
+                SizedBox(height: isDesktop ? 40 : 32),
+                Text(
+                  'Welcome Back',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 48 : 36,
+                    fontWeight: FontWeight.bold,
+                    color: isDark ? Colors.white : Colors.blue.shade800,
+                  ),
+                ),
+                SizedBox(height: isDesktop ? 20 : 16),
+                Text(
+                  'Sign in to access your RAK account and manage your registrations.',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 18 : 16,
+                    color: isDark ? Colors.grey.shade300 : Colors.grey.shade600,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        // Right side - Login Form
+        Expanded(
+          flex: isDesktop ? 2 : 3,
+          child: Container(
+            height: double.infinity,
+            decoration: BoxDecoration(
+              color: isDark
+                  ? const Color(0xFF1E1E1E).withOpacity(0.95)
+                  : Colors.white.withOpacity(0.98),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(isDark ? 0.3 : 0.1),
+                  blurRadius: 20,
+                  offset: const Offset(-5, 0),
+                ),
+              ],
+            ),
+            child: Center(
+              child: SingleChildScrollView(
+                padding: EdgeInsets.all(isDesktop ? 60 : 40),
+                child: FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: SlideTransition(
+                    position: _slideAnimation,
+                    child: Container(
+                      constraints: const BoxConstraints(maxWidth: 400),
+                      child: _buildLoginForm(isDark),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 
-        print('📊 Backend login successful, creating user data...');
-        print('📊 Login response data: ${loginResponse.data}');
+  Widget _buildLoginForm(bool isDark) {
+    return Form(
+      key: _formKey,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildAnimatedTitle(),
+          const SizedBox(height: 32),
+          ModernTextField(
+            controller: _userIdController,
+            labelText: 'User ID',
+            hintText: 'Enter your user ID',
+            keyboardType: TextInputType.text,
+            isDark: isDark,
+            prefixIcon: Icons.person_outline,
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Please enter your user ID';
+              }
+              return null;
+            },
+            delay: const Duration(milliseconds: 300),
+          ),
+          const SizedBox(height: 24),
+          ModernPasswordField(
+            controller: _passwordController,
+            labelText: 'Password',
+            hintText: 'Enter your password',
+            isDark: isDark,
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Please enter your password';
+              }
+              if (value.length < 6) {
+                return 'Password must be at least 6 characters';
+              }
+              return null;
+            },
+            delay: const Duration(milliseconds: 450),
+          ),
+          const SizedBox(height: 16),
+          _buildRememberMeSection(),
+          const SizedBox(height: 32),
+          ModernButton(
+            text: 'Sign In',
+            isLoading: _isLoading,
+            onPressed: _handleLogin,
+            isPrimary: true,
+            isDark: isDark,
+            delay: const Duration(milliseconds: 600),
+          ),
+          const SizedBox(height: 16),
+          ModernButton(
+            text: 'Continue with OTP',
+            isLoading: false,
+            onPressed: () {
+              context.push('/login-otp');
+            },
+            isPrimary: false,
+            isDark: isDark,
+            delay: const Duration(milliseconds: 750),
+          ),
+          const SizedBox(height: 24),
+          _buildSignUpSection(),
+        ],
+      ),
+    );
+  }
 
-        // Create user data
-        final userDataWithId = UserData(
-          emplName: loginResponse.data.emplName,
-          areaCode: loginResponse.data.areaCode,
-          roles: loginResponse.data.roles,
-          pages: loginResponse.data.pages,
-          userID: userId, // Make sure userId parameter is used
+  Widget _buildAnimatedTitle() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOut,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 20 * (1 - value)),
+            child: child,
+          ),
         );
-
-        print('📊 Created UserData: userID="${userDataWithId.userID}", name="${userDataWithId.emplName}"');
-
-        // Set user in AuthManager first
-        AuthManager.setUser(userDataWithId);
-
-        // Then sign in to Firebase for web session management
-        if (kIsWeb) {
-          final firebaseResult = await _firebaseSignIn(userId, password);
-          if (firebaseResult['success'] != true) {
-            _logger.warning('Firebase authentication failed but backend succeeded');
-            // Continue anyway - Firebase is for session management only
-          }
-        }
-
-        print('✅ Login completed successfully');
-        return true;
-      } else {
-        print('❌ Backend authentication failed: ${result['error']}');
-      }
-      return false;
-    } catch (e) {
-      _logger.error('Login error', e);
-      return false;
-    }
+      },
+      child: Text(
+        'Login',
+        style: AppTheme.headline.copyWith(color: Colors.blue),
+      ),
+    );
   }
 
-  static Future<bool> loginWithOtp(String mobile, String otp) async {
-    await Future.delayed(const Duration(seconds: 1));
-    return mobile.isNotEmpty && otp.isNotEmpty;
+  Widget _buildRememberMeSection() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Row(
+            children: [
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: Checkbox(
+                  value: _rememberMe,
+                  onChanged: (value) {
+                    setState(() {
+                      _rememberMe = value ?? false;
+                    });
+                  },
+                  activeColor: Colors.blue,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Remember me',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: _isDarkMode
+                      ? Colors.grey.shade300
+                      : Colors.grey.shade600,
+                ),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: () {
+                  // Implement forgot password
+                  _showErrorSnackBar('Forgot password will be implemented');
+                },
+                child: Text(
+                  'Forgot Password?',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.blue.shade600,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
-  static Future<bool> sendOtp(String mobile) async {
-    await Future.delayed(const Duration(seconds: 1));
-    return mobile.isNotEmpty;
-  }
-
-  static Future<void> logout() async {
-    // Firebase sign out first
-    if (kIsWeb) {
-      await _firebaseSignOut();
-    }
-
-    // Try to logout from server
-    final serverLogout = await logoutFromServer();
-    if (!serverLogout['success']) {
-      _logger.warning('Server logout failed, clearing local session anyway');
-    }
-
-    AuthManager.clearUser();
-    await Future.delayed(const Duration(milliseconds: 500));
-  }
-
-  static Future<Map<String, dynamic>> testConnection() async {
-    try {
-      _logger.info('Testing connection to auth server');
-
-      final uri = Uri.parse('$baseUrl/health');
-      final response = await http
-          .get(uri, headers: {'Accept': 'application/json'})
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Health check response: ${response.statusCode}');
-
-      return {
-        'success': response.statusCode == 200,
-        'statusCode': response.statusCode,
-        'message': response.statusCode == 200
-            ? 'Connection successful'
-            : 'Server responded with status ${response.statusCode}',
-      };
-    } catch (e) {
-      _logger.error('Connection test failed', e);
-      return {
-        'success': false,
-        'statusCode': 0,
-        'message': 'Connection failed: ${e.toString()}',
-      };
-    }
-  }
-
-  static Map<String, dynamic> _safeJsonDecode(String body) {
-    try {
-      final decoded = jsonDecode(body);
-      return decoded is Map<String, dynamic>
-          ? decoded
-          : {'raw': decoded.toString()};
-    } catch (_) {
-      return {'raw': body};
-    }
-  }
-
-  // Session validation endpoint
-  static Future<Map<String, dynamic>> validateSession() async {
-    try {
-      _logger.info('Validating user session');
-
-      final uri = Uri.parse('$baseUrl/auth/me');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final response = await http
-          .get(uri, headers: requestHeaders)
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Session validation response: ${response.statusCode}');
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
-
-        return {
-          'success': true,
-          'data': responseData,
-          'statusCode': response.statusCode,
-        };
-      } else {
-        return {
-          'success': false,
-          'error': 'Session validation failed',
-          'statusCode': response.statusCode,
-        };
-      }
-    } catch (e) {
-      _logger.error('Session validation error', e);
-      return {
-        'success': false,
-        'error': 'Network error during session validation',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  // Token refresh endpoint
-  static Future<Map<String, dynamic>> refreshToken() async {
-    try {
-      _logger.info('Refreshing access token');
-
-      final uri = Uri.parse('$baseUrl/auth/refresh');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final response = await http
-          .post(uri, headers: requestHeaders)
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Token refresh response: ${response.statusCode}');
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
-
-        return {
-          'success': true,
-          'data': responseData,
-          'statusCode': response.statusCode,
-        };
-      } else {
-        return {
-          'success': false,
-          'error': 'Token refresh failed',
-          'statusCode': response.statusCode,
-        };
-      }
-    } catch (e) {
-      _logger.error('Token refresh error', e);
-      return {
-        'success': false,
-        'error': 'Network error during token refresh',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  // Enhanced logout with server-side session clearing
-  static Future<Map<String, dynamic>> logoutFromServer() async {
-    try {
-      _logger.info('Logging out from server');
-
-      final uri = Uri.parse('$baseUrl/auth/logout');
-      final requestHeaders = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      };
-
-      final response = await http
-          .post(uri, headers: requestHeaders)
-          .timeout(const Duration(seconds: 10));
-
-      _logger.debug('Server logout response: ${response.statusCode}');
-
-      return {
-        'success': response.statusCode == 200,
-        'statusCode': response.statusCode,
-      };
-    } catch (e) {
-      _logger.error('Server logout error', e);
-      return {
-        'success': false,
-        'error': 'Network error during logout',
-        'statusCode': 0,
-      };
-    }
-  }
-
-  // Firebase Authentication Helper Methods
-  static Future<Map<String, dynamic>> _firebaseSignIn(String email, String password) async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      _logger.info('Attempting Firebase sign in for: $email');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseAuthManager) {
-            return await window.FirebaseAuthManager.signInWithEmailAndPassword('$email', '$password');
-          }
-          return { success: false, error: 'Firebase not initialized' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        _logger.info('Firebase sign in successful');
-        return {'success': true, 'user': result['user']};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        _logger.warning('Firebase sign in failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      _logger.error('Firebase sign in error', e);
-      return {'success': false, 'error': 'Firebase authentication failed: $e'};
-    }
-  }
-
-  static Future<Map<String, dynamic>> _firebaseSignOut() async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      _logger.info('Signing out from Firebase');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseAuthManager) {
-            return await window.FirebaseAuthManager.signOut();
-          }
-          return { success: false, error: 'Firebase not initialized' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        _logger.info('Firebase sign out successful');
-        return {'success': true};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        _logger.warning('Firebase sign out failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      _logger.error('Firebase sign out error', e);
-      return {'success': false, 'error': 'Firebase sign out failed: $e'};
-    }
-  }
-
-  static Future<Map<String, dynamic>> firebaseSignInWithPhone(String phoneNumber) async {
-    if (!kIsWeb) {
-      return {'success': false, 'error': 'Firebase auth only available on web'};
-    }
-
-    try {
-      _logger.info('Attempting Firebase phone sign in for: $phoneNumber');
-
-      final result = await js.context.callMethod('eval', ['''
-        (async function() {
-          if (window.FirebaseAuthManager) {
-            // Note: Phone auth requires reCAPTCHA setup in production
-            // For now, this is a placeholder for future implementation
-            return { success: false, error: 'Phone authentication not configured' };
-          }
-          return { success: false, error: 'Firebase not initialized' };
-        })()
-      ''']);
-
-      if (result != null && result['success'] == true) {
-        _logger.info('Firebase phone sign in successful');
-        return {'success': true, 'confirmationResult': result['confirmationResult']};
-      } else {
-        final error = result?['error'] ?? 'Unknown Firebase error';
-        _logger.warning('Firebase phone sign in failed: $error');
-        return {'success': false, 'error': error};
-      }
-    } catch (e) {
-      _logger.error('Firebase phone sign in error', e);
-      return {'success': false, 'error': 'Firebase phone authentication failed: $e'};
-    }
+  Widget _buildSignUpSection() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 800),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                "Don't have an account? ",
+                style: TextStyle(
+                  fontSize: 14,
+                  color: _isDarkMode
+                      ? Colors.grey.shade400
+                      : Colors.grey.shade600,
+                ),
+              ),
+              TextButton(
+                onPressed: () {
+                  context.push('/registration-type');
+                },
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(
+                  'Sign up',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.blue.shade600,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }
 
-class AuthManager {
-  static UserData? _currentUser;
-  static String? _authToken;
-  static final _authChangeNotifier = ValueNotifier<int>(0);
-  static bool _firebaseInitialized = false;
+class AnimatedPasswordField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? Function(String?)? validator;
+  final Duration delay;
 
-  static UserData? get currentUser => _currentUser;
-  static String? get authToken => _authToken;
-  static bool get isLoggedIn => _currentUser != null;
-  static ValueNotifier<int> get authChangeNotifier => _authChangeNotifier;
+  const AnimatedPasswordField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.validator,
+    required this.delay,
+  });
 
-  // Initialize Firebase auth state sync
-  static Future<void> initializeFirebaseSync() async {
-    if (!kIsWeb || _firebaseInitialized) return;
+  @override
+  State<AnimatedPasswordField> createState() => _AnimatedPasswordFieldState();
+}
 
-    try {
-      // Set up Firebase auth state listener
-      js.context.callMethod('eval', ['''
-        if (window.FirebaseAuthManager) {
-          window.FirebaseAuthManager.onAuthStateChanged((user) => {
-            console.log('Firebase auth state changed:', user ? 'signed in' : 'signed out');
+class _AnimatedPasswordFieldState extends State<AnimatedPasswordField> {
+  bool _isVisible = false;
+  bool _obscureText = true;
 
-            // Communicate with Flutter
-            if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
-              window.flutter_inappwebview.callHandler('firebase_auth_changed', {
-                isSignedIn: !!user,
-                uid: user ? user.uid : null,
-                email: user ? user.email : null
-              });
-            } else {
-              // For regular browser, use custom event
-              window.dispatchEvent(new CustomEvent('firebaseAuthChanged', {
-                detail: {
-                  isSignedIn: !!user,
-                  uid: user ? user.uid : null,
-                  email: user ? user.email : null
-                }
-              }));
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: TextFormField(
+          controller: widget.controller,
+          obscureText: _obscureText,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            filled: true,
+            fillColor: Colors.grey.shade100,
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Colors.blue, width: 2),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+            suffixIcon: IconButton(
+              icon: Icon(
+                _obscureText ? Icons.visibility : Icons.visibility_off,
+                color: Colors.grey,
+              ),
+              onPressed: () {
+                setState(() {
+                  _obscureText = !_obscureText;
+                });
+              },
+            ),
+          ),
+          validator: widget.validator,
+        ),
+      ),
+    );
+  }
+}
+
+// Custom animated text field
+class AnimatedTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? prefixText;
+  final TextInputType keyboardType;
+  final String? Function(String?)? validator;
+  final Duration delay;
+
+  const AnimatedTextField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.prefixText,
+    required this.keyboardType,
+    this.validator,
+    required this.delay,
+  });
+
+  @override
+  State<AnimatedTextField> createState() => _AnimatedTextFieldState();
+}
+
+class _AnimatedTextFieldState extends State<AnimatedTextField> {
+  bool _isVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: TextFormField(
+          controller: widget.controller,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            prefixText: widget.prefixText,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            filled: true,
+            fillColor: Colors.grey.shade100,
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Colors.blue, width: 2),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+          ),
+          keyboardType: widget.keyboardType,
+          validator: widget.validator,
+        ),
+      ),
+    );
+  }
+}
+
+// Custom animated button
+class AnimatedButton extends StatefulWidget {
+  final String text;
+  final bool isLoading;
+  final VoidCallback onPressed;
+  final Duration delay;
+  final Color? textColor;
+
+  const AnimatedButton({
+    super.key,
+    required this.text,
+    required this.isLoading,
+    required this.onPressed,
+    required this.delay,
+    this.textColor,
+  });
+
+  @override
+  State<AnimatedButton> createState() => _AnimatedButtonState();
+}
+
+class _AnimatedButtonState extends State<AnimatedButton> {
+  bool _isVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: widget.isLoading ? null : widget.onPressed,
+            style: ElevatedButton.styleFrom(
+              elevation: 8,
+              shadowColor: Colors.blue.withOpacity(0.3),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              backgroundColor: Colors.blue,
+              foregroundColor: widget.textColor ?? Colors.white,
+            ),
+            child: widget.isLoading
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(width: 16),
+                      Text('Please wait...'),
+                    ],
+                  )
+                : Text(
+                    widget.text,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: widget.textColor ?? Colors.white,
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Modern TextField Component
+class ModernTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final TextInputType keyboardType;
+  final String? Function(String?)? validator;
+  final Duration delay;
+  final bool isDark;
+  final IconData? prefixIcon;
+
+  const ModernTextField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    required this.keyboardType,
+    this.validator,
+    required this.delay,
+    required this.isDark,
+    this.prefixIcon,
+  });
+
+  @override
+  State<ModernTextField> createState() => _ModernTextFieldState();
+}
+
+class _ModernTextFieldState extends State<ModernTextField> {
+  bool _isVisible = false;
+  bool _isFocused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: Focus(
+          onFocusChange: (focused) {
+            setState(() {
+              _isFocused = focused;
+            });
+          },
+          child: TextFormField(
+            controller: widget.controller,
+            keyboardType: widget.keyboardType,
+            style: TextStyle(
+              fontSize: 16,
+              color: widget.isDark ? Colors.white : Colors.black87,
+            ),
+            decoration: InputDecoration(
+              labelText: widget.labelText,
+              hintText: widget.hintText,
+              prefixIcon: widget.prefixIcon != null
+                  ? Icon(
+                      widget.prefixIcon,
+                      color: _isFocused
+                          ? Colors.blue
+                          : (widget.isDark
+                                ? Colors.grey.shade400
+                                : Colors.grey.shade600),
+                    )
+                  : null,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.blue, width: 2),
+              ),
+              errorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 1),
+              ),
+              focusedErrorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 2),
+              ),
+              filled: true,
+              fillColor: widget.isDark
+                  ? Colors.grey.shade800.withOpacity(0.3)
+                  : Colors.grey.shade50,
+              labelStyle: TextStyle(
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              hintStyle: TextStyle(
+                color: widget.isDark
+                    ? Colors.grey.shade500
+                    : Colors.grey.shade400,
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 20,
+              ),
+            ),
+            validator: widget.validator,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Modern Password Field Component
+class ModernPasswordField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? Function(String?)? validator;
+  final Duration delay;
+  final bool isDark;
+
+  const ModernPasswordField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.validator,
+    required this.delay,
+    required this.isDark,
+  });
+
+  @override
+  State<ModernPasswordField> createState() => _ModernPasswordFieldState();
+}
+
+class _ModernPasswordFieldState extends State<ModernPasswordField> {
+  bool _isVisible = false;
+  bool _obscureText = true;
+  bool _isFocused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: Focus(
+          onFocusChange: (focused) {
+            setState(() {
+              _isFocused = focused;
+            });
+          },
+          child: TextFormField(
+            controller: widget.controller,
+            obscureText: _obscureText,
+            style: TextStyle(
+              fontSize: 16,
+              color: widget.isDark ? Colors.white : Colors.black87,
+            ),
+            decoration: InputDecoration(
+              labelText: widget.labelText,
+              hintText: widget.hintText,
+              prefixIcon: Icon(
+                Icons.lock_outline,
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              suffixIcon: IconButton(
+                icon: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: Icon(
+                    _obscureText
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                    key: ValueKey(_obscureText),
+                    color: widget.isDark
+                        ? Colors.grey.shade400
+                        : Colors.grey.shade600,
+                  ),
+                ),
+                onPressed: () {
+                  setState(() {
+                    _obscureText = !_obscureText;
+                  });
+                },
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.blue, width: 2),
+              ),
+              errorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 1),
+              ),
+              focusedErrorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 2),
+              ),
+              filled: true,
+              fillColor: widget.isDark
+                  ? Colors.grey.shade800.withOpacity(0.3)
+                  : Colors.grey.shade50,
+              labelStyle: TextStyle(
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              hintStyle: TextStyle(
+                color: widget.isDark
+                    ? Colors.grey.shade500
+                    : Colors.grey.shade400,
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 20,
+              ),
+            ),
+            validator: widget.validator,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Modern Button Component
+class ModernButton extends StatefulWidget {
+  final String text;
+  final bool isLoading;
+  final VoidCallback onPressed;
+  final Duration delay;
+  final bool isPrimary;
+  final bool isDark;
+
+  const ModernButton({
+    super.key,
+    required this.text,
+    required this.isLoading,
+    required this.onPressed,
+    required this.delay,
+    required this.isPrimary,
+    required this.isDark,
+  });
+
+  @override
+  State<ModernButton> createState() => _ModernButtonState();
+}
+
+class _ModernButtonState extends State<ModernButton> {
+  bool _isVisible = false;
+  bool _isHovered = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: widget.isPrimary
+              ? ElevatedButton(
+                  onPressed: widget.isLoading ? null : widget.onPressed,
+                  style:
+                      ElevatedButton.styleFrom(
+                        elevation: _isHovered ? 12 : 6,
+                        shadowColor: Colors.blue.withOpacity(0.3),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                      ).copyWith(
+                        backgroundColor: WidgetStateProperty.resolveWith((
+                          states,
+                        ) {
+                          if (states.contains(WidgetState.disabled)) {
+                            return Colors.grey.shade400;
+                          }
+                          return Colors.blue;
+                        }),
+                      ),
+                  onHover: (hovering) {
+                    setState(() {
+                      _isHovered = hovering;
+                    });
+                  },
+                  child: widget.isLoading
+                      ? const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            ),
+                            SizedBox(width: 16),
+                            Text('Signing in...'),
+                          ],
+                        )
+                      : Text(
+                          widget.text,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                )
+              : OutlinedButton(
+                  onPressed: widget.onPressed,
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(
+                      color: widget.isDark
+                          ? Colors.grey.shade600
+                          : Colors.grey.shade300,
+                      width: 1.5,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    backgroundColor: _isHovered
+                        ? (widget.isDark
+                              ? Colors.grey.shade800.withOpacity(0.5)
+                              : Colors.grey.shade50)
+                        : null,
+                  ),
+                  onHover: (hovering) {
+                    setState(() {
+                      _isHovered = hovering;
+                    });
+                  },
+                  child: Text(
+                    widget.text,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                      color: widget.isDark
+                          ? Colors.grey.shade300
+                          : Colors.grey.shade700,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+// Custom animated outline button
+class AnimatedOutlineButton extends StatefulWidget {
+  final String text;
+  final VoidCallback onPressed;
+  final Duration delay;
+
+  const AnimatedOutlineButton({
+    super.key,
+    required this.text,
+    required this.onPressed,
+    required this.delay,
+  });
+
+  @override
+  State<AnimatedOutlineButton> createState() => _AnimatedOutlineButtonState();
+}
+
+class _AnimatedOutlineButtonState extends State<AnimatedOutlineButton> {
+  bool _isVisible = false;
+  bool _isHovered = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: MouseRegion(
+          onEnter: (_) => setState(() => _isHovered = true),
+          onExit: (_) => setState(() => _isHovered = false),
+          child: OutlinedButton(
+            onPressed: widget.onPressed,
+            style: OutlinedButton.styleFrom(
+              side: BorderSide(
+                color: _isHovered ? Colors.blue : Colors.grey.shade400,
+                width: 1.5,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              backgroundColor: _isHovered
+                  ? Colors.blue.withOpacity(0.05)
+                  : null,
+            ),
+            child: Text(
+              widget.text,
+              style: TextStyle(
+                fontSize: 14,
+                color: _isHovered ? Colors.blue : Colors.grey.shade700,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Flutter will replace this with the value from --base-href -->
+  <base href="$FLUTTER_BASE_HREF" />
+
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+  <meta name="description" content="RAK Web App" />
+
+  <!-- PWA / theme -->
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="rak_web" />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="apple-touch-icon" href="icons/Icon-192.png" />
+  <link rel="icon" href="icons/Icon-192.png" />
+
+  <!-- Viewport -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover" />
+
+  <!-- Meta CSP (header CSP in IIS/web.config will override this if set) -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self' https:;
+    script-src 'self' https: 'unsafe-inline' 'unsafe-eval';
+    img-src 'self' blob: data: https:;
+    style-src 'self' 'unsafe-inline' https:;
+    connect-src 'self' https: http: wss: ws: blob: https://qa.birlawhite.com:55232 https://rak.birlawhite.com;
+    font-src 'self' https: data:;
+    media-src 'self' blob: data: https:;
+    worker-src 'self' blob: https:;
+    child-src 'self' blob:;
+    frame-src 'self';
+  " />
+
+  <title>rak_web</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="assets/css/roboto.css" />
+
+  <style>
+    html, body { margin: 0; height: 100%; overscroll-behavior: none; background: #fff; }
+  </style>
+</head>
+<body>
+  <!-- PDF.js - Local -->
+  <script src="assets/js/pdf.min.js"></script>
+  <script>
+    // Enhanced PDF.js worker configuration with better fallbacks
+    if (typeof pdfjsLib !== 'undefined') {
+      console.log('PDF.js version:', pdfjsLib.version || 'unknown');
+
+      // Create a robust worker configuration
+      const configurePDFWorker = () => {
+        try {
+          // Dynamic version detection or fallback to known version
+          const pdfVersion = pdfjsLib.version || '3.11.174';
+          const cdnWorkerUrl = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfVersion}/pdf.worker.min.js`;
+
+          pdfjsLib.GlobalWorkerOptions.workerSrc = cdnWorkerUrl;
+
+          console.log('PDF.js worker configured successfully with URL:', cdnWorkerUrl);
+
+          // Test worker loading
+          const testWorker = () => {
+            try {
+              if (pdfjsLib.getDocument) {
+                console.log('PDF.js worker test successful');
+              }
+            } catch (error) {
+              console.error('PDF.js worker test failed:', error);
+            }
+          };
+
+          setTimeout(testWorker, 100);
+
+        } catch (error) {
+          console.error('Failed to configure PDF.js worker:', error);
+        }
+      };
+
+      // Configure immediately
+      configurePDFWorker();
+
+      // Also configure on document ready as fallback
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', configurePDFWorker);
+      }
+    } else {
+      console.warn('PDF.js library not found');
+    }
+  </script>
+
+  <!-- Firebase Web SDK -->
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+
+  <!-- Third-party libs - Local -->
+  <script defer src="assets/js/tesseract.min.js"></script>
+  <script defer src="assets/js/jsQR.js"></script>
+
+  <!-- Firebase Configuration -->
+  <script>
+    // Firebase configuration
+    const firebaseConfig = {
+      apiKey: "AIzaSyA7DZnKbvRlBvq23Zakcu-_nYJqeSaOKa8",
+      authDomain: "rak-circle.firebaseapp.com",
+      projectId: "rak-circle",
+      storageBucket: "rak-circle.firebasestorage.app",
+      messagingSenderId: "346258797033",
+      appId: "1:346258797033:web:e48a94e9560234e0c2db78",
+      measurementId: "G-707FN3TQPD"
+    };
+
+    // Initialize Firebase
+    firebase.initializeApp(firebaseConfig);
+
+    // Set auth persistence to LOCAL (stores in IndexedDB/localStorage)
+    firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+      .then(() => {
+        console.log('Firebase auth persistence set to LOCAL');
+      })
+      .catch((error) => {
+        console.error('Failed to set Firebase auth persistence:', error);
+      });
+
+    // Global Firebase Auth instance
+    window.firebaseAuth = firebase.auth();
+
+    // Firebase Auth State Management
+    window.FirebaseAuthManager = {
+      currentUser: null,
+      authStateListeners: [],
+      isInitialized: false,
+
+      // Initialize auth state listener
+      init() {
+        if (this.isInitialized) return;
+
+        console.log('🔥 Initializing Firebase Auth state listener');
+
+        firebase.auth().onAuthStateChanged((user) => {
+          console.log('🔄 Firebase auth state changed:', user ? 'SIGNED IN' : 'SIGNED OUT');
+          if (user) {
+            console.log('👤 User details:', {
+              uid: user.uid,
+              email: user.email,
+              emailVerified: user.emailVerified
+            });
+          }
+          this.currentUser = user;
+
+          // Notify all listeners
+          this.authStateListeners.forEach(callback => {
+            try {
+              callback(user);
+            } catch (error) {
+              console.error('❌ Auth state listener error:', error);
             }
           });
+        });
+
+        this.isInitialized = true;
+        console.log('✅ Firebase Auth Manager initialized');
+      },
+
+      // Add auth state change listener
+      onAuthStateChanged(callback) {
+        this.authStateListeners.push(callback);
+
+        // If already initialized, call immediately with current state
+        if (this.isInitialized && this.currentUser !== null) {
+          callback(this.currentUser);
         }
-      ''']);
+      },
 
-      _firebaseInitialized = true;
-    } catch (e) {
-      print('Failed to initialize Firebase sync: $e');
-    }
-  }
+      // Get current Firebase user
+      getCurrentUser() {
+        return firebase.auth().currentUser;
+      },
 
-  static void setUser(UserData userData, {String? token}) {
-    _currentUser = userData;
-    _authToken = token;
-
-    // Save user session to localStorage for persistence across tabs
-    if (kIsWeb) {
-      _saveUserSession(userData);
-    }
-
-    _notifyAuthChanged();
-  }
-
-  static void clearUser() {
-    _currentUser = null;
-    _authToken = null;
-
-    // Clear user session from localStorage
-    if (kIsWeb) {
-      _clearUserSession();
-    }
-
-    _notifyAuthChanged();
-  }
-
-  // Try to restore user session on app startup
-  static Future<bool> restoreUserSession() async {
-    if (!kIsWeb) {
-      print('📱 Not web platform, skipping session restoration');
-      return false;
-    }
-
-    try {
-      print('🔄 Calling SessionManager.restoreUserSession()...');
-
-      // Check if SessionManager exists first
-      final sessionManagerExists = js.context.callMethod('eval', ['''
-        typeof window.SessionManager !== 'undefined'
-      ''']);
-
-      if (!sessionManagerExists) {
-        print('❌ SessionManager not available');
-        return false;
-      }
-
-      final sessionData = js.context.callMethod('eval', ['''
-        window.SessionManager.restoreUserSession()
-      ''']);
-
-      print('📊 Session data received: $sessionData');
-      print('📊 Session data type: ${sessionData.runtimeType}');
-
-      if (sessionData != null) {
-        // Convert JavaScript object to Dart Map
-        final Map<String, dynamic> dataMap = {};
+      // Get Firebase ID token
+      async getIdToken() {
+        const user = this.getCurrentUser();
+        if (!user) {
+          console.log('🎫 No Firebase user for token');
+          return null;
+        }
 
         try {
-          dataMap['emplName'] = js.context.callMethod('eval', ['''
-            window.SessionManager.restoreUserSession()?.emplName || ''
-          ''']);
-          dataMap['areaCode'] = js.context.callMethod('eval', ['''
-            window.SessionManager.restoreUserSession()?.areaCode || ''
-          ''']);
-          dataMap['userID'] = js.context.callMethod('eval', ['''
-            window.SessionManager.restoreUserSession()?.userID || ''
-          ''']);
+          const token = await user.getIdToken();
+          console.log('🎫 Firebase ID token obtained:', token ? 'SUCCESS' : 'NULL');
+          return token;
+        } catch (error) {
+          console.error('❌ Failed to get Firebase ID token:', error);
+          return null;
+        }
+      },
 
-          final rolesData = js.context.callMethod('eval', ['''
-            JSON.stringify(window.SessionManager.restoreUserSession()?.roles || [])
-          ''']);
-          final pagesData = js.context.callMethod('eval', ['''
-            JSON.stringify(window.SessionManager.restoreUserSession()?.pages || [])
-          ''']);
+      // Sign in with email and password
+      async signInWithEmailAndPassword(email, password) {
+        try {
+          console.log('🔐 Attempting Firebase sign in for:', email);
+          const userCredential = await firebase.auth().signInWithEmailAndPassword(email, password);
+          console.log('✅ Firebase sign in successful for:', email);
+          return { success: true, user: userCredential.user };
+        } catch (error) {
+          console.error('❌ Firebase sign in error:', error);
+          return { success: false, error: error.message };
+        }
+      },
 
-          dataMap['roles'] = jsonDecode(rolesData.toString());
-          dataMap['pages'] = jsonDecode(pagesData.toString());
+      // Sign in with phone number
+      async signInWithPhoneNumber(phoneNumber, recaptchaVerifier) {
+        try {
+          const confirmationResult = await firebase.auth().signInWithPhoneNumber(phoneNumber, recaptchaVerifier);
+          return { success: true, confirmationResult };
+        } catch (error) {
+          console.error('Firebase phone sign in error:', error);
+          return { success: false, error: error.message };
+        }
+      },
 
-          print('📊 Parsed data: $dataMap');
+      // Create user with email and password
+      async createUserWithEmailAndPassword(email, password) {
+        try {
+          const userCredential = await firebase.auth().createUserWithEmailAndPassword(email, password);
+          return { success: true, user: userCredential.user };
+        } catch (error) {
+          console.error('Firebase create user error:', error);
+          return { success: false, error: error.message };
+        }
+      },
 
-          final restoredUserID = dataMap['userID']?.toString();
-          if (restoredUserID != null && restoredUserID.isNotEmpty && restoredUserID != 'null') {
-            final userData = UserData(
-              emplName: dataMap['emplName']?.toString() ?? '',
-              areaCode: dataMap['areaCode']?.toString() ?? '',
-              roles: List<String>.from(dataMap['roles'] ?? []),
-              pages: List<String>.from(dataMap['pages'] ?? []),
-              userID: restoredUserID,
-            );
+      // Sign out
+      async signOut() {
+        try {
+          await firebase.auth().signOut();
+          return { success: true };
+        } catch (error) {
+          console.error('Firebase sign out error:', error);
+          return { success: false, error: error.message };
+        }
+      },
 
-            _currentUser = userData;
-            _notifyAuthChanged();
+      // Send password reset email
+      async sendPasswordResetEmail(email) {
+        try {
+          await firebase.auth().sendPasswordResetEmail(email);
+          return { success: true };
+        } catch (error) {
+          console.error('Firebase password reset error:', error);
+          return { success: false, error: error.message };
+        }
+      }
+    };
 
-            print('✅ User session restored successfully: $restoredUserID');
-            return true;
+    // Session Restoration Helper
+    window.SessionManager = {
+      // Save user data to localStorage
+      saveUserSession(userData) {
+        try {
+          localStorage.setItem('flutter_user_session', JSON.stringify(userData));
+          console.log('💾 User session saved to localStorage:', userData);
+        } catch (error) {
+          console.error('❌ Failed to save user session:', error);
+        }
+      },
+
+      // Restore user data from localStorage
+      restoreUserSession() {
+        try {
+          const sessionData = localStorage.getItem('flutter_user_session');
+          if (sessionData) {
+            const userData = JSON.parse(sessionData);
+            console.log('📱 User session restored from localStorage:', userData);
+            return userData;
           } else {
-            print('❌ Invalid session data - missing or invalid userID: $restoredUserID');
+            console.log('📱 No user session found in localStorage');
           }
-        } catch (parseError) {
-          print('❌ Failed to parse session data: $parseError');
+        } catch (error) {
+          console.error('❌ Failed to restore user session:', error);
         }
-      } else {
-        print('❌ No session data found');
+        return null;
+      },
+
+      // Clear user session
+      clearUserSession() {
+        try {
+          localStorage.removeItem('flutter_user_session');
+          console.log('🗑️ User session cleared from localStorage');
+        } catch (error) {
+          console.error('❌ Failed to clear user session:', error);
+        }
+      }
+    };
+
+    // Debug helper - call from console: window.debugAuth()
+    window.debugAuth = function() {
+      console.log('🔍 AUTH DEBUG INFO:');
+      console.log('Firebase ready:', !!window.FirebaseAuthManager);
+      console.log('SessionManager ready:', !!window.SessionManager);
+
+      if (window.FirebaseAuthManager) {
+        const user = window.FirebaseAuthManager.getCurrentUser();
+        console.log('Firebase user:', user ? {
+          uid: user.uid,
+          email: user.email,
+          emailVerified: user.emailVerified
+        } : 'NO USER');
+      }
+
+      if (window.SessionManager) {
+        const session = window.SessionManager.restoreUserSession();
+        console.log('Stored session:', session);
+      }
+
+      // Check localStorage directly
+      const rawSession = localStorage.getItem('flutter_user_session');
+      console.log('Raw localStorage:', rawSession);
+    };
+
+    // Clear any corrupted session data on page load
+    try {
+      const session = localStorage.getItem('flutter_user_session');
+      if (session) {
+        const data = JSON.parse(session);
+        if (data.userID === 'null' || data.userID === null || !data.userID) {
+          console.log('🗑️ Clearing corrupted session data with invalid userID');
+          localStorage.removeItem('flutter_user_session');
+        }
       }
     } catch (e) {
-      print('❌ Failed to restore user session: $e');
+      console.log('🗑️ Clearing invalid session data');
+      localStorage.removeItem('flutter_user_session');
     }
 
-    return false;
-  }
+    // Initialize Firebase Auth Manager when DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        window.FirebaseAuthManager.init();
+      });
+    } else {
+      window.FirebaseAuthManager.init();
+    }
+  </script>
 
-  static void _saveUserSession(UserData userData) {
-    try {
-      // Validate userID before saving
-      final userID = userData.userID;
-      if (userID == null || userID.isEmpty) {
-        print('❌ Cannot save session: userID is null or empty');
-        return;
+  <!-- Your local scripts -->
+  <script defer src="mlkit-ocr.js"></script>
+  <script defer src="ocr.js"></script>
+
+  <!-- QR Code + Geolocation helpers -->
+  <script>
+    window.detectQRCode = function(imageData, width, height) {
+      try {
+        if (typeof jsQR !== 'undefined') {
+          const code = jsQR(imageData, width, height);
+          return code ? code.data : null;
+        }
+      } catch (e) { console.error('QR detection error:', e); }
+      return null;
+    };
+
+    window.requestGeoPosition = async function () {
+      if (!('geolocation' in navigator)) return { ok: false, error: 'Geolocation not supported' };
+      return new Promise((resolve) => {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            const lat = +pos.coords.latitude.toFixed(6);
+            const lng = +pos.coords.longitude.toFixed(6);
+            try { localStorage.setItem('lastLat', String(lat)); localStorage.setItem('lastLng', String(lng)); } catch {}
+            resolve({ ok: true, lat, lng });
+          },
+          (err) => resolve({ ok: false, error: err.message }),
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      });
+    };
+  </script>
+
+  <!-- Native Permissions Bridge -->
+  <script>
+    (function () {
+      const w = window;
+      const hasBridge = !!(w.flutter_inappwebview && typeof w.flutter_inappwebview.callHandler === 'function');
+
+      async function callHandler(name, payload) {
+        if (!hasBridge) return { ok: false, status: 'no-bridge', error: 'InAppWebView bridge not available' };
+        try {
+          const res = await w.flutter_inappwebview.callHandler(name, payload);
+          return (res && typeof res === 'object') ? res : { ok: false, status: 'invalid', error: 'Bad response' };
+        } catch (e) {
+          return { ok: false, status: 'error', error: String(e) };
+        }
       }
 
-      print('💾 Saving user session for: $userID');
+      async function warmUpBrowser(type) {
+        try {
+          if (type === 'camera') {
+            if (!navigator.mediaDevices?.getUserMedia) return { ok: false, error: 'getUserMedia not supported' };
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            stream.getTracks().forEach(t => t.stop());
+            return { ok: true };
+          }
+          if (type === 'microphone') {
+            if (!navigator.mediaDevices?.getUserMedia) return { ok: false, error: 'getUserMedia not supported' };
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            stream.getTracks().forEach(t => t.stop());
+            return { ok: true };
+          }
+          if (type === 'geolocation') return await w.requestGeoPosition();
+          if (type === 'notifications') {
+            if (!('Notification' in w)) return { ok: false, error: 'Notifications not supported' };
+            const perm = await Notification.requestPermission();
+            return { ok: perm === 'granted', status: perm };
+          }
+          if (type === 'bluetooth') {
+            if (!navigator.bluetooth) return { ok: false, error: 'Web Bluetooth not supported' };
+            return { ok: true, status: 'user-gesture-required' };
+          }
+          if (type === 'storage' && navigator.storage?.persist) {
+            const persisted = await navigator.storage.persist();
+            return { ok: persisted, status: persisted ? 'persisted' : 'not-persisted' };
+          }
+          return { ok: true };
+        } catch (e) { return { ok: false, error: String(e) }; }
+      }
 
-      // Create safe data object
-      final sessionData = {
-        'emplName': userData.emplName,
-        'areaCode': userData.areaCode,
-        'roles': userData.roles,
-        'pages': userData.pages,
-        'userID': userID, // Use the validated userID
+      async function browserPermissionStatus(type) {
+        try {
+          if (!navigator.permissions?.query) return null;
+          const nameMap = { camera: 'camera', microphone: 'microphone', geolocation: 'geolocation', notifications: 'notifications' };
+          const name = nameMap[type]; if (!name) return null;
+          const status = await navigator.permissions.query({ name });
+          return status.state;
+        } catch { return null; }
+      }
+
+      w.NativePerms = {
+        request: async function (type, rationale) {
+          const native = await callHandler('perm_request', { type, rationale });
+          if (!native.ok) return native;
+          const web = await warmUpBrowser(type);
+          if (!web.ok) return { ok: true, status: native.status || 'granted', webError: web.error || web.status };
+          return { ok: true, status: native.status || 'granted' };
+        },
+        status: async function (type) {
+          const native = await callHandler('perm_status', { type });
+          const browser = await browserPermissionStatus(type);
+          if (browser) native.browser = browser;
+          return native;
+        },
+        openSettings: function () { return callHandler('open_settings', {}); }
       };
+    })();
+  </script>
 
-      print('💾 Session data to save: $sessionData');
+  <!-- Camera Uploader -->
+  <script>
+    (function () {
+      const w = window;
+      const input = document.createElement('input');
+      input.type = 'file'; input.accept = 'image/*'; input.capture = 'environment';
+      input.style.position = 'fixed'; input.style.left = '-9999px';
+      document.body.appendChild(input);
 
-      js.context.callMethod('eval', ['''
-        if (window.SessionManager) {
-          window.SessionManager.saveUserSession(${jsonEncode(sessionData)});
-        } else {
-          console.error('❌ SessionManager not available');
+      function pickViaInput() {
+        return new Promise((res, rej) => {
+          input.value = '';
+          const onChange = () => {
+            input.removeEventListener('change', onChange);
+            const f = input.files?.[0]; if (!f) return rej(new Error('no-file-selected')); res(f);
+          };
+          input.addEventListener('change', onChange, { once: true });
+          input.click();
+        });
+      }
+
+      function overlay() {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = `position:fixed; inset:0; background:rgba(0,0,0,.85); display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:2147483647; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;`;
+        const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = true;
+        v.style.cssText = 'max-width:90vw; max-height:60vh; background:#000; border-radius:12px;';
+        const row = document.createElement('div'); row.style.cssText = 'display:flex; gap:12px; margin-top:16px;';
+        const shot = document.createElement('button'); const cancel = document.createElement('button');
+        [shot, cancel].forEach(b=>b.style.cssText='padding:12px 18px; border-radius:10px; border:none; font-weight:600; cursor:pointer;');
+        shot.textContent = 'Take Photo'; shot.style.background = '#21a0ff';
+        cancel.textContent = 'Cancel'; cancel.style.background = '#666';
+        row.append(shot, cancel);
+        const msg = document.createElement('div'); msg.style.cssText = 'margin-top:10px; font-size:12px; opacity:.8;';
+        msg.textContent = 'If video is black, camera permission was denied or not available.';
+        wrap.append(v, row, msg); document.body.appendChild(wrap);
+        return { wrap, v, shot, cancel };
+      }
+
+      async function pickViaGUM() {
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('gum-not-supported');
+        const { wrap, v, shot, cancel } = overlay();
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+        } catch (e) { wrap.remove(); throw new Error('gum-permission-failed: ' + (e?.message || e)); }
+        v.srcObject = stream;
+        const file = await new Promise((resolve, reject) => {
+          cancel.onclick = () => { try { stream.getTracks().forEach(t=>t.stop()); } catch{} wrap.remove(); reject(new Error('user-cancelled')); };
+          shot.onclick = async () => {
+            try {
+              const c = document.createElement('canvas'); const vw = v.videoWidth || 1920, vh = v.videoHeight || 1080;
+              c.width = vw; c.height = vh; c.getContext('2d', { alpha:false }).drawImage(v, 0, 0, vw, vh);
+              const blob = await new Promise(r=>c.toBlob(r, 'image/jpeg', 0.9));
+              resolve(new File([blob], 'camera.jpg', { type: 'image/jpeg' }));
+            } catch (e) { reject(e); }
+            finally { try { stream.getTracks().forEach(t=>t.stop()); } catch{} wrap.remove(); }
+          };
+        });
+        return file;
+      }
+
+      async function downscale(f, maxW=1600, q=0.85) {
+        try {
+          const img = new Image(); const url = URL.createObjectURL(f);
+          await new Promise((ok,bad)=>{ img.onload=ok; img.onerror=bad; img.src=url; });
+          const scale = Math.min(1, maxW / img.width); URL.revokeObjectURL(url);
+          if (scale >= 1) return f;
+          const c = document.createElement('canvas'); c.width = Math.round(img.width*scale); c.height = Math.round(img.height*scale);
+          c.getContext('2d', { alpha:false }).drawImage(img,0,0,c.width,c.height);
+          const blob = await new Promise(r=>c.toBlob(r,'image/jpeg',q));
+          return new File([blob], f.name.replace(/\.\w+$/, '-scaled.jpg'), { type:'image/jpeg' });
+        } catch { return f; }
+      }
+
+      async function toB64(f){ return await new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(String(r.result)); r.onerror=rej; r.readAsDataURL(f); }); }
+
+      w.CameraUploader = {
+        async pick({ prefer='input', downscaleImage=true } = {}) {
+          try {
+            if (w.NativePerms) await w.NativePerms.request('camera');
+            let f;
+            if (prefer==='gum') { try { f = await pickViaGUM(); } catch { f = await pickViaInput(); } }
+            else { try { f = await pickViaInput(); } catch { f = await pickViaGUM(); } }
+            if (downscaleImage) f = await downscale(f);
+            const base64 = await toB64(f);
+            return { ok:true, fileName:f.name, mime:f.type, size:f.size, base64 };
+          } catch (e) { return { ok:false, error:String(e) }; }
+        },
+        async upload({ endpoint, fieldName='photo', extra={}, headers={}, method='POST', prefer='input', downscaleImage=true } = {}) {
+          if (!endpoint) return { ok:false, error:'Missing endpoint' };
+          try {
+            const picked = await this.pick({ prefer, downscaleImage });
+            if (!picked.ok) return picked;
+            const resp = await fetch(picked.base64); const blob = await resp.blob();
+            const file = new File([blob], picked.fileName || 'photo.jpg', { type:picked.mime || 'image/jpeg' });
+            const fd = new FormData(); fd.append(fieldName, file, file.name);
+            Object.entries(extra).forEach(([k,v])=>fd.append(k, String(v)));
+            const rsp = await fetch(endpoint, { method, body: fd, headers });
+            const ct = rsp.headers.get('content-type') || '';
+            const payload = ct.includes('application/json') ? await rsp.json().catch(()=>({})) : await rsp.text();
+            return { ok:rsp.ok, status:rsp.status, data:payload };
+          } catch (e) { return { ok:false, error:String(e) }; }
         }
-      ''']);
-    } catch (e) {
-      print('❌ Failed to save user session: $e');
-    }
-  }
+      };
+    })();
+  </script>
 
-  static void _clearUserSession() {
-    try {
-      js.context.callMethod('eval', ['''
-        if (window.SessionManager) {
-          window.SessionManager.clearUserSession();
-        }
-      ''']);
-    } catch (e) {
-      print('Failed to clear user session: $e');
-    }
-  }
-
-  static void Function()? _authChangeCallback;
-
-  static void setAuthChangeCallback(void Function() callback) {
-    _authChangeCallback = callback;
-  }
-
-  static void _notifyAuthChanged() {
-    _authChangeCallback?.call();
-    _authChangeNotifier.value++;
-  }
-
-  static bool hasRole(String role) {
-    return _currentUser?.hasRole(role) ?? false;
-  }
-
-  static bool hasPage(String page) {
-    return _currentUser?.hasPage(page) ?? false;
-  }
-
-  static bool hasAnyRole(List<String> roles) {
-    return _currentUser?.hasAnyRole(roles) ?? false;
-  }
-
-  static bool hasAnyPage(List<String> pages) {
-    return _currentUser?.hasAnyPage(pages) ?? false;
-  }
-
-  static List<String> getUserRoles() {
-    return _currentUser?.roles ?? [];
-  }
-
-  static List<String> getUserPages() {
-    return _currentUser?.pages ?? [];
-  }
-
-  static String getUserName() {
-    return _currentUser?.emplName ?? '';
-  }
-
-  static String getUserAreaCode() {
-    return _currentUser?.areaCode ?? '';
-  }
-}
+  <!-- Flutter bootstrap -->
+  <script defer src="flutter_bootstrap.js"></script>
+</body>
+</html>
