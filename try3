@@ -183,34 +183,36 @@ class AuthService {
     return await FirebaseAuthService.checkAutoLogin();
   }
 
-  /// Create or sign in to Firebase after successful API authentication
+  /// Create or sign in to Firebase after successful API authentication using username
   static Future<void> _createOrSignInFirebaseUser(String userId, String password, UserData userData) async {
     try {
-      _logger.info('Creating/signing in Firebase user for: $userId');
+      _logger.info('Creating/signing in Firebase user for username: $userId');
 
-      // First try to sign in (user might already exist)
-      var firebaseResult = await FirebaseAuthService.signInWithEmailPassword(
-        email: userId,
+      // First try to sign in with username (user might already exist)
+      var firebaseResult = await FirebaseAuthService.signInWithUsername(
+        username: userId,
         password: password,
         rememberMe: true,
       );
 
       if (firebaseResult['success'] == true) {
-        _logger.info('Firebase sign-in successful for existing user: $userId');
+        _logger.info('Firebase sign-in successful for existing username: $userId');
         return;
       }
 
-      // If sign-in failed, try to create account
-      _logger.info('Firebase sign-in failed, attempting to create account for: $userId');
-      firebaseResult = await FirebaseAuthService.createAccount(
-        email: userId,
+      _logger.info('Firebase sign-in failed: ${firebaseResult['error']}');
+
+      // If sign-in failed, try to create account with username
+      _logger.info('Attempting to create Firebase account for username: $userId');
+      firebaseResult = await FirebaseAuthService.createAccountWithUsername(
+        username: userId,
         password: password,
         displayName: userData.emplName,
         rememberMe: true,
       );
 
       if (firebaseResult['success'] == true) {
-        _logger.info('Firebase account created successfully for: $userId');
+        _logger.info('Firebase account created successfully for username: $userId');
 
         // Update Firestore with additional user data
         await FirebaseAuthService.updateUserProfile(
@@ -224,6 +226,7 @@ class AuthService {
         );
       } else {
         _logger.warning('Firebase account creation failed: ${firebaseResult['error']}');
+        _logger.warning('Error details: ${firebaseResult['errorCode']}');
       }
     } catch (e) {
       _logger.warning('Error creating/signing in Firebase user: $e');
@@ -334,5 +337,541 @@ class AuthManager {
 
   static String getUserAreaCode() {
     return _currentUser?.areaCode ?? '';
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../models/auth_models.dart';
+import '../utils/app_logger.dart';
+import 'auth_service.dart';
+
+class FirebaseAuthService {
+  static final AppLogger _logger = AppLogger();
+  static final FirebaseAuth _auth = FirebaseAuth.instance;
+  static final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  static const String _userCollectionName = 'users';
+  static const String _lastLoginKey = 'last_login_time';
+  static const String _rememberMeKey = 'remember_me';
+  static const String _savedUserIdKey = 'saved_user_id';
+  static const String _autoLoginKey = 'auto_login_enabled';
+
+  /// Initialize Firebase Auth state listener
+  static void initializeAuthListener() {
+    _auth.authStateChanges().listen((User? user) {
+      if (user != null) {
+        _logger.info('Firebase user signed in: ${user.uid}');
+        _loadUserFromFirestore(user.uid);
+      } else {
+        _logger.info('Firebase user signed out');
+        AuthManager.clearUser();
+      }
+    });
+  }
+
+  /// Sign in anonymously and store username/password in Firestore
+  static Future<Map<String, dynamic>> signInWithUsername({
+    required String username,
+    required String password,
+    bool rememberMe = true,
+  }) async {
+    try {
+      _logger.info('🔄 Starting signInWithUsername for: $username');
+      _logger.info('🔄 This method uses Firebase Anonymous Auth, NOT email/password');
+
+      // Check if user already exists in Firestore
+      final existingUser = await _getUserByUsername(username);
+
+      if (existingUser != null) {
+        // User exists, verify password
+        final storedPassword = existingUser['password'] as String?;
+        if (storedPassword == password) {
+          // Sign in anonymously and restore session
+          final UserCredential userCredential = await _auth.signInAnonymously();
+
+          if (userCredential.user != null) {
+            await _handleSuccessfulUsernameSignIn(
+              userCredential.user!,
+              username,
+              password,
+              existingUser,
+              rememberMe,
+            );
+
+            return {
+              'success': true,
+              'user': userCredential.user,
+              'message': 'Sign in successful',
+            };
+          }
+        } else {
+          return {
+            'success': false,
+            'error': 'Invalid password',
+            'errorCode': 'wrong-password',
+          };
+        }
+      } else {
+        return {
+          'success': false,
+          'error': 'User not found',
+          'errorCode': 'user-not-found',
+        };
+      }
+
+      return {
+        'success': false,
+        'error': 'Sign in failed',
+      };
+    } on FirebaseAuthException catch (e) {
+      _logger.error('Firebase Auth Error: ${e.code} - ${e.message}');
+      return {
+        'success': false,
+        'error': _getFirebaseErrorMessage(e.code),
+        'errorCode': e.code,
+      };
+    } catch (e) {
+      _logger.error('Unexpected error during Firebase sign in', e);
+      return {
+        'success': false,
+        'error': 'An unexpected error occurred: ${e.toString()}',
+      };
+    }
+  }
+
+  /// Create account with username/password
+  static Future<Map<String, dynamic>> createAccountWithUsername({
+    required String username,
+    required String password,
+    required String displayName,
+    bool rememberMe = true,
+  }) async {
+    try {
+      _logger.info('🔄 Starting createAccountWithUsername for: $username');
+      _logger.info('🔄 This method uses Firebase Anonymous Auth, NOT email/password');
+
+      // Check if username already exists
+      final existingUser = await _getUserByUsername(username);
+      if (existingUser != null) {
+        return {
+          'success': false,
+          'error': 'Username already exists',
+          'errorCode': 'username-already-in-use',
+        };
+      }
+
+      // Create anonymous user
+      final UserCredential userCredential = await _auth.signInAnonymously();
+
+      if (userCredential.user != null) {
+        // Create user document in Firestore with username
+        await _createUsernameUserDocument(
+          userCredential.user!,
+          username,
+          password,
+          displayName,
+        );
+
+        await _handleSuccessfulUsernameSignIn(
+          userCredential.user!,
+          username,
+          password,
+          {
+            'username': username,
+            'displayName': displayName,
+            'password': password,
+          },
+          rememberMe,
+        );
+
+        return {
+          'success': true,
+          'user': userCredential.user,
+          'message': 'Account created successfully',
+        };
+      }
+
+      return {
+        'success': false,
+        'error': 'Account creation failed - no user returned',
+      };
+    } on FirebaseAuthException catch (e) {
+      _logger.error('Firebase Auth Error: ${e.code} - ${e.message}');
+      return {
+        'success': false,
+        'error': _getFirebaseErrorMessage(e.code),
+        'errorCode': e.code,
+      };
+    } catch (e) {
+      _logger.error('Unexpected error during account creation', e);
+      return {
+        'success': false,
+        'error': 'An unexpected error occurred: ${e.toString()}',
+      };
+    }
+  }
+
+  /// Check if user is currently signed in and auto-login if enabled
+  static Future<bool> checkAutoLogin() async {
+    try {
+      _logger.info('Starting auto-login check...');
+
+      final prefs = await SharedPreferences.getInstance();
+      final autoLoginEnabled = prefs.getBool(_autoLoginKey) ?? false;
+      final rememberMe = prefs.getBool(_rememberMeKey) ?? false;
+      final savedUsername = prefs.getString(_savedUserIdKey);
+
+      if (!autoLoginEnabled || !rememberMe) {
+        _logger.info('Auto-login disabled by user preference');
+        return false;
+      }
+
+      final user = _auth.currentUser;
+      if (user != null && savedUsername != null) {
+        _logger.info('Auto-login successful for user: ${user.uid}');
+
+        // Load user data from username collection
+        final userData = await _getUserByUsername(savedUsername);
+        if (userData != null) {
+          final userDataObj = UserData(
+            userID: savedUsername,
+            emplName: userData['displayName'] ?? '',
+            areaCode: userData['areaCode'] ?? 'DEFAULT',
+            roles: List<String>.from(userData['roles'] ?? ['USER']),
+            pages: List<String>.from(userData['pages'] ?? ['DASHBOARD']),
+          );
+
+          AuthManager.setUser(userDataObj);
+          return true;
+        }
+      }
+
+      _logger.info('No valid auto-login session found');
+      return false;
+    } catch (e) {
+      _logger.error('Error during auto-login check', e);
+      return false;
+    }
+  }
+
+  /// Sign out and clear stored credentials
+  static Future<void> signOut() async {
+    try {
+      await _auth.signOut();
+      await _clearStoredCredentials();
+      AuthManager.clearUser();
+      _logger.info('User signed out successfully');
+    } catch (e) {
+      _logger.error('Error during sign out', e);
+    }
+  }
+
+  /// Update user profile in Firestore
+  static Future<void> updateUserProfile({
+    required String displayName,
+    Map<String, dynamic>? additionalData,
+  }) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) return;
+
+      await user.updateDisplayName(displayName);
+
+      final userDoc = _firestore.collection(_userCollectionName).doc(user.uid);
+      await userDoc.update({
+        'displayName': displayName,
+        'lastUpdated': FieldValue.serverTimestamp(),
+        ...?additionalData,
+      });
+
+      _logger.info('User profile updated successfully');
+    } catch (e) {
+      _logger.error('Error updating user profile', e);
+    }
+  }
+
+  /// Get current Firebase user
+  static User? getCurrentUser() {
+    return _auth.currentUser;
+  }
+
+  /// Check if user is signed in
+  static bool isSignedIn() {
+    return _auth.currentUser != null;
+  }
+
+  /// Handle successful sign in
+  static Future<void> _handleSuccessfulSignIn(
+    User user,
+    String email,
+    String password,
+    bool rememberMe,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      // Store login preferences
+      await prefs.setBool(_rememberMeKey, rememberMe);
+      await prefs.setBool(_autoLoginKey, rememberMe);
+      await prefs.setString(_savedUserIdKey, email);
+      await prefs.setString(_lastLoginKey, DateTime.now().toIso8601String());
+
+      // Load user data from Firestore
+      await _loadUserFromFirestore(user.uid);
+
+      _logger.info('Successful sign in handling completed');
+    } catch (e) {
+      _logger.error('Error handling successful sign in', e);
+    }
+  }
+
+  /// Load user data from Firestore and update AuthManager
+  static Future<void> _loadUserFromFirestore(String uid) async {
+    try {
+      final userDoc = await _firestore.collection(_userCollectionName).doc(uid).get();
+
+      if (userDoc.exists) {
+        final data = userDoc.data()!;
+        final userData = UserData(
+          userID: data['email'] ?? '',
+          emplName: data['displayName'] ?? '',
+          areaCode: data['areaCode'] ?? 'DEFAULT',
+          roles: List<String>.from(data['roles'] ?? ['USER']),
+          pages: List<String>.from(data['pages'] ?? ['DASHBOARD']),
+        );
+
+        AuthManager.setUser(userData);
+        _logger.info('User data loaded from Firestore');
+      } else {
+        // Create default user data if document doesn't exist
+        final user = _auth.currentUser;
+        if (user != null) {
+          // For anonymous users, we can't create a default document
+          // User data should be created during the login process
+          _logger.warning('No user document found for anonymous user: $uid');
+        }
+      }
+    } catch (e) {
+      _logger.error('Error loading user from Firestore', e);
+    }
+  }
+
+  /// Create user document in Firestore with username
+  static Future<void> _createUsernameUserDocument(
+    User user,
+    String username,
+    String password,
+    String displayName,
+  ) async {
+    try {
+      // Store user by username for lookup
+      final usernameDoc = _firestore.collection('usernames').doc(username);
+      await usernameDoc.set({
+        'uid': user.uid,
+        'username': username,
+        'password': password, // In production, hash this
+        'displayName': displayName,
+        'areaCode': 'DEFAULT',
+        'roles': ['USER'],
+        'pages': ['DASHBOARD'],
+        'createdAt': FieldValue.serverTimestamp(),
+        'lastLogin': FieldValue.serverTimestamp(),
+      });
+
+      // Also store user data by UID
+      final userDoc = _firestore.collection(_userCollectionName).doc(user.uid);
+      await userDoc.set({
+        'uid': user.uid,
+        'username': username,
+        'displayName': displayName,
+        'areaCode': 'DEFAULT',
+        'roles': ['USER'],
+        'pages': ['DASHBOARD'],
+        'createdAt': FieldValue.serverTimestamp(),
+        'lastLogin': FieldValue.serverTimestamp(),
+      });
+
+      _logger.info('Username user document created in Firestore');
+    } catch (e) {
+      _logger.error('Error creating username user document', e);
+    }
+  }
+
+  /// Get user by username
+  static Future<Map<String, dynamic>?> _getUserByUsername(String username) async {
+    try {
+      final doc = await _firestore.collection('usernames').doc(username).get();
+      if (doc.exists) {
+        return doc.data();
+      }
+      return null;
+    } catch (e) {
+      _logger.error('Error getting user by username', e);
+      return null;
+    }
+  }
+
+  /// Handle successful username sign in
+  static Future<void> _handleSuccessfulUsernameSignIn(
+    User user,
+    String username,
+    String password,
+    Map<String, dynamic> userData,
+    bool rememberMe,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      // Store login preferences
+      await prefs.setBool(_rememberMeKey, rememberMe);
+      await prefs.setBool(_autoLoginKey, rememberMe);
+      await prefs.setString(_savedUserIdKey, username);
+      await prefs.setString(_lastLoginKey, DateTime.now().toIso8601String());
+
+      // Create UserData object
+      final userDataObj = UserData(
+        userID: username,
+        emplName: userData['displayName'] ?? '',
+        areaCode: userData['areaCode'] ?? 'DEFAULT',
+        roles: List<String>.from(userData['roles'] ?? ['USER']),
+        pages: List<String>.from(userData['pages'] ?? ['DASHBOARD']),
+      );
+
+      AuthManager.setUser(userDataObj);
+
+      _logger.info('Successful username sign in handling completed');
+    } catch (e) {
+      _logger.error('Error handling successful username sign in', e);
+    }
+  }
+
+  /// Clear stored credentials
+  static Future<void> _clearStoredCredentials() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_rememberMeKey);
+      await prefs.remove(_autoLoginKey);
+      await prefs.remove(_savedUserIdKey);
+      await prefs.remove(_lastLoginKey);
+
+      _logger.info('Stored credentials cleared');
+    } catch (e) {
+      _logger.error('Error clearing stored credentials', e);
+    }
+  }
+
+  /// Get user-friendly error messages
+  static String _getFirebaseErrorMessage(String errorCode) {
+    switch (errorCode) {
+      case 'user-not-found':
+        return 'No user found with this email address.';
+      case 'wrong-password':
+        return 'Incorrect password. Please try again.';
+      case 'invalid-email':
+        return 'Invalid email address format.';
+      case 'user-disabled':
+        return 'This account has been disabled.';
+      case 'too-many-requests':
+        return 'Too many failed attempts. Please try again later.';
+      case 'email-already-in-use':
+        return 'An account already exists with this email address.';
+      case 'weak-password':
+        return 'Password is too weak. Please choose a stronger password.';
+      case 'network-request-failed':
+        return 'Network error. Please check your internet connection.';
+      default:
+        return 'Authentication failed. Please try again.';
+    }
+  }
+
+  /// Get stored login preferences
+  static Future<Map<String, dynamic>> getLoginPreferences() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return {
+        'rememberMe': prefs.getBool(_rememberMeKey) ?? false,
+        'autoLogin': prefs.getBool(_autoLoginKey) ?? false,
+        'savedUserId': prefs.getString(_savedUserIdKey) ?? '',
+        'lastLogin': prefs.getString(_lastLoginKey),
+      };
+    } catch (e) {
+      _logger.error('Error getting login preferences', e);
+      return {};
+    }
+  }
+
+  /// Update auto-login preference
+  static Future<void> setAutoLogin(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_autoLoginKey, enabled);
+      await prefs.setBool(_rememberMeKey, enabled);
+
+      _logger.info('Auto-login preference updated: $enabled');
+    } catch (e) {
+      _logger.error('Error updating auto-login preference', e);
+    }
+  }
+
+  /// Reset password
+  static Future<Map<String, dynamic>> resetPassword(String email) async {
+    try {
+      await _auth.sendPasswordResetEmail(email: email);
+      return {
+        'success': true,
+        'message': 'Password reset email sent successfully.',
+      };
+    } on FirebaseAuthException catch (e) {
+      return {
+        'success': false,
+        'error': _getFirebaseErrorMessage(e.code),
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Failed to send password reset email.',
+      };
+    }
   }
 }
