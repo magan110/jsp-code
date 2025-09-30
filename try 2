@@ -1,254 +1,2760 @@
-using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Security.Cryptography;
-using System.Text;
+import 'package:shared_preferences/shared_preferences.dart';
+import '../utils/app_logger.dart';
 
-namespace sparshWebService.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    public class AuthController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-        private const int ITERATION_NUMBER = 1; // matches your stored scheme
+class StorageService {
+  static final AppLogger _logger = AppLogger();
+  static const String _appRegIdKey = 'app_reg_id';
+  static const String _userIdKey = 'user_id';
+  static const String _rememberMeKey = 'remember_me';
 
-        public AuthController(DatabaseHelper dbHelper) => _db = dbHelper;
+  /// Generate a unique app registration ID for this device/app installation
+  static String generateAppRegId() {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final random = DateTime.now().microsecond;
+    return 'mobile_app_${timestamp}_$random';
+  }
 
-        // --------- Envelope ----------
-        public sealed class ApiResponse<T>
-        {
-            public bool Success { get; set; }
-            public T Data { get; set; }
-            public string Error { get; set; }
-            public static ApiResponse<T> Ok(T d) => new() { Success = true, Data = d };
-            public static ApiResponse<T> Fail(string m) => new() { Success = false, Error = m };
-        }
-
-        // --------- DTOs ----------
-        public class LoginRequest
-        {
-            public string userID { get; set; }
-            public string password { get; set; }
-            public string appRegId { get; set; } // REQUIRED (from Flutter)
-        }
-
-        public class AutoLoginRequest { public string appRegId { get; set; } }
-        public class LogoutRequest    { public string appRegId { get; set; } }
-
-        public class UserDetails
-        {
-            public string emplName { get; set; }
-            public string areaCode { get; set; }
-            public HashSet<string> roles { get; set; }
-            public HashSet<string> pages { get; set; }
-        }
-
-        // ===================================================
-        //                      LOGIN
-        // ===================================================
-        [AllowAnonymous]
-        [HttpPost("login")]
-        public IActionResult Login([FromBody] LoginRequest request)
-        {
-            if (request == null ||
-                string.IsNullOrWhiteSpace(request.userID) ||
-                string.IsNullOrWhiteSpace(request.password) ||
-                string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest(ApiResponse<object>.Fail(
-                    "Parameters 'userID', 'password', and 'appRegId' are required."
-                ));
-            }
-
-            try
-            {
-                // 1) Read stored hash/salt
-                const string credSql = @"
-                    SELECT loginIdm, hashPass, hashSalt
-                    FROM wcmUserCred WITH (NOLOCK)
-                    WHERE loginIdM = @userID";
-                var credParams = new Dictionary<string, object> { { "@userID", request.userID } };
-                var credRows = _db.QaEWebBean(credSql, credParams);
-
-                if (credRows == null || credRows.Count == 0)
-                    return Unauthorized(ApiResponse<object>.Fail("Invalid userID."));
-
-                string hashPass = credRows[0]["hashPass"]?.ToString();
-                string hashSalt = credRows[0]["hashSalt"]?.ToString();
-                if (string.IsNullOrWhiteSpace(hashPass) || string.IsNullOrWhiteSpace(hashSalt))
-                    return BadRequest(ApiResponse<object>.Fail("Hash or salt not configured for this user."));
-
-                // 2) Verify password
-                string inputHash = HashPassword(request.password, hashSalt);
-                if (!string.Equals(inputHash, hashPass, StringComparison.Ordinal))
-                    return Unauthorized(ApiResponse<object>.Fail("Invalid password."));
-
-                // 3) Store provided appRegId
-                const string updSql = @"
-                    UPDATE wcmUserCred
-                    SET appRegId = @appRegId,
-                        updateDt = GETDATE(),
-                        updateID = @userID
-                    WHERE loginIdm = @userID";
-                _db.QaEWebBean(updSql, new Dictionary<string, object>
-                {
-                    { "@appRegId", request.appRegId },
-                    { "@userID",   request.userID  }
-                });
-
-                // 4) Load user details
-                var details = GetUserDetails(request.userID);
-                if (details == null)
-                    return Unauthorized(ApiResponse<object>.Fail("No active role/page data found."));
-
-                var payload = new
-                {
-                    appRegId = request.appRegId,
-                    userID   = request.userID,
-                    emplName = details.emplName,
-                    areaCode = details.areaCode,
-                    roles    = details.roles,
-                    pages    = details.pages
-                };
-                return Ok(ApiResponse<object>.Ok(payload));
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ApiResponse<object>.Fail($"Internal server error: {ex.Message}"));
-            }
-        }
-
-        // ===================================================
-        //                   AUTO-LOGIN
-        // ===================================================
-        [AllowAnonymous]
-        [HttpPost("auto-login")]
-        public IActionResult AutoLogin([FromBody] AutoLoginRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-                return BadRequest(ApiResponse<object>.Fail("Parameter 'appRegId' is required."));
-
-            try
-            {
-                const string findSql = @"
-                    SELECT loginIdm FROM wcmUserCred WITH (NOLOCK)
-                    WHERE appRegId = @appRegId";
-                var rows = _db.QaEWebBean(findSql, new Dictionary<string, object>
-                {
-                    { "@appRegId", request.appRegId }
-                });
-
-                if (rows == null || rows.Count == 0)
-                    return Unauthorized(ApiResponse<object>.Fail("App registration not found."));
-
-                string userID = rows[0]["loginIdm"]?.ToString();
-                if (string.IsNullOrWhiteSpace(userID))
-                    return Unauthorized(ApiResponse<object>.Fail("Invalid app registration record."));
-
-                var details = GetUserDetails(userID);
-                if (details == null)
-                    return Unauthorized(ApiResponse<object>.Fail("No active role/page data found."));
-
-                // Touch last access time (optional)
-                const string touchSql = @"UPDATE wcmUserCred SET updateDt = GETDATE() WHERE loginIdm = @userID";
-                _db.QaEWebBean(touchSql, new Dictionary<string, object> { { "@userID", userID } });
-
-                var payload = new
-                {
-                    userID,
-                    emplName = details.emplName,
-                    areaCode = details.areaCode,
-                    roles    = details.roles,
-                    pages    = details.pages
-                };
-                return Ok(ApiResponse<object>.Ok(payload));
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ApiResponse<object>.Fail($"Internal server error: {ex.Message}"));
-            }
-        }
-
-        // ===================================================
-        //                      LOGOUT
-        // ===================================================
-        [AllowAnonymous]
-        [HttpPost("logout")]
-        public IActionResult Logout([FromBody] LogoutRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-                return BadRequest(ApiResponse<object>.Fail("Parameter 'appRegId' is required."));
-
-            try
-            {
-                const string updSql = @"
-                    UPDATE wcmUserCred
-                    SET appRegId = NULL,
-                        updateDt = GETDATE()
-                    WHERE appRegId = @appRegId";
-                _db.QaEWebBean(updSql, new Dictionary<string, object>
-                {
-                    { "@appRegId", request.appRegId }
-                });
-
-                return Ok(ApiResponse<object>.Ok(new { msg = "Logout successful" }));
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ApiResponse<object>.Fail($"Internal server error: {ex.Message}"));
-            }
-        }
-
-        // ---------------- Helpers ----------------
-        private UserDetails GetUserDetails(string userID)
-        {
-            const string sql = @"
-                SELECT a.emplName, a.areaCode, b.roleCode, c.mobPagId
-                FROM prmEmployee a WITH (NOLOCK)
-                JOIN wcmEmplRole b WITH (NOLOCK) ON a.loginIdM = b.loginIdM
-                JOIN wcmMobPgMas c WITH (NOLOCK) ON b.roleCode = c.roleCode
-                WHERE a.isActive = 'Y' AND b.isActive = 'Y' AND c.isActive = 'Y'
-                  AND a.loginIdM = @userID";
-
-            var rs = _db.QaEWebBean(sql, new Dictionary<string, object> { { "@userID", userID } });
-            if (rs == null || rs.Count == 0) return null;
-
-            var roles = new HashSet<string>();
-            var pages = new HashSet<string>();
-            string emplName = rs[0]["emplName"]?.ToString();
-            string areaCode = rs[0]["areaCode"]?.ToString();
-
-            foreach (var row in rs)
-            {
-                var role = row["roleCode"]?.ToString();
-                var page = row["mobPagId"]?.ToString();
-                if (!string.IsNullOrWhiteSpace(role)) roles.Add(role);
-                if (!string.IsNullOrWhiteSpace(page)) pages.Add(page);
-            }
-
-            return new UserDetails { emplName = emplName, areaCode = areaCode, roles = roles, pages = pages };
-        }
-
-        private static string HashPassword(string password, string saltBase64)
-        {
-            if (string.IsNullOrWhiteSpace(password) || string.IsNullOrWhiteSpace(saltBase64)) return null;
-
-            var saltBytes = Convert.FromBase64String(saltBase64);
-            var pwdBytes  = Encoding.UTF8.GetBytes(password);
-
-            using var sha1 = SHA1.Create();
-
-            var combined = new byte[saltBytes.Length + pwdBytes.Length];
-            Buffer.BlockCopy(saltBytes, 0, combined, 0, saltBytes.Length);
-            Buffer.BlockCopy(pwdBytes, 0, combined, saltBytes.Length, pwdBytes.Length);
-
-            var hash = sha1.ComputeHash(combined);
-            for (int i = 0; i < ITERATION_NUMBER; i++) hash = sha1.ComputeHash(hash);
-
-            return Convert.ToBase64String(hash);
-        }
+  /// Save app registration ID to local storage
+  static Future<bool> saveAppRegId(String appRegId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final success = await prefs.setString(_appRegIdKey, appRegId);
+      if (success) {
+        _logger.info('App registration ID saved successfully');
+      } else {
+        _logger.error('Failed to save app registration ID');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Error saving app registration ID', e);
+      return false;
     }
+  }
+
+  /// Get stored app registration ID
+  static Future<String?> getAppRegId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final appRegId = prefs.getString(_appRegIdKey);
+      if (appRegId != null) {
+        _logger.debug('Retrieved app registration ID: $appRegId');
+      }
+      return appRegId;
+    } catch (e) {
+      _logger.error('Error retrieving app registration ID', e);
+      return null;
+    }
+  }
+
+  /// Clear app registration ID (for logout)
+  static Future<bool> clearAppRegId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final success = await prefs.remove(_appRegIdKey);
+      if (success) {
+        _logger.info('App registration ID cleared successfully');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Error clearing app registration ID', e);
+      return false;
+    }
+  }
+
+  /// Save user ID for remember me functionality
+  static Future<bool> saveUserId(String userId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return await prefs.setString(_userIdKey, userId);
+    } catch (e) {
+      _logger.error('Error saving user ID', e);
+      return false;
+    }
+  }
+
+  /// Get stored user ID
+  static Future<String?> getUserId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_userIdKey);
+    } catch (e) {
+      _logger.error('Error retrieving user ID', e);
+      return null;
+    }
+  }
+
+  /// Save remember me preference
+  static Future<bool> saveRememberMe(bool remember) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return await prefs.setBool(_rememberMeKey, remember);
+    } catch (e) {
+      _logger.error('Error saving remember me preference', e);
+      return false;
+    }
+  }
+
+  /// Get remember me preference
+  static Future<bool> getRememberMe() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_rememberMeKey) ?? false;
+    } catch (e) {
+      _logger.error('Error retrieving remember me preference', e);
+      return false;
+    }
+  }
+
+  /// Clear all stored authentication data
+  static Future<bool> clearAllAuthData() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final results = await Future.wait([
+        prefs.remove(_appRegIdKey),
+        prefs.remove(_userIdKey),
+        prefs.remove(_rememberMeKey),
+      ]);
+      
+      final success = results.every((result) => result);
+      if (success) {
+        _logger.info('All authentication data cleared successfully');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Error clearing authentication data', e);
+      return false;
+    }
+  }
+
+  /// Check if auto-login is possible (has stored appRegId)
+  static Future<bool> canAutoLogin() async {
+    final appRegId = await getAppRegId();
+    return appRegId != null && appRegId.isNotEmpty;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class LoginRequest {
+  final String userID;
+  final String password;
+  final String appRegId;
+
+  const LoginRequest({
+    required this.userID,
+    required this.password,
+    required this.appRegId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'userID': userID,
+        'password': password,
+        'appRegId': appRegId,
+      };
+
+  factory LoginRequest.fromJson(Map<String, dynamic> json) => LoginRequest(
+        userID: json['userID'] as String,
+        password: json['password'] as String,
+        appRegId: json['appRegId'] as String,
+      );
+}
+
+class LoginResponse {
+  final String msg;
+  final UserData data;
+
+  const LoginResponse({
+    required this.msg,
+    required this.data,
+  });
+
+  factory LoginResponse.fromJson(Map<String, dynamic> json) => LoginResponse(
+        msg: json['msg'] as String,
+        data: UserData.fromJson(json['data'] as Map<String, dynamic>),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'msg': msg,
+        'data': data.toJson(),
+      };
+}
+
+class AutoLoginRequest {
+  final String appRegId;
+
+  const AutoLoginRequest({
+    required this.appRegId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'appRegId': appRegId,
+      };
+
+  factory AutoLoginRequest.fromJson(Map<String, dynamic> json) => AutoLoginRequest(
+        appRegId: json['appRegId'] as String,
+      );
+}
+
+class LogoutRequest {
+  final String appRegId;
+
+  const LogoutRequest({
+    required this.appRegId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'appRegId': appRegId,
+      };
+
+  factory LogoutRequest.fromJson(Map<String, dynamic> json) => LogoutRequest(
+        appRegId: json['appRegId'] as String,
+      );
+}
+
+class UserData {
+  final String emplName;
+  final String areaCode;
+  final List<String> roles;
+  final List<String> pages;
+  final String? userID; // Add userID field
+  final String? appRegId; // Add appRegId field
+
+  const UserData({
+    required this.emplName,
+    required this.areaCode,
+    required this.roles,
+    required this.pages,
+    this.userID,
+    this.appRegId,
+  });
+
+  factory UserData.fromJson(Map<String, dynamic> json) => UserData(
+        emplName: json['emplName'] as String,
+        areaCode: json['areaCode'] as String,
+        roles: (json['roles'] as List<dynamic>).cast<String>(),
+        pages: (json['pages'] as List<dynamic>).cast<String>(),
+        userID: json['userID'] as String?,
+        appRegId: json['appRegId'] as String?,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'emplName': emplName,
+        'areaCode': areaCode,
+        'roles': roles,
+        'pages': pages,
+        'userID': userID,
+        'appRegId': appRegId,
+      };
+
+  bool hasRole(String role) => roles.contains(role);
+  bool hasPage(String page) => pages.contains(page);
+  bool hasAnyRole(List<String> roleList) => roleList.any((role) => roles.contains(role));
+  bool hasAnyPage(List<String> pageList) => pageList.any((page) => pages.contains(page));
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import '../models/auth_models.dart';
+import '../utils/app_logger.dart';
+import 'storage_service.dart';
+
+class AuthService {
+  static final AppLogger _logger = AppLogger();
+  static const Duration _defaultTimeout = Duration(seconds: 30);
+
+  static const String baseUrl = 'https://qa.birlawhite.com:55232';
+  static const String authEndpoint = '/api/Auth/execute';
+  static const String loginEndpoint = '/api/Auth/login';
+  static const String autoLoginEndpoint = '/api/Auth/auto-login';
+  static const String logoutEndpoint = '/api/Auth/logout';
+
+  static Future<Map<String, dynamic>> authenticateUser({
+    required String userID,
+    required String password,
+    String? appRegId,
+  }) async {
+    try {
+      _logger.info('Authenticating user: $userID');
+
+      // Generate or use provided appRegId
+      final finalAppRegId = appRegId ?? StorageService.generateAppRegId();
+
+      final loginRequest = LoginRequest(
+        userID: userID,
+        password: password,
+        appRegId: finalAppRegId,
+      );
+
+      final uri = Uri.parse('$baseUrl$loginEndpoint');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final requestBody = jsonEncode(loginRequest.toJson());
+
+      _logger.debug('Making POST request to: $uri');
+      _logger.debug('Request headers: $requestHeaders');
+      _logger.debug('Request body: $requestBody');
+
+      final response = await http
+          .post(uri, headers: requestHeaders, body: requestBody)
+          .timeout(_defaultTimeout);
+
+      _logger.debug('Response status: ${response.statusCode}');
+      _logger.debug('Response headers: ${response.headers}');
+      _logger.debug('Response body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        try {
+          // Check if response has the expected structure
+          if (responseData['success'] == true && responseData['data'] != null) {
+            final userData = responseData['data'] as Map<String, dynamic>;
+            
+            // Create UserData with appRegId
+            final userDataWithAppRegId = UserData(
+              emplName: userData['emplName'] as String,
+              areaCode: userData['areaCode'] as String,
+              roles: (userData['roles'] as List<dynamic>).cast<String>(),
+              pages: (userData['pages'] as List<dynamic>).cast<String>(),
+              userID: userData['userID'] as String? ?? userID,
+              appRegId: finalAppRegId,
+            );
+
+            // Save appRegId to local storage for auto-login
+            await StorageService.saveAppRegId(finalAppRegId);
+
+            _logger.info('Authentication successful for user: $userID');
+
+            return {
+              'success': true,
+              'data': LoginResponse(
+                msg: 'Login successful',
+                data: userDataWithAppRegId,
+              ),
+              'statusCode': response.statusCode,
+            };
+          } else {
+            return {
+              'success': false,
+              'error': responseData['error'] ?? 'Invalid response format',
+              'statusCode': response.statusCode,
+            };
+          }
+        } catch (e) {
+          _logger.error('Failed to parse login response', e);
+          return {
+            'success': false,
+            'error': 'Invalid response format from server',
+            'statusCode': response.statusCode,
+          };
+        }
+      } else if (response.statusCode == 401) {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? 'Authentication failed';
+
+        _logger.warning(
+          'Authentication failed for user: $userID - $errorMessage',
+        );
+
+        return {
+          'success': false,
+          'error': errorMessage,
+          'statusCode': response.statusCode,
+        };
+      } else if (response.statusCode == 400) {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? response.body.isNotEmpty
+            ? response.body
+            : 'Invalid request parameters';
+
+        _logger.warning('Bad request for user: $userID - $errorMessage');
+        _logger.warning('Request was: $requestBody');
+
+        return {
+          'success': false,
+          'error': 'Bad Request: $errorMessage',
+          'statusCode': response.statusCode,
+          'raw_response': response.body,
+        };
+      } else {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? 'Server error occurred';
+
+        _logger.error(
+          'Server error during authentication: ${response.statusCode} - $errorMessage',
+        );
+
+        return {
+          'success': false,
+          'error': errorMessage,
+          'statusCode': response.statusCode,
+        };
+      }
+    } on http.ClientException catch (e) {
+      _logger.error('Network error during authentication', e);
+      return {
+        'success': false,
+        'error':
+            'Network connection failed. Please check your internet connection.',
+        'statusCode': 0,
+      };
+    } on FormatException catch (e) {
+      _logger.error('JSON parsing error during authentication', e);
+      return {
+        'success': false,
+        'error': 'Invalid response from server',
+        'statusCode': 0,
+      };
+    } catch (e) {
+      _logger.error('Unexpected error during authentication', e);
+      return {
+        'success': false,
+        'error': 'An unexpected error occurred: ${e.toString()}',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  /// Auto-login using stored appRegId
+  static Future<Map<String, dynamic>> autoLogin() async {
+    try {
+      _logger.info('Attempting auto-login');
+
+      // Get stored appRegId
+      final appRegId = await StorageService.getAppRegId();
+      if (appRegId == null || appRegId.isEmpty) {
+        _logger.info('No stored appRegId found for auto-login');
+        return {
+          'success': false,
+          'error': 'No stored session found',
+          'statusCode': 0,
+        };
+      }
+
+      final autoLoginRequest = AutoLoginRequest(appRegId: appRegId);
+      final uri = Uri.parse('$baseUrl$autoLoginEndpoint');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final requestBody = jsonEncode(autoLoginRequest.toJson());
+
+      _logger.debug('Making auto-login POST request to: $uri');
+      _logger.debug('Request body: $requestBody');
+
+      final response = await http
+          .post(uri, headers: requestHeaders, body: requestBody)
+          .timeout(_defaultTimeout);
+
+      _logger.debug('Auto-login response status: ${response.statusCode}');
+      _logger.debug('Auto-login response body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        try {
+          // Check if response has the expected structure
+          if (responseData['success'] == true && responseData['data'] != null) {
+            final userData = responseData['data'] as Map<String, dynamic>;
+            
+            // Create UserData with appRegId
+            final userDataWithAppRegId = UserData(
+              emplName: userData['emplName'] as String,
+              areaCode: userData['areaCode'] as String,
+              roles: (userData['roles'] as List<dynamic>).cast<String>(),
+              pages: (userData['pages'] as List<dynamic>).cast<String>(),
+              userID: userData['userID'] as String?,
+              appRegId: appRegId,
+            );
+
+            _logger.info('Auto-login successful');
+
+            return {
+              'success': true,
+              'data': userDataWithAppRegId,
+              'statusCode': response.statusCode,
+            };
+          } else {
+            return {
+              'success': false,
+              'error': responseData['error'] ?? 'Invalid response format',
+              'statusCode': response.statusCode,
+            };
+          }
+        } catch (e) {
+          _logger.error('Failed to parse auto-login response', e);
+          return {
+            'success': false,
+            'error': 'Invalid response format from server',
+            'statusCode': response.statusCode,
+          };
+        }
+      } else if (response.statusCode == 401) {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? 'Session expired';
+
+        _logger.warning('Auto-login failed: $errorMessage');
+
+        // Clear invalid appRegId
+        await StorageService.clearAppRegId();
+
+        return {
+          'success': false,
+          'error': errorMessage,
+          'statusCode': response.statusCode,
+        };
+      } else {
+        final errorData = _safeJsonDecode(response.body);
+        final errorMessage = errorData['error'] ?? 'Auto-login failed';
+
+        _logger.error('Auto-login server error: ${response.statusCode} - $errorMessage');
+
+        return {
+          'success': false,
+          'error': errorMessage,
+          'statusCode': response.statusCode,
+        };
+      }
+    } on http.ClientException catch (e) {
+      _logger.error('Network error during auto-login', e);
+      return {
+        'success': false,
+        'error': 'Network connection failed. Please check your internet connection.',
+        'statusCode': 0,
+      };
+    } catch (e) {
+      _logger.error('Unexpected error during auto-login', e);
+      return {
+        'success': false,
+        'error': 'An unexpected error occurred: ${e.toString()}',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  static Future<bool> login(String userId, String password) async {
+    final result = await authenticateUser(userID: userId, password: password);
+    if (result['success'] == true) {
+      final loginResponse = result['data'] as LoginResponse;
+      AuthManager.setUser(loginResponse.data);
+      return true;
+    }
+    return false;
+  }
+
+  static Future<bool> loginWithOtp(String mobile, String otp) async {
+    await Future.delayed(const Duration(seconds: 1));
+    return mobile.isNotEmpty && otp.isNotEmpty;
+  }
+
+  static Future<bool> sendOtp(String mobile) async {
+    await Future.delayed(const Duration(seconds: 1));
+    return mobile.isNotEmpty;
+  }
+
+  static Future<void> logout() async {
+    // Try to logout from server first
+    final serverLogout = await logoutFromServer();
+    if (!serverLogout['success']) {
+      _logger.warning('Server logout failed, clearing local session anyway');
+    }
+
+    // Clear local storage
+    await StorageService.clearAllAuthData();
+    AuthManager.clearUser();
+    await Future.delayed(const Duration(milliseconds: 500));
+  }
+
+  static Future<Map<String, dynamic>> testConnection() async {
+    try {
+      _logger.info('Testing connection to auth server');
+
+      final uri = Uri.parse('$baseUrl/health');
+      final response = await http
+          .get(uri, headers: {'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Health check response: ${response.statusCode}');
+
+      return {
+        'success': response.statusCode == 200,
+        'statusCode': response.statusCode,
+        'message': response.statusCode == 200
+            ? 'Connection successful'
+            : 'Server responded with status ${response.statusCode}',
+      };
+    } catch (e) {
+      _logger.error('Connection test failed', e);
+      return {
+        'success': false,
+        'statusCode': 0,
+        'message': 'Connection failed: ${e.toString()}',
+      };
+    }
+  }
+
+  static Map<String, dynamic> _safeJsonDecode(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      return decoded is Map<String, dynamic>
+          ? decoded
+          : {'raw': decoded.toString()};
+    } catch (_) {
+      return {'raw': body};
+    }
+  }
+
+  // Session validation endpoint
+  static Future<Map<String, dynamic>> validateSession() async {
+    try {
+      _logger.info('Validating user session');
+
+      final uri = Uri.parse('$baseUrl/auth/me');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final response = await http
+          .get(uri, headers: requestHeaders)
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Session validation response: ${response.statusCode}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        return {
+          'success': true,
+          'data': responseData,
+          'statusCode': response.statusCode,
+        };
+      } else {
+        return {
+          'success': false,
+          'error': 'Session validation failed',
+          'statusCode': response.statusCode,
+        };
+      }
+    } catch (e) {
+      _logger.error('Session validation error', e);
+      return {
+        'success': false,
+        'error': 'Network error during session validation',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  // Token refresh endpoint
+  static Future<Map<String, dynamic>> refreshToken() async {
+    try {
+      _logger.info('Refreshing access token');
+
+      final uri = Uri.parse('$baseUrl/auth/refresh');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final response = await http
+          .post(uri, headers: requestHeaders)
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Token refresh response: ${response.statusCode}');
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body) as Map<String, dynamic>;
+
+        return {
+          'success': true,
+          'data': responseData,
+          'statusCode': response.statusCode,
+        };
+      } else {
+        return {
+          'success': false,
+          'error': 'Token refresh failed',
+          'statusCode': response.statusCode,
+        };
+      }
+    } catch (e) {
+      _logger.error('Token refresh error', e);
+      return {
+        'success': false,
+        'error': 'Network error during token refresh',
+        'statusCode': 0,
+      };
+    }
+  }
+
+  // Enhanced logout with server-side session clearing
+  static Future<Map<String, dynamic>> logoutFromServer() async {
+    try {
+      _logger.info('Logging out from server');
+
+      // Get stored appRegId for logout
+      final appRegId = await StorageService.getAppRegId();
+      if (appRegId == null || appRegId.isEmpty) {
+        _logger.info('No appRegId found for server logout');
+        return {
+          'success': true,
+          'statusCode': 200,
+        };
+      }
+
+      final logoutRequest = LogoutRequest(appRegId: appRegId);
+      final uri = Uri.parse('$baseUrl$logoutEndpoint');
+      final requestHeaders = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      final requestBody = jsonEncode(logoutRequest.toJson());
+
+      final response = await http
+          .post(uri, headers: requestHeaders, body: requestBody)
+          .timeout(const Duration(seconds: 10));
+
+      _logger.debug('Server logout response: ${response.statusCode}');
+
+      return {
+        'success': response.statusCode == 200,
+        'statusCode': response.statusCode,
+      };
+    } catch (e) {
+      _logger.error('Server logout error', e);
+      return {
+        'success': false,
+        'error': 'Network error during logout',
+        'statusCode': 0,
+      };
+    }
+  }
+}
+
+class AuthManager {
+  static UserData? _currentUser;
+  static String? _authToken;
+  static final _authChangeNotifier = ValueNotifier<int>(0);
+
+  static UserData? get currentUser => _currentUser;
+  static String? get authToken => _authToken;
+  static bool get isLoggedIn => _currentUser != null;
+  static ValueNotifier<int> get authChangeNotifier => _authChangeNotifier;
+
+  static void setUser(UserData userData, {String? token}) {
+    _currentUser = userData;
+    _authToken = token;
+    _notifyAuthChanged();
+  }
+
+  static void clearUser() {
+    _currentUser = null;
+    _authToken = null;
+    _notifyAuthChanged();
+  }
+
+  static void Function()? _authChangeCallback;
+
+  static void setAuthChangeCallback(void Function() callback) {
+    _authChangeCallback = callback;
+  }
+
+  static void _notifyAuthChanged() {
+    _authChangeCallback?.call();
+    _authChangeNotifier.value++;
+  }
+
+  static bool hasRole(String role) {
+    return _currentUser?.hasRole(role) ?? false;
+  }
+
+  static bool hasPage(String page) {
+    return _currentUser?.hasPage(page) ?? false;
+  }
+
+  static bool hasAnyRole(List<String> roles) {
+    return _currentUser?.hasAnyRole(roles) ?? false;
+  }
+
+  static bool hasAnyPage(List<String> pages) {
+    return _currentUser?.hasAnyPage(pages) ?? false;
+  }
+
+  static List<String> getUserRoles() {
+    return _currentUser?.roles ?? [];
+  }
+
+  static List<String> getUserPages() {
+    return _currentUser?.pages ?? [];
+  }
+
+  static String getUserName() {
+    return _currentUser?.emplName ?? '';
+  }
+
+  static String getUserAreaCode() {
+    return _currentUser?.areaCode ?? '';
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'dart:async';
+import '../core/services/auth_service.dart';
+import '../core/services/storage_service.dart';
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen>
+    with TickerProviderStateMixin {
+  late AnimationController _fadeController;
+  late AnimationController _scaleController;
+  late AnimationController _slideController;
+  late Animation<double> _fadeAnimation;
+  late Animation<double> _scaleAnimation;
+  late Animation<Offset> _slideAnimation;
+  late AnimationController _particleController;
+  late Animation<double> _particleAnimation;
+  
+  String _loadingText = 'Loading...';
+  bool _isAutoLoginAttempting = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Initialize animation controllers
+    _fadeController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+
+    _scaleController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
+      vsync: this,
+    );
+
+    _slideController = AnimationController(
+      duration: const Duration(milliseconds: 1200),
+      vsync: this,
+    );
+
+    _particleController = AnimationController(
+      duration: const Duration(milliseconds: 3000),
+      vsync: this,
+    );
+
+    // Define animations
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut),
+    );
+
+    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
+      CurvedAnimation(parent: _scaleController, curve: Curves.elasticOut),
+    );
+
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.5), end: Offset.zero).animate(
+          CurvedAnimation(parent: _slideController, curve: Curves.easeOutCubic),
+        );
+
+    _particleAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _particleController, curve: Curves.easeInOut),
+    );
+
+    // Start animations
+    _fadeController.forward();
+    _scaleController.forward();
+    _slideController.forward();
+    _particleController.repeat();
+
+    // Check for auto-login after animations start
+    _checkAutoLoginAndNavigate();
+  }
+
+  Future<void> _checkAutoLoginAndNavigate() async {
+    // Minimum splash screen display time
+    const minSplashDuration = Duration(milliseconds: 2000);
+    final startTime = DateTime.now();
+
+    try {
+      // Check if auto-login is possible
+      final canAutoLogin = await StorageService.canAutoLogin();
+      
+      if (canAutoLogin) {
+        setState(() {
+          _isAutoLoginAttempting = true;
+          _loadingText = 'Signing you in...';
+        });
+        
+        // Attempt auto-login
+        final autoLoginResult = await AuthService.autoLogin();
+        
+        if (autoLoginResult['success'] == true) {
+          final userData = autoLoginResult['data'];
+          
+          // Set user data in AuthManager
+          AuthManager.setUser(userData);
+          
+          setState(() {
+            _loadingText = 'Welcome back!';
+          });
+          
+          // Brief delay to show welcome message
+          await Future.delayed(const Duration(milliseconds: 500));
+          
+          // Ensure minimum splash time has passed
+          final elapsed = DateTime.now().difference(startTime);
+          if (elapsed < minSplashDuration) {
+            await Future.delayed(minSplashDuration - elapsed);
+          }
+          
+          if (mounted) {
+            _navigateBasedOnRole(userData);
+          }
+          return;
+        } else {
+          // Auto-login failed, clear stored data and continue to login
+          await StorageService.clearAppRegId();
+          setState(() {
+            _loadingText = 'Loading...';
+          });
+        }
+      }
+      
+      // Ensure minimum splash time has passed
+      final elapsed = DateTime.now().difference(startTime);
+      if (elapsed < minSplashDuration) {
+        await Future.delayed(minSplashDuration - elapsed);
+      }
+      
+      // Navigate to login screen
+      if (mounted) {
+        context.go('/login-password');
+      }
+    } catch (e) {
+      // Handle any errors during auto-login
+      print('Auto-login error: $e');
+      
+      setState(() {
+        _loadingText = 'Loading...';
+      });
+      
+      // Ensure minimum splash time has passed
+      final elapsed = DateTime.now().difference(startTime);
+      if (elapsed < minSplashDuration) {
+        await Future.delayed(minSplashDuration - elapsed);
+      }
+      
+      // Navigate to login screen on error
+      if (mounted) {
+        context.go('/login-password');
+      }
+    }
+  }
+
+  void _navigateBasedOnRole(userData) {
+    // Check user's pages to determine which screen to navigate to
+    final userPages = userData.pages as List<String>;
+    final userRoles = userData.roles as List<String>;
+
+    // Navigate to the appropriate screen based on user's access
+    if (userPages.contains('DASHBOARD') || userRoles.contains('ADMIN')) {
+      context.go('/dashboard');
+    } else if (userPages.contains('QUALITY_CONTROL') ||
+        userRoles.contains('QC_MANAGER')) {
+      context.go('/approval-dashboard');
+    } else if (userPages.contains('PRODUCTS') ||
+        userRoles.contains('PRODUCT_MANAGER')) {
+      context.go('/new-product-entry');
+    } else if (userPages.contains('REGISTRATION') ||
+        userRoles.contains('REGISTRAR')) {
+      context.go('/registration-type');
+    } else {
+      // Default to main dashboard/home if no specific role matches
+      context.go('/home');
+    }
+  }
+
+  @override
+  void dispose() {
+    _fadeController.dispose();
+    _scaleController.dispose();
+    _slideController.dispose();
+    _particleController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F9FA),
+      body: Stack(
+        children: [
+          // Background gradient
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  const Color(0xFFFFFFFF),
+                  const Color(0xFFF5F7FA),
+                  const Color(0xFFE9ECEF),
+                ],
+              ),
+            ),
+          ),
+
+          // Animated particles background
+          AnimatedBuilder(
+            animation: _particleAnimation,
+            builder: (context, child) {
+              return CustomPaint(
+                painter: ParticlePainter(_particleAnimation.value),
+                size: Size.infinite,
+              );
+            },
+          ),
+
+          // Main content
+          Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Logo/Icon container
+                // Logo/Icon container
+                FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: ScaleTransition(
+                    scale: _scaleAnimation,
+                    child: Container(
+                      width: 140,
+                      height: 140,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            const Color(0xFF2C5282),
+                            const Color(0xFF2B6CB0),
+                            const Color(0xFF3182CE),
+                          ],
+                        ),
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.3),
+                            blurRadius: 20,
+                            offset: const Offset(0, 10),
+                          ),
+                          BoxShadow(
+                            color: const Color(0xFF3182CE).withValues(alpha: 0.4),
+                            blurRadius: 25,
+                            offset: const Offset(0, 5),
+                          ),
+                        ],
+                      ),
+                      padding: const EdgeInsets.all(8),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.1),
+                              blurRadius: 8,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: ClipOval(
+                          child: Image.asset(
+                            "assets/images/rak_logo.jpg",
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) {
+                              return const Icon(
+                                Icons.business,
+                                color: Color(0xFF2C5282),
+                                size: 60,
+                              );
+                            },
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 40),
+
+                // Company name
+                FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: SlideTransition(
+                    position: _slideAnimation,
+                    child: Column(
+                      children: [
+                        Text(
+                          'RAK',
+                          style: TextStyle(
+                            fontSize: 48,
+                            fontWeight: FontWeight.bold,
+                            color: const Color(0xFF2C5282),
+                            letterSpacing: 3,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'WHITE CEMENT',
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w600,
+                            color: const Color(0xFF4A5568),
+                            letterSpacing: 2,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Container(
+                          width: 60,
+                          height: 3,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                const Color(0xFF3182CE),
+                                const Color(0xFF2B6CB0),
+                              ],
+                            ),
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          'Construction Materials',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w400,
+                            color: const Color(0xFF718096),
+                            letterSpacing: 1,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 60),
+
+                // Loading indicator
+                FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: Column(
+                    children: [
+                      SizedBox(
+                        width: 40,
+                        height: 40,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 3,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            const Color(0xFF3182CE),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        _loadingText,
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: const Color(0xFF718096),
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Bottom footer
+          Positioned(
+            bottom: 30,
+            left: 0,
+            right: 0,
+            child: FadeTransition(
+              opacity: _fadeAnimation,
+              child: Column(
+                children: [
+                  Text(
+                    'Est. 1980',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: const Color(0xFFA0AEC0),
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Ras Al Khaimah, United Arab Emirates',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: const Color(0xFFA0AEC0),
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ParticlePainter extends CustomPainter {
+  final double animationValue;
+
+  ParticlePainter(this.animationValue);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.blue.withValues(alpha: 0.1);
+
+    // Create floating particles
+    for (int i = 0; i < 20; i++) {
+      final x = (size.width / 20) * i + (animationValue * 50) % size.width;
+      final y =
+          size.height * 0.5 +
+          (animationValue * 100 + i * 30) % size.height -
+          size.height * 0.25;
+
+      canvas.drawCircle(Offset(x, y), 2 + (animationValue * 2) % 3, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:go_router/go_router.dart';
+import '../../../core/theme/theme.dart';
+import '../../../core/widgets/custom_back_button.dart';
+import '../../../core/services/auth_service.dart';
+import '../../../core/services/storage_service.dart';
+
+class LoginWithPasswordScreen extends StatefulWidget {
+  const LoginWithPasswordScreen({super.key});
+
+  @override
+  State<LoginWithPasswordScreen> createState() =>
+      _LoginWithPasswordScreenState();
+}
+
+class _LoginWithPasswordScreenState extends State<LoginWithPasswordScreen>
+    with SingleTickerProviderStateMixin {
+  final _formKey = GlobalKey<FormState>();
+  final _userIdController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _isLoading = false;
+  final bool _isDarkMode = false;
+  bool _rememberMe = false;
+
+  late AnimationController _animationController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeAnimations();
+    _animationController.forward();
+    _loadSavedCredentials();
+  }
+
+  Future<void> _loadSavedCredentials() async {
+    final rememberMe = await StorageService.getRememberMe();
+    if (rememberMe) {
+      final savedUserId = await StorageService.getUserId();
+      if (savedUserId != null) {
+        setState(() {
+          _userIdController.text = savedUserId;
+          _rememberMe = true;
+        });
+      }
+    }
+  }
+
+  void _initializeAnimations() {
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    );
+
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _animationController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _userIdController.dispose();
+    _passwordController.dispose();
+    _animationController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _handleLogin() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      // Trim input values to remove any whitespace
+      final userID = _userIdController.text.trim();
+      final password = _passwordController.text.trim();
+
+      // Use new AuthService.authenticateUser method
+      final result = await AuthService.authenticateUser(
+        userID: userID,
+        password: password,
+      );
+
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+
+        if (result['success'] == true) {
+          final loginResponse = result['data'];
+          final userData = loginResponse.data;
+
+          // Save credentials if remember me is checked
+          if (_rememberMe) {
+            await StorageService.saveUserId(userID);
+            await StorageService.saveRememberMe(true);
+          } else {
+            await StorageService.saveRememberMe(false);
+          }
+
+          // Set user data in AuthManager
+          AuthManager.setUser(userData);
+
+          // Navigate based on user roles and pages
+          _navigateBasedOnRole(userData);
+        } else {
+          final errorMessage =
+              result['error'] ?? 'Login failed. Please try again.';
+          _showErrorSnackBar(errorMessage);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+        _showErrorSnackBar(
+          'Network error. Please check your connection and try again.',
+        );
+      }
+    }
+  }
+
+  void _navigateBasedOnRole(userData) {
+    // Check user's pages to determine which screen to navigate to
+    final userPages = userData.pages as List<String>;
+    final userRoles = userData.roles as List<String>;
+
+    // Navigate to the appropriate screen based on user's access
+    if (userPages.contains('DASHBOARD') || userRoles.contains('ADMIN')) {
+      context.go('/dashboard');
+    } else if (userPages.contains('QUALITY_CONTROL') ||
+        userRoles.contains('QC_MANAGER')) {
+      context.go('/approval-dashboard');
+    } else if (userPages.contains('PRODUCTS') ||
+        userRoles.contains('PRODUCT_MANAGER')) {
+      context.go('/new-product-entry');
+    } else if (userPages.contains('REGISTRATION') ||
+        userRoles.contains('REGISTRAR')) {
+      context.go('/registration-type');
+    } else {
+      // Default to main dashboard/home if no specific role matches
+      context.go('/home');
+    }
+  }
+
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = _isDarkMode;
+
+    SystemChrome.setSystemUIOverlayStyle(
+      SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: isDark ? Brightness.light : Brightness.dark,
+        statusBarBrightness: isDark ? Brightness.dark : Brightness.light,
+      ),
+    );
+
+    return Scaffold(
+      backgroundColor: isDark ? const Color(0xFF0A0A0A) : Colors.white,
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final isMobile = constraints.maxWidth < 600;
+          final isTablet =
+              constraints.maxWidth >= 600 && constraints.maxWidth < 1200;
+          final isDesktop = constraints.maxWidth >= 1200;
+
+          return Container(
+            width: double.infinity,
+            height: double.infinity,
+            decoration: BoxDecoration(
+              gradient: isDark
+                  ? const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFF0A0A0A),
+                        Color(0xFF1A1A2E),
+                        Color(0xFF16213E),
+                      ],
+                    )
+                  : const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFFf8f9ff),
+                        Color(0xFFe3f2fd),
+                        Color(0xFFffffff),
+                      ],
+                    ),
+            ),
+            child: Stack(
+              children: [
+                if (Navigator.of(context).canPop())
+                  const Positioned(
+                    top: 50,
+                    left: 20,
+                    child: CustomBackButton(),
+                  ),
+                isMobile
+                    ? _buildMobileLayout(isDark)
+                    : _buildWebLayout(isDark, isTablet, isDesktop),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildAnimatedLogo() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Transform.scale(
+          scale: 0.8 + (0.2 * value),
+          child: Container(
+            height: 120,
+            width: 120,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blue.withOpacity(0.2),
+                  blurRadius: 15,
+                  spreadRadius: 3,
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: ClipOval(
+                child: Image.asset(
+                  'assets/images/rak_logo.jpg',
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) {
+                    // Fallback with RAK text logo if image fails to load
+                    return Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [Colors.blue.shade700, Colors.blue.shade500],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Center(
+                        child: Text(
+                          'RAK',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMobileLayout(bool isDark) {
+    return Center(
+      child: SingleChildScrollView(
+        child: FadeTransition(
+          opacity: _fadeAnimation,
+          child: SlideTransition(
+            position: _slideAnimation,
+            child: ScaleTransition(
+              scale: _scaleAnimation,
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 420),
+                margin: const EdgeInsets.symmetric(horizontal: 24),
+                child: Card(
+                  elevation: isDark ? 0 : 24,
+                  shadowColor: isDark
+                      ? Colors.transparent
+                      : Colors.blue.withOpacity(0.15),
+                  color: isDark
+                      ? const Color(0xFF1E1E1E).withOpacity(0.95)
+                      : Colors.white.withOpacity(0.98),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(28),
+                    side: isDark
+                        ? BorderSide(
+                            color: Colors.white.withOpacity(0.1),
+                            width: 1,
+                          )
+                        : BorderSide.none,
+                  ),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    padding: const EdgeInsets.all(40),
+                    child: _buildLoginForm(isDark),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebLayout(bool isDark, bool isTablet, bool isDesktop) {
+    return Row(
+      children: [
+        // Left side - Branding/Info
+        Expanded(
+          flex: isDesktop ? 3 : 2,
+          child: Container(
+            padding: EdgeInsets.all(isDesktop ? 80 : 60),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildAnimatedLogo(),
+                SizedBox(height: isDesktop ? 40 : 32),
+                Text(
+                  'Welcome Back',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 48 : 36,
+                    fontWeight: FontWeight.bold,
+                    color: isDark ? Colors.white : Colors.blue.shade800,
+                  ),
+                ),
+                SizedBox(height: isDesktop ? 20 : 16),
+                Text(
+                  'Sign in to access your RAK account and manage your registrations.',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 18 : 16,
+                    color: isDark ? Colors.grey.shade300 : Colors.grey.shade600,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        // Right side - Login Form
+        Expanded(
+          flex: isDesktop ? 2 : 3,
+          child: Container(
+            height: double.infinity,
+            decoration: BoxDecoration(
+              color: isDark
+                  ? const Color(0xFF1E1E1E).withOpacity(0.95)
+                  : Colors.white.withOpacity(0.98),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(isDark ? 0.3 : 0.1),
+                  blurRadius: 20,
+                  offset: const Offset(-5, 0),
+                ),
+              ],
+            ),
+            child: Center(
+              child: SingleChildScrollView(
+                padding: EdgeInsets.all(isDesktop ? 60 : 40),
+                child: FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: SlideTransition(
+                    position: _slideAnimation,
+                    child: Container(
+                      constraints: const BoxConstraints(maxWidth: 400),
+                      child: _buildLoginForm(isDark),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLoginForm(bool isDark) {
+    return Form(
+      key: _formKey,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildAnimatedTitle(),
+          const SizedBox(height: 32),
+          ModernTextField(
+            controller: _userIdController,
+            labelText: 'User ID',
+            hintText: 'Enter your user ID',
+            keyboardType: TextInputType.text,
+            isDark: isDark,
+            prefixIcon: Icons.person_outline,
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Please enter your user ID';
+              }
+              return null;
+            },
+            delay: const Duration(milliseconds: 300),
+          ),
+          const SizedBox(height: 24),
+          ModernPasswordField(
+            controller: _passwordController,
+            labelText: 'Password',
+            hintText: 'Enter your password',
+            isDark: isDark,
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Please enter your password';
+              }
+              if (value.length < 6) {
+                return 'Password must be at least 6 characters';
+              }
+              return null;
+            },
+            delay: const Duration(milliseconds: 450),
+          ),
+          const SizedBox(height: 16),
+          _buildRememberMeSection(),
+          const SizedBox(height: 32),
+          ModernButton(
+            text: 'Sign In',
+            isLoading: _isLoading,
+            onPressed: _handleLogin,
+            isPrimary: true,
+            isDark: isDark,
+            delay: const Duration(milliseconds: 600),
+          ),
+          const SizedBox(height: 16),
+          ModernButton(
+            text: 'Continue with OTP',
+            isLoading: false,
+            onPressed: () {
+              context.push('/login-otp');
+            },
+            isPrimary: false,
+            isDark: isDark,
+            delay: const Duration(milliseconds: 750),
+          ),
+          const SizedBox(height: 24),
+          _buildSignUpSection(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAnimatedTitle() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOut,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 20 * (1 - value)),
+            child: child,
+          ),
+        );
+      },
+      child: Text(
+        'Login',
+        style: AppTheme.headline.copyWith(color: Colors.blue),
+      ),
+    );
+  }
+
+  Widget _buildRememberMeSection() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Row(
+            children: [
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: Checkbox(
+                  value: _rememberMe,
+                  onChanged: (value) {
+                    setState(() {
+                      _rememberMe = value ?? false;
+                    });
+                  },
+                  activeColor: Colors.blue,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Remember me',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: _isDarkMode
+                      ? Colors.grey.shade300
+                      : Colors.grey.shade600,
+                ),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: () {
+                  // Implement forgot password
+                  _showErrorSnackBar('Forgot password will be implemented');
+                },
+                child: Text(
+                  'Forgot Password?',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.blue.shade600,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSignUpSection() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 800),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                "Don't have an account? ",
+                style: TextStyle(
+                  fontSize: 14,
+                  color: _isDarkMode
+                      ? Colors.grey.shade400
+                      : Colors.grey.shade600,
+                ),
+              ),
+              TextButton(
+                onPressed: () {
+                  context.push('/registration-type');
+                },
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(
+                  'Sign up',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.blue.shade600,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class AnimatedPasswordField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? Function(String?)? validator;
+  final Duration delay;
+
+  const AnimatedPasswordField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.validator,
+    required this.delay,
+  });
+
+  @override
+  State<AnimatedPasswordField> createState() => _AnimatedPasswordFieldState();
+}
+
+class _AnimatedPasswordFieldState extends State<AnimatedPasswordField> {
+  bool _isVisible = false;
+  bool _obscureText = true;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: TextFormField(
+          controller: widget.controller,
+          obscureText: _obscureText,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            filled: true,
+            fillColor: Colors.grey.shade100,
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Colors.blue, width: 2),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+            suffixIcon: IconButton(
+              icon: Icon(
+                _obscureText ? Icons.visibility : Icons.visibility_off,
+                color: Colors.grey,
+              ),
+              onPressed: () {
+                setState(() {
+                  _obscureText = !_obscureText;
+                });
+              },
+            ),
+          ),
+          validator: widget.validator,
+        ),
+      ),
+    );
+  }
+}
+
+// Custom animated text field
+class AnimatedTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? prefixText;
+  final TextInputType keyboardType;
+  final String? Function(String?)? validator;
+  final Duration delay;
+
+  const AnimatedTextField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.prefixText,
+    required this.keyboardType,
+    this.validator,
+    required this.delay,
+  });
+
+  @override
+  State<AnimatedTextField> createState() => _AnimatedTextFieldState();
+}
+
+class _AnimatedTextFieldState extends State<AnimatedTextField> {
+  bool _isVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: TextFormField(
+          controller: widget.controller,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            prefixText: widget.prefixText,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            filled: true,
+            fillColor: Colors.grey.shade100,
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Colors.blue, width: 2),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+          ),
+          keyboardType: widget.keyboardType,
+          validator: widget.validator,
+        ),
+      ),
+    );
+  }
+}
+
+// Custom animated button
+class AnimatedButton extends StatefulWidget {
+  final String text;
+  final bool isLoading;
+  final VoidCallback onPressed;
+  final Duration delay;
+  final Color? textColor;
+
+  const AnimatedButton({
+    super.key,
+    required this.text,
+    required this.isLoading,
+    required this.onPressed,
+    required this.delay,
+    this.textColor,
+  });
+
+  @override
+  State<AnimatedButton> createState() => _AnimatedButtonState();
+}
+
+class _AnimatedButtonState extends State<AnimatedButton> {
+  bool _isVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: widget.isLoading ? null : widget.onPressed,
+            style: ElevatedButton.styleFrom(
+              elevation: 8,
+              shadowColor: Colors.blue.withOpacity(0.3),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              backgroundColor: Colors.blue,
+              foregroundColor: widget.textColor ?? Colors.white,
+            ),
+            child: widget.isLoading
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(width: 16),
+                      Text('Please wait...'),
+                    ],
+                  )
+                : Text(
+                    widget.text,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: widget.textColor ?? Colors.white,
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Modern TextField Component
+class ModernTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final TextInputType keyboardType;
+  final String? Function(String?)? validator;
+  final Duration delay;
+  final bool isDark;
+  final IconData? prefixIcon;
+
+  const ModernTextField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    required this.keyboardType,
+    this.validator,
+    required this.delay,
+    required this.isDark,
+    this.prefixIcon,
+  });
+
+  @override
+  State<ModernTextField> createState() => _ModernTextFieldState();
+}
+
+class _ModernTextFieldState extends State<ModernTextField> {
+  bool _isVisible = false;
+  bool _isFocused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: Focus(
+          onFocusChange: (focused) {
+            setState(() {
+              _isFocused = focused;
+            });
+          },
+          child: TextFormField(
+            controller: widget.controller,
+            keyboardType: widget.keyboardType,
+            style: TextStyle(
+              fontSize: 16,
+              color: widget.isDark ? Colors.white : Colors.black87,
+            ),
+            decoration: InputDecoration(
+              labelText: widget.labelText,
+              hintText: widget.hintText,
+              prefixIcon: widget.prefixIcon != null
+                  ? Icon(
+                      widget.prefixIcon,
+                      color: _isFocused
+                          ? Colors.blue
+                          : (widget.isDark
+                                ? Colors.grey.shade400
+                                : Colors.grey.shade600),
+                    )
+                  : null,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.blue, width: 2),
+              ),
+              errorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 1),
+              ),
+              focusedErrorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 2),
+              ),
+              filled: true,
+              fillColor: widget.isDark
+                  ? Colors.grey.shade800.withOpacity(0.3)
+                  : Colors.grey.shade50,
+              labelStyle: TextStyle(
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              hintStyle: TextStyle(
+                color: widget.isDark
+                    ? Colors.grey.shade500
+                    : Colors.grey.shade400,
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 20,
+              ),
+            ),
+            validator: widget.validator,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Modern Password Field Component
+class ModernPasswordField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? Function(String?)? validator;
+  final Duration delay;
+  final bool isDark;
+
+  const ModernPasswordField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.validator,
+    required this.delay,
+    required this.isDark,
+  });
+
+  @override
+  State<ModernPasswordField> createState() => _ModernPasswordFieldState();
+}
+
+class _ModernPasswordFieldState extends State<ModernPasswordField> {
+  bool _isVisible = false;
+  bool _obscureText = true;
+  bool _isFocused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: Focus(
+          onFocusChange: (focused) {
+            setState(() {
+              _isFocused = focused;
+            });
+          },
+          child: TextFormField(
+            controller: widget.controller,
+            obscureText: _obscureText,
+            style: TextStyle(
+              fontSize: 16,
+              color: widget.isDark ? Colors.white : Colors.black87,
+            ),
+            decoration: InputDecoration(
+              labelText: widget.labelText,
+              hintText: widget.hintText,
+              prefixIcon: Icon(
+                Icons.lock_outline,
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              suffixIcon: IconButton(
+                icon: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: Icon(
+                    _obscureText
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                    key: ValueKey(_obscureText),
+                    color: widget.isDark
+                        ? Colors.grey.shade400
+                        : Colors.grey.shade600,
+                  ),
+                ),
+                onPressed: () {
+                  setState(() {
+                    _obscureText = !_obscureText;
+                  });
+                },
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.blue, width: 2),
+              ),
+              errorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 1),
+              ),
+              focusedErrorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 2),
+              ),
+              filled: true,
+              fillColor: widget.isDark
+                  ? Colors.grey.shade800.withOpacity(0.3)
+                  : Colors.grey.shade50,
+              labelStyle: TextStyle(
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              hintStyle: TextStyle(
+                color: widget.isDark
+                    ? Colors.grey.shade500
+                    : Colors.grey.shade400,
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 20,
+              ),
+            ),
+            validator: widget.validator,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Modern Button Component
+class ModernButton extends StatefulWidget {
+  final String text;
+  final bool isLoading;
+  final VoidCallback onPressed;
+  final Duration delay;
+  final bool isPrimary;
+  final bool isDark;
+
+  const ModernButton({
+    super.key,
+    required this.text,
+    required this.isLoading,
+    required this.onPressed,
+    required this.delay,
+    required this.isPrimary,
+    required this.isDark,
+  });
+
+  @override
+  State<ModernButton> createState() => _ModernButtonState();
+}
+
+class _ModernButtonState extends State<ModernButton> {
+  bool _isVisible = false;
+  bool _isHovered = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: widget.isPrimary
+              ? ElevatedButton(
+                  onPressed: widget.isLoading ? null : widget.onPressed,
+                  style:
+                      ElevatedButton.styleFrom(
+                        elevation: _isHovered ? 12 : 6,
+                        shadowColor: Colors.blue.withOpacity(0.3),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                      ).copyWith(
+                        backgroundColor: WidgetStateProperty.resolveWith((
+                          states,
+                        ) {
+                          if (states.contains(WidgetState.disabled)) {
+                            return Colors.grey.shade400;
+                          }
+                          return Colors.blue;
+                        }),
+                      ),
+                  onHover: (hovering) {
+                    setState(() {
+                      _isHovered = hovering;
+                    });
+                  },
+                  child: widget.isLoading
+                      ? const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            ),
+                            SizedBox(width: 16),
+                            Text('Signing in...'),
+                          ],
+                        )
+                      : Text(
+                          widget.text,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                )
+              : OutlinedButton(
+                  onPressed: widget.onPressed,
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(
+                      color: widget.isDark
+                          ? Colors.grey.shade600
+                          : Colors.grey.shade300,
+                      width: 1.5,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    backgroundColor: _isHovered
+                        ? (widget.isDark
+                              ? Colors.grey.shade800.withOpacity(0.5)
+                              : Colors.grey.shade50)
+                        : null,
+                  ),
+                  onHover: (hovering) {
+                    setState(() {
+                      _isHovered = hovering;
+                    });
+                  },
+                  child: Text(
+                    widget.text,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                      color: widget.isDark
+                          ? Colors.grey.shade300
+                          : Colors.grey.shade700,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+// Custom animated outline button
+class AnimatedOutlineButton extends StatefulWidget {
+  final String text;
+  final VoidCallback onPressed;
+  final Duration delay;
+
+  const AnimatedOutlineButton({
+    super.key,
+    required this.text,
+    required this.onPressed,
+    required this.delay,
+  });
+
+  @override
+  State<AnimatedOutlineButton> createState() => _AnimatedOutlineButtonState();
+}
+
+class _AnimatedOutlineButtonState extends State<AnimatedOutlineButton> {
+  bool _isVisible = false;
+  bool _isHovered = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: MouseRegion(
+          onEnter: (_) => setState(() => _isHovered = true),
+          onExit: (_) => setState(() => _isHovered = false),
+          child: OutlinedButton(
+            onPressed: widget.onPressed,
+            style: OutlinedButton.styleFrom(
+              side: BorderSide(
+                color: _isHovered ? Colors.blue : Colors.grey.shade400,
+                width: 1.5,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              backgroundColor: _isHovered
+                  ? Colors.blue.withOpacity(0.05)
+                  : null,
+            ),
+            child: Text(
+              widget.text,
+              style: TextStyle(
+                fontSize: 14,
+                color: _isHovered ? Colors.blue : Colors.grey.shade700,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
