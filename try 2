@@ -1,487 +1,4318 @@
-using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.IdentityModel.Tokens;
-using sparshWebService.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Security.Cryptography;
-using System.Text;
-using FirebaseAdmin;
-using FirebaseAdmin.Auth;
-using Google.Apis.Auth.OAuth2;
-using System.Threading.Tasks;
+import 'package:shared_preferences/shared_preferences.dart';
+import '../utils/app_logger.dart';
 
-namespace sparshWebService.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    public class AuthController : ControllerBase
-    {
-        private readonly DatabaseHelper _dbHelper;
-        private const int ITERATION_NUMBER = 1;
+class StorageService {
+  static final AppLogger _logger = AppLogger();
+  static SharedPreferences? _prefs;
 
-        public AuthController(DatabaseHelper dbHelper)
-        {
-            _dbHelper = dbHelper;
-            InitializeFirebase();
+  // Storage keys
+  static const String _appRegIdKey = 'app_reg_id';
+  static const String _userIdKey = 'user_id';
+  static const String _lastLoginKey = 'last_login';
+  static const String _autoLoginEnabledKey = 'auto_login_enabled';
+
+  /// Initialize SharedPreferences
+  static Future<void> init() async {
+    try {
+      _prefs = await SharedPreferences.getInstance();
+      _logger.info('Storage service initialized');
+    } catch (e) {
+      _logger.error('Failed to initialize storage service', e);
+      rethrow;
+    }
+  }
+
+  /// Get SharedPreferences instance
+  static SharedPreferences get prefs {
+    if (_prefs == null) {
+      throw Exception('StorageService not initialized. Call StorageService.init() first.');
+    }
+    return _prefs!;
+  }
+
+  /// Save appRegId for auto-login
+  static Future<bool> saveAppRegId(String appRegId) async {
+    try {
+      final success = await prefs.setString(_appRegIdKey, appRegId);
+      if (success) {
+        _logger.info('AppRegId saved successfully');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Failed to save appRegId', e);
+      return false;
+    }
+  }
+
+  /// Get saved appRegId
+  static String? getAppRegId() {
+    try {
+      return prefs.getString(_appRegIdKey);
+    } catch (e) {
+      _logger.error('Failed to get appRegId', e);
+      return null;
+    }
+  }
+
+  /// Save user ID
+  static Future<bool> saveUserId(String userId) async {
+    try {
+      final success = await prefs.setString(_userIdKey, userId);
+      if (success) {
+        _logger.info('UserId saved successfully');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Failed to save userId', e);
+      return false;
+    }
+  }
+
+  /// Get saved user ID
+  static String? getUserId() {
+    try {
+      return prefs.getString(_userIdKey);
+    } catch (e) {
+      _logger.error('Failed to get userId', e);
+      return null;
+    }
+  }
+
+  /// Save last login timestamp
+  static Future<bool> saveLastLogin() async {
+    try {
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final success = await prefs.setInt(_lastLoginKey, timestamp);
+      if (success) {
+        _logger.info('Last login timestamp saved');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Failed to save last login timestamp', e);
+      return false;
+    }
+  }
+
+  /// Get last login timestamp
+  static DateTime? getLastLogin() {
+    try {
+      final timestamp = prefs.getInt(_lastLoginKey);
+      return timestamp != null ? DateTime.fromMillisecondsSinceEpoch(timestamp) : null;
+    } catch (e) {
+      _logger.error('Failed to get last login timestamp', e);
+      return null;
+    }
+  }
+
+  /// Enable/disable auto-login
+  static Future<bool> setAutoLoginEnabled(bool enabled) async {
+    try {
+      final success = await prefs.setBool(_autoLoginEnabledKey, enabled);
+      if (success) {
+        _logger.info('Auto-login ${enabled ? 'enabled' : 'disabled'}');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Failed to set auto-login preference', e);
+      return false;
+    }
+  }
+
+  /// Check if auto-login is enabled
+  static bool isAutoLoginEnabled() {
+    try {
+      return prefs.getBool(_autoLoginEnabledKey) ?? true; // Default to enabled
+    } catch (e) {
+      _logger.error('Failed to get auto-login preference', e);
+      return true; // Default to enabled on error
+    }
+  }
+
+  /// Check if auto-login is valid (not expired)
+  static bool isAutoLoginValid({int maxDaysValid = 30}) {
+    final lastLogin = getLastLogin();
+    if (lastLogin == null) return false;
+
+    final daysSinceLogin = DateTime.now().difference(lastLogin).inDays;
+    return daysSinceLogin <= maxDaysValid;
+  }
+
+  /// Clear all stored authentication data
+  static Future<bool> clearAuthData() async {
+    try {
+      final futures = [
+        prefs.remove(_appRegIdKey),
+        prefs.remove(_userIdKey),
+        prefs.remove(_lastLoginKey),
+      ];
+      
+      final results = await Future.wait(futures);
+      final success = results.every((result) => result);
+      
+      if (success) {
+        _logger.info('All auth data cleared successfully');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Failed to clear auth data', e);
+      return false;
+    }
+  }
+
+  /// Clear all stored data
+  static Future<bool> clearAll() async {
+    try {
+      final success = await prefs.clear();
+      if (success) {
+        _logger.info('All stored data cleared');
+      }
+      return success;
+    } catch (e) {
+      _logger.error('Failed to clear all data', e);
+      return false;
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class LoginRequest {
+  final String userID;
+  final String password;
+  final String appRegId;
+
+  const LoginRequest({
+    required this.userID,
+    required this.password,
+    required this.appRegId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'userID': userID,
+        'password': password,
+        'appRegId': appRegId,
+      };
+
+  factory LoginRequest.fromJson(Map<String, dynamic> json) => LoginRequest(
+        userID: json['userID'] as String,
+        password: json['password'] as String,
+        appRegId: json['appRegId'] as String,
+      );
+}
+
+class LoginResponse {
+  final String msg;
+  final LoginData data;
+
+  const LoginResponse({
+    required this.msg,
+    required this.data,
+  });
+
+  factory LoginResponse.fromJson(Map<String, dynamic> json) => LoginResponse(
+        msg: json['msg'] as String,
+        data: LoginData.fromJson(json['data'] as Map<String, dynamic>),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'msg': msg,
+        'data': data.toJson(),
+      };
+}
+
+class LoginData {
+  final String appRegId;
+  final String userID;
+  final String emplName;
+  final String areaCode;
+  final List<String> roles;
+  final List<String> pages;
+
+  const LoginData({
+    required this.appRegId,
+    required this.userID,
+    required this.emplName,
+    required this.areaCode,
+    required this.roles,
+    required this.pages,
+  });
+
+  factory LoginData.fromJson(Map<String, dynamic> json) => LoginData(
+        appRegId: json['appRegId'] as String,
+        userID: json['userID'] as String,
+        emplName: json['emplName'] as String,
+        areaCode: json['areaCode'] as String,
+        roles: (json['roles'] as List<dynamic>).cast<String>(),
+        pages: (json['pages'] as List<dynamic>).cast<String>(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'appRegId': appRegId,
+        'userID': userID,
+        'emplName': emplName,
+        'areaCode': areaCode,
+        'roles': roles,
+        'pages': pages,
+      };
+
+  /// Convert to UserData for compatibility
+  UserData toUserData() => UserData(
+        emplName: emplName,
+        areaCode: areaCode,
+        roles: roles,
+        pages: pages,
+        userID: userID,
+      );
+}
+
+class UserData {
+  final String emplName;
+  final String areaCode;
+  final List<String> roles;
+  final List<String> pages;
+  final String? userID; // Add userID field
+
+  const UserData({
+    required this.emplName,
+    required this.areaCode,
+    required this.roles,
+    required this.pages,
+    this.userID,
+  });
+
+  factory UserData.fromJson(Map<String, dynamic> json) => UserData(
+        emplName: json['emplName'] as String,
+        areaCode: json['areaCode'] as String,
+        roles: (json['roles'] as List<dynamic>).cast<String>(),
+        pages: (json['pages'] as List<dynamic>).cast<String>(),
+        userID: json['userID'] as String?,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'emplName': emplName,
+        'areaCode': areaCode,
+        'roles': roles,
+        'pages': pages,
+        'userID': userID,
+      };
+
+  bool hasRole(String role) => roles.contains(role);
+  bool hasPage(String page) => pages.contains(page);
+  bool hasAnyRole(List<String> roleList) => roleList.any((role) => roles.contains(role));
+  bool hasAnyPage(List<String> pageList) => pageList.any((page) => pages.contains(page));
+}
+
+class AutoLoginRequest {
+  final String appRegId;
+
+  const AutoLoginRequest({
+    required this.appRegId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'appRegId': appRegId,
+      };
+
+  factory AutoLoginRequest.fromJson(Map<String, dynamic> json) => AutoLoginRequest(
+        appRegId: json['appRegId'] as String,
+      );
+}
+
+class AutoLoginResponse {
+  final String msg;
+  final AutoLoginData data;
+
+  const AutoLoginResponse({
+    required this.msg,
+    required this.data,
+  });
+
+  factory AutoLoginResponse.fromJson(Map<String, dynamic> json) => AutoLoginResponse(
+        msg: json['msg'] as String,
+        data: AutoLoginData.fromJson(json['data'] as Map<String, dynamic>),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'msg': msg,
+        'data': data.toJson(),
+      };
+}
+
+class AutoLoginData {
+  final String userID;
+  final String emplName;
+  final String areaCode;
+  final List<String> roles;
+  final List<String> pages;
+
+  const AutoLoginData({
+    required this.userID,
+    required this.emplName,
+    required this.areaCode,
+    required this.roles,
+    required this.pages,
+  });
+
+  factory AutoLoginData.fromJson(Map<String, dynamic> json) => AutoLoginData(
+        userID: json['userID'] as String,
+        emplName: json['emplName'] as String,
+        areaCode: json['areaCode'] as String,
+        roles: (json['roles'] as List<dynamic>).cast<String>(),
+        pages: (json['pages'] as List<dynamic>).cast<String>(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'userID': userID,
+        'emplName': emplName,
+        'areaCode': areaCode,
+        'roles': roles,
+        'pages': pages,
+      };
+
+  /// Convert to UserData for compatibility
+  UserData toUserData() => UserData(
+        emplName: emplName,
+        areaCode: areaCode,
+        roles: roles,
+        pages: pages,
+        userID: userID,
+      );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:get_it/get_it.dart';
+import '../services/analytics_service.dart';
+import '../services/qr_scanner_service.dart';
+import '../services/storage_service.dart';
+import '../controllers/home_controller.dart';
+
+/// Global service locator instance
+final getIt = GetIt.instance;
+
+/// Setup dependency injection
+Future<void> setupServiceLocator() async {
+  // Initialize storage service first
+  await StorageService.init();
+  
+  // Register services as singletons
+  getIt.registerLazySingleton<AnalyticsService>(() => AnalyticsService());
+  getIt.registerLazySingleton<QRScannerService>(() => QRScannerService());
+
+  // Register controllers as factory (new instance each time)
+  getIt.registerFactory<HomeController>(
+    () => HomeController(
+      analyticsService: getIt<AnalyticsService>(),
+      qrScannerService: getIt<QRScannerService>(),
+    ),
+  );
+}
+
+/// Get service instances
+AnalyticsService get analyticsService => getIt<AnalyticsService>();
+QRScannerService get qrScannerService => getIt<QRScannerService>();
+HomeController get homeController => getIt<HomeController>();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'dart:async';
+import '../core/services/auth_service.dart';
+import '../core/utils/app_logger.dart';
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen>
+    with TickerProviderStateMixin {
+  late AnimationController _fadeController;
+  late AnimationController _scaleController;
+  late AnimationController _slideController;
+  late Animation<double> _fadeAnimation;
+  late Animation<double> _scaleAnimation;
+  late Animation<Offset> _slideAnimation;
+  late AnimationController _particleController;
+  late Animation<double> _particleAnimation;
+  
+  static final AppLogger _logger = AppLogger();
+  bool _isCheckingAutoLogin = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Initialize animation controllers
+    _fadeController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+
+    _scaleController = AnimationController(
+      duration: const Duration(milliseconds: 1000),
+      vsync: this,
+    );
+
+    _slideController = AnimationController(
+      duration: const Duration(milliseconds: 1200),
+      vsync: this,
+    );
+
+    _particleController = AnimationController(
+      duration: const Duration(milliseconds: 3000),
+      vsync: this,
+    );
+
+    // Define animations
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut),
+    );
+
+    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
+      CurvedAnimation(parent: _scaleController, curve: Curves.elasticOut),
+    );
+
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.5), end: Offset.zero).animate(
+          CurvedAnimation(parent: _slideController, curve: Curves.easeOutCubic),
+        );
+
+    _particleAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _particleController, curve: Curves.easeInOut),
+    );
+
+    // Start animations
+    _fadeController.forward();
+    _scaleController.forward();
+    _slideController.forward();
+    _particleController.repeat();
+
+    // Check for auto-login after animations start
+    Timer(const Duration(milliseconds: 2000), () {
+      if (mounted) {
+        _checkAutoLoginAndNavigate();
+      }
+    });
+  }
+
+  Future<void> _checkAutoLoginAndNavigate() async {
+    if (_isCheckingAutoLogin) return;
+    
+    setState(() {
+      _isCheckingAutoLogin = true;
+    });
+
+    try {
+      _logger.info('Checking for auto-login possibility');
+      
+      // Check if auto-login is possible
+      if (AuthService.canAutoLogin()) {
+        _logger.info('Auto-login is possible, attempting...');
+        
+        // Attempt auto-login
+        final success = await AuthService.tryAutoLogin();
+        
+        if (success) {
+          _logger.info('Auto-login successful, navigating to home');
+          if (mounted) {
+            context.go('/home');
+            return;
+          }
+        } else {
+          _logger.info('Auto-login failed, will show login screen');
         }
+      } else {
+        _logger.info('Auto-login not available');
+      }
+    } catch (e) {
+      _logger.error('Error during auto-login check', e);
+    }
 
-        private void InitializeFirebase()
-        {
-            if (FirebaseApp.DefaultInstance == null)
-            {
-                try
-                {
-                    FirebaseApp.Create(new AppOptions()
-                    {
-                        Credential = GoogleCredential.FromFile("firebase-service-account.json"),
+    // If auto-login failed or not available, navigate to login
+    if (mounted) {
+      context.go('/login-password');
+    }
+  }
+
+  @override
+  void dispose() {
+    _fadeController.dispose();
+    _scaleController.dispose();
+    _slideController.dispose();
+    _particleController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F9FA),
+      body: Stack(
+        children: [
+          // Background gradient
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  const Color(0xFFFFFFFF),
+                  const Color(0xFFF5F7FA),
+                  const Color(0xFFE9ECEF),
+                ],
+              ),
+            ),
+          ),
+
+          // Animated particles background
+          AnimatedBuilder(
+            animation: _particleAnimation,
+            builder: (context, child) {
+              return CustomPaint(
+                painter: ParticlePainter(_particleAnimation.value),
+                size: Size.infinite,
+              );
+            },
+          ),
+
+          // Main content
+          Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Logo/Icon container
+                // Logo/Icon container
+                FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: ScaleTransition(
+                    scale: _scaleAnimation,
+                    child: Container(
+                      width: 140,
+                      height: 140,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            const Color(0xFF2C5282),
+                            const Color(0xFF2B6CB0),
+                            const Color(0xFF3182CE),
+                          ],
+                        ),
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.3),
+                            blurRadius: 20,
+                            offset: const Offset(0, 10),
+                          ),
+                          BoxShadow(
+                            color: const Color(0xFF3182CE).withOpacity(0.4),
+                            blurRadius: 25,
+                            offset: const Offset(0, 5),
+                          ),
+                        ],
+                      ),
+                      padding: const EdgeInsets.all(8),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.1),
+                              blurRadius: 8,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: ClipOval(
+                          child: Image.asset(
+                            "assets/images/rak_logo.jpg",
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) {
+                              return const Icon(
+                                Icons.business,
+                                color: Color(0xFF2C5282),
+                                size: 60,
+                              );
+                            },
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 40),
+
+                // Company name
+                FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: SlideTransition(
+                    position: _slideAnimation,
+                    child: Column(
+                      children: [
+                        Text(
+                          'RAK',
+                          style: TextStyle(
+                            fontSize: 48,
+                            fontWeight: FontWeight.bold,
+                            color: const Color(0xFF2C5282),
+                            letterSpacing: 3,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'WHITE CEMENT',
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w600,
+                            color: const Color(0xFF4A5568),
+                            letterSpacing: 2,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Container(
+                          width: 60,
+                          height: 3,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                const Color(0xFF3182CE),
+                                const Color(0xFF2B6CB0),
+                              ],
+                            ),
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          'Construction Materials',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w400,
+                            color: const Color(0xFF718096),
+                            letterSpacing: 1,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 60),
+
+                // Loading indicator
+                FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: Column(
+                    children: [
+                      SizedBox(
+                        width: 40,
+                        height: 40,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 3,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            const Color(0xFF3182CE),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        _isCheckingAutoLogin ? 'Checking saved login...' : 'Loading...',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: const Color(0xFF718096),
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Bottom footer
+          Positioned(
+            bottom: 30,
+            left: 0,
+            right: 0,
+            child: FadeTransition(
+              opacity: _fadeAnimation,
+              child: Column(
+                children: [
+                  Text(
+                    'Est. 1980',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: const Color(0xFFA0AEC0),
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Ras Al Khaimah, United Arab Emirates',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: const Color(0xFFA0AEC0),
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ParticlePainter extends CustomPainter {
+  final double animationValue;
+
+  ParticlePainter(this.animationValue);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.blue.withOpacity(0.1);
+
+    // Create floating particles
+    for (int i = 0; i < 20; i++) {
+      final x = (size.width / 20) * i + (animationValue * 50) % size.width;
+      final y =
+          size.height * 0.5 +
+          (animationValue * 100 + i * 30) % size.height -
+          size.height * 0.25;
+
+      canvas.drawCircle(Offset(x, y), 2 + (animationValue * 2) % 3, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import '../../../core/services/auth_service.dart';
+import '../../../core/services/storage_service.dart';
+import '../../../core/utils/app_logger.dart';
+
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  static final AppLogger _logger = AppLogger();
+  bool _autoLoginEnabled = true;
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  void _loadSettings() {
+    setState(() {
+      _autoLoginEnabled = StorageService.isAutoLoginEnabled();
+    });
+  }
+
+  Future<void> _toggleAutoLogin(bool value) async {
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      final success = await StorageService.setAutoLoginEnabled(value);
+      if (success) {
+        setState(() {
+          _autoLoginEnabled = value;
+        });
+        
+        if (!value) {
+          // If disabling auto-login, clear stored auth data
+          await StorageService.clearAuthData();
+          _showSnackBar('Auto-login disabled and stored data cleared');
+        } else {
+          _showSnackBar('Auto-login enabled');
+        }
+      } else {
+        _showSnackBar('Failed to update auto-login setting');
+      }
+    } catch (e) {
+      _logger.error('Error toggling auto-login', e);
+      _showSnackBar('Error updating setting');
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _clearStoredData() async {
+    final confirmed = await _showConfirmDialog(
+      'Clear Stored Data',
+      'This will clear all stored authentication data and you will need to login again. Continue?',
+    );
+
+    if (confirmed) {
+      setState(() {
+        _isLoading = true;
+      });
+
+      try {
+        await StorageService.clearAuthData();
+        _showSnackBar('Stored authentication data cleared');
+      } catch (e) {
+        _logger.error('Error clearing stored data', e);
+        _showSnackBar('Error clearing data');
+      } finally {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _logout() async {
+    final confirmed = await _showConfirmDialog(
+      'Logout',
+      'Are you sure you want to logout?',
+    );
+
+    if (confirmed) {
+      setState(() {
+        _isLoading = true;
+      });
+
+      try {
+        await AuthService.logout();
+        if (mounted) {
+          context.go('/login-password');
+        }
+      } catch (e) {
+        _logger.error('Error during logout', e);
+        _showSnackBar('Error during logout');
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<bool> _showConfirmDialog(String title, String message) async {
+    return await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    ) ?? false;
+  }
+
+  void _showSnackBar(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = AuthManager.currentUser;
+    final lastLogin = StorageService.getLastLogin();
+    final canAutoLogin = AuthService.canAutoLogin();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Settings'),
+        backgroundColor: const Color(0xFF2C5282),
+        foregroundColor: Colors.white,
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                // User Info Section
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'User Information',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 12),
+                        _buildInfoRow('Name', user?.emplName ?? 'N/A'),
+                        _buildInfoRow('User ID', user?.userID ?? 'N/A'),
+                        _buildInfoRow('Area Code', user?.areaCode ?? 'N/A'),
+                        if (lastLogin != null)
+                          _buildInfoRow(
+                            'Last Login',
+                            '${lastLogin.day}/${lastLogin.month}/${lastLogin.year} ${lastLogin.hour}:${lastLogin.minute.toString().padLeft(2, '0')}',
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                // Auto-Login Settings
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Auto-Login Settings',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 12),
+                        SwitchListTile(
+                          title: const Text('Enable Auto-Login'),
+                          subtitle: const Text('Automatically login when app starts'),
+                          value: _autoLoginEnabled,
+                          onChanged: _toggleAutoLogin,
+                        ),
+                        const Divider(),
+                        ListTile(
+                          leading: Icon(
+                            canAutoLogin ? Icons.check_circle : Icons.error,
+                            color: canAutoLogin ? Colors.green : Colors.red,
+                          ),
+                          title: Text(
+                            canAutoLogin ? 'Auto-login Available' : 'Auto-login Not Available',
+                          ),
+                          subtitle: Text(
+                            canAutoLogin
+                                ? 'You can login automatically'
+                                : 'Login required or session expired',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                // Actions Section
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Actions',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 12),
+                        ListTile(
+                          leading: const Icon(Icons.clear_all, color: Colors.orange),
+                          title: const Text('Clear Stored Data'),
+                          subtitle: const Text('Remove saved authentication data'),
+                          onTap: _clearStoredData,
+                        ),
+                        const Divider(),
+                        ListTile(
+                          leading: const Icon(Icons.logout, color: Colors.red),
+                          title: const Text('Logout'),
+                          subtitle: const Text('Sign out of the application'),
+                          onTap: _logout,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                // App Info
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'App Information',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 12),
+                        _buildInfoRow('Version', '1.0.0'),
+                        _buildInfoRow('Build', '1'),
+                        _buildInfoRow('Environment', 'QA'),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 100,
+            child: Text(
+              '$label:',
+              style: const TextStyle(fontWeight: FontWeight.w500),
+            ),
+          ),
+          Expanded(
+            child: Text(value),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:go_router/go_router.dart';
+import 'package:flutter/material.dart';
+import 'package:rak_web/features/products/screens/incentive_scheme_form.dart';
+import 'package:rak_web/features/products/screens/sampling_drive_form_screen.dart';
+import 'package:rak_web/features/quality_control/screens/dashboard_screen.dart';
+
+// Import AuthManager for authentication checks
+import '../services/auth_service.dart';
+
+// Auth Screens
+import '../../features/auth/screens/login_screen_with_otp.dart';
+import '../../features/auth/screens/login_with_password_screen.dart';
+
+// Registration Screens
+import '../../features/registration/screens/registration_type_screen.dart';
+import '../../features/registration/screens/contractor_registration_screen.dart';
+import '../../features/registration/screens/painter_registration_screen.dart';
+import '../../features/registration/screens/registration_details_screen.dart';
+import '../../features/registration/screens/success_screen.dart';
+
+// Retail Screens
+import '../../features/retail/screens/retailer_onboarding_screen.dart';
+
+
+// Product Screens
+import '../../features/products/screens/new_product_entry_screen.dart';
+import '../../features/products/screens/sample_distribution_entry_screen.dart';
+
+// Quality Control Screens
+import '../../features/quality_control/screens/approval_dashboard_screen.dart';
+
+
+// Activity Screens
+import '../../features/activity/screens/activity_entry_screen.dart';
+
+// Settings Screens
+import '../../features/settings/screens/settings_screen.dart';
+
+// Common Screens (to be moved later)
+import '../../screens/splash_screen.dart';
+import '../../screens/home_screen.dart';
+
+import '../../screens/file_manager_screen.dart';
+
+import '../../screens/camera_scanner_screen.dart';
+import '../../screens/qr_input_screen.dart';
+
+class AppRouter {
+  static const String splash = '/';
+  static const String loginPassword = '/login-password';
+  static const String loginOtp = '/login-otp';
+  static const String home = '/home';
+
+  // Authentication redirect function
+  static String? _handleRedirect(BuildContext context, GoRouterState state) {
+    final isLoggedIn = AuthManager.isLoggedIn;
+    final currentPath = state.uri.path;
+
+    // List of public routes that don't require authentication
+    final publicRoutes = [
+      splash,
+      loginPassword,
+      loginOtp,
+      registrationType,
+      contractorRegistration,
+      painterRegistration,
+      registrationSuccess,
+    ];
+
+    // If user is not logged in and trying to access a protected route
+    if (!isLoggedIn && !publicRoutes.contains(currentPath)) {
+      return loginPassword;
+    }
+
+    // If user is logged in and trying to access login pages (but not splash), redirect to home
+    if (isLoggedIn &&
+        (currentPath == loginPassword || currentPath == loginOtp)) {
+      return home;
+    }
+
+    // No redirect needed
+    return null;
+  }
+
+  // Registration routes
+  static const String registrationType = '/registration-type';
+  static const String contractorRegistration = '/contractor-registration';
+  static const String painterRegistration = '/painter-registration';
+  static const String registrationDetails = '/registration-details';
+  static const String registrationSuccess = '/success';
+  static const String retailerRegistration = '/retailer-registration';
+
+  // Retail routes
+  static const String retailerOnboarding = '/retailer-onboarding';
+  static const String retailerPlan = '/retailer-plan';
+  static const String retailEntry = '/retail-entry';
+
+  // Product routes
+  static const String newProductEntry = '/new-product-entry';
+  static const String sampleDistribution = '/sample-distribution';
+  static const String samplingDriveForm = '/sampling-drive-form';
+  static const String incentiveSchemeForm = '/incentive-scheme-form';
+  static const String expertMeetClaim = '/expert-meet-claim';
+
+  // Quality Control routes
+  static const String approvalDashboard = '/approval-dashboard';
+  static const String dashboard = '/dashboard';
+
+  // Utility routes
+  static const String fileManager = '/file-manager';
+  static const String uploadTest = '/upload-test';
+  static const String cameraScanner = '/camera-scanner';
+  static const String qrInput = '/qr-input';
+
+  // Activity routes
+  static const String activityEntry = '/activity-entry';
+
+  // Settings routes
+  static const String settings = '/settings';
+
+  static final GoRouter router = GoRouter(
+    initialLocation: splash,
+    redirect: _handleRedirect,
+    refreshListenable: AuthManager.authChangeNotifier,
+    routes: [
+      // Splash and Auth
+      GoRoute(path: splash, builder: (context, state) => const SplashScreen()),
+      GoRoute(
+        path: loginPassword,
+        builder: (context, state) => const LoginWithPasswordScreen(),
+      ),
+      GoRoute(
+        path: loginOtp,
+        builder: (context, state) => const LoginScreenWithOtp(),
+      ),
+
+      // Main App
+      GoRoute(path: home, builder: (context, state) => const HomeScreen()),
+
+      // Registration Feature
+      GoRoute(
+        path: registrationType,
+        builder: (context, state) => const RegistrationTypeScreen(),
+      ),
+      GoRoute(
+        path: contractorRegistration,
+        builder: (context, state) => const ContractorRegistrationScreen(),
+      ),
+      GoRoute(
+        path: painterRegistration,
+        builder: (context, state) => const PainterRegistrationScreen(),
+      ),
+      GoRoute(
+        path: '$registrationDetails/:id',
+        builder: (context, state) {
+          final id = state.pathParameters['id'];
+          return RegistrationDetailsScreen(registrationId: id);
+        },
+      ),
+      GoRoute(
+        path: registrationSuccess,
+        builder: (context, state) => const SuccessScreen(),
+      ),
+
+      // Retail Feature
+      GoRoute(
+        path: retailerOnboarding,
+        builder: (context, state) => const RetailerOnboardingApp(),
+      ),
+
+
+      // Product Feature
+      GoRoute(
+        path: newProductEntry,
+        builder: (context, state) => NewProductEntry(),
+      ),
+      GoRoute(
+        path: sampleDistribution,
+        builder: (context, state) => SampleDistributEntry(),
+      ),
+      GoRoute(
+        path: samplingDriveForm,
+        builder: (context, state) => SamplingDriveFormPage(),
+      ),
+      GoRoute(
+        path: incentiveSchemeForm,
+        builder: (context, state) => IncentiveSchemeFormPage(),
+      ),
+
+
+      // Quality Control Feature
+      GoRoute(
+        path: approvalDashboard,
+        builder: (context, state) => const ApprovalDashboardScreen(),
+      ),
+      GoRoute(
+        path: dashboard,
+        builder: (context, state) => const DashboardScreen(),
+      ),
+
+      // Utilities
+      GoRoute(
+        path: fileManager,
+        builder: (context, state) => const FileManagerScreen(),
+      ),
+
+      GoRoute(
+        path: cameraScanner,
+        builder: (context, state) => const CameraScannerScreen(),
+      ),
+      GoRoute(
+        path: qrInput,
+        builder: (context, state) => const QRInputScreen(),
+      ),
+
+      // Activity Feature
+      GoRoute(
+        path: activityEntry,
+        builder: (context, state) => ActivityEntryScreen(),
+      ),
+
+      // Settings Feature
+      GoRoute(
+        path: settings,
+        builder: (context, state) => const SettingsScreen(),
+      ),
+    ],
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:go_router/go_router.dart';
+import 'package:rak_web/core/controllers/home_controller.dart';
+import 'package:rak_web/core/di/service_locator.dart';
+import 'package:rak_web/features/home/widgets/home_tab.dart';
+import 'package:rak_web/core/utils/app_logger.dart';
+import 'package:rak_web/core/services/auth_service.dart';
+
+/// Refactored HomeScreen with clean architecture
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
+  late HomeController _controller;
+  late AnimationController _mainController;
+  late AnimationController _navController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+  late Animation<double> _navScaleAnimation;
+  final AppLogger _logger = AppLogger();
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = homeController;
+    _controller.addListener(_onControllerChanged);
+    _mainController = AnimationController(
+      duration: const Duration(milliseconds: 1200),
+      vsync: this,
+    );
+    _navController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _mainController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _mainController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+    _navScaleAnimation = Tween<double>(begin: 0.8, end: 1.0).animate(
+      CurvedAnimation(parent: _navController, curve: Curves.elasticOut),
+    );
+    _mainController.forward();
+    _navController.forward();
+    _logger.info('HomeScreenRefactored initialized');
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onControllerChanged);
+    _mainController.dispose();
+    _navController.dispose();
+    _logger.info('HomeScreenRefactored disposed');
+    super.dispose();
+  }
+
+  void _onControllerChanged() {
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+        statusBarBrightness: Brightness.light,
+      ),
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isWeb = constraints.maxWidth > 800;
+        final isTablet =
+            constraints.maxWidth > 600 && constraints.maxWidth <= 800;
+        final isMobile = constraints.maxWidth <= 600;
+        final isDesktop = constraints.maxWidth > 1200;
+
+        return Scaffold(
+          key: _scaffoldKey,
+          backgroundColor: const Color(0xFFF3F4F6),
+          appBar: isWeb ? null : _buildAppBar(),
+          drawer: isWeb ? null : _buildDrawerMenu(),
+          body: isWeb
+              ? _buildDesktopLayout(isDesktop: isDesktop)
+              : _buildMobileLayout(isTablet: isTablet, isMobile: isMobile),
+        );
+      },
+    );
+  }
+
+  Widget _buildDesktopLayout({bool isDesktop = false}) {
+    return Row(
+      children: [
+        _buildSidebar(isDesktop: isDesktop),
+        Expanded(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: isDesktop ? 1200 : 1000),
+              child: _buildMainContent(
+                isWeb: true,
+                isTablet: false,
+                isMobile: false,
+                isDesktop: isDesktop,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMobileLayout({bool isTablet = false, bool isMobile = false}) {
+    return Stack(
+      children: [
+        _buildMainContent(
+          isWeb: false,
+          isTablet: isTablet,
+          isMobile: isMobile,
+          isDesktop: false,
+        ),
+        _buildBottomNavigation(isWeb: false, isTablet: isTablet),
+      ],
+    );
+  }
+
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      backgroundColor: const Color(0xFFF3F4F6),
+      elevation: 0,
+      toolbarHeight: 70,
+      leading: Builder(
+        builder: (context) => IconButton(
+          onPressed: () {
+            Scaffold.of(context).openDrawer();
+          },
+          icon: const Icon(
+            Icons.menu_rounded,
+            color: Color(0xFF1E3A8A),
+            size: 24,
+          ),
+        ),
+      ),
+      title: Container(
+        height: 50,
+        margin: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(25),
+          border: Border.all(color: Colors.grey.shade200, width: 1),
+        ),
+        child: Row(
+          children: [
+            const SizedBox(width: 20),
+            Icon(Icons.search_rounded, color: Colors.grey[600], size: 22),
+            const SizedBox(width: 12),
+            Expanded(
+              child: TextField(
+                style: TextStyle(
+                  color: Colors.grey[800],
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                ),
+                decoration: InputDecoration(
+                  hintText: 'Search',
+                  hintStyle: TextStyle(
+                    color: Colors.grey[500],
+                    fontSize: 15,
+                    fontWeight: FontWeight.w400,
+                  ),
+                  border: InputBorder.none,
+                  contentPadding: const EdgeInsets.symmetric(vertical: 15),
+                ),
+              ),
+            ),
+            Container(
+              margin: const EdgeInsets.only(right: 8),
+              height: 34,
+              width: 34,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(17),
+                color: const Color(0xFF1E3A8A).withOpacity(0.1),
+              ),
+              child: IconButton(
+                onPressed: () {},
+                padding: EdgeInsets.zero,
+                icon: const Icon(
+                  Icons.tune_rounded,
+                  color: Color(0xFF1E3A8A),
+                  size: 18,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        IconButton(
+          onPressed: () => context.go('/settings'),
+          icon: const Icon(
+            Icons.settings_rounded,
+            color: Color(0xFF1E3A8A),
+            size: 24,
+          ),
+          tooltip: 'Settings',
+        ),
+        Stack(
+          children: [
+            IconButton(
+              onPressed: () {},
+              icon: const Icon(
+                Icons.notifications_rounded,
+                color: Color(0xFF1E3A8A),
+                size: 24,
+              ),
+            ),
+            Positioned(
+              right: 8,
+              top: 8,
+              child: Container(
+                height: 8,
+                width: 8,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEF4444),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.white, width: 1.5),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSidebar({bool isDesktop = false}) {
+    return Container(
+      width: isDesktop ? 280 : 240,
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Color(0x0F000000),
+            blurRadius: 10,
+            offset: Offset(1, 0),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              border: Border(
+                bottom: BorderSide(color: Colors.grey, width: 0.5),
+              ),
+            ),
+            child: Center(
+              child: Image.asset(
+                'assets/images/rak_logo.jpg',
+                height: isDesktop ? 120 : 100,
+                width: isDesktop ? 120 : 100,
+                fit: BoxFit.contain,
+                errorBuilder: (context, error, stackTrace) => Icon(
+                  Icons.business,
+                  color: Colors.grey,
+                  size: isDesktop ? 120 : 100,
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
+              children: [
+                _buildDrawerItem(
+                  icon: Icons.dashboard,
+                  title: 'Dashboard',
+                  onTap: () {
+                    context.push('/dashboard');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.format_paint,
+                  title: 'Painter Registration',
+                  onTap: () {
+                    context.push('/painter-registration');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.construction,
+                  title: 'Contractor Registration',
+                  onTap: () {
+                    context.push('/contractor-registration');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.approval,
+                  title: 'Approval Dashboard',
+                  onTap: () {
+                    context.push('/approval-dashboard');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.storefront,
+                  title: 'Retailer Onboarding',
+                  onTap: () {
+                    context.push('/retailer-onboarding');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.inventory,
+                  title: 'Sample Distribution Entry',
+                  onTap: () {
+                    context.push('/sample-distribution');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.science,
+                  title: 'Sample Execution Entry',
+                  onTap: () {
+                    context.push('/sampling-drive-form');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.science,
+                  title: 'Incentive Scheme Form',
+                  onTap: () {
+                    context.push('/incentive-scheme-form');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.event_note,
+                  title: 'Promotion Activity Entry',
+                  onTap: () {
+                    context.push('/activity-entry');
+                  },
+                ),
+                const Divider(height: 32),
+                _buildDrawerItem(
+                  icon: Icons.settings,
+                  title: 'Settings',
+                  onTap: () {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Settings - Coming Soon!')),
+                    );
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.help_outline,
+                  title: 'Help & Support',
+                  onTap: () {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Help & Support - Coming Soon!'),
+                      ),
+                    );
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.logout,
+                  title: 'Logout',
+                  onTap: () async {
+                    await AuthService.logout();
+                    if (context.mounted) {
+                      context.go('/login-password');
+                    }
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDrawerMenu() {
+    return Drawer(
+      backgroundColor: Colors.white,
+      width: MediaQuery.of(context).size.width * 0.75,
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              border: Border(
+                bottom: BorderSide(color: Colors.grey, width: 0.5),
+              ),
+            ),
+            child: Center(
+              child: Image.asset(
+                'assets/images/rak_logo.jpg',
+                height: 100,
+                width: 100,
+                fit: BoxFit.contain,
+                errorBuilder: (context, error, stackTrace) =>
+                    const Icon(Icons.business, color: Colors.grey, size: 100),
+              ),
+            ),
+          ),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
+              children: [
+                _buildDrawerItem(
+                  icon: Icons.dashboard,
+                  title: 'Dashboard',
+                  onTap: () {
+                    context.pop();
+                    context.push('/dashboard');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.format_paint,
+                  title: 'Painter Registration',
+                  onTap: () {
+                    context.pop();
+                    context.push('/painter-registration');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.construction,
+                  title: 'Contractor Registration',
+                  onTap: () {
+                    context.pop();
+                    context.push('/contractor-registration');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.approval,
+                  title: 'Approval Dashboard',
+                  onTap: () {
+                    context.pop();
+                    context.push('/approval-dashboard');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.storefront,
+                  title: 'Retailer Onboarding',
+                  onTap: () {
+                    context.pop();
+                    context.push('/retailer-onboarding');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.inventory,
+                  title: 'Sample Distibution Entry',
+                  onTap: () {
+                    context.pop();
+                    context.push('/sample-distribution');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.science,
+                  title: 'Sample Execution Entry',
+                  onTap: () {
+                    context.pop();
+                    context.push('/sampling-drive-form');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.science,
+                  title: 'Incentive Scheme Form',
+                  onTap: () {
+                    context.pop();
+                    context.push('/incentive-scheme-form');
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.event_note,
+                  title: 'Activity Entry',
+                  onTap: () {
+                    context.pop();
+                    context.push('/activity-entry');
+                  },
+                ),
+                const Divider(height: 32),
+                _buildDrawerItem(
+                  icon: Icons.settings,
+                  title: 'Settings',
+                  onTap: () {
+                    context.pop();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Settings - Coming Soon!')),
+                    );
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.help_outline,
+                  title: 'Help & Support',
+                  onTap: () {
+                    context.pop();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Help & Support - Coming Soon!'),
+                      ),
+                    );
+                  },
+                ),
+                _buildDrawerItem(
+                  icon: Icons.logout,
+                  title: 'Logout',
+                  onTap: () async {
+                    await AuthService.logout();
+                    if (context.mounted) {
+                      context.go('/login-password');
+                    }
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDrawerItem({
+    required IconData icon,
+    required String title,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      leading: Container(
+        height: 40,
+        width: 40,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          color: const Color(0xFF1E3A8A).withOpacity(0.1),
+        ),
+        child: Icon(icon, color: const Color(0xFF1E3A8A), size: 20),
+      ),
+      title: Text(
+        title,
+        style: const TextStyle(
+          fontSize: 16,
+          fontWeight: FontWeight.w500,
+          color: Colors.black87,
+        ),
+      ),
+      onTap: onTap,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
+    );
+  }
+
+  Widget _buildMainContent({
+    required bool isWeb,
+    required bool isTablet,
+    required bool isMobile,
+    required bool isDesktop,
+  }) {
+    return FadeTransition(
+      opacity: _fadeAnimation,
+      child: SlideTransition(
+        position: _slideAnimation,
+        child: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Color(0xFFF8FAFC), Color(0xFFF1F5F9)],
+            ),
+          ),
+          child: IndexedStack(
+            index: _controller.currentIndex,
+            children: [
+              HomeTab(
+                controller: _controller,
+                isWeb: isWeb,
+                isTablet: isTablet,
+                isMobile: isMobile,
+                isDesktop: isDesktop,
+              ),
+              _buildQRScannerTab(
+                isWeb: isWeb,
+                isTablet: isTablet,
+                isDesktop: isDesktop,
+              ),
+              _buildProfileTab(
+                isWeb: isWeb,
+                isTablet: isTablet,
+                isDesktop: isDesktop,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildQRScannerTab({
+    bool isWeb = false,
+    bool isTablet = false,
+    bool isDesktop = false,
+  }) {
+    return Container(
+      decoration: const BoxDecoration(color: Color(0xFFF3F4F6)),
+      child: SafeArea(
+        child: Padding(
+          padding: EdgeInsets.all(isDesktop ? 40 : 20),
+          child: Column(
+            children: [
+              _buildScannerHeader(isDesktop: isDesktop),
+              SizedBox(height: isDesktop ? 40 : 30),
+              Expanded(child: _buildScannerOptions(isDesktop: isDesktop)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildScannerHeader({bool isDesktop = false}) {
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(isDesktop ? 48 : 32),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x331E3A8A),
+            blurRadius: 20,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Container(
+            width: isDesktop ? 120 : 100,
+            height: isDesktop ? 120 : 100,
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.2),
+              shape: BoxShape.circle,
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x1A000000),
+                  blurRadius: 20,
+                  offset: Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Icon(
+              Icons.qr_code_scanner,
+              size: isDesktop ? 60 : 50,
+              color: Colors.white,
+            ),
+          ),
+          SizedBox(height: isDesktop ? 32 : 24),
+          Text(
+            'QR Scanner',
+            style: TextStyle(
+              fontSize: isDesktop ? 40 : 32,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          SizedBox(height: isDesktop ? 16 : 12),
+          Text(
+            'Scan or enter QR codes for quick processing',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: isDesktop ? 20 : 16,
+              color: Colors.white70,
+              height: 1.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildScannerOptions({bool isDesktop = false}) {
+    if (isDesktop) {
+      return Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 800),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Expanded(
+                child: _buildScannerCard(
+                  'Camera Scan',
+                  Icons.camera_alt,
+                  const Color(0xFF10B981),
+                  () => context.push('/camera-scanner'),
+                ),
+              ),
+              const SizedBox(width: 40),
+              Expanded(
+                child: _buildScannerCard(
+                  'Manual Entry',
+                  Icons.keyboard,
+                  const Color(0xFF3B82F6),
+                  () => context.push('/qr-input'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return GridView.count(
+      crossAxisCount: 2,
+      crossAxisSpacing: 20,
+      mainAxisSpacing: 20,
+      childAspectRatio: 1.1,
+      children: [
+        _buildScannerCard(
+          'Camera Scan',
+          Icons.camera_alt,
+          const Color(0xFF10B981),
+          () => context.push('/camera-scanner'),
+        ),
+        _buildScannerCard(
+          'Manual Entry',
+          Icons.keyboard,
+          const Color(0xFF3B82F6),
+          () => context.push('/qr-input'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildScannerCard(
+    String title,
+    IconData icon,
+    Color color,
+    VoidCallback onTap,
+  ) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x0D000000),
+              blurRadius: 20,
+              offset: Offset(0, 8),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 70,
+              height: 70,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [color, color.withOpacity(0.8)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: color.withOpacity(0.3),
+                    blurRadius: 15,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: Icon(icon, color: Colors.white, size: 32),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              title,
+              style: const TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF1F2937),
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProfileTab({
+    bool isWeb = false,
+    bool isTablet = false,
+    bool isDesktop = false,
+  }) {
+    return SingleChildScrollView(
+      padding: EdgeInsets.only(
+        left: isDesktop ? 60 : 20,
+        right: isDesktop ? 60 : 20,
+        top: isDesktop ? 40 : 20,
+        bottom: isWeb ? 20 : 120,
+      ),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: isDesktop ? 800 : double.infinity,
+          ),
+          child: Column(
+            children: [
+              Container(
+                width: double.infinity,
+                padding: EdgeInsets.all(isDesktop ? 48 : 32),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF1E3A8A), Color(0xFF3B82F6)],
+                  ),
+                  borderRadius: BorderRadius.circular(24),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Color(0x331E3A8A),
+                      blurRadius: 20,
+                      offset: Offset(0, 10),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    CircleAvatar(
+                      radius: isDesktop ? 80 : 60,
+                      backgroundColor: Colors.white,
+                      child: Icon(
+                        Icons.person,
+                        size: isDesktop ? 80 : 60,
+                        color: const Color(0xFF1E3A8A),
+                      ),
+                    ),
+                    SizedBox(height: isDesktop ? 32 : 24),
+                    Text(
+                      'Magan',
+                      style: TextStyle(
+                        fontSize: isDesktop ? 36 : 28,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                    SizedBox(height: isDesktop ? 12 : 8),
+                    Text(
+                      'Gold Member • Partner ID: RAK2024',
+                      style: TextStyle(
+                        fontSize: isDesktop ? 20 : 16,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    SizedBox(height: isDesktop ? 12 : 8),
+                    Text(
+                      'magan@rakwhitecement.ae',
+                      style: TextStyle(
+                        fontSize: isDesktop ? 20 : 16,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(height: isDesktop ? 48 : 32),
+              _buildProfileSection('Account Settings', [
+                _buildProfileOption(
+                  'Personal Information',
+                  Icons.person,
+                  const Color(0xFF3B82F6),
+                  () {},
+                ),
+                const SizedBox(height: 16),
+                _buildProfileOption(
+                  'Security',
+                  Icons.security,
+                  const Color(0xFF10B981),
+                  () {},
+                ),
+                const SizedBox(height: 16),
+                _buildProfileOption(
+                  'Notifications',
+                  Icons.notifications,
+                  const Color(0xFFF59E0B),
+                  () {},
+                ),
+              ]),
+              SizedBox(height: isDesktop ? 48 : 32),
+              _buildProfileSection('Support', [
+                _buildProfileOption(
+                  'Help Center',
+                  Icons.help,
+                  const Color(0xFF60A5FA),
+                  () {},
+                ),
+                const SizedBox(height: 16),
+                _buildProfileOption(
+                  'Contact Us',
+                  Icons.contact_support,
+                  const Color(0xFF1E3A8A),
+                  () {},
+                ),
+                const SizedBox(height: 16),
+                _buildProfileOption(
+                  'About',
+                  Icons.info,
+                  const Color(0xFF6B7280),
+                  () {},
+                ),
+              ]),
+              SizedBox(height: isDesktop ? 48 : 32),
+              SizedBox(
+                width: double.infinity,
+                height: isDesktop ? 64 : 56,
+                child: ElevatedButton.icon(
+                  onPressed: () async {
+                    await AuthService.logout();
+                    if (context.mounted) {
+                      context.go('/login-password');
+                    }
+                  },
+                  icon: const Icon(Icons.logout),
+                  label: const Text('Logout'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFEF4444),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    elevation: 0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProfileSection(String title, List<Widget> children) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+            color: Color(0xFF1F2937),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x0D000000),
+                blurRadius: 10,
+                offset: Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Column(children: children),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildProfileOption(
+    String title,
+    IconData icon,
+    Color color,
+    VoidCallback onTap,
+  ) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 48,
+              height: 48,
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: color, size: 24),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                  color: Color(0xFF1F2937),
+                ),
+              ),
+            ),
+            const Icon(Icons.chevron_right, color: Color(0xFF6B7280)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomNavigation({bool isWeb = false, bool isTablet = false}) {
+    if (isWeb) {
+      return Positioned(
+        top: 0,
+        left: 0,
+        right: 0,
+        child: Container(
+          height: 70,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                Colors.white.withOpacity(0.95),
+                Colors.white.withOpacity(0.85),
+              ],
+            ),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x191E3A8A),
+                blurRadius: 30,
+                offset: Offset(0, 8),
+              ),
+            ],
+          ),
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 8),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                const Color(0xFF1E3A8A).withOpacity(0.2),
+                                const Color(0xFF1E3A8A).withOpacity(0.1),
+                              ],
+                            ),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: const Icon(
+                            Icons.business,
+                            color: Color(0xFF1E3A8A),
+                            size: 24,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        const Text(
+                          'RAK White Cement',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF1E3A8A),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Spacer(),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.7),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: Colors.white.withOpacity(0.3),
+                        width: 1,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        _buildWebNavItem(
+                          0,
+                          Icons.home_rounded,
+                          'Home',
+                          const Color(0xFF1E3A8A),
+                        ),
+                        const SizedBox(width: 8),
+                        _buildWebNavItem(
+                          1,
+                          Icons.qr_code_scanner_rounded,
+                          'Scan',
+                          const Color(0xFF3B82F6),
+                        ),
+                        const SizedBox(width: 8),
+                        _buildWebNavItem(
+                          2,
+                          Icons.person_rounded,
+                          'Profile',
+                          const Color(0xFF6B7280),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return Positioned(
+      bottom: 4,
+      left: 20,
+      right: 20,
+      child: Container(
+        height: 75,
+        margin: EdgeInsets.zero,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Colors.white.withOpacity(0.95),
+              Colors.white.withOpacity(0.85),
+              Colors.white.withOpacity(0.9),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(25),
+          border: Border.all(color: Colors.white.withOpacity(0.3), width: 1.5),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x331E3A8A),
+              blurRadius: 25,
+              offset: Offset(0, 8),
+            ),
+          ],
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: isTablet ? 24.0 : 16.0,
+              vertical: isTablet ? 12.0 : 10.0,
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildNavItem(
+                  0,
+                  Icons.home_rounded,
+                  'Home',
+                  const Color(0xFF1E3A8A),
+                  isTablet: isTablet,
+                ),
+                _buildNavItem(
+                  1,
+                  Icons.qr_code_scanner_rounded,
+                  'Scan',
+                  const Color(0xFF3B82F6),
+                  isTablet: isTablet,
+                ),
+                _buildNavItem(
+                  2,
+                  Icons.person_rounded,
+                  'Profile',
+                  const Color(0xFF6B7280),
+                  isTablet: isTablet,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebNavItem(int index, IconData icon, String label, Color color) {
+    final isSelected = _controller.currentIndex == index;
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.mediumImpact();
+        _controller.setCurrentIndex(index);
+        _navController.reset();
+        _navController.forward();
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 400),
+        padding: EdgeInsets.symmetric(
+          horizontal: 16 + (4 * (isSelected ? 1 : 0)),
+          vertical: 8 + (2 * (isSelected ? 1 : 0)),
+        ),
+        decoration: BoxDecoration(
+          gradient: isSelected
+              ? LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [color.withOpacity(0.2), color.withOpacity(0.1)],
+                )
+              : null,
+          borderRadius: BorderRadius.circular(12 + (4 * (isSelected ? 1 : 0))),
+          border: Border.all(
+            color: isSelected ? color.withOpacity(0.4) : Colors.transparent,
+            width: 1 + (isSelected ? 1 : 0),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 20 + (2 * (isSelected ? 1 : 0)),
+              color: Color.lerp(
+                const Color(0xFF6B7280),
+                color,
+                isSelected ? 1 : 0,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 16 + (isSelected ? 1 : 0),
+                fontWeight: FontWeight.lerp(
+                  FontWeight.w500,
+                  FontWeight.w600,
+                  isSelected ? 1 : 0,
+                ),
+                color: Color.lerp(
+                  const Color(0xFF6B7280),
+                  color,
+                  isSelected ? 1 : 0,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNavItem(
+    int index,
+    IconData icon,
+    String label,
+    Color color, {
+    bool isTablet = false,
+  }) {
+    final isSelected = _controller.currentIndex == index;
+    final iconSize = isTablet
+        ? (44.0 + (16.0 * (isSelected ? 1 : 0)))
+        : (40.0 + (16.0 * (isSelected ? 1 : 0)));
+    final iconInnerSize = isTablet
+        ? (26.0 + (4.0 * (isSelected ? 1 : 0)))
+        : (24.0 + (4.0 * (isSelected ? 1 : 0)));
+    final fontSize = isTablet
+        ? (12.0 + (2.0 * (isSelected ? 1 : 0)))
+        : (10.0 + (2.0 * (isSelected ? 1 : 0)));
+    return Expanded(
+      child: GestureDetector(
+        onTapDown: (_) => HapticFeedback.lightImpact(),
+        onTap: () {
+          HapticFeedback.heavyImpact();
+          _controller.setCurrentIndex(index);
+          _navController.reset();
+          _navController.forward();
+        },
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 600),
+              width: iconSize,
+              height: iconSize,
+              decoration: BoxDecoration(
+                gradient: isSelected
+                    ? LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          color.withOpacity(0.9),
+                          color.withOpacity(0.7),
+                          color.withOpacity(0.9),
+                        ],
+                      )
+                    : LinearGradient(
+                        colors: [
+                          Colors.white.withOpacity(0.1),
+                          Colors.white.withOpacity(0.05),
+                        ],
+                      ),
+                borderRadius: BorderRadius.circular(iconSize / 2),
+                border: Border.all(
+                  color: isSelected
+                      ? color.withOpacity(0.3)
+                      : Colors.white.withOpacity(0.2),
+                  width: isSelected ? 2 : 1,
+                ),
+                boxShadow: isSelected
+                    ? [
+                        BoxShadow(
+                          color: color.withOpacity(0.4),
+                          blurRadius: 20,
+                          offset: const Offset(0, 8),
+                        ),
+                      ]
+                    : [
+                        const BoxShadow(
+                          color: Color(0x1A000000),
+                          blurRadius: 8,
+                          offset: Offset(0, 4),
+                        ),
+                      ],
+              ),
+              child: Icon(
+                icon,
+                size: iconInnerSize,
+                color: isSelected
+                    ? Colors.white
+                    : const Color(0xFF6B7280).withOpacity(0.7),
+              ),
+            ),
+            SizedBox(height: isTablet ? 8 : 6),
+            AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 400),
+              style: TextStyle(
+                fontSize: fontSize,
+                fontWeight: FontWeight.lerp(
+                  FontWeight.w400,
+                  FontWeight.w700,
+                  isSelected ? 1 : 0,
+                ),
+                color: Color.lerp(
+                  const Color(0xFF6B7280).withOpacity(0.6),
+                  color,
+                  isSelected ? 1 : 0,
+                ),
+              ),
+              child: Text(label),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:go_router/go_router.dart';
+import '../../../core/theme/theme.dart';
+import '../../../core/widgets/custom_back_button.dart';
+import '../../../core/services/auth_service.dart';
+import '../../../core/services/storage_service.dart';
+
+class LoginWithPasswordScreen extends StatefulWidget {
+  const LoginWithPasswordScreen({super.key});
+
+  @override
+  State<LoginWithPasswordScreen> createState() =>
+      _LoginWithPasswordScreenState();
+}
+
+class _LoginWithPasswordScreenState extends State<LoginWithPasswordScreen>
+    with SingleTickerProviderStateMixin {
+  final _formKey = GlobalKey<FormState>();
+  final _userIdController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _isLoading = false;
+  final bool _isDarkMode = false;
+  bool _rememberMe = false;
+
+  late AnimationController _animationController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  late Animation<double> _scaleAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeAnimations();
+    _animationController.forward();
+  }
+
+  void _initializeAnimations() {
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    );
+
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(
+            parent: _animationController,
+            curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
+          ),
+        );
+
+    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _userIdController.dispose();
+    _passwordController.dispose();
+    _animationController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _handleLogin() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      // Trim input values to remove any whitespace
+      final userID = _userIdController.text.trim();
+      final password = _passwordController.text.trim();
+
+      // Use new AuthService.authenticateUser method
+      final result = await AuthService.authenticateUser(
+        userID: userID,
+        password: password,
+      );
+
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+
+        if (result['success'] == true) {
+          final loginResponse = result['data'];
+          final userData = loginResponse.data;
+
+          // Set user data in AuthManager
+          AuthManager.setUser(userData);
+
+          // Navigate based on user roles and pages
+          _navigateBasedOnRole(userData);
+        } else {
+          final errorMessage =
+              result['error'] ?? 'Login failed. Please try again.';
+          _showErrorSnackBar(errorMessage);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+        _showErrorSnackBar(
+          'Network error. Please check your connection and try again.',
+        );
+      }
+    }
+  }
+
+  void _navigateBasedOnRole(userData) {
+    // Check user's pages to determine which screen to navigate to
+    final userPages = userData.pages as List<String>;
+    final userRoles = userData.roles as List<String>;
+
+    // Navigate to the appropriate screen based on user's access
+    if (userPages.contains('DASHBOARD') || userRoles.contains('ADMIN')) {
+      context.go('/dashboard');
+    } else if (userPages.contains('QUALITY_CONTROL') ||
+        userRoles.contains('QC_MANAGER')) {
+      context.go('/approval-dashboard');
+    } else if (userPages.contains('PRODUCTS') ||
+        userRoles.contains('PRODUCT_MANAGER')) {
+      context.go('/new-product-entry');
+    } else if (userPages.contains('REGISTRATION') ||
+        userRoles.contains('REGISTRAR')) {
+      context.go('/registration-type');
+    } else {
+      // Default to main dashboard/home if no specific role matches
+      context.go('/home');
+    }
+  }
+
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = _isDarkMode;
+
+    SystemChrome.setSystemUIOverlayStyle(
+      SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: isDark ? Brightness.light : Brightness.dark,
+        statusBarBrightness: isDark ? Brightness.dark : Brightness.light,
+      ),
+    );
+
+    return Scaffold(
+      backgroundColor: isDark ? const Color(0xFF0A0A0A) : Colors.white,
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final isMobile = constraints.maxWidth < 600;
+          final isTablet =
+              constraints.maxWidth >= 600 && constraints.maxWidth < 1200;
+          final isDesktop = constraints.maxWidth >= 1200;
+
+          return Container(
+            width: double.infinity,
+            height: double.infinity,
+            decoration: BoxDecoration(
+              gradient: isDark
+                  ? const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFF0A0A0A),
+                        Color(0xFF1A1A2E),
+                        Color(0xFF16213E),
+                      ],
+                    )
+                  : const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFFf8f9ff),
+                        Color(0xFFe3f2fd),
+                        Color(0xFFffffff),
+                      ],
+                    ),
+            ),
+            child: Stack(
+              children: [
+                if (Navigator.of(context).canPop())
+                  const Positioned(
+                    top: 50,
+                    left: 20,
+                    child: CustomBackButton(),
+                  ),
+                isMobile
+                    ? _buildMobileLayout(isDark)
+                    : _buildWebLayout(isDark, isTablet, isDesktop),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildAnimatedLogo() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Transform.scale(
+          scale: 0.8 + (0.2 * value),
+          child: Container(
+            height: 120,
+            width: 120,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blue.withOpacity(0.2),
+                  blurRadius: 15,
+                  spreadRadius: 3,
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: ClipOval(
+                child: Image.asset(
+                  'assets/images/rak_logo.jpg',
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) {
+                    // Fallback with RAK text logo if image fails to load
+                    return Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [Colors.blue.shade700, Colors.blue.shade500],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Center(
+                        child: Text(
+                          'RAK',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMobileLayout(bool isDark) {
+    return Center(
+      child: SingleChildScrollView(
+        child: FadeTransition(
+          opacity: _fadeAnimation,
+          child: SlideTransition(
+            position: _slideAnimation,
+            child: ScaleTransition(
+              scale: _scaleAnimation,
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 420),
+                margin: const EdgeInsets.symmetric(horizontal: 24),
+                child: Card(
+                  elevation: isDark ? 0 : 24,
+                  shadowColor: isDark
+                      ? Colors.transparent
+                      : Colors.blue.withOpacity(0.15),
+                  color: isDark
+                      ? const Color(0xFF1E1E1E).withOpacity(0.95)
+                      : Colors.white.withOpacity(0.98),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(28),
+                    side: isDark
+                        ? BorderSide(
+                            color: Colors.white.withOpacity(0.1),
+                            width: 1,
+                          )
+                        : BorderSide.none,
+                  ),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    padding: const EdgeInsets.all(40),
+                    child: _buildLoginForm(isDark),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebLayout(bool isDark, bool isTablet, bool isDesktop) {
+    return Row(
+      children: [
+        // Left side - Branding/Info
+        Expanded(
+          flex: isDesktop ? 3 : 2,
+          child: Container(
+            padding: EdgeInsets.all(isDesktop ? 80 : 60),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildAnimatedLogo(),
+                SizedBox(height: isDesktop ? 40 : 32),
+                Text(
+                  'Welcome Back',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 48 : 36,
+                    fontWeight: FontWeight.bold,
+                    color: isDark ? Colors.white : Colors.blue.shade800,
+                  ),
+                ),
+                SizedBox(height: isDesktop ? 20 : 16),
+                Text(
+                  'Sign in to access your RAK account and manage your registrations.',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 18 : 16,
+                    color: isDark ? Colors.grey.shade300 : Colors.grey.shade600,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        // Right side - Login Form
+        Expanded(
+          flex: isDesktop ? 2 : 3,
+          child: Container(
+            height: double.infinity,
+            decoration: BoxDecoration(
+              color: isDark
+                  ? const Color(0xFF1E1E1E).withOpacity(0.95)
+                  : Colors.white.withOpacity(0.98),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(isDark ? 0.3 : 0.1),
+                  blurRadius: 20,
+                  offset: const Offset(-5, 0),
+                ),
+              ],
+            ),
+            child: Center(
+              child: SingleChildScrollView(
+                padding: EdgeInsets.all(isDesktop ? 60 : 40),
+                child: FadeTransition(
+                  opacity: _fadeAnimation,
+                  child: SlideTransition(
+                    position: _slideAnimation,
+                    child: Container(
+                      constraints: const BoxConstraints(maxWidth: 400),
+                      child: _buildLoginForm(isDark),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLoginForm(bool isDark) {
+    return Form(
+      key: _formKey,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildAnimatedTitle(),
+          const SizedBox(height: 32),
+          ModernTextField(
+            controller: _userIdController,
+            labelText: 'User ID',
+            hintText: 'Enter your user ID',
+            keyboardType: TextInputType.text,
+            isDark: isDark,
+            prefixIcon: Icons.person_outline,
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Please enter your user ID';
+              }
+              return null;
+            },
+            delay: const Duration(milliseconds: 300),
+          ),
+          const SizedBox(height: 24),
+          ModernPasswordField(
+            controller: _passwordController,
+            labelText: 'Password',
+            hintText: 'Enter your password',
+            isDark: isDark,
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Please enter your password';
+              }
+              if (value.length < 6) {
+                return 'Password must be at least 6 characters';
+              }
+              return null;
+            },
+            delay: const Duration(milliseconds: 450),
+          ),
+          const SizedBox(height: 16),
+          _buildRememberMeSection(),
+          const SizedBox(height: 32),
+          ModernButton(
+            text: 'Sign In',
+            isLoading: _isLoading,
+            onPressed: _handleLogin,
+            isPrimary: true,
+            isDark: isDark,
+            delay: const Duration(milliseconds: 600),
+          ),
+          const SizedBox(height: 16),
+          ModernButton(
+            text: 'Continue with OTP',
+            isLoading: false,
+            onPressed: () {
+              context.push('/login-otp');
+            },
+            isPrimary: false,
+            isDark: isDark,
+            delay: const Duration(milliseconds: 750),
+          ),
+          const SizedBox(height: 24),
+          _buildSignUpSection(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAnimatedTitle() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeOut,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 20 * (1 - value)),
+            child: child,
+          ),
+        );
+      },
+      child: Text(
+        'Login',
+        style: AppTheme.headline.copyWith(color: Colors.blue),
+      ),
+    );
+  }
+
+  
+  Widget _buildRememberMeSection() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 600),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Row(
+            children: [
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: Checkbox(
+                  value: _rememberMe,
+                  onChanged: (value) {
+                    setState(() {
+                      _rememberMe = value ?? false;
                     });
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Firebase initialization failed: {ex.Message}");
-                    // Continue without Firebase - will use fallback appRegId generation
-                }
-            }
-        }
+                  },
+                  activeColor: Colors.blue,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Remember me',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: _isDarkMode
+                      ? Colors.grey.shade300
+                      : Colors.grey.shade600,
+                ),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: () {
+                  // Implement forgot password
+                  _showErrorSnackBar('Forgot password will be implemented');
+                },
+                child: Text(
+                  'Forgot Password?',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.blue.shade600,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
-        /// <summary>
-        /// Main login endpoint - handles user authentication with Firebase appRegId
-        /// </summary>
-        [AllowAnonymous]
-        [HttpPost("execute")]
-        public async Task<IActionResult> ExecuteStoredProcedure([FromBody] AuthRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.userID) || string.IsNullOrWhiteSpace(request.password))
-            {
-                return BadRequest("Parameter 'userID' and 'password' is required.");
-            }
+  Widget _buildSignUpSection() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 800),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                "Don't have an account? ",
+                style: TextStyle(
+                  fontSize: 14,
+                  color: _isDarkMode
+                      ? Colors.grey.shade400
+                      : Colors.grey.shade600,
+                ),
+              ),
+              TextButton(
+                onPressed: () {
+                  context.push('/registration-type');
+                },
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(
+                  'Sign up',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.blue.shade600,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
 
-            try
-            {
-                // Step 1: Validate user credentials
-                var query = "SELECT loginIdm, hashPass, hashSalt FROM wcmUserCred WHERE loginIdM = @userID";
-                var parameters = new Dictionary<string, object> { { "@userID", request.userID } };
+class AnimatedPasswordField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? Function(String?)? validator;
+  final Duration delay;
 
-                var result = _dbHelper.QaEWebBean(query, parameters);
+  const AnimatedPasswordField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.validator,
+    required this.delay,
+  });
 
-                if (result == null || result.Count == 0)
-                {
-                    return Unauthorized("Invalid userID.");
-                }
+  @override
+  State<AnimatedPasswordField> createState() => _AnimatedPasswordFieldState();
+}
 
-                string storedHash = result[0]["hashPass"]?.ToString();
-                string storedSalt = result[0]["hashSalt"]?.ToString();
+class _AnimatedPasswordFieldState extends State<AnimatedPasswordField> {
+  bool _isVisible = false;
+  bool _obscureText = true;
 
-                if (string.IsNullOrWhiteSpace(storedHash) || string.IsNullOrWhiteSpace(storedSalt))
-                {
-                    return BadRequest("Hash or salt not configured for this user.");
-                }
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-                // Step 2: Verify password
-                string inputHash = HashPassword(request.password, storedSalt);
-
-                if (!string.Equals(inputHash, storedHash, StringComparison.Ordinal))
-                {
-                    return Unauthorized("Invalid password.");
-                }
-
-                // Step 3: Generate or use provided appRegId
-                string appRegId = request.appRegId;
-                if (string.IsNullOrWhiteSpace(appRegId))
-                {
-                    appRegId = await GenerateFirebaseAppRegId(request.userID);
-                }
-
-                // Step 4: Update appRegId in database
-                var updateApId = @"UPDATE wcmUserCred
-                                  SET appRegId = @appRegId,
-                                      updateDt = getdate(),
-                                      updateID = @loginIdm
-                                  WHERE loginIdm = @UserId";
-
-                var parameter1 = new Dictionary<string, object>
-                {
-                    { "@appRegId", appRegId },
-                    { "@loginIdm", request.userID },
-                    { "@UserId", request.userID }
-                };
-
-                _dbHelper.QaEWebBean(updateApId, parameter1);
-
-                // Step 5: Get user details
-                var userDetails = GetUserDetails(request.userID);
-                if (userDetails == null)
-                {
-                    return Unauthorized("No role/page data found.");
-                }
-
-                // Step 6: Return success response
-                return Ok(new
-                {
-                    msg = "Authentication successful",
-                    data = new
-                    {
-                        appRegId = appRegId,
-                        userID = request.userID,
-                        emplName = userDetails.emplName,
-                        areaCode = userDetails.areaCode,
-                        roles = userDetails.roles,
-                        pages = userDetails.pages
-                    }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: TextFormField(
+          controller: widget.controller,
+          obscureText: _obscureText,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            filled: true,
+            fillColor: Colors.grey.shade100,
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Colors.blue, width: 2),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+            suffixIcon: IconButton(
+              icon: Icon(
+                _obscureText ? Icons.visibility : Icons.visibility_off,
+                color: Colors.grey,
+              ),
+              onPressed: () {
+                setState(() {
+                  _obscureText = !_obscureText;
                 });
+              },
+            ),
+          ),
+          validator: widget.validator,
+        ),
+      ),
+    );
+  }
+}
 
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
+// Custom animated text field
+class AnimatedTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? prefixText;
+  final TextInputType keyboardType;
+  final String? Function(String?)? validator;
+  final Duration delay;
 
-        /// <summary>
-        /// Auto-login endpoint - validates stored appRegId and returns user data
-        /// </summary>
-        [AllowAnonymous]
-        [HttpPost("auto-login")]
-        public async Task<IActionResult> AutoLogin([FromBody] AutoLoginRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest("Parameter 'appRegId' is required.");
-            }
+  const AnimatedTextField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.prefixText,
+    required this.keyboardType,
+    this.validator,
+    required this.delay,
+  });
 
-            try
-            {
-                // Step 1: Verify Firebase token (optional but recommended)
-                var tokenValidation = await VerifyFirebaseToken(request.appRegId);
-                if (!tokenValidation.isValid)
-                {
-                    return Unauthorized("Invalid or expired Firebase token.");
-                }
+  @override
+  State<AnimatedTextField> createState() => _AnimatedTextFieldState();
+}
 
-                // Step 2: Check if appRegId exists in database
-                var query = "SELECT loginIdm FROM wcmUserCred WHERE appRegId = @appRegId";
-                var parameters = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
+class _AnimatedTextFieldState extends State<AnimatedTextField> {
+  bool _isVisible = false;
 
-                var result = _dbHelper.QaEWebBean(query, parameters);
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-                if (result == null || result.Count == 0)
-                {
-                    return Unauthorized("App registration not found in database.");
-                }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: TextFormField(
+          controller: widget.controller,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            prefixText: widget.prefixText,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            filled: true,
+            fillColor: Colors.grey.shade100,
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Colors.blue, width: 2),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+          ),
+          keyboardType: widget.keyboardType,
+          validator: widget.validator,
+        ),
+      ),
+    );
+  }
+}
 
-                string userID = result[0]["loginIdm"]?.ToString();
+// Custom animated button
+class AnimatedButton extends StatefulWidget {
+  final String text;
+  final bool isLoading;
+  final VoidCallback onPressed;
+  final Duration delay;
+  final Color? textColor;
 
-                // Step 3: Verify token's UID matches database userID (if Firebase token)
-                if (!string.IsNullOrEmpty(tokenValidation.uid) && tokenValidation.uid != userID)
-                {
-                    return Unauthorized("Token user ID mismatch.");
-                }
+  const AnimatedButton({
+    super.key,
+    required this.text,
+    required this.isLoading,
+    required this.onPressed,
+    required this.delay,
+    this.textColor,
+  });
 
-                // Step 4: Get user details
-                var userDetails = GetUserDetails(userID);
-                if (userDetails == null)
-                {
-                    return Unauthorized("No role/page data found.");
-                }
+  @override
+  State<AnimatedButton> createState() => _AnimatedButtonState();
+}
 
-                // Step 5: Update last access time
-                var updateQuery = @"UPDATE wcmUserCred
-                                   SET updateDt = getdate()
-                                   WHERE loginIdm = @userID";
-                var updateParams = new Dictionary<string, object> { { "@userID", userID } };
-                _dbHelper.QaEWebBean(updateQuery, updateParams);
+class _AnimatedButtonState extends State<AnimatedButton> {
+  bool _isVisible = false;
 
-                // Step 6: Return success response
-                return Ok(new
-                {
-                    msg = "Auto-login successful",
-                    data = new
-                    {
-                        userID = userID,
-                        emplName = userDetails.emplName,
-                        areaCode = userDetails.areaCode,
-                        roles = userDetails.roles,
-                        pages = userDetails.pages
-                    }
-                });
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: ElevatedButton(
+            onPressed: widget.isLoading ? null : widget.onPressed,
+            style: ElevatedButton.styleFrom(
+              elevation: 8,
+              shadowColor: Colors.blue.withOpacity(0.3),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              backgroundColor: Colors.blue,
+              foregroundColor: widget.textColor ?? Colors.white,
+            ),
+            child: widget.isLoading
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(width: 16),
+                      Text('Please wait...'),
+                    ],
+                  )
+                : Text(
+                    widget.text,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: widget.textColor ?? Colors.white,
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
-        /// <summary>
-        /// Logout endpoint - clears appRegId from database
-        /// </summary>
-        [AllowAnonymous]
-        [HttpPost("logout")]
-        public IActionResult Logout([FromBody] LogoutRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest("Parameter 'appRegId' is required.");
-            }
+// Modern TextField Component
+class ModernTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final TextInputType keyboardType;
+  final String? Function(String?)? validator;
+  final Duration delay;
+  final bool isDark;
+  final IconData? prefixIcon;
 
-            try
-            {
-                // Clear the appRegId from database
-                var updateQuery = @"UPDATE wcmUserCred
-                                   SET appRegId = NULL,
-                                       updateDt = getdate()
-                                   WHERE appRegId = @appRegId";
+  const ModernTextField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    required this.keyboardType,
+    this.validator,
+    required this.delay,
+    required this.isDark,
+    this.prefixIcon,
+  });
 
-                var parameters = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
+  @override
+  State<ModernTextField> createState() => _ModernTextFieldState();
+}
 
-                _dbHelper.QaEWebBean(updateQuery, parameters);
+class _ModernTextFieldState extends State<ModernTextField> {
+  bool _isVisible = false;
+  bool _isFocused = false;
 
-                return Ok(new { msg = "Logout successful" });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-        /// <summary>
-        /// Check if appRegId is valid - utility endpoint for testing
-        /// </summary>
-        [AllowAnonymous]
-        [HttpPost("validate-token")]
-        public async Task<IActionResult> ValidateToken([FromBody] ValidateTokenRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest("Parameter 'appRegId' is required.");
-            }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: Focus(
+          onFocusChange: (focused) {
+            setState(() {
+              _isFocused = focused;
+            });
+          },
+          child: TextFormField(
+            controller: widget.controller,
+            keyboardType: widget.keyboardType,
+            style: TextStyle(
+              fontSize: 16,
+              color: widget.isDark ? Colors.white : Colors.black87,
+            ),
+            decoration: InputDecoration(
+              labelText: widget.labelText,
+              hintText: widget.hintText,
+              prefixIcon: widget.prefixIcon != null
+                  ? Icon(
+                      widget.prefixIcon,
+                      color: _isFocused
+                          ? Colors.blue
+                          : (widget.isDark
+                                ? Colors.grey.shade400
+                                : Colors.grey.shade600),
+                    )
+                  : null,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.blue, width: 2),
+              ),
+              errorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 1),
+              ),
+              focusedErrorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 2),
+              ),
+              filled: true,
+              fillColor: widget.isDark
+                  ? Colors.grey.shade800.withOpacity(0.3)
+                  : Colors.grey.shade50,
+              labelStyle: TextStyle(
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              hintStyle: TextStyle(
+                color: widget.isDark
+                    ? Colors.grey.shade500
+                    : Colors.grey.shade400,
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 20,
+              ),
+            ),
+            validator: widget.validator,
+          ),
+        ),
+      ),
+    );
+  }
+}
 
-            try
-            {
-                // Check Firebase token validity
-                var tokenValidation = await VerifyFirebaseToken(request.appRegId);
+// Modern Password Field Component
+class ModernPasswordField extends StatefulWidget {
+  final TextEditingController controller;
+  final String labelText;
+  final String? hintText;
+  final String? Function(String?)? validator;
+  final Duration delay;
+  final bool isDark;
 
-                // Check database
-                var query = "SELECT loginIdm, updateDt FROM wcmUserCred WHERE appRegId = @appRegId";
-                var parameters = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
-                var result = _dbHelper.QaEWebBean(query, parameters);
+  const ModernPasswordField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    this.hintText,
+    this.validator,
+    required this.delay,
+    required this.isDark,
+  });
 
-                bool existsInDb = result != null && result.Count > 0;
+  @override
+  State<ModernPasswordField> createState() => _ModernPasswordFieldState();
+}
 
-                return Ok(new
-                {
-                    firebaseValid = tokenValidation.isValid,
-                    databaseValid = existsInDb,
-                    isValid = tokenValidation.isValid && existsInDb,
-                    userID = existsInDb ? result[0]["loginIdm"]?.ToString() : null,
-                    lastUpdate = existsInDb ? result[0]["updateDt"]?.ToString() : null
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
+class _ModernPasswordFieldState extends State<ModernPasswordField> {
+  bool _isVisible = false;
+  bool _obscureText = true;
+  bool _isFocused = false;
 
-        /// <summary>
-        /// Generate Firebase-based appRegId or fallback to GUID
-        /// </summary>
-        private async Task<string> GenerateFirebaseAppRegId(string userID)
-        {
-            try
-            {
-                // Create custom claims for the user
-                var claims = new Dictionary<string, object>
-                {
-                    { "userID", userID },
-                    { "loginTime", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
-                    { "appName", "RAK_BusinessApp" },
-                    { "version", "1.0" }
-                };
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-                // Generate custom token with 24-hour expiry (adjust as needed)
-                var customToken = await FirebaseAuth.DefaultInstance.CreateCustomTokenAsync(userID, claims);
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: Focus(
+          onFocusChange: (focused) {
+            setState(() {
+              _isFocused = focused;
+            });
+          },
+          child: TextFormField(
+            controller: widget.controller,
+            obscureText: _obscureText,
+            style: TextStyle(
+              fontSize: 16,
+              color: widget.isDark ? Colors.white : Colors.black87,
+            ),
+            decoration: InputDecoration(
+              labelText: widget.labelText,
+              hintText: widget.hintText,
+              prefixIcon: Icon(
+                Icons.lock_outline,
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              suffixIcon: IconButton(
+                icon: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: Icon(
+                    _obscureText
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                    key: ValueKey(_obscureText),
+                    color: widget.isDark
+                        ? Colors.grey.shade400
+                        : Colors.grey.shade600,
+                  ),
+                ),
+                onPressed: () {
+                  setState(() {
+                    _obscureText = !_obscureText;
+                  });
+                },
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: widget.isDark
+                      ? Colors.grey.shade600
+                      : Colors.grey.shade300,
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.blue, width: 2),
+              ),
+              errorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 1),
+              ),
+              focusedErrorBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: Colors.red, width: 2),
+              ),
+              filled: true,
+              fillColor: widget.isDark
+                  ? Colors.grey.shade800.withOpacity(0.3)
+                  : Colors.grey.shade50,
+              labelStyle: TextStyle(
+                color: _isFocused
+                    ? Colors.blue
+                    : (widget.isDark
+                          ? Colors.grey.shade400
+                          : Colors.grey.shade600),
+              ),
+              hintStyle: TextStyle(
+                color: widget.isDark
+                    ? Colors.grey.shade500
+                    : Colors.grey.shade400,
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 20,
+              ),
+            ),
+            validator: widget.validator,
+          ),
+        ),
+      ),
+    );
+  }
+}
 
-                Console.WriteLine($"✅ Generated Firebase token for user: {userID}");
-                return customToken;
-            }
-            catch (Exception ex)
-            {
-                // Fallback to timestamp-based GUID if Firebase fails
-                Console.WriteLine($"⚠️ Firebase token generation failed for {userID}: {ex.Message}");
-                return $"APP_{userID}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Guid.NewGuid().ToString("N")[..8]}";
-            }
-        }
+// Modern Button Component
+class ModernButton extends StatefulWidget {
+  final String text;
+  final bool isLoading;
+  final VoidCallback onPressed;
+  final Duration delay;
+  final bool isPrimary;
+  final bool isDark;
 
-        /// <summary>
-        /// Verify Firebase token validity
-        /// </summary>
-        private async Task<(bool isValid, string uid)> VerifyFirebaseToken(string token)
-        {
-            try
-            {
-                // First try as ID token
-                var decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(token);
-                return (true, decodedToken.Uid);
-            }
-            catch (FirebaseAuthException ex)
-            {
-                Console.WriteLine($"Firebase token verification failed: {ex.Message}");
+  const ModernButton({
+    super.key,
+    required this.text,
+    required this.isLoading,
+    required this.onPressed,
+    required this.delay,
+    required this.isPrimary,
+    required this.isDark,
+  });
 
-                // If it's not an ID token, it might be a custom token or fallback ID
-                // For custom tokens, we can't verify directly, so we'll accept non-Firebase formats
-                if (token.StartsWith("APP_") || token.Length == 36) // GUID format
-                {
-                    return (true, ExtractUserIdFromToken(token));
-                }
+  @override
+  State<ModernButton> createState() => _ModernButtonState();
+}
 
-                return (false, null);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Token verification error: {ex.Message}");
-                return (false, null);
-            }
-        }
+class _ModernButtonState extends State<ModernButton> {
+  bool _isVisible = false;
+  bool _isHovered = false;
 
-        /// <summary>
-        /// Extract userID from fallback token format
-        /// </summary>
-        private string ExtractUserIdFromToken(string token)
-        {
-            try
-            {
-                if (token.StartsWith("APP_"))
-                {
-                    var parts = token.Split('_');
-                    if (parts.Length >= 2)
-                    {
-                        return parts[1]; // Return userID part
-                    }
-                }
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-        /// <summary>
-        /// Get user details including roles and pages
-        /// </summary>
-        private UserDetails GetUserDetails(string userID)
-        {
-            var detailQuery = @"
-                SELECT
-                    a.emplName AS emplName,
-                    a.areaCode AS areaCode,
-                    b.roleCode AS roleCode,
-                    c.mobPagId AS mobPagId
-                FROM prmEmployee a WITH (NOLOCK)
-                JOIN wcmEmplRole b WITH (NOLOCK) ON a.loginIdM = b.loginIdM
-                JOIN wcmMobPgMas c WITH (NOLOCK) ON b.roleCode = c.roleCode
-                WHERE
-                    a.isActive = 'Y'
-                    AND b.isActive = 'Y'
-                    AND c.isActive = 'Y'
-                    AND a.loginIdM = @userID";
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: widget.isPrimary
+              ? ElevatedButton(
+                  onPressed: widget.isLoading ? null : widget.onPressed,
+                  style:
+                      ElevatedButton.styleFrom(
+                        elevation: _isHovered ? 12 : 6,
+                        shadowColor: Colors.blue.withOpacity(0.3),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                      ).copyWith(
+                        backgroundColor: WidgetStateProperty.resolveWith((
+                          states,
+                        ) {
+                          if (states.contains(WidgetState.disabled)) {
+                            return Colors.grey.shade400;
+                          }
+                          return Colors.blue;
+                        }),
+                      ),
+                  onHover: (hovering) {
+                    setState(() {
+                      _isHovered = hovering;
+                    });
+                  },
+                  child: widget.isLoading
+                      ? const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            ),
+                            SizedBox(width: 16),
+                            Text('Signing in...'),
+                          ],
+                        )
+                      : Text(
+                          widget.text,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                )
+              : OutlinedButton(
+                  onPressed: widget.onPressed,
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(
+                      color: widget.isDark
+                          ? Colors.grey.shade600
+                          : Colors.grey.shade300,
+                      width: 1.5,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    backgroundColor: _isHovered
+                        ? (widget.isDark
+                              ? Colors.grey.shade800.withOpacity(0.5)
+                              : Colors.grey.shade50)
+                        : null,
+                  ),
+                  onHover: (hovering) {
+                    setState(() {
+                      _isHovered = hovering;
+                    });
+                  },
+                  child: Text(
+                    widget.text,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                      color: widget.isDark
+                          ? Colors.grey.shade300
+                          : Colors.grey.shade700,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
 
-            var param = new Dictionary<string, object> { { "@userID", userID } };
-            var rset = _dbHelper.QaEWebBean(detailQuery, param);
+// Custom animated outline button
+class AnimatedOutlineButton extends StatefulWidget {
+  final String text;
+  final VoidCallback onPressed;
+  final Duration delay;
 
-            if (rset == null || rset.Count == 0)
-            {
-                return null;
-            }
+  const AnimatedOutlineButton({
+    super.key,
+    required this.text,
+    required this.onPressed,
+    required this.delay,
+  });
 
-            string emplName = rset[0]["emplName"]?.ToString();
-            string areaCode = rset[0]["areaCode"]?.ToString();
+  @override
+  State<AnimatedOutlineButton> createState() => _AnimatedOutlineButtonState();
+}
 
-            var roles = new HashSet<string>();
-            var pages = new HashSet<string>();
+class _AnimatedOutlineButtonState extends State<AnimatedOutlineButton> {
+  bool _isVisible = false;
+  bool _isHovered = false;
 
-            foreach (var row in rset)
-            {
-                var role = row["roleCode"]?.ToString();
-                var page = row["mobPagId"]?.ToString();
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(widget.delay, () {
+      if (mounted) {
+        setState(() {
+          _isVisible = true;
+        });
+      }
+    });
+  }
 
-                if (!string.IsNullOrWhiteSpace(role))
-                    roles.Add(role);
-
-                if (!string.IsNullOrWhiteSpace(page))
-                    pages.Add(page);
-            }
-
-            return new UserDetails
-            {
-                emplName = emplName,
-                areaCode = areaCode,
-                roles = roles,
-                pages = pages
-            };
-        }
-
-        /// <summary>
-        /// Hash password using SHA1 with salt
-        /// </summary>
-        private string HashPassword(string password, string saltBase64)
-        {
-            if (string.IsNullOrWhiteSpace(password) || string.IsNullOrWhiteSpace(saltBase64))
-                return null;
-
-            byte[] saltBytes = Convert.FromBase64String(saltBase64);
-            byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
-
-            using (var sha1 = SHA1.Create())
-            {
-                // Step 1: SHA-1(salt + password)
-                byte[] combined = new byte[saltBytes.Length + passwordBytes.Length];
-                Buffer.BlockCopy(saltBytes, 0, combined, 0, saltBytes.Length);
-                Buffer.BlockCopy(passwordBytes, 0, combined, saltBytes.Length, passwordBytes.Length);
-
-                byte[] hash = sha1.ComputeHash(combined);
-
-                // Step 2: Apply iteration hashing
-                for (int i = 0; i < ITERATION_NUMBER; i++)
-                {
-                    hash = sha1.ComputeHash(hash);
-                }
-
-                return Convert.ToBase64String(hash);
-            }
-        }
-    }
-
-    // Request/Response Models
-    public class AuthRequest
-    {
-        public string userID { get; set; }
-        public string password { get; set; }
-        public string appRegId { get; set; }
-    }
-
-    public class AutoLoginRequest
-    {
-        public string appRegId { get; set; }
-    }
-
-    public class LogoutRequest
-    {
-        public string appRegId { get; set; }
-    }
-
-    public class ValidateTokenRequest
-    {
-        public string appRegId { get; set; }
-    }
-
-    public class UserDetails
-    {
-        public string emplName { get; set; }
-        public string areaCode { get; set; }
-        public HashSet<string> roles { get; set; }
-        public HashSet<string> pages { get; set; }
-    }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _isVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 500),
+      curve: Curves.easeOut,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
+        child: MouseRegion(
+          onEnter: (_) => setState(() => _isHovered = true),
+          onExit: (_) => setState(() => _isHovered = false),
+          child: OutlinedButton(
+            onPressed: widget.onPressed,
+            style: OutlinedButton.styleFrom(
+              side: BorderSide(
+                color: _isHovered ? Colors.blue : Colors.grey.shade400,
+                width: 1.5,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              backgroundColor: _isHovered
+                  ? Colors.blue.withOpacity(0.05)
+                  : null,
+            ),
+            child: Text(
+              widget.text,
+              style: TextStyle(
+                fontSize: 14,
+                color: _isHovered ? Colors.blue : Colors.grey.shade700,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
