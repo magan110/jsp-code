@@ -13,11 +13,11 @@ namespace sparshWebService.Controllers
     public class AuthController : ControllerBase
     {
         private readonly DatabaseHelper _db;
-        private const int ITERATION_NUMBER = 1; // matches your current scheme
+        private const int ITERATION_NUMBER = 1; // matches your stored scheme
 
         public AuthController(DatabaseHelper dbHelper) => _db = dbHelper;
 
-        // ---------------- Response Envelope ----------------
+        // --------- Envelope ----------
         public sealed class ApiResponse<T>
         {
             public bool Success { get; set; }
@@ -27,23 +27,16 @@ namespace sparshWebService.Controllers
             public static ApiResponse<T> Fail(string m) => new() { Success = false, Error = m };
         }
 
-        // ---------------- DTOs ----------------
+        // --------- DTOs ----------
         public class LoginRequest
         {
             public string userID { get; set; }
             public string password { get; set; }
-            public string appRegId { get; set; } // Flutter-generated preferred; server will fallback if empty
+            public string appRegId { get; set; } // REQUIRED (from Flutter)
         }
 
-        public class AutoLoginRequest
-        {
-            public string appRegId { get; set; }
-        }
-
-        public class LogoutRequest
-        {
-            public string appRegId { get; set; }
-        }
+        public class AutoLoginRequest { public string appRegId { get; set; } }
+        public class LogoutRequest    { public string appRegId { get; set; } }
 
         public class UserDetails
         {
@@ -54,7 +47,7 @@ namespace sparshWebService.Controllers
         }
 
         // ===================================================
-        //                  LOGIN (sets appRegId)
+        //                      LOGIN
         // ===================================================
         [AllowAnonymous]
         [HttpPost("login")]
@@ -62,65 +55,63 @@ namespace sparshWebService.Controllers
         {
             if (request == null ||
                 string.IsNullOrWhiteSpace(request.userID) ||
-                string.IsNullOrWhiteSpace(request.password))
+                string.IsNullOrWhiteSpace(request.password) ||
+                string.IsNullOrWhiteSpace(request.appRegId))
             {
-                return BadRequest(ApiResponse<object>.Fail("Parameters 'userID' and 'password' are required."));
+                return BadRequest(ApiResponse<object>.Fail(
+                    "Parameters 'userID', 'password', and 'appRegId' are required."
+                ));
             }
 
             try
             {
-                // 1) Fetch stored hash + salt
-                const string credSql = @"SELECT loginIdm, hashPass, hashSalt
-                                         FROM wcmUserCred WITH (NOLOCK)
-                                         WHERE loginIdM = @userID";
+                // 1) Read stored hash/salt
+                const string credSql = @"
+                    SELECT loginIdm, hashPass, hashSalt
+                    FROM wcmUserCred WITH (NOLOCK)
+                    WHERE loginIdM = @userID";
                 var credParams = new Dictionary<string, object> { { "@userID", request.userID } };
                 var credRows = _db.QaEWebBean(credSql, credParams);
 
                 if (credRows == null || credRows.Count == 0)
                     return Unauthorized(ApiResponse<object>.Fail("Invalid userID."));
 
-                string storedHash = credRows[0]["hashPass"]?.ToString();
-                string storedSalt = credRows[0]["hashSalt"]?.ToString();
-                if (string.IsNullOrWhiteSpace(storedHash) || string.IsNullOrWhiteSpace(storedSalt))
+                string hashPass = credRows[0]["hashPass"]?.ToString();
+                string hashSalt = credRows[0]["hashSalt"]?.ToString();
+                if (string.IsNullOrWhiteSpace(hashPass) || string.IsNullOrWhiteSpace(hashSalt))
                     return BadRequest(ApiResponse<object>.Fail("Hash or salt not configured for this user."));
 
-                // 2) Verify password (salted SHA-1 with 1 extra iteration to match your current scheme)
-                string inputHash = HashPassword(request.password, storedSalt);
-                if (!string.Equals(inputHash, storedHash, StringComparison.Ordinal))
+                // 2) Verify password
+                string inputHash = HashPassword(request.password, hashSalt);
+                if (!string.Equals(inputHash, hashPass, StringComparison.Ordinal))
                     return Unauthorized(ApiResponse<object>.Fail("Invalid password."));
 
-                // 3) Decide appRegId: prefer Flutter-provided, else fallback to server-generated
-                string appRegId = string.IsNullOrWhiteSpace(request.appRegId)
-                    ? $"APP_{request.userID}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Guid.NewGuid():N}"
-                    : request.appRegId;
-
-                // 4) Store/Update appRegId
-                const string updSql = @"UPDATE wcmUserCred
-                                        SET appRegId = @appRegId,
-                                            updateDt = GETDATE(),
-                                            updateID = @userID
-                                        WHERE loginIdm = @userID";
-                var updParams = new Dictionary<string, object>
+                // 3) Store provided appRegId
+                const string updSql = @"
+                    UPDATE wcmUserCred
+                    SET appRegId = @appRegId,
+                        updateDt = GETDATE(),
+                        updateID = @userID
+                    WHERE loginIdm = @userID";
+                _db.QaEWebBean(updSql, new Dictionary<string, object>
                 {
-                    { "@appRegId", appRegId },
-                    { "@userID", request.userID }
-                };
-                _db.QaEWebBean(updSql, updParams);
+                    { "@appRegId", request.appRegId },
+                    { "@userID",   request.userID  }
+                });
 
-                // 5) Pull user details (roles/pages)
+                // 4) Load user details
                 var details = GetUserDetails(request.userID);
                 if (details == null)
                     return Unauthorized(ApiResponse<object>.Fail("No active role/page data found."));
 
-                // 6) Done
                 var payload = new
                 {
-                    appRegId,
-                    userID = request.userID,
+                    appRegId = request.appRegId,
+                    userID   = request.userID,
                     emplName = details.emplName,
                     areaCode = details.areaCode,
-                    roles = details.roles,
-                    pages = details.pages
+                    roles    = details.roles,
+                    pages    = details.pages
                 };
                 return Ok(ApiResponse<object>.Ok(payload));
             }
@@ -131,7 +122,7 @@ namespace sparshWebService.Controllers
         }
 
         // ===================================================
-        //                 AUTO-LOGIN (by appRegId)
+        //                   AUTO-LOGIN
         // ===================================================
         [AllowAnonymous]
         [HttpPost("auto-login")]
@@ -142,12 +133,13 @@ namespace sparshWebService.Controllers
 
             try
             {
-                // 1) Lookup user by appRegId
-                const string findSql = @"SELECT loginIdm
-                                         FROM wcmUserCred WITH (NOLOCK)
-                                         WHERE appRegId = @appRegId";
-                var findParams = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
-                var rows = _db.QaEWebBean(findSql, findParams);
+                const string findSql = @"
+                    SELECT loginIdm FROM wcmUserCred WITH (NOLOCK)
+                    WHERE appRegId = @appRegId";
+                var rows = _db.QaEWebBean(findSql, new Dictionary<string, object>
+                {
+                    { "@appRegId", request.appRegId }
+                });
 
                 if (rows == null || rows.Count == 0)
                     return Unauthorized(ApiResponse<object>.Fail("App registration not found."));
@@ -156,15 +148,12 @@ namespace sparshWebService.Controllers
                 if (string.IsNullOrWhiteSpace(userID))
                     return Unauthorized(ApiResponse<object>.Fail("Invalid app registration record."));
 
-                // 2) User details
                 var details = GetUserDetails(userID);
                 if (details == null)
                     return Unauthorized(ApiResponse<object>.Fail("No active role/page data found."));
 
-                // 3) Touch last access time (optional)
-                const string touchSql = @"UPDATE wcmUserCred
-                                          SET updateDt = GETDATE()
-                                          WHERE loginIdm = @userID";
+                // Touch last access time (optional)
+                const string touchSql = @"UPDATE wcmUserCred SET updateDt = GETDATE() WHERE loginIdm = @userID";
                 _db.QaEWebBean(touchSql, new Dictionary<string, object> { { "@userID", userID } });
 
                 var payload = new
@@ -172,8 +161,8 @@ namespace sparshWebService.Controllers
                     userID,
                     emplName = details.emplName,
                     areaCode = details.areaCode,
-                    roles = details.roles,
-                    pages = details.pages
+                    roles    = details.roles,
+                    pages    = details.pages
                 };
                 return Ok(ApiResponse<object>.Ok(payload));
             }
@@ -184,7 +173,7 @@ namespace sparshWebService.Controllers
         }
 
         // ===================================================
-        //                       LOGOUT
+        //                      LOGOUT
         // ===================================================
         [AllowAnonymous]
         [HttpPost("logout")]
@@ -195,11 +184,15 @@ namespace sparshWebService.Controllers
 
             try
             {
-                const string updSql = @"UPDATE wcmUserCred
-                                        SET appRegId = NULL,
-                                            updateDt = GETDATE()
-                                        WHERE appRegId = @appRegId";
-                _db.QaEWebBean(updSql, new Dictionary<string, object> { { "@appRegId", request.appRegId } });
+                const string updSql = @"
+                    UPDATE wcmUserCred
+                    SET appRegId = NULL,
+                        updateDt = GETDATE()
+                    WHERE appRegId = @appRegId";
+                _db.QaEWebBean(updSql, new Dictionary<string, object>
+                {
+                    { "@appRegId", request.appRegId }
+                });
 
                 return Ok(ApiResponse<object>.Ok(new { msg = "Logout successful" }));
             }
@@ -209,37 +202,26 @@ namespace sparshWebService.Controllers
             }
         }
 
-        // ===================================================
-        //                  HELPERS (private)
-        // ===================================================
+        // ---------------- Helpers ----------------
         private UserDetails GetUserDetails(string userID)
         {
-            const string detailSql = @"
-                SELECT
-                    a.emplName AS emplName,
-                    a.areaCode AS areaCode,
-                    b.roleCode AS roleCode,
-                    c.mobPagId AS mobPagId
+            const string sql = @"
+                SELECT a.emplName, a.areaCode, b.roleCode, c.mobPagId
                 FROM prmEmployee a WITH (NOLOCK)
                 JOIN wcmEmplRole b WITH (NOLOCK) ON a.loginIdM = b.loginIdM
                 JOIN wcmMobPgMas c WITH (NOLOCK) ON b.roleCode = c.roleCode
-                WHERE
-                    a.isActive = 'Y'
-                    AND b.isActive = 'Y'
-                    AND c.isActive = 'Y'
-                    AND a.loginIdM = @userID";
+                WHERE a.isActive = 'Y' AND b.isActive = 'Y' AND c.isActive = 'Y'
+                  AND a.loginIdM = @userID";
 
-            var param = new Dictionary<string, object> { { "@userID", userID } };
-            var rset = _db.QaEWebBean(detailSql, param);
-            if (rset == null || rset.Count == 0) return null;
+            var rs = _db.QaEWebBean(sql, new Dictionary<string, object> { { "@userID", userID } });
+            if (rs == null || rs.Count == 0) return null;
 
             var roles = new HashSet<string>();
             var pages = new HashSet<string>();
+            string emplName = rs[0]["emplName"]?.ToString();
+            string areaCode = rs[0]["areaCode"]?.ToString();
 
-            string emplName = rset[0]["emplName"]?.ToString();
-            string areaCode = rset[0]["areaCode"]?.ToString();
-
-            foreach (var row in rset)
+            foreach (var row in rs)
             {
                 var role = row["roleCode"]?.ToString();
                 var page = row["mobPagId"]?.ToString();
@@ -247,35 +229,24 @@ namespace sparshWebService.Controllers
                 if (!string.IsNullOrWhiteSpace(page)) pages.Add(page);
             }
 
-            return new UserDetails
-            {
-                emplName = emplName,
-                areaCode = areaCode,
-                roles = roles,
-                pages = pages
-            };
+            return new UserDetails { emplName = emplName, areaCode = areaCode, roles = roles, pages = pages };
         }
 
         private static string HashPassword(string password, string saltBase64)
         {
-            if (string.IsNullOrWhiteSpace(password) || string.IsNullOrWhiteSpace(saltBase64))
-                return null;
+            if (string.IsNullOrWhiteSpace(password) || string.IsNullOrWhiteSpace(saltBase64)) return null;
 
-            byte[] saltBytes = Convert.FromBase64String(saltBase64);
-            byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
+            var saltBytes = Convert.FromBase64String(saltBase64);
+            var pwdBytes  = Encoding.UTF8.GetBytes(password);
 
             using var sha1 = SHA1.Create();
 
-            // SHA1(salt + password)
-            byte[] combined = new byte[saltBytes.Length + passwordBytes.Length];
+            var combined = new byte[saltBytes.Length + pwdBytes.Length];
             Buffer.BlockCopy(saltBytes, 0, combined, 0, saltBytes.Length);
-            Buffer.BlockCopy(passwordBytes, 0, combined, saltBytes.Length, passwordBytes.Length);
+            Buffer.BlockCopy(pwdBytes, 0, combined, saltBytes.Length, pwdBytes.Length);
 
-            byte[] hash = sha1.ComputeHash(combined);
-
-            // Apply iteration(s) to match your stored hashes
-            for (int i = 0; i < ITERATION_NUMBER; i++)
-                hash = sha1.ComputeHash(hash);
+            var hash = sha1.ComputeHash(combined);
+            for (int i = 0; i < ITERATION_NUMBER; i++) hash = sha1.ComputeHash(hash);
 
             return Convert.ToBase64String(hash);
         }
