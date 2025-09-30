@@ -1,15 +1,10 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.IdentityModel.Tokens;
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
-using FirebaseAdmin;
-using FirebaseAdmin.Auth;
-using Google.Apis.Auth.OAuth2;
-using System.Threading.Tasks;
 
 namespace sparshWebService.Controllers
 {
@@ -17,363 +12,209 @@ namespace sparshWebService.Controllers
     [ApiController]
     public class AuthController : ControllerBase
     {
-        private readonly DatabaseHelper _dbHelper;
-        private const int ITERATION_NUMBER = 1;
+        private readonly DatabaseHelper _db;
+        private const int ITERATION_NUMBER = 1; // matches your current scheme
 
-        public AuthController(DatabaseHelper dbHelper)
+        public AuthController(DatabaseHelper dbHelper) => _db = dbHelper;
+
+        // ---------------- Response Envelope ----------------
+        public sealed class ApiResponse<T>
         {
-            _dbHelper = dbHelper;
-            InitializeFirebase();
+            public bool Success { get; set; }
+            public T Data { get; set; }
+            public string Error { get; set; }
+            public static ApiResponse<T> Ok(T d) => new() { Success = true, Data = d };
+            public static ApiResponse<T> Fail(string m) => new() { Success = false, Error = m };
         }
 
-        private void InitializeFirebase()
+        // ---------------- DTOs ----------------
+        public class LoginRequest
         {
-            if (FirebaseApp.DefaultInstance == null)
-            {
-                try
-                {
-                    FirebaseApp.Create(new AppOptions()
-                    {
-                        Credential = GoogleCredential.FromFile("firebase-service-account.json"),
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Firebase initialization failed: {ex.Message}");
-                    // Continue without Firebase - will use fallback appRegId generation
-                }
-            }
+            public string userID { get; set; }
+            public string password { get; set; }
+            public string appRegId { get; set; } // Flutter-generated preferred; server will fallback if empty
         }
 
-        /// <summary>
-        /// Main login endpoint - handles user authentication with Firebase appRegId
-        /// </summary>
+        public class AutoLoginRequest
+        {
+            public string appRegId { get; set; }
+        }
+
+        public class LogoutRequest
+        {
+            public string appRegId { get; set; }
+        }
+
+        public class UserDetails
+        {
+            public string emplName { get; set; }
+            public string areaCode { get; set; }
+            public HashSet<string> roles { get; set; }
+            public HashSet<string> pages { get; set; }
+        }
+
+        // ===================================================
+        //                  LOGIN (sets appRegId)
+        // ===================================================
         [AllowAnonymous]
-        [HttpPost("execute")]
-        public async Task<IActionResult> ExecuteStoredProcedure([FromBody] AuthRequest request)
+        [HttpPost("login")]
+        public IActionResult Login([FromBody] LoginRequest request)
         {
-            if (request == null || string.IsNullOrWhiteSpace(request.userID) || string.IsNullOrWhiteSpace(request.password))
+            if (request == null ||
+                string.IsNullOrWhiteSpace(request.userID) ||
+                string.IsNullOrWhiteSpace(request.password))
             {
-                return BadRequest("Parameter 'userID' and 'password' is required.");
+                return BadRequest(ApiResponse<object>.Fail("Parameters 'userID' and 'password' are required."));
             }
 
             try
             {
-                // Step 1: Validate user credentials
-                var query = "SELECT loginIdm, hashPass, hashSalt FROM wcmUserCred WHERE loginIdM = @userID";
-                var parameters = new Dictionary<string, object> { { "@userID", request.userID } };
+                // 1) Fetch stored hash + salt
+                const string credSql = @"SELECT loginIdm, hashPass, hashSalt
+                                         FROM wcmUserCred WITH (NOLOCK)
+                                         WHERE loginIdM = @userID";
+                var credParams = new Dictionary<string, object> { { "@userID", request.userID } };
+                var credRows = _db.QaEWebBean(credSql, credParams);
 
-                var result = _dbHelper.QaEWebBean(query, parameters);
+                if (credRows == null || credRows.Count == 0)
+                    return Unauthorized(ApiResponse<object>.Fail("Invalid userID."));
 
-                if (result == null || result.Count == 0)
-                {
-                    return Unauthorized("Invalid userID.");
-                }
-
-                string storedHash = result[0]["hashPass"]?.ToString();
-                string storedSalt = result[0]["hashSalt"]?.ToString();
-
+                string storedHash = credRows[0]["hashPass"]?.ToString();
+                string storedSalt = credRows[0]["hashSalt"]?.ToString();
                 if (string.IsNullOrWhiteSpace(storedHash) || string.IsNullOrWhiteSpace(storedSalt))
-                {
-                    return BadRequest("Hash or salt not configured for this user.");
-                }
+                    return BadRequest(ApiResponse<object>.Fail("Hash or salt not configured for this user."));
 
-                // Step 2: Verify password
+                // 2) Verify password (salted SHA-1 with 1 extra iteration to match your current scheme)
                 string inputHash = HashPassword(request.password, storedSalt);
-
                 if (!string.Equals(inputHash, storedHash, StringComparison.Ordinal))
-                {
-                    return Unauthorized("Invalid password.");
-                }
+                    return Unauthorized(ApiResponse<object>.Fail("Invalid password."));
 
-                // Step 3: Generate or use provided appRegId
-                string appRegId = request.appRegId;
-                if (string.IsNullOrWhiteSpace(appRegId))
-                {
-                    appRegId = await GenerateFirebaseAppRegId(request.userID);
-                }
+                // 3) Decide appRegId: prefer Flutter-provided, else fallback to server-generated
+                string appRegId = string.IsNullOrWhiteSpace(request.appRegId)
+                    ? $"APP_{request.userID}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Guid.NewGuid():N}"
+                    : request.appRegId;
 
-                // Step 4: Update appRegId in database
-                var updateApId = @"UPDATE wcmUserCred
-                                  SET appRegId = @appRegId,
-                                      updateDt = getdate(),
-                                      updateID = @loginIdm
-                                  WHERE loginIdm = @UserId";
-
-                var parameter1 = new Dictionary<string, object>
+                // 4) Store/Update appRegId
+                const string updSql = @"UPDATE wcmUserCred
+                                        SET appRegId = @appRegId,
+                                            updateDt = GETDATE(),
+                                            updateID = @userID
+                                        WHERE loginIdm = @userID";
+                var updParams = new Dictionary<string, object>
                 {
                     { "@appRegId", appRegId },
-                    { "@loginIdm", request.userID },
-                    { "@UserId", request.userID }
+                    { "@userID", request.userID }
                 };
+                _db.QaEWebBean(updSql, updParams);
 
-                _dbHelper.QaEWebBean(updateApId, parameter1);
+                // 5) Pull user details (roles/pages)
+                var details = GetUserDetails(request.userID);
+                if (details == null)
+                    return Unauthorized(ApiResponse<object>.Fail("No active role/page data found."));
 
-                // Step 5: Get user details
-                var userDetails = GetUserDetails(request.userID);
-                if (userDetails == null)
+                // 6) Done
+                var payload = new
                 {
-                    return Unauthorized("No role/page data found.");
-                }
-
-                // Step 6: Return success response
-                return Ok(new
-                {
-                    msg = "Authentication successful",
-                    data = new
-                    {
-                        appRegId = appRegId,
-                        userID = request.userID,
-                        emplName = userDetails.emplName,
-                        areaCode = userDetails.areaCode,
-                        roles = userDetails.roles,
-                        pages = userDetails.pages
-                    }
-                });
-
+                    appRegId,
+                    userID = request.userID,
+                    emplName = details.emplName,
+                    areaCode = details.areaCode,
+                    roles = details.roles,
+                    pages = details.pages
+                };
+                return Ok(ApiResponse<object>.Ok(payload));
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
+                return StatusCode(500, ApiResponse<object>.Fail($"Internal server error: {ex.Message}"));
             }
         }
 
-        /// <summary>
-        /// Auto-login endpoint - validates stored appRegId and returns user data
-        /// </summary>
+        // ===================================================
+        //                 AUTO-LOGIN (by appRegId)
+        // ===================================================
         [AllowAnonymous]
         [HttpPost("auto-login")]
-        public async Task<IActionResult> AutoLogin([FromBody] AutoLoginRequest request)
+        public IActionResult AutoLogin([FromBody] AutoLoginRequest request)
         {
             if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest("Parameter 'appRegId' is required.");
-            }
+                return BadRequest(ApiResponse<object>.Fail("Parameter 'appRegId' is required."));
 
             try
             {
-                // Step 1: Verify Firebase token (optional but recommended)
-                var tokenValidation = await VerifyFirebaseToken(request.appRegId);
-                if (!tokenValidation.isValid)
+                // 1) Lookup user by appRegId
+                const string findSql = @"SELECT loginIdm
+                                         FROM wcmUserCred WITH (NOLOCK)
+                                         WHERE appRegId = @appRegId";
+                var findParams = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
+                var rows = _db.QaEWebBean(findSql, findParams);
+
+                if (rows == null || rows.Count == 0)
+                    return Unauthorized(ApiResponse<object>.Fail("App registration not found."));
+
+                string userID = rows[0]["loginIdm"]?.ToString();
+                if (string.IsNullOrWhiteSpace(userID))
+                    return Unauthorized(ApiResponse<object>.Fail("Invalid app registration record."));
+
+                // 2) User details
+                var details = GetUserDetails(userID);
+                if (details == null)
+                    return Unauthorized(ApiResponse<object>.Fail("No active role/page data found."));
+
+                // 3) Touch last access time (optional)
+                const string touchSql = @"UPDATE wcmUserCred
+                                          SET updateDt = GETDATE()
+                                          WHERE loginIdm = @userID";
+                _db.QaEWebBean(touchSql, new Dictionary<string, object> { { "@userID", userID } });
+
+                var payload = new
                 {
-                    return Unauthorized("Invalid or expired Firebase token.");
-                }
-
-                // Step 2: Check if appRegId exists in database
-                var query = "SELECT loginIdm FROM wcmUserCred WHERE appRegId = @appRegId";
-                var parameters = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
-
-                var result = _dbHelper.QaEWebBean(query, parameters);
-
-                if (result == null || result.Count == 0)
-                {
-                    return Unauthorized("App registration not found in database.");
-                }
-
-                string userID = result[0]["loginIdm"]?.ToString();
-
-                // Step 3: Verify token's UID matches database userID (if Firebase token)
-                if (!string.IsNullOrEmpty(tokenValidation.uid) && tokenValidation.uid != userID)
-                {
-                    return Unauthorized("Token user ID mismatch.");
-                }
-
-                // Step 4: Get user details
-                var userDetails = GetUserDetails(userID);
-                if (userDetails == null)
-                {
-                    return Unauthorized("No role/page data found.");
-                }
-
-                // Step 5: Update last access time
-                var updateQuery = @"UPDATE wcmUserCred
-                                   SET updateDt = getdate()
-                                   WHERE loginIdm = @userID";
-                var updateParams = new Dictionary<string, object> { { "@userID", userID } };
-                _dbHelper.QaEWebBean(updateQuery, updateParams);
-
-                // Step 6: Return success response
-                return Ok(new
-                {
-                    msg = "Auto-login successful",
-                    data = new
-                    {
-                        userID = userID,
-                        emplName = userDetails.emplName,
-                        areaCode = userDetails.areaCode,
-                        roles = userDetails.roles,
-                        pages = userDetails.pages
-                    }
-                });
-
+                    userID,
+                    emplName = details.emplName,
+                    areaCode = details.areaCode,
+                    roles = details.roles,
+                    pages = details.pages
+                };
+                return Ok(ApiResponse<object>.Ok(payload));
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
+                return StatusCode(500, ApiResponse<object>.Fail($"Internal server error: {ex.Message}"));
             }
         }
 
-        /// <summary>
-        /// Logout endpoint - clears appRegId from database
-        /// </summary>
+        // ===================================================
+        //                       LOGOUT
+        // ===================================================
         [AllowAnonymous]
         [HttpPost("logout")]
         public IActionResult Logout([FromBody] LogoutRequest request)
         {
             if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest("Parameter 'appRegId' is required.");
-            }
+                return BadRequest(ApiResponse<object>.Fail("Parameter 'appRegId' is required."));
 
             try
             {
-                // Clear the appRegId from database
-                var updateQuery = @"UPDATE wcmUserCred
-                                   SET appRegId = NULL,
-                                       updateDt = getdate()
-                                   WHERE appRegId = @appRegId";
+                const string updSql = @"UPDATE wcmUserCred
+                                        SET appRegId = NULL,
+                                            updateDt = GETDATE()
+                                        WHERE appRegId = @appRegId";
+                _db.QaEWebBean(updSql, new Dictionary<string, object> { { "@appRegId", request.appRegId } });
 
-                var parameters = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
-
-                _dbHelper.QaEWebBean(updateQuery, parameters);
-
-                return Ok(new { msg = "Logout successful" });
+                return Ok(ApiResponse<object>.Ok(new { msg = "Logout successful" }));
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
+                return StatusCode(500, ApiResponse<object>.Fail($"Internal server error: {ex.Message}"));
             }
         }
 
-        /// <summary>
-        /// Check if appRegId is valid - utility endpoint for testing
-        /// </summary>
-        [AllowAnonymous]
-        [HttpPost("validate-token")]
-        public async Task<IActionResult> ValidateToken([FromBody] ValidateTokenRequest request)
-        {
-            if (request == null || string.IsNullOrWhiteSpace(request.appRegId))
-            {
-                return BadRequest("Parameter 'appRegId' is required.");
-            }
-
-            try
-            {
-                // Check Firebase token validity
-                var tokenValidation = await VerifyFirebaseToken(request.appRegId);
-
-                // Check database
-                var query = "SELECT loginIdm, updateDt FROM wcmUserCred WHERE appRegId = @appRegId";
-                var parameters = new Dictionary<string, object> { { "@appRegId", request.appRegId } };
-                var result = _dbHelper.QaEWebBean(query, parameters);
-
-                bool existsInDb = result != null && result.Count > 0;
-
-                return Ok(new
-                {
-                    firebaseValid = tokenValidation.isValid,
-                    databaseValid = existsInDb,
-                    isValid = tokenValidation.isValid && existsInDb,
-                    userID = existsInDb ? result[0]["loginIdm"]?.ToString() : null,
-                    lastUpdate = existsInDb ? result[0]["updateDt"]?.ToString() : null
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal server error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Generate Firebase-based appRegId or fallback to GUID
-        /// </summary>
-        private async Task<string> GenerateFirebaseAppRegId(string userID)
-        {
-            try
-            {
-                // Create custom claims for the user
-                var claims = new Dictionary<string, object>
-                {
-                    { "userID", userID },
-                    { "loginTime", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
-                    { "appName", "RAK_BusinessApp" },
-                    { "version", "1.0" }
-                };
-
-                // Generate custom token with 24-hour expiry (adjust as needed)
-                var customToken = await FirebaseAuth.DefaultInstance.CreateCustomTokenAsync(userID, claims);
-
-                Console.WriteLine($"✅ Generated Firebase token for user: {userID}");
-                return customToken;
-            }
-            catch (Exception ex)
-            {
-                // Fallback to timestamp-based GUID if Firebase fails
-                Console.WriteLine($"⚠️ Firebase token generation failed for {userID}: {ex.Message}");
-                return $"APP_{userID}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Guid.NewGuid().ToString("N")[..8]}";
-            }
-        }
-
-        /// <summary>
-        /// Verify Firebase token validity
-        /// </summary>
-        private async Task<(bool isValid, string uid)> VerifyFirebaseToken(string token)
-        {
-            try
-            {
-                // First try as ID token
-                var decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(token);
-                return (true, decodedToken.Uid);
-            }
-            catch (FirebaseAuthException ex)
-            {
-                Console.WriteLine($"Firebase token verification failed: {ex.Message}");
-
-                // If it's not an ID token, it might be a custom token or fallback ID
-                // For custom tokens, we can't verify directly, so we'll accept non-Firebase formats
-                if (token.StartsWith("APP_") || token.Length == 36) // GUID format
-                {
-                    return (true, ExtractUserIdFromToken(token));
-                }
-
-                return (false, null);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Token verification error: {ex.Message}");
-                return (false, null);
-            }
-        }
-
-        /// <summary>
-        /// Extract userID from fallback token format
-        /// </summary>
-        private string ExtractUserIdFromToken(string token)
-        {
-            try
-            {
-                if (token.StartsWith("APP_"))
-                {
-                    var parts = token.Split('_');
-                    if (parts.Length >= 2)
-                    {
-                        return parts[1]; // Return userID part
-                    }
-                }
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Get user details including roles and pages
-        /// </summary>
+        // ===================================================
+        //                  HELPERS (private)
+        // ===================================================
         private UserDetails GetUserDetails(string userID)
         {
-            var detailQuery = @"
+            const string detailSql = @"
                 SELECT
                     a.emplName AS emplName,
                     a.areaCode AS areaCode,
@@ -389,29 +230,21 @@ namespace sparshWebService.Controllers
                     AND a.loginIdM = @userID";
 
             var param = new Dictionary<string, object> { { "@userID", userID } };
-            var rset = _dbHelper.QaEWebBean(detailQuery, param);
-
-            if (rset == null || rset.Count == 0)
-            {
-                return null;
-            }
-
-            string emplName = rset[0]["emplName"]?.ToString();
-            string areaCode = rset[0]["areaCode"]?.ToString();
+            var rset = _db.QaEWebBean(detailSql, param);
+            if (rset == null || rset.Count == 0) return null;
 
             var roles = new HashSet<string>();
             var pages = new HashSet<string>();
+
+            string emplName = rset[0]["emplName"]?.ToString();
+            string areaCode = rset[0]["areaCode"]?.ToString();
 
             foreach (var row in rset)
             {
                 var role = row["roleCode"]?.ToString();
                 var page = row["mobPagId"]?.ToString();
-
-                if (!string.IsNullOrWhiteSpace(role))
-                    roles.Add(role);
-
-                if (!string.IsNullOrWhiteSpace(page))
-                    pages.Add(page);
+                if (!string.IsNullOrWhiteSpace(role)) roles.Add(role);
+                if (!string.IsNullOrWhiteSpace(page)) pages.Add(page);
             }
 
             return new UserDetails
@@ -423,10 +256,7 @@ namespace sparshWebService.Controllers
             };
         }
 
-        /// <summary>
-        /// Hash password using SHA1 with salt
-        /// </summary>
-        private string HashPassword(string password, string saltBase64)
+        private static string HashPassword(string password, string saltBase64)
         {
             if (string.IsNullOrWhiteSpace(password) || string.IsNullOrWhiteSpace(saltBase64))
                 return null;
@@ -434,54 +264,20 @@ namespace sparshWebService.Controllers
             byte[] saltBytes = Convert.FromBase64String(saltBase64);
             byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
 
-            using (var sha1 = SHA1.Create())
-            {
-                // Step 1: SHA-1(salt + password)
-                byte[] combined = new byte[saltBytes.Length + passwordBytes.Length];
-                Buffer.BlockCopy(saltBytes, 0, combined, 0, saltBytes.Length);
-                Buffer.BlockCopy(passwordBytes, 0, combined, saltBytes.Length, passwordBytes.Length);
+            using var sha1 = SHA1.Create();
 
-                byte[] hash = sha1.ComputeHash(combined);
+            // SHA1(salt + password)
+            byte[] combined = new byte[saltBytes.Length + passwordBytes.Length];
+            Buffer.BlockCopy(saltBytes, 0, combined, 0, saltBytes.Length);
+            Buffer.BlockCopy(passwordBytes, 0, combined, saltBytes.Length, passwordBytes.Length);
 
-                // Step 2: Apply iteration hashing
-                for (int i = 0; i < ITERATION_NUMBER; i++)
-                {
-                    hash = sha1.ComputeHash(hash);
-                }
+            byte[] hash = sha1.ComputeHash(combined);
 
-                return Convert.ToBase64String(hash);
-            }
+            // Apply iteration(s) to match your stored hashes
+            for (int i = 0; i < ITERATION_NUMBER; i++)
+                hash = sha1.ComputeHash(hash);
+
+            return Convert.ToBase64String(hash);
         }
-    }
-
-    // Request/Response Models
-    public class AuthRequest
-    {
-        public string userID { get; set; }
-        public string password { get; set; }
-        public string appRegId { get; set; }
-    }
-
-    public class AutoLoginRequest
-    {
-        public string appRegId { get; set; }
-    }
-
-    public class LogoutRequest
-    {
-        public string appRegId { get; set; }
-    }
-
-    public class ValidateTokenRequest
-    {
-        public string appRegId { get; set; }
-    }
-
-    public class UserDetails
-    {
-        public string emplName { get; set; }
-        public string areaCode { get; set; }
-        public HashSet<string> roles { get; set; }
-        public HashSet<string> pages { get; set; }
     }
 }
