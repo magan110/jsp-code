@@ -1,1348 +1,346 @@
-// lib/features/auth/screens/login_screen_with_otp.dart
-import 'dart:convert';
-import 'dart:math';
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using sparshWebService.DataAccess; // DatabaseHelper
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:go_router/go_router.dart';
-import 'package:http/http.dart' as http;
-import 'package:rak_web/core/navigation/app_router.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+namespace sparshWebService.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public sealed class SmsUaeController : ControllerBase
+    {
+        private readonly IConfiguration _cfg;
+        private readonly ILogger<SmsUaeController> _log;
+        private readonly DatabaseHelper _db;
 
-import '../../../core/theme/theme.dart';
-import '../../../core/widgets/custom_back_button.dart';
-import '../../../core/services/auth_service.dart';
-import '../../../core/models/auth_models.dart';
-
-class LoginScreenWithOtp extends StatefulWidget {
-  const LoginScreenWithOtp({super.key});
-
-  @override
-  State<LoginScreenWithOtp> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<LoginScreenWithOtp>
-    with SingleTickerProviderStateMixin {
-  final _formKey = GlobalKey<FormState>();
-  final _mobileController = TextEditingController();
-  final _otpController = TextEditingController();
-  bool _showOtpField = false;
-  bool _isLoading = false;
-
-  // ===== OTP constants & keys =====
-  static const _otpKeyCode = 'otp_code';
-  static const _otpKeyMobile = 'otp_mobile';
-  static const _otpKeyExpiry = 'otp_expiry'; // epoch millis
-  static const _otpKeyCooldown = 'otp_cooldown'; // epoch millis
-  static const _otpTtl = Duration(minutes: 5);
-  static const _resendCooldown = Duration(seconds: 30);
-
-  // ===== API endpoints (env split) =====
-  // QA (for verify / route)
-  static const String _qaSmsBase = 'https://qa.birlawhite.com:55232/api/SmsUae';
-  static const String _epVerify = '$_qaSmsBase/verify-mobile';
-  static const String _epRouteByMobile = '$_qaSmsBase/route-by-mobile';
-
-  // Relay on QA that forwards to prod (final sender)
-  static const String _relaySendUrl =
-      'https://qa.birlawhite.com:55232/api/RemoteSms/send';
-
-  SharedPreferences? _prefs;
-
-  late AnimationController _animationController;
-  late Animation<double> _fadeAnimation;
-  late Animation<Offset> _slideAnimation;
-  late Animation<double> _scaleAnimation;
-
-  @override
-  void initState() {
-    super.initState();
-
-    // Initialize animations
-    _animationController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1000),
-    );
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _animationController,
-        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
-      ),
-    );
-    _slideAnimation =
-        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
-      CurvedAnimation(
-        parent: _animationController,
-        curve: const Interval(0.2, 0.7, curve: Curves.easeOutCubic),
-      ),
-    );
-    _scaleAnimation = Tween<double>(begin: 0.95, end: 1.0).animate(
-      CurvedAnimation(
-        parent: _animationController,
-        curve: const Interval(0.3, 0.8, curve: Curves.easeOutCubic),
-      ),
-    );
-    _animationController.forward();
-  }
-
-  // ========= SharedPreferences helpers =========
-  Future<void> _initPrefs() async {
-    _prefs ??= await SharedPreferences.getInstance();
-  }
-
-  Future<void> _saveOtpLocally({
-    required String mobile,
-    required String otp,
-  }) async {
-    await _initPrefs();
-    final expiry = DateTime.now().add(_otpTtl).millisecondsSinceEpoch;
-    await _prefs!.setString(_otpKeyCode, otp);
-    await _prefs!.setString(_otpKeyMobile, mobile);
-    await _prefs!.setInt(_otpKeyExpiry, expiry);
-  }
-
-  Future<Map<String, dynamic>?> _loadOtp() async {
-    await _initPrefs();
-    final otp = _prefs!.getString(_otpKeyCode);
-    final mobile = _prefs!.getString(_otpKeyMobile);
-    final expiry = _prefs!.getInt(_otpKeyExpiry);
-    if (otp == null || mobile == null || expiry == null) return null;
-    return {'otp': otp, 'mobile': mobile, 'expiry': expiry};
-  }
-
-  Future<void> _clearOtp() async {
-    await _initPrefs();
-    await _prefs!.remove(_otpKeyCode);
-    await _prefs!.remove(_otpKeyMobile);
-    await _prefs!.remove(_otpKeyExpiry);
-  }
-
-  Future<void> _setResendCooldown() async {
-    await _initPrefs();
-    final ts = DateTime.now().add(_resendCooldown).millisecondsSinceEpoch;
-    await _prefs!.setInt(_otpKeyCooldown, ts);
-  }
-
-  Future<int?> _getResendCooldownLeft() async {
-    await _initPrefs();
-    final until = _prefs!.getInt(_otpKeyCooldown);
-    if (until == null) return null;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final left = until - now;
-    return left > 0 ? left : 0;
-  }
-
-  // ========= OTP utils & API =========
-  String _genOtp6() {
-    final rnd = Random.secure();
-    return (rnd.nextInt(900000) + 100000).toString(); // 100000..999999
-  }
-
-  // Store in prefs as MSISDN starting with 971 to avoid mismatch later.
-  String _normalizeForPrefs(String raw) {
-    var d = raw.replaceAll(RegExp(r'\D'), '');
-    if (d.startsWith('971')) return d;
-    return '971$d';
-  }
-
-  // --- Verify number exists on QA ---
-  Future<bool> _verifyMobileOnServer(String rawMobile) async {
-    final payload = {'mobileNo': rawMobile};
-    try {
-      final res = await http
-          .post(
-            Uri.parse(_epVerify),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(payload),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      if (res.statusCode == 200) {
-        final obj = jsonDecode(res.body) as Map<String, dynamic>;
-        final exists = (obj['exists'] ?? true) == true;
-        if (!exists) {
-          _showErrorSnackBar('Mobile not registered. Please contact support.');
-          return false;
+        public SmsUaeController(IConfiguration cfg, ILogger<SmsUaeController> log, DatabaseHelper db)
+        {
+            _cfg = cfg;
+            _log = log;
+            _db = db;
         }
-        return true;
-      }
-      if (res.statusCode == 404) {
-        _showErrorSnackBar('Mobile not registered. Please contact support.');
-        return false;
-      }
-      _showErrorSnackBar('Check failed (code ${res.statusCode}). Try again.');
-      return false;
-    } catch (_) {
-      _showErrorSnackBar('Network error while checking mobile. Try again.');
-      return false;
+
+        // ===== Request models =====
+        public sealed class SmsUaeRequest
+        {
+            public string MobileNo { get; set; } = "";   // e.g. "971521302203" or "521302203"
+            public string Message { get; set; } = "";    // e.g. "Dear User Your OTP is : 123456 Birla White (RAK)"
+            public string Priority { get; set; } = "High";
+            public string CountryCode { get; set; } = "ALL";
+        }
+
+        public sealed class RouteByMobileRequest
+        {
+            public string MobileNo { get; set; } = "";
+        }
+
+        // ===== Kyoto options (override via appsettings:SmsUae) =====
+        private sealed class SmsUaeOptions
+        {
+            public string BaseUrl { get; set; } = "http://sms.kyoto-tech.com/sendurl.aspx";
+            public string User { get; set; } = "RAK1976487";
+            public string Password { get; set; } = "ybsjy19u";
+            public string SenderId { get; set; } = "RAKWHITE";
+
+            public bool UseProxy { get; set; } = true;
+            public string ProxyHost { get; set; } = "185.46.212.90";
+            public int ProxyPort { get; set; } = 80;
+            public string ProxyUser { get; set; } = "rajendra.sikhwal";
+            public string ProxyPassword { get; set; } = "Raju@45103";
+
+            // Only relevant if you switch BaseUrl to HTTPS
+            public bool TrustAllSsl { get; set; } = true;
+        }
+
+        private SmsUaeOptions LoadOptions()
+        {
+            var opt = new SmsUaeOptions();
+            var section = _cfg.GetSection("SmsUae");
+            if (section.Exists()) section.Bind(opt);
+            return opt;
+        }
+
+        // --- Forwarding options (override via appsettings:SmsForward) ---
+        private sealed class SmsForwardOptions
+        {
+            public string TargetUrl { get; set; } =
+                "https://www.birlawhite.com:55230/api/SmsUae/send";
+
+
+            // If your environment uses intercepting proxy/self-signed certs
+            public bool TrustAllSsl { get; set; } = false;
+            public int TimeoutSeconds { get; set; } = 30;
+        }
+
+        private SmsForwardOptions LoadForwardOptions()
+        {
+            var opt = new SmsForwardOptions();
+            var section = _cfg.GetSection("SmsForward");
+            if (section.Exists()) section.Bind(opt);
+            return opt;
+        }
+
+        // ===== Health =====
+        [HttpGet("health")]
+        public IActionResult Health() => Ok(new { status = "OK", utc = DateTime.UtcNow });
+
+        // ===== Helpers =====
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length);
+            foreach (var ch in s)
+                if (ch >= '0' && ch <= '9') sb.Append(ch);
+            return sb.ToString();
+        }
+
+        private static string LastNDigits(string s, int n)
+        {
+            var d = Digits(s);
+            return d.Length <= n ? d : d.Substring(d.Length - n);
+        }
+
+        private static string SqlDigitsExpr(string column)
+        {
+            // Remove space, +, -, (, ) in SQL side
+            return $"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL({column},''),' ',''),'-',''),'+',''),'(',''),')','')";
+        }
+
+        private static string NormalizeToMsisdn(string raw)
+        {
+            // For Kyoto: ensure "971" + 9 digits
+            var d9 = LastNDigits(raw, 9);
+            return "971" + d9;
+        }
+
+        private (bool found, string inflType) FindInflTypeByMobile(string mobileInput)
+        {
+            // Accept any input; compare on digits-only using 9 and 11 last digits
+            var m9 = LastNDigits(mobileInput, 9);
+            var m11 = LastNDigits(mobileInput, 11);
+            if (string.IsNullOrEmpty(m9)) return (false, "");
+
+            var digitsSql = SqlDigitsExpr("mobileNo");
+
+            // If your table truly stores ONLY 9-digit values, the equality on @m9 already covers it.
+            // RIGHT(...,11) handles stored 11-digit formats.
+            var sql = $@"
+SELECT TOP 1 inflType
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE RIGHT({digitsSql}, 9)  = @m9
+   OR RIGHT({digitsSql}, 11) = @m11
+   OR mobileNo = @m9
+   OR mobileNo = @m11
+ORDER BY ISNULL(createDt, '1900-01-01') DESC;";
+
+            var prms = new Dictionary<string, object?>
+            {
+                ["@m9"] = m9,
+                ["@m11"] = m11
+            };
+
+            var rows = _db.QaEWebBean(sql, prms) ?? new List<Dictionary<string, object>>();
+            if (rows.Count == 0) return (false, "");
+
+            var inflType = (rows[0]["inflType"]?.ToString() ?? "").Trim().ToUpperInvariant();
+            return (true, inflType);
+        }
+
+        // ===== 1) Verify: /api/SmsUae/verify-mobile =====
+        [HttpPost("verify-mobile")]
+        public IActionResult VerifyMobile([FromBody] RouteByMobileRequest req)
+        {
+            try
+            {
+                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
+                    return BadRequest(new { success = false, message = "MobileNo is required." });
+
+                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
+                if (!found)
+                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
+
+                return Ok(new { success = true, exists = true, inflType });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "verify-mobile failed");
+                return StatusCode(500, new { success = false, message = "Error verifying mobile.", error = ex.Message });
+            }
+        }
+
+        // ===== 2) Route: /api/SmsUae/route-by-mobile =====
+        [HttpPost("route-by-mobile")]
+        public IActionResult RouteByMobile([FromBody] RouteByMobileRequest req)
+        {
+            try
+            {
+                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
+                    return BadRequest(new { success = false, message = "MobileNo is required." });
+
+                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
+                if (!found)
+                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
+
+                var route = inflType == "PN" ? "painter" : "contractor";
+                var message = route == "painter" ? "navigate to painter screen" : "navigate to contractor screen";
+
+                return Ok(new { success = true, exists = true, inflType, route, message });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "route-by-mobile failed");
+                return StatusCode(500, new { success = false, message = "Error deciding route.", error = ex.Message });
+            }
+        }
+
+        // ===== 3) Direct Send (Forward JSON to external API): /api/SmsUae/send =====
+        [HttpPost("send")]
+        public async Task<IActionResult> Send([FromBody] SmsUaeRequest req, CancellationToken ct)
+        {
+            if (req is null ||
+                string.IsNullOrWhiteSpace(req.MobileNo) ||
+                string.IsNullOrWhiteSpace(req.Message))
+            {
+                return BadRequest(new { success = false, message = "mobileNo and message are required." });
+            }
+
+            var fwd = LoadForwardOptions();
+
+            // Build HttpClient handler (proxy/trust settings if needed)
+            var handler = new HttpClientHandler();
+
+            if (fwd.TrustAllSsl)
+            {
+                handler.ServerCertificateCustomValidationCallback =
+                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            }
+
+            try
+            {
+                using var http = new HttpClient(handler, disposeHandler: true)
+                {
+                    Timeout = TimeSpan.FromSeconds(fwd.TimeoutSeconds <= 0 ? 30 : fwd.TimeoutSeconds)
+                };
+
+                // Serialize with camelCase to match external API keys
+                var json = JsonSerializer.Serialize(req, new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+                });
+
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                var resp = await http.PostAsync(fwd.TargetUrl, content, ct);
+                var respBody = await resp.Content.ReadAsStringAsync(ct);
+
+                // Pass-through style response (plus meta for debugging)
+                return StatusCode((int)resp.StatusCode, new
+                {
+                    success = resp.IsSuccessStatusCode,
+                    statusCode = (int)resp.StatusCode,
+                    forwardedTo = fwd.TargetUrl,
+                    requestBody = req,          // echoes what we sent
+                    response = respBody
+                });
+            }
+            catch (TaskCanceledException tex) when (!ct.IsCancellationRequested)
+            {
+                // Timeout
+                _log.LogError(tex, "SmsUaeController.send timed out");
+                return StatusCode(504, new { success = false, message = "Upstream timeout.", error = tex.Message });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "SmsUaeController.send failed");
+                return StatusCode(500, new { success = false, message = "Error forwarding SMS.", error = ex.Message });
+            }
+        }
+
+        // ===== 4) Verify + Send (Kyoto form-post): /api/SmsUae/send-if-registered =====
+        [HttpPost("send-if-registered")]
+        public async Task<IActionResult> SendIfRegistered([FromBody] SmsUaeRequest req, CancellationToken ct)
+        {
+            try
+            {
+                if (req is null || string.IsNullOrWhiteSpace(req.MobileNo) || string.IsNullOrWhiteSpace(req.Message))
+                    return BadRequest(new { success = false, message = "MobileNo and Message are required." });
+
+                // 1) verify
+                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
+                if (!found)
+                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
+
+                // 2) normalize to MSISDN for Kyoto (971 + last 9)
+                var msisdn = NormalizeToMsisdn(req.MobileNo);
+
+                // forward to Kyoto with normalized number
+                var toSend = new SmsUaeRequest
+                {
+                    MobileNo = msisdn,
+                    Message = req.Message,
+                    Priority = string.IsNullOrWhiteSpace(req.Priority) ? "High" : req.Priority,
+                    CountryCode = string.IsNullOrWhiteSpace(req.CountryCode) ? "ALL" : req.CountryCode
+                };
+
+                var opt = LoadOptions();
+
+                static string FormEnc(string s) => Uri.EscapeDataString(s ?? string.Empty);
+                var sb = new StringBuilder();
+                sb.Append("user=").Append(FormEnc(opt.User))
+                  .Append("&pwd=").Append(FormEnc(opt.Password))
+                  .Append("&senderid=").Append(FormEnc(opt.SenderId))
+                  .Append("&mobileno=").Append(FormEnc(toSend.MobileNo))
+                  .Append("&msgtext=").Append(FormEnc(toSend.Message))
+                  .Append("&priority=").Append(FormEnc(toSend.Priority))
+                  .Append("&CountryCode=").Append(FormEnc(toSend.CountryCode));
+                var formBody = sb.ToString();
+
+                var handler = new HttpClientHandler();
+                if (opt.UseProxy && !string.IsNullOrWhiteSpace(opt.ProxyHost))
+                {
+                    var proxy = new WebProxy(opt.ProxyHost, opt.ProxyPort)
+                    {
+                        BypassProxyOnLocal = false,
+                        Credentials = new NetworkCredential(opt.ProxyUser, opt.ProxyPassword)
+                    };
+                    handler.Proxy = proxy;
+                    handler.UseProxy = true;
+                }
+                if (opt.TrustAllSsl)
+                {
+                    handler.ServerCertificateCustomValidationCallback =
+                        HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+                }
+
+                using var http = new HttpClient(handler, disposeHandler: true);
+                using var content = new StringContent(formBody, Encoding.UTF8, "application/x-www-form-urlencoded");
+                var resp = await http.PostAsync(opt.BaseUrl, content, ct);
+                var body = await resp.Content.ReadAsStringAsync(ct);
+
+                var route = inflType == "PN" ? "painter" : "contractor";
+                return Ok(new
+                {
+                    success = true,
+                    exists = true,
+                    inflType,
+                    route,
+                    kyotoStatus = (int)resp.StatusCode,
+                    kyotoResponse = body
+                });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "send-if-registered failed");
+                return StatusCode(500, new { success = false, message = "Error sending SMS.", error = ex.Message });
+            }
+        }
     }
-  }
-
-  // --- Decide route on QA (painter/contractor) ---
-  Future<String?> _fetchRouteForMobile(String rawMobile) async {
-    final payload = {'mobileNo': rawMobile};
-    try {
-      final res = await http
-          .post(
-            Uri.parse(_epRouteByMobile),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(payload),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      if (res.statusCode == 200) {
-        final obj = jsonDecode(res.body) as Map<String, dynamic>;
-        final route = (obj['route'] ?? '').toString().toLowerCase();
-        if (route == 'painter' || route == 'contractor') return route;
-        return null;
-      }
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  // --- Send OTP via relay (calls RemoteSms -> prod) ---
-  Future<bool> _sendOtpThroughServer(String rawMobile, String otp) async {
-    final msg =
-        'Dear User, your one-time password (OTP) is: $otp Birla White (RAK)';
-
-    final payload = {
-      'mobileNo': rawMobile, // relay/server will normalize
-      'message': msg,
-      'priority': 'High',
-      'countryCode': 'ALL',
-    };
-
-    try {
-      final res = await http
-          .post(
-            Uri.parse(_relaySendUrl),
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-            },
-            body: jsonEncode(payload),
-          )
-          .timeout(const Duration(seconds: 20));
-
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        return true;
-      }
-
-      // Show detailed relay info if available
-      String info = 'code ${res.statusCode}';
-      try {
-        final obj = jsonDecode(res.body) as Map<String, dynamic>;
-        final rs = obj['remoteStatus'];
-        final rr = obj['remoteResponse'];
-        if (rs != null) info += ', remoteStatus: $rs';
-        if (rr != null) info += ', remoteResponse: $rr';
-      } catch (_) {
-        // ignore parse errors; show raw code only
-      }
-
-      _showErrorSnackBar('Failed to send OTP ($info).');
-      return false;
-    } catch (_) {
-      _showErrorSnackBar('Network error sending OTP. Please try again.');
-      return false;
-    }
-  }
-
-  // ========= Actions =========
-  Future<void> _handleOtpLogin() async {
-    if (!_formKey.currentState!.validate()) return;
-
-    setState(() => _isLoading = true);
-
-    try {
-      final mobileRaw = _mobileController.text.trim();
-      final enteredOtp = _otpController.text.trim();
-
-      if (enteredOtp.isEmpty) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('Please enter OTP');
-        return;
-      }
-      if (enteredOtp.length != 6 || !RegExp(r'^\d{6}$').hasMatch(enteredOtp)) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('OTP must be 6 digits');
-        return;
-      }
-
-      final stored = await _loadOtp();
-      if (stored == null) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('No OTP found. Please request a new OTP.');
-        return;
-      }
-
-      final now = DateTime.now().millisecondsSinceEpoch;
-      final targetMobile = stored['mobile'] as String;
-      final savedOtp = stored['otp'] as String;
-      final expiry = stored['expiry'] as int;
-
-      if (_normalizeForPrefs(mobileRaw) != targetMobile) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('Mobile number mismatch. Request OTP again.');
-        return;
-      }
-      if (now > expiry) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('OTP expired. Please request a new OTP.');
-        return;
-      }
-      if (enteredOtp != savedOtp) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('Invalid OTP. Please try again.');
-        return;
-      }
-
-      // Success -> clear OTP
-      await _clearOtp();
-
-      // Get route based on inflType
-      final route = await _fetchRouteForMobile(mobileRaw);
-
-      // Set a basic session
-      final role = (route == 'painter') ? 'PAINTER' : 'CONTRACTOR';
-      final dummyUser = UserData(
-        emplName: 'OTP User',
-        areaCode: 'DEFAULT',
-        roles: [role],
-        pages: ['DASHBOARD'],
-      );
-      AuthManager.setUser(dummyUser);
-
-      if (!mounted) return;
-
-      // Navigate based on route
-      if (route == 'painter') {
-        context.go('${AppRouter.painterHome}?newRegistration=false&role=$role');
-      } else {
-        context.go(
-          '${AppRouter.contractorHome}?newRegistration=false&role=$role',
-        );
-      }
-
-      setState(() => _isLoading = false);
-    } catch (_) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-        _showErrorSnackBar('Error during OTP verification. Please try again.');
-      }
-    }
-  }
-
-  void _showErrorSnackBar(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: Colors.red,
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
-
-  @override
-  void dispose() {
-    _mobileController.dispose();
-    _otpController.dispose();
-    _animationController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    SystemChrome.setSystemUIOverlayStyle(
-      const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-        statusBarBrightness: Brightness.light,
-      ),
-    );
-
-    return Scaffold(
-      backgroundColor: Colors.white,
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final isMobile = constraints.maxWidth < 600;
-          final isTablet =
-              constraints.maxWidth >= 600 && constraints.maxWidth < 1200;
-          final isDesktop = constraints.maxWidth >= 1200;
-
-          return Container(
-            width: double.infinity,
-            height: double.infinity,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  Colors.blue.shade50,
-                  Colors.blue.shade100,
-                  Colors.purple.shade50,
-                ],
-              ),
-            ),
-            child: Stack(
-              children: [
-                if (Navigator.of(context).canPop())
-                  const Positioned(
-                    top: 50,
-                    left: 20,
-                    child: CustomBackButton(),
-                  ),
-                isMobile
-                    ? _buildMobileLayout()
-                    : _buildWebLayout(isTablet, isDesktop),
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildMobileLayout() {
-    return Center(
-      child: SingleChildScrollView(
-        child: FadeTransition(
-          opacity: _fadeAnimation,
-          child: SlideTransition(
-            position: _slideAnimation,
-            child: ScaleTransition(
-              scale: _scaleAnimation,
-              child: Container(
-                constraints: const BoxConstraints(maxWidth: 420),
-                margin: const EdgeInsets.symmetric(horizontal: 24),
-                child: Card(
-                  elevation: 24,
-                  shadowColor: Colors.blue.withOpacity(0.15),
-                  color: Colors.white.withOpacity(0.98),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(28),
-                  ),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 300),
-                    padding: const EdgeInsets.all(40),
-                    child: _buildLoginForm(),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildWebLayout(bool isTablet, bool isDesktop) {
-    return Row(
-      children: [
-        // Left side - Branding/Info
-        Expanded(
-          flex: isDesktop ? 3 : 2,
-          child: Container(
-            padding: EdgeInsets.all(isDesktop ? 80 : 60),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildAnimatedLogo(),
-                SizedBox(height: isDesktop ? 40 : 32),
-                Text(
-                  'Welcome Back',
-                  style: TextStyle(
-                    fontSize: isDesktop ? 48 : 36,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.blue.shade800,
-                  ),
-                ),
-                SizedBox(height: isDesktop ? 20 : 16),
-                Text(
-                  'Enter your mobile number to receive an OTP and access your RAK account.',
-                  style: TextStyle(
-                    fontSize: isDesktop ? 18 : 16,
-                    color: Colors.grey.shade600,
-                    height: 1.5,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        // Right side - Login Form
-        Expanded(
-          flex: isDesktop ? 2 : 3,
-          child: Container(
-            height: double.infinity,
-            decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.98),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.1),
-                  blurRadius: 20,
-                  offset: const Offset(-5, 0),
-                ),
-              ],
-            ),
-            child: Center(
-              child: SingleChildScrollView(
-                padding: EdgeInsets.all(isDesktop ? 60 : 40),
-                child: FadeTransition(
-                  opacity: _fadeAnimation,
-                  child: SlideTransition(
-                    position: _slideAnimation,
-                    child: Container(
-                      constraints: const BoxConstraints(maxWidth: 400),
-                      child: _buildLoginForm(),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAnimatedLogo() {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 600),
-      curve: Curves.easeOutCubic,
-      builder: (context, value, child) {
-        return Transform.scale(
-          scale: 0.8 + (0.2 * value),
-          child: Container(
-            height: 120,
-            width: 120,
-            decoration: BoxDecoration(
-              color: Colors.white,
-              shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.blue.withOpacity(0.2),
-                  blurRadius: 15,
-                  spreadRadius: 3,
-                ),
-              ],
-            ),
-            child: Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: ClipOval(
-                child: Image.asset(
-                  'assets/images/rak_logo.jpg',
-                  fit: BoxFit.contain,
-                  errorBuilder: (context, error, stackTrace) {
-                    return Container(
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [Colors.blue.shade700, Colors.blue.shade500],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Center(
-                        child: Text(
-                          'RAK',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 28,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 2,
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildLoginForm() {
-    return Form(
-      key: _formKey,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildAnimatedTitle(),
-          const SizedBox(height: 32),
-          ModernTextField(
-            controller: _mobileController,
-            labelText: 'Mobile Number',
-            hintText: '50XXXXXXX',
-            keyboardType: TextInputType.phone,
-            isDark: false,
-            prefixIcon: Icons.phone_outlined,
-            validator: (value) {
-              if (value == null || value.trim().isEmpty) {
-                return 'Please enter mobile number';
-              }
-              return null;
-            },
-            delay: const Duration(milliseconds: 300),
-          ),
-          const SizedBox(height: 24),
-          if (_showOtpField)
-            ModernTextField(
-              controller: _otpController,
-              labelText: 'OTP',
-              hintText: 'Enter 6-digit OTP',
-              keyboardType: TextInputType.number,
-              isDark: false,
-              prefixIcon: Icons.security_outlined,
-              validator: (value) {
-                if (!_showOtpField) return null;
-                if (value == null || value.trim().isEmpty) {
-                  return 'Please enter OTP';
-                }
-                if (value.trim().length != 6) {
-                  return 'OTP must be 6 digits';
-                }
-                return null;
-              },
-              delay: const Duration(milliseconds: 450),
-            ),
-          const SizedBox(height: 32),
-          if (!_showOtpField)
-            ModernButton(
-              text: 'Get OTP',
-              isLoading: _isLoading,
-              onPressed: () async {
-                if (_isLoading) return;
-                if (!_formKey.currentState!.validate()) return;
-
-                final mobileRaw = _mobileController.text.trim();
-
-                // Rate-limit for resend
-                final leftMs = await _getResendCooldownLeft();
-                if (leftMs != null && leftMs > 0) {
-                  final secs = (leftMs / 1000).ceil();
-                  _showErrorSnackBar(
-                    'Please wait ${secs}s before requesting again.',
-                  );
-                  return;
-                }
-
-                setState(() => _isLoading = true);
-
-                // 1) Verify on QA that mobile exists in table
-                final ok = await _verifyMobileOnServer(mobileRaw);
-                if (!ok) {
-                  if (mounted) setState(() => _isLoading = false);
-                  return;
-                }
-
-                // 2) Generate OTP and send via PROD (through relay)
-                final otp = _genOtp6();
-                final sent = await _sendOtpThroughServer(mobileRaw, otp);
-
-                if (mounted) setState(() => _isLoading = false);
-
-                if (sent) {
-                  // Save OTP locally for client-side match
-                  await _saveOtpLocally(
-                    mobile: _normalizeForPrefs(mobileRaw),
-                    otp: otp,
-                  );
-                  await _setResendCooldown();
-
-                  if (mounted) {
-                    setState(() => _showOtpField = true);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('OTP sent successfully!'),
-                        backgroundColor: Colors.green,
-                        duration: Duration(seconds: 3),
-                      ),
-                    );
-                  }
-                }
-              },
-              isPrimary: true,
-              isDark: false,
-              delay: const Duration(milliseconds: 600),
-            ),
-          if (_showOtpField) ...[
-            ModernButton(
-              text: 'Verify & Login',
-              isLoading: _isLoading,
-              onPressed: () async => _handleOtpLogin(),
-              isPrimary: true,
-              isDark: false,
-              delay: const Duration(milliseconds: 600),
-            ),
-            const SizedBox(height: 16),
-            ModernButton(
-              text: 'Resend OTP',
-              isLoading: false,
-              onPressed: () async {
-                final leftMs = await _getResendCooldownLeft();
-                if (leftMs != null && leftMs > 0) {
-                  _showErrorSnackBar(
-                    'Please wait ${(leftMs / 1000).ceil()}s before resending.',
-                  );
-                  return;
-                }
-                final mobileRaw = _mobileController.text.trim();
-                if (mobileRaw.isEmpty) {
-                  _showErrorSnackBar('Enter mobile to resend OTP.');
-                  return;
-                }
-
-                // Optional: verify again on QA
-                final ok = await _verifyMobileOnServer(mobileRaw);
-                if (!ok) return;
-
-                final otp = _genOtp6();
-                final sent = await _sendOtpThroughServer(mobileRaw, otp);
-                if (sent) {
-                  await _saveOtpLocally(
-                    mobile: _normalizeForPrefs(mobileRaw),
-                    otp: otp,
-                  );
-                  await _setResendCooldown();
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('OTP resent successfully!'),
-                      backgroundColor: Colors.blue,
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
-                }
-              },
-              isPrimary: false,
-              isDark: false,
-              delay: const Duration(milliseconds: 750),
-            ),
-          ],
-          const SizedBox(height: 24),
-          _buildSignUpSection(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAnimatedTitle() {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 600),
-      curve: Curves.easeOut,
-      builder: (context, value, child) {
-        return Opacity(
-          opacity: value,
-          child: Transform.translate(
-            offset: Offset(0, 20 * (1 - value)),
-            child: child,
-          ),
-        );
-      },
-      child: Text(
-        'OTP Login',
-        style: AppTheme.headline.copyWith(color: Colors.blue),
-      ),
-    );
-  }
-
-  Widget _buildSignUpSection() {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 800),
-      builder: (context, value, child) {
-        return Opacity(
-          opacity: value,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                "Don't have an account? ",
-                style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
-              ),
-              TextButton(
-                onPressed: () {
-                  context.push(AppRouter.registrationType);
-                },
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                child: Text(
-                  'Sign up',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Colors.blue.shade600,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-// ---------------- Shared UI widgets (unchanged) ----------------
-
-class ModernTextField extends StatefulWidget {
-  final TextEditingController controller;
-  final String labelText;
-  final String? hintText;
-  final TextInputType keyboardType;
-  final String? Function(String?)? validator;
-  final Duration delay;
-  final bool isDark;
-  final IconData? prefixIcon;
-
-  const ModernTextField({
-    super.key,
-    required this.controller,
-    required this.labelText,
-    this.hintText,
-    required this.keyboardType,
-    this.validator,
-    required this.delay,
-    required this.isDark,
-    this.prefixIcon,
-  });
-
-  @override
-  State<ModernTextField> createState() => _ModernTextFieldState();
-}
-
-class _ModernTextFieldState extends State<ModernTextField> {
-  bool _isVisible = false;
-  bool _isFocused = false;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(widget.delay, () {
-      if (mounted) {
-        setState(() {
-          _isVisible = true;
-        });
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: Focus(
-          onFocusChange: (focused) {
-            setState(() {
-              _isFocused = focused;
-            });
-          },
-          child: TextFormField(
-            controller: widget.controller,
-            keyboardType: widget.keyboardType,
-            style: const TextStyle(fontSize: 16, color: Colors.black87),
-            decoration: InputDecoration(
-              labelText: widget.labelText,
-              hintText: widget.hintText,
-              prefixIcon: widget.prefixIcon != null
-                  ? Icon(
-                      widget.prefixIcon,
-                      color: _isFocused ? Colors.blue : Colors.grey.shade600,
-                    )
-                  : null,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(16),
-                borderSide: BorderSide(color: Colors.grey.shade300),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(16),
-                borderSide: BorderSide(color: Colors.grey.shade300),
-              ),
-              focusedBorder: const OutlineInputBorder(
-                borderRadius: BorderRadius.all(Radius.circular(16)),
-                borderSide: BorderSide(color: Colors.blue, width: 2),
-              ),
-              errorBorder: const OutlineInputBorder(
-                borderRadius: BorderRadius.all(Radius.circular(16)),
-                borderSide: BorderSide(color: Colors.red, width: 1),
-              ),
-              focusedErrorBorder: const OutlineInputBorder(
-                borderRadius: BorderRadius.all(Radius.circular(16)),
-                borderSide: BorderSide(color: Colors.red, width: 2),
-              ),
-              filled: true,
-              fillColor: Colors.grey.shade50,
-              labelStyle: TextStyle(
-                color: _isFocused ? Colors.blue : Colors.grey.shade600,
-              ),
-              hintStyle: TextStyle(color: Colors.grey.shade400),
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 20,
-                vertical: 20,
-              ),
-            ),
-            validator: widget.validator,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class ModernButton extends StatefulWidget {
-  final String text;
-  final bool isLoading;
-  final VoidCallback onPressed;
-  final Duration delay;
-  final bool isPrimary;
-  final bool isDark;
-
-  const ModernButton({
-    super.key,
-    required this.text,
-    required this.isLoading,
-    required this.onPressed,
-    required this.delay,
-    required this.isPrimary,
-    required this.isDark,
-  });
-
-  @override
-  State<ModernButton> createState() => _ModernButtonState();
-}
-
-class _ModernButtonState extends State<ModernButton> {
-  bool _isVisible = false;
-  bool _isHovered = false;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(widget.delay, () {
-      if (mounted) {
-        setState(() {
-          _isVisible = true;
-        });
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: SizedBox(
-          width: double.infinity,
-          height: 56,
-          child: widget.isPrimary
-              ? ElevatedButton(
-                  onPressed: widget.isLoading ? null : widget.onPressed,
-                  style: ElevatedButton.styleFrom(
-                    elevation: _isHovered ? 12 : 6,
-                    shadowColor: Colors.blue.withOpacity(0.3),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    backgroundColor: Colors.blue,
-                    foregroundColor: Colors.white,
-                  ).copyWith(
-                    backgroundColor:
-                        WidgetStateProperty.resolveWith((states) {
-                      if (states.contains(WidgetState.disabled)) {
-                        return Colors.grey.shade400;
-                      }
-                      return Colors.blue;
-                    }),
-                  ),
-                  onHover: (hovering) {
-                    setState(() {
-                      _isHovered = hovering;
-                    });
-                  },
-                  child: widget.isLoading
-                      ? const Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
-                              ),
-                            ),
-                            SizedBox(width: 16),
-                            Text('Please wait...'),
-                          ],
-                        )
-                      : Text(
-                          widget.text,
-                          style: const TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
-                )
-              : OutlinedButton(
-                  onPressed: widget.onPressed,
-                  style: OutlinedButton.styleFrom(
-                    side: BorderSide(color: Colors.grey.shade300, width: 1.5),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    backgroundColor:
-                        _isHovered ? Colors.grey.shade50 : null,
-                  ),
-                  onHover: (hovering) {
-                    setState(() {
-                      _isHovered = hovering;
-                    });
-                  },
-                  child: Text(
-                    widget.text,
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w500,
-                      color: Colors.grey.shade700,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                ),
-        ),
-      ),
-    );
-  }
-}
-
-class AnimatedTextField extends StatefulWidget {
-  final TextEditingController controller;
-  final String labelText;
-  final String? hintText;
-  final String? prefixText;
-  final TextInputType keyboardType;
-  final String? Function(String?)? validator;
-  final Duration delay;
-
-  const AnimatedTextField({
-    super.key,
-    required this.controller,
-    required this.labelText,
-    this.hintText,
-    this.prefixText,
-    required this.keyboardType,
-    this.validator,
-    required this.delay,
-  });
-
-  @override
-  State<AnimatedTextField> createState() => _AnimatedTextFieldState();
-}
-
-class _AnimatedTextFieldState extends State<AnimatedTextField> {
-  bool _isVisible = false;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(widget.delay, () {
-      if (mounted) {
-        setState(() {
-          _isVisible = true;
-        });
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: TextFormField(
-          controller: widget.controller,
-          decoration: InputDecoration(
-            labelText: widget.labelText,
-            hintText: widget.hintText,
-            prefixText: widget.prefixText,
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-              borderSide: BorderSide.none,
-            ),
-            filled: true,
-            fillColor: Colors.grey.shade100,
-            focusedBorder: const OutlineInputBorder(
-              borderRadius: BorderRadius.all(Radius.circular(12)),
-              borderSide: BorderSide(color: Colors.blue, width: 2),
-            ),
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 16,
-              vertical: 16,
-            ),
-          ),
-          keyboardType: widget.keyboardType,
-          validator: widget.validator,
-        ),
-      ),
-    );
-  }
-}
-
-class AnimatedCheckbox extends StatefulWidget {
-  final bool value;
-  final Function(bool?)? onChanged;
-  final Duration delay;
-
-  const AnimatedCheckbox({
-    super.key,
-    required this.value,
-    this.onChanged,
-    required this.delay,
-  });
-
-  @override
-  State<AnimatedCheckbox> createState() => _AnimatedCheckboxState();
-}
-
-class _AnimatedCheckboxState extends State<AnimatedCheckbox> {
-  bool _isVisible = false;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(widget.delay, () {
-      if (mounted) {
-        setState(() {
-          _isVisible = true;
-        });
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: Row(
-          children: [
-            AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: widget.value ? Colors.blue : Colors.transparent,
-                border: Border.all(
-                  color: widget.value ? Colors.blue : Colors.grey,
-                  width: 2,
-                ),
-              ),
-              width: 24,
-              height: 24,
-              child: widget.value
-                  ? const Icon(Icons.check, color: Colors.white, size: 16)
-                  : null,
-            ),
-            const SizedBox(width: 12),
-            GestureDetector(
-              onTap: () => widget.onChanged?.call(!widget.value),
-              child: const Text(
-                'Employee Login',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class AnimatedButton extends StatefulWidget {
-  final String text;
-  final bool isLoading;
-  final VoidCallback onPressed;
-  final Duration delay;
-  final Color? textColor;
-
-  const AnimatedButton({
-    super.key,
-    required this.text,
-    required this.isLoading,
-    required this.onPressed,
-    required this.delay,
-    this.textColor,
-  });
-
-  @override
-  State<AnimatedButton> createState() => _AnimatedButtonState();
-}
-
-class _AnimatedButtonState extends State<AnimatedButton> {
-  bool _isVisible = false;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(widget.delay, () {
-      if (mounted) {
-        setState(() {
-          _isVisible = true;
-        });
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: SizedBox(
-          width: double.infinity,
-          height: 56,
-          child: ElevatedButton(
-            onPressed: widget.isLoading ? null : widget.onPressed,
-            style: ElevatedButton.styleFrom(
-              elevation: 8,
-              shadowColor: Colors.blue.withOpacity(0.3),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16),
-              ),
-              backgroundColor: Colors.blue,
-              foregroundColor: widget.textColor ?? Colors.white,
-            ),
-            child: widget.isLoading
-                ? const Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      ),
-                      SizedBox(width: 16),
-                      Text('Please wait...'),
-                    ],
-                  )
-                : Text(
-                    widget.text,
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                      color: widget.textColor ?? Colors.white,
-                    ),
-                  ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class AnimatedOutlineButton extends StatefulWidget {
-  final String text;
-  final VoidCallback onPressed;
-  final Duration delay;
-
-  const AnimatedOutlineButton({
-    super.key,
-    required this.text,
-    required this.onPressed,
-    required this.delay,
-  });
-
-  @override
-  State<AnimatedOutlineButton> createState() => _AnimatedOutlineButtonState();
-}
-
-class _AnimatedOutlineButtonState extends State<AnimatedOutlineButton> {
-  bool _isVisible = false;
-  bool _isHovered = false;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(widget.delay, () {
-      if (mounted) {
-        setState(() {
-          _isVisible = true;
-        });
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      opacity: _isVisible ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        transform: Matrix4.translationValues(_isVisible ? 0 : 20, 0, 0),
-        child: MouseRegion(
-          onEnter: (_) => setState(() => _isHovered = true),
-          onExit: (_) => setState(() => _isHovered = false),
-          child: OutlinedButton(
-            onPressed: widget.onPressed,
-            style: OutlinedButton.styleFrom(
-              side: BorderSide(
-                color: _isHovered ? Colors.blue : Colors.grey.shade400,
-                width: 1.5,
-              ),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              backgroundColor:
-                  _isHovered ? Colors.blue.withOpacity(0.05) : null,
-            ),
-            child: Text(
-              widget.text,
-              style: TextStyle(
-                fontSize: 14,
-                color: _isHovered ? Colors.blue : Colors.grey.shade700,
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
 }
