@@ -1,3 +1,4 @@
+// lib/features/auth/screens/login_screen_with_otp.dart
 import 'dart:convert';
 import 'dart:math';
 
@@ -11,6 +12,7 @@ import '../../../core/theme/theme.dart';
 import '../../../core/widgets/custom_back_button.dart';
 import '../../../core/services/auth_service.dart';
 import '../../../core/models/auth_models.dart';
+import '../../../navigation/app_router.dart'; // <-- ensure this import points to your AppRouter
 
 class LoginScreenWithOtp extends StatefulWidget {
   const LoginScreenWithOtp({super.key});
@@ -35,10 +37,13 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
   static const _otpTtl = Duration(minutes: 5);
   static const _resendCooldown = Duration(seconds: 30);
 
-  // ===== API endpoints (NEW) =====
-  static const String _base = 'https://www.birlawhite.com:55230/api/SmsUae';
-  static const String _epVerify = '$_base/verify-mobile';
-  static const String _epSendIfRegistered = '$_base/send-if-registered';
+  // ===== API endpoints (as per your environment split) =====
+  static const String _qaBase = 'https://qa.birlawhite.com:55232/api/SmsUae';
+  static const String _prodBase = 'https://www.birlawhite.com:55230/api/SmsUae';
+
+  static const String _epVerify = '$_qaBase/verify-mobile';
+  static const String _epRouteByMobile = '$_qaBase/route-by-mobile';
+  static const String _epSend = '$_prodBase/send';
 
   SharedPreferences? _prefs;
 
@@ -138,7 +143,7 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
     return '971$d';
   }
 
-  // --- NEW: Call server to check if mobile exists in ctmInfluncr ---
+  // --- Verify number exists on QA ---
   Future<bool> _verifyMobileOnServer(String rawMobile) async {
     final payload = {'mobileNo': rawMobile};
     try {
@@ -171,13 +176,37 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
     }
   }
 
-  // --- NEW: Send OTP using send-if-registered (server re-validates & normalizes) ---
+  // --- Decide route on QA (painter/contractor) ---
+  Future<String?> _fetchRouteForMobile(String rawMobile) async {
+    final payload = {'mobileNo': rawMobile};
+    try {
+      final res = await http
+          .post(
+            Uri.parse(_epRouteByMobile),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(payload),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (res.statusCode == 200) {
+        final obj = jsonDecode(res.body) as Map<String, dynamic>;
+        final route = (obj['route'] ?? '').toString().toLowerCase();
+        if (route == 'painter' || route == 'contractor') return route;
+        return null;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // --- Send OTP on PROD ---
   Future<bool> _sendOtpThroughServer(String rawMobile, String otp) async {
     final msg =
         'Dear User, your one-time password (OTP) is: $otp Birla White (RAK)';
 
     final payload = {
-      'mobileNo': rawMobile, // server normalizes & checks registration
+      'mobileNo': rawMobile, // API will normalize to 971 + last 9
       'message': msg,
       'priority': 'High',
       'countryCode': 'ALL',
@@ -186,7 +215,7 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
     try {
       final res = await http
           .post(
-            Uri.parse(_epSendIfRegistered),
+            Uri.parse(_epSend),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(payload),
           )
@@ -194,10 +223,6 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
 
       if (res.statusCode >= 200 && res.statusCode < 300) {
         return true;
-      }
-      if (res.statusCode == 404) {
-        _showErrorSnackBar('Mobile not registered. Please contact support.');
-        return false;
       }
       _showErrorSnackBar('Failed to send OTP (code ${res.statusCode}).');
       return false;
@@ -256,23 +281,32 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
         return;
       }
 
-      // Treat as success after local verification.
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-
-      // Clear OTP after successful login
+      // Success -> clear OTP
       await _clearOtp();
 
-      // Your existing dummy user + session
+      // Get route based on inflType
+      final route = await _fetchRouteForMobile(mobileRaw);
+
+      // Set a basic session
+      final role = (route == 'painter') ? 'PAINTER' : 'CONTRACTOR';
       final dummyUser = UserData(
         emplName: 'OTP User',
         areaCode: 'DEFAULT',
-        roles: ['USER'],
+        roles: [role],
         pages: ['DASHBOARD'],
       );
       AuthManager.setUser(dummyUser);
 
-      context.go('/home');
+      if (!mounted) return;
+
+      // Navigate based on route
+      if (route == 'painter') {
+        context.go('${AppRouter.painterHome}?newRegistration=false&role=$role');
+      } else {
+        context.go('${AppRouter.contractorHome}?newRegistration=false&role=$role');
+      }
+
+      setState(() => _isLoading = false);
     } catch (_) {
       if (mounted) {
         setState(() => _isLoading = false);
@@ -583,14 +617,14 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
 
                 setState(() => _isLoading = true);
 
-                // 1) Verify on server that mobile exists in table
+                // 1) Verify on QA that mobile exists in table
                 final ok = await _verifyMobileOnServer(mobileRaw);
                 if (!ok) {
                   if (mounted) setState(() => _isLoading = false);
                   return;
                 }
 
-                // 2) Generate OTP and send via server (send-if-registered)
+                // 2) Generate OTP and send via PROD
                 final otp = _genOtp6();
                 final sent = await _sendOtpThroughServer(mobileRaw, otp);
 
@@ -636,8 +670,7 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
               onPressed: () async {
                 final leftMs = await _getResendCooldownLeft();
                 if (leftMs != null && leftMs > 0) {
-                  final secs = (leftMs / 1000).ceil();
-                  _showErrorSnackBar('Please wait ${secs}s before resending.');
+                  _showErrorSnackBar('Please wait ${ (leftMs / 1000).ceil() }s before resending.');
                   return;
                 }
                 final mobileRaw = _mobileController.text.trim();
@@ -646,7 +679,7 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
                   return;
                 }
 
-                // Ensure still registered (optional, but safer)
+                // Optional: verify again on QA
                 final ok = await _verifyMobileOnServer(mobileRaw);
                 if (!ok) return;
 
@@ -716,7 +749,7 @@ class _LoginScreenState extends State<LoginScreenWithOtp>
               ),
               TextButton(
                 onPressed: () {
-                  context.push('/registration-type');
+                  context.push(AppRouter.registrationType);
                 },
                 style: TextButton.styleFrom(
                   padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -904,25 +937,24 @@ class _ModernButtonState extends State<ModernButton> {
           child: widget.isPrimary
               ? ElevatedButton(
                   onPressed: widget.isLoading ? null : widget.onPressed,
-                  style:
-                      ElevatedButton.styleFrom(
-                        elevation: _isHovered ? 12 : 6,
-                        shadowColor: Colors.blue.withOpacity(0.3),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        backgroundColor: Colors.blue,
-                        foregroundColor: Colors.white,
-                      ).copyWith(
-                        backgroundColor: WidgetStateProperty.resolveWith((
-                          states,
-                        ) {
-                          if (states.contains(WidgetState.disabled)) {
-                            return Colors.grey.shade400;
-                          }
-                          return Colors.blue;
-                        }),
-                      ),
+                  style: ElevatedButton.styleFrom(
+                    elevation: _isHovered ? 12 : 6,
+                    shadowColor: Colors.blue.withOpacity(0.3),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    backgroundColor: Colors.blue,
+                    foregroundColor: Colors.white,
+                  ).copyWith(
+                    backgroundColor: WidgetStateProperty.resolveWith(
+                      (states) {
+                        if (states.contains(WidgetState.disabled)) {
+                          return Colors.grey.shade400;
+                        }
+                        return Colors.blue;
+                      },
+                    ),
+                  ),
                   onHover: (hovering) {
                     setState(() {
                       _isHovered = hovering;
