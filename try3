@@ -1,982 +1,347 @@
+// Controllers/SmsUaeController.cs
 using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using sparshWebService.DataAccess; // DatabaseHelper
 using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace sparshWebService.Controllers
 {
-    [Route("api/[controller]")]
     [ApiController]
-    [Produces("application/json")]
-    public class PainterController : ControllerBase
+    [Route("api/[controller]")]
+    public sealed class SmsUaeController : ControllerBase
     {
+        private readonly IConfiguration _cfg;
+        private readonly ILogger<SmsUaeController> _log;
         private readonly DatabaseHelper _db;
 
-        public PainterController(DatabaseHelper dbHelper)
+        public SmsUaeController(IConfiguration cfg, ILogger<SmsUaeController> log, DatabaseHelper db)
         {
-            _db = dbHelper;
+            _cfg = cfg;
+            _log = log;
+            _db = db;
         }
 
-        // POST: /api/Painter/register
-        [HttpPost("register")]
-        [Consumes("application/json")]
-        public IActionResult Register([FromBody] PainterRegistrationRequest? request = null)
+        // ===== Request models =====
+        public sealed class SmsUaeRequest
         {
-            try
-            {
-                request ??= new PainterRegistrationRequest();
-
-                // --- Keys / defaults ---
-                var inflType = "PN";                                                           // char(2) -> Painter
-                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();           // char(3) - use emirates code as area code
-
-                // NEW: Generate sequential inflCode = "PN" + 6-digit number (char(8))
-                string inflCode = GetNextInfluencerCode(inflType);
-
-                // Names
-                var fullName = string.Join(" ",
-                    new[] { request.FirstName, request.MiddleName, request.LastName }
-                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
-
-                var inflName256 = Cut(fullName, 256);  // inflName nvarchar(256)
-                var contName40 = Cut(fullName, 40);   // contName varchar(40)
-
-                // Address cluster (legacy)
-                var inflAdd1_50 = Cut(request.Address, 50);
-                var inflAdd2_100 = "";
-                var inflAdd3_30 = "";                // keep empty (NOT NULL but "" allowed)
-                var inflCity_255 = "";
-
-                // Mobile
-                var mobile11 = FormatMobile11(request.MobileNumber); // varchar(11)
-
-                // Bank (legacy)
-                var bankName100 = Cut(request.BankName, 100);
-                var branchName100 = Cut(request.BranchName, 100);
-                var acctHolder40 = Cut(request.AccountHolderName, 40);
-
-                // Painter extra (varchar 255 columns we added)
-                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
-                var idholder255 = Cut(request.IdName, 255);
-                var nationty255 = Cut(request.Nationality, 255);
-                var employer255 = Cut(request.CompanyDetails, 255);
-                var issudate255 = Cut(request.IssueDate, 255);
-                var expirydt255 = Cut(request.ExpiryDate, 255);
-                var occupatn255 = Cut(request.Occupation, 255);
-                var bankaddr255 = Cut(request.BankAddress, 255);
-
-                // Existing “new” 255 columns reused when relevant
-                var contrtyp255 = "Painter";                            // painter role label
-                var frstname255 = Cut(request.FirstName, 255);
-                var middname255 = Cut(request.MiddleName, 255);
-                var lastname255 = Cut(request.LastName, 255);
-                var emirates255 = Cut(request.Emirates, 255);
-                var referenc255 = Cut(request.Reference, 255);
-                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
-
-                // DOB -> map to legacy smalldatetime birthDat
-                var birthDat = SafeParseDate(request.DateOfBirth);
-
-                // Build parameter bag (EVERY param used in INSERT must exist)
-                var p = new Dictionary<string, object?>
-                {
-                    // ==== Required legacy (NOT NULL) ====
-                    ["@inflCode"] = inflCode,                // char(8) - sequential PN000001...
-                    ["@inflType"] = inflType,                // char(2)
-                    ["@inflName"] = inflName256,             // nvarchar(256)
-                    ["@contName"] = contName40,              // varchar(40)
-
-                    // Address cluster
-                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
-                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
-                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
-                    ["@inflCity"] = inflCity_255,            // varchar(255)
-                    ["@district"] = "",                      // varchar(30)  NOT NULL
-                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
-
-                    ["@mobileNo"] = mobile11,                // varchar(11)  NOT NULL
-                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
-                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
-                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
-                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
-                    ["@expertis"] = "",                      // varchar(100) YES (send "")
-                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
-                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
-                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
-                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
-                    ["@isActive"] = "T",                     // char(1)      NOT NULL
-                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
-                    ["@updateId"] = DBNull.Value,
-                    ["@updateDt"] = DBNull.Value,
-                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
-                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
-                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
-
-                    // Tax IDs / misc
-                    ["@itxPanNo"] = "",
-                    ["@locStxNo"] = "",
-
-                    // Banking (legacy)
-                    ["@bankAcNo"] = "",
-                    ["@bankBnNm"] = bankName100,
-                    ["@bankBnDs"] = branchName100,
-                    ["@bankBnNo"] = "",
-                    ["@bankIFSC"] = "",
-
-                    // KYC & misc
-                    ["@kycVerFl"] = "",
-                    ["@kycVerDt"] = DBNull.Value,
-                    ["@idCardTy"] = "",
-                    ["@idCardNo"] = "",
-                    ["@inDocCnt"] = DBNull.Value,
-                    ["@rjcRemrk"] = "",
-                    ["@entrBySg"] = "",
-                    ["@kycVrTyp"] = "",
-                    ["@adhrName"] = "",
-                    ["@panCName"] = "",
-                    ["@sapInsDt"] = DBNull.Value,
-                    ["@sapUpdDt"] = DBNull.Value,
-                    ["@urbRurFl"] = "",
-
-                    ["@bankApNm"] = acctHolder40,            // varchar(40)
-
-                    // Permanent/alt address
-                    ["@infAddP1"] = "",
-                    ["@infAddP2"] = "",
-                    ["@infAddP3"] = "",
-                    ["@infPCity"] = "",
-                    ["@distrctP"] = "",
-                    ["@infPinCP"] = "",
-
-                    ["@adhOtpFl"] = "",
-                    ["@concEmpl"] = "",
-                    ["@bnkKycFl"] = "",
-                    ["@bnkKycDt"] = DBNull.Value,
-                    ["@inflPinL"] = "",
-                    ["@adhCpUId"] = "",
-                    ["@adhCpUDt"] = DBNull.Value,
-                    ["@panCpUId"] = "",
-                    ["@panCpUDt"] = DBNull.Value,
-                    ["@bnkCpUId"] = "",
-                    ["@bnkCpUDt"] = DBNull.Value,
-                    ["@randNmSt"] = "",
-                    ["@kycStats"] = "",
-                    ["@inflTyOl"] = "",
-                    ["@kycAprBy"] = "",
-                    ["@blkStuts"] = "",
-                    ["@blkStDat"] = DBNull.Value,
-                    ["@cntrApFl"] = "",
-                    ["@frstScDt"] = DBNull.Value,
-                    ["@sourceCnt"] = "",
-                    ["@promoteNm"] = "",
-                    ["@pmobilen"] = "",
-                    ["@isTDSEli"] = "",
-                    ["@panAdhLk"] = "",
-                    ["@panVldIn"] = "",
-                    ["@panCatgF"] = "",
-
-                    // ==== Existing 255s we reuse ====
-                    ["@contrtyp"] = "Painter",
-                    ["@frstname"] = frstname255,
-                    ["@middname"] = middname255,
-                    ["@lastname"] = lastname255,
-                    ["@emirates"] = emirates255,
-                    ["@referenc"] = referenc255,
-                    ["@ibannumb"] = ibannumb255,
-                    ["@vatfrmnm"] = "",
-                    ["@vatraddr"] = "",
-                    ["@vattxreg"] = "",
-                    ["@vatefdt"] = "",
-                    ["@comlcnno"] = "",
-                    ["@comissau"] = "",
-                    ["@comlctyp"] = "",
-                    ["@comestdt"] = "",
-                    ["@comexpdt"] = "",
-                    ["@comtrdnm"] = "",
-                    ["@comrespn"] = "",
-                    ["@comraddr"] = "",
-                    ["@comeffdt"] = "",
-
-                    // ==== Painter-specific 8-char columns ====
-                    ["@emiridno"] = emiridno255,
-                    ["@idholder"] = idholder255,
-                    ["@nationty"] = nationty255,
-                    ["@employer"] = employer255,
-                    ["@issudate"] = issudate255,
-                    ["@expirydt"] = expirydt255,
-                    ["@occupatn"] = occupatn255,
-                    ["@bankaddr"] = bankaddr255,
-                };
-
-                // INSERT (covers all required legacy + reused 255s + painter extras)
-                var sql = @"
-INSERT INTO dbo.ctmInfluncr
-(
-    inflCode, inflType, inflName, contName,
-    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
-    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
-    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
-    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
-    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
-    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
-    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
-    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
-    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
-    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
-
-    -- shared 255s
-    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
-    vatfrmnm, vatraddr, vattxreg, vatefdt,
-    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
-
-    -- painter-specific 8-char name columns (varchar 255)
-    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
-)
-VALUES
-(
-    @inflCode, @inflType, @inflName, @contName,
-    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
-    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
-    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
-    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
-    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
-    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
-    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
-    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
-    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
-    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
-
-    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
-    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
-    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
-
-    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
-);
-
-SELECT @inflCode AS InflCode;
-";
-
-                var result = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
-                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
-
-                return Ok(new
-                {
-                    success = true,
-                    message = "Painter registration saved",
-                    influencerCode = savedCode,
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
+            public string MobileNo { get; set; } = "";   // e.g. "971521302203" or "521302203"
+            public string Message { get; set; } = "";    // e.g. "Dear User Your OTP is : 123456 Birla White (RAK)"
+            public string Priority { get; set; } = "High";
+            public string CountryCode { get; set; } = "ALL";
         }
 
-        // (Optional) dropdowns if you need them for painter UI
-        [HttpGet("emirates-list")]
-        public ActionResult<IEnumerable<AreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
+        public sealed class RouteByMobileRequest
         {
-            try
-            {
-                const string sql = @"
-SELECT areaCode, areaDesc
-FROM dbo.bkmAreaMast WITH (NOLOCK)
-WHERE (@onlyActive = 0 OR isActive = 'Y')
-ORDER BY areaDesc;";
-
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@onlyActive", onlyActive ? 1 : 0 }
-                };
-
-                var result = _db.QaEWebBean(sql, parameters);
-                var list = new List<AreaItem>();
-
-                if (result != null)
-                {
-                    foreach (var row in result)
-                    {
-                        list.Add(new AreaItem
-                        {
-                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
-                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
-                        });
-                    }
-                }
-
-                return Ok(list);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
+            public string MobileNo { get; set; } = "";
         }
 
-        //duplicate number check
-        [HttpGet("check-mobile")]
-        public IActionResult CheckDuplicateMobile([FromQuery] string mobileNumber)
+        // ===== Kyoto options (override via appsettings:SmsUae) =====
+        private sealed class SmsUaeOptions
         {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(mobileNumber))
-                    return BadRequest(new { success = false, message = "Mobile number is required." });
+            public string BaseUrl { get; set; } = "http://sms.kyoto-tech.com/sendurl.aspx";
+            public string User { get; set; } = "RAK1976487";
+            public string Password { get; set; } = "ybsjy19u";
+            public string SenderId { get; set; } = "RAKWHITE";
 
-                var formattedMobile = FormatMobile11(mobileNumber);
+            public bool UseProxy { get; set; } = true;
+            public string ProxyHost { get; set; } = "185.46.212.90";
+            public int ProxyPort { get; set; } = 80;
+            public string ProxyUser { get; set; } = "rajendra.sikhwal";
+            public string ProxyPassword { get; set; } = "Raju@45103";
 
-                const string sql = @"
-            SELECT COUNT(*) AS Count
-            FROM dbo.ctmInfluncr
-            WHERE mobileNo = @mobileNo";
-
-                var parameters = new Dictionary<string, object?>
-                {
-                    ["@mobileNo"] = formattedMobile
-                };
-
-                var result = _db.QaEWebBean(sql, parameters);
-                var count = result?.FirstOrDefault()?["Count"] ?? 0;
-                bool exists = Convert.ToInt32(count) > 0;
-
-                return Ok(new
-                {
-                    success = true,
-                    exists,
-                    message = exists ? "Mobile number already registered." : "Mobile number is available.",
-                    timestamp = DateTime.Now
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = "Error checking mobile number.",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
-            }
+            // Only relevant if you switch BaseUrl to HTTPS
+            public bool TrustAllSsl { get; set; } = true;
         }
 
-
-        // ----------------- helpers -----------------
-        private string GetNextInfluencerCode(string inflType)
+        private SmsUaeOptions LoadOptions()
         {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                // Get the next sequential number for 2IK codes
-                int nextNumber = GetNextInfluencerSequence();
-                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
-                attempts++;
-
-                if (attempts >= maxAttempts)
-                {
-                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
-                }
-
-            } while (IsInfluencerCodeExists(newCode));
-
-            return newCode;
+            var opt = new SmsUaeOptions();
+            var section = _cfg.GetSection("SmsUae");
+            if (section.Exists()) section.Bind(opt);
+            return opt;
         }
 
-        private int GetNextInfluencerSequence()
+        // --- Forwarding options (override via appsettings:SmsForward) ---
+        private sealed class SmsForwardOptions
         {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.ctmInfluncr
-                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
+            public string TargetUrl { get; set; } =
+                "https://www.birlawhite.com:55230/api/SmsUae/send";
 
-            var result = _db.QaEWebBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
 
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
+            // If your environment uses intercepting proxy/self-signed certs
+            public bool TrustAllSsl { get; set; } = false;
+            public int TimeoutSeconds { get; set; } = 30;
         }
 
-        private bool IsInfluencerCodeExists(string influencerCode)
+        private SmsForwardOptions LoadForwardOptions()
         {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
-            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
-
-            var result = _db.QaEWebBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-
-            return count != null && Convert.ToInt32(count) > 0;
+            var opt = new SmsForwardOptions();
+            var section = _cfg.GetSection("SmsForward");
+            if (section.Exists()) section.Bind(opt);
+            return opt;
         }
 
-        private static string MakeFixed(int size, string input)
-        {
-            if (string.IsNullOrEmpty(input)) input = "";
-            return input.Length >= size ? input[..size]
-                   : input + new string('A', size - input.Length);
-        }
+        // ===== Health =====
+        [HttpGet("health")]
+        public IActionResult Health() => Ok(new { status = "OK", utc = DateTime.UtcNow });
 
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
+        // ===== Helpers =====
         private static string Digits(string? s)
         {
             if (string.IsNullOrEmpty(s)) return "";
-            return new string(s.Where(char.IsDigit).ToArray());
+            var sb = new StringBuilder(s.Length);
+            foreach (var ch in s)
+                if (ch >= '0' && ch <= '9') sb.Append(ch);
+            return sb.ToString();
         }
 
-        // keep last 11 digits if user typed country code
-        private static string FormatMobile11(string? s)
+        private static string LastNDigits(string s, int n)
         {
             var d = Digits(s);
-            if (d.Length <= 11) return d;
-            return d.Substring(d.Length - 11);
+            return d.Length <= n ? d : d.Substring(d.Length - n);
         }
 
-        private static string? FormatIban(string? s)
+        private static string SqlDigitsExpr(string column)
         {
-            if (string.IsNullOrWhiteSpace(s)) return s;
-            return s.Replace(" ", "").ToUpperInvariant();
+            // Remove space, +, -, (, ) in SQL side
+            return $"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL({column},''),' ',''),'-',''),'+',''),'(',''),')','')";
         }
 
-        private static DateTime? SafeParseDate(string? dateString)
+        private static string NormalizeToMsisdn(string raw)
         {
-            if (string.IsNullOrWhiteSpace(dateString)) return null;
-            var formats = new[] {
-                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
-                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
+            // For Kyoto: ensure "971" + 9 digits
+            var d9 = LastNDigits(raw, 9);
+            return "971" + d9;
+        }
+
+        private (bool found, string inflType) FindInflTypeByMobile(string mobileInput)
+        {
+            // Accept any input; compare on digits-only using 9 and 11 last digits
+            var m9 = LastNDigits(mobileInput, 9);
+            var m11 = LastNDigits(mobileInput, 11);
+            if (string.IsNullOrEmpty(m9)) return (false, "");
+
+            var digitsSql = SqlDigitsExpr("mobileNo");
+
+            // If your table truly stores ONLY 9-digit values, the equality on @m9 already covers it.
+            // RIGHT(...,11) handles stored 11-digit formats.
+            var sql = $@"
+SELECT TOP 1 inflType
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE RIGHT({digitsSql}, 9)  = @m9
+   OR RIGHT({digitsSql}, 11) = @m11
+   OR mobileNo = @m9
+   OR mobileNo = @m11
+ORDER BY ISNULL(createDt, '1900-01-01') DESC;";
+
+            var prms = new Dictionary<string, object?>
+            {
+                ["@m9"] = m9,
+                ["@m11"] = m11
             };
-            foreach (var f in formats)
-            {
-                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out var dt))
-                    return dt;
-            }
-            if (DateTime.TryParse(dateString, out var any)) return any;
-            return null;
-        }
-    }
 
-    // -------- request model --------
-    public class PainterRegistrationRequest
-    {
-        // Personal
-        public string? FirstName { get; set; }
-        public string? MiddleName { get; set; }
-        public string? LastName { get; set; }
-        public string? MobileNumber { get; set; }
-        public string? Address { get; set; }
-        public string? Area { get; set; }
-        public string? Emirates { get; set; }
-        public string? Reference { get; set; }
+            var rows = _db.QaEWebBean(sql, prms) ?? new List<Dictionary<string, object>>();
+            if (rows.Count == 0) return (false, "");
 
-        // Emirates ID Details
-        public string? EmiratesIdNumber { get; set; }
-        public string? IdName { get; set; }          // Name on ID
-        public string? DateOfBirth { get; set; }     // maps to birthDat
-        public string? Nationality { get; set; }
-        public string? CompanyDetails { get; set; }  // Employer
-        public string? IssueDate { get; set; }
-        public string? ExpiryDate { get; set; }
-        public string? Occupation { get; set; }
-
-        // Bank Details (optional)
-        public string? AccountHolderName { get; set; }
-        public string? IbanNumber { get; set; }
-        public string? BankName { get; set; }
-        public string? BranchName { get; set; }
-        public string? BankAddress { get; set; }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-
-namespace sparshWebService.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    [Produces("application/json")]
-    public class ContractorController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
-
-        public ContractorController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
+            var inflType = (rows[0]["inflType"]?.ToString() ?? "").Trim().ToUpperInvariant();
+            return (true, inflType);
         }
 
-        // POST: /api/Contractor/register
-        [HttpPost("register")]
-        [Consumes("application/json")]
-        public IActionResult Register([FromBody] ContractorRegistrationRequest? request = null)
+        // ===== 1) Verify: /api/SmsUae/verify-mobile =====
+        [HttpPost("verify-mobile")]
+        public IActionResult VerifyMobile([FromBody] RouteByMobileRequest req)
         {
             try
             {
-                request ??= new ContractorRegistrationRequest();
+                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
+                    return BadRequest(new { success = false, message = "MobileNo is required." });
 
-                // --- Keys / defaults ---
-                var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant(); // char(2)
-                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();       // char(3)
+                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
+                if (!found)
+                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
 
-                // ---- NEW: normalize & duplicate-check mobile BEFORE anything else ----
-                var mobile11 = FormatMobile11(request.MobileNumber);
-                if (string.IsNullOrWhiteSpace(mobile11))
+                return Ok(new { success = true, exists = true, inflType });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "verify-mobile failed");
+                return StatusCode(500, new { success = false, message = "Error verifying mobile.", error = ex.Message });
+            }
+        }
+
+        // ===== 2) Route: /api/SmsUae/route-by-mobile =====
+        [HttpPost("route-by-mobile")]
+        public IActionResult RouteByMobile([FromBody] RouteByMobileRequest req)
+        {
+            try
+            {
+                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
+                    return BadRequest(new { success = false, message = "MobileNo is required." });
+
+                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
+                if (!found)
+                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
+
+                var route = inflType == "PN" ? "painter" : "contractor";
+                var message = route == "painter" ? "navigate to painter screen" : "navigate to contractor screen";
+
+                return Ok(new { success = true, exists = true, inflType, route, message });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "route-by-mobile failed");
+                return StatusCode(500, new { success = false, message = "Error deciding route.", error = ex.Message });
+            }
+        }
+
+        // ===== 3) Direct Send (Forward JSON to external API): /api/SmsUae/send =====
+        [HttpPost("send")]
+        public async Task<IActionResult> Send([FromBody] SmsUaeRequest req, CancellationToken ct)
+        {
+            if (req is null ||
+                string.IsNullOrWhiteSpace(req.MobileNo) ||
+                string.IsNullOrWhiteSpace(req.Message))
+            {
+                return BadRequest(new { success = false, message = "mobileNo and message are required." });
+            }
+
+            var fwd = LoadForwardOptions();
+
+            // Build HttpClient handler (proxy/trust settings if needed)
+            var handler = new HttpClientHandler();
+
+            if (fwd.TrustAllSsl)
+            {
+                handler.ServerCertificateCustomValidationCallback =
+                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            }
+
+            try
+            {
+                using var http = new HttpClient(handler, disposeHandler: true)
                 {
-                    return BadRequest(new
-                    {
-                        success = false,
-                        message = "Mobile number is required.",
-                        field = "mobileNumber",
-                        timestamp = DateTime.Now
-                    });
-                }
-
-                if (IsMobileExists(mobile11))
-                {
-                    return StatusCode(StatusCodes.Status409Conflict, new
-                    {
-                        success = false,
-                        duplicate = true,
-                        message = "Mobile number already registered.",
-                        field = "mobileNumber",
-                        timestamp = DateTime.Now
-                    });
-                }
-                // ---------------------------------------------------------------------
-
-                // Generate sequential inflCode (kept your 2IKxxxxx logic)
-                string inflCode = GetNextInfluencerCode(inflType);
-
-                // Build names and enforce sizes
-                var fullName = string.Join(" ",
-                    new[] { request.FirstName, request.MiddleName, request.LastName }
-                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
-
-                var inflName256 = Cut(fullName, 256); // inflName nvarchar(256)
-                var contName40 = Cut(fullName, 40);  // contName varchar(40)
-
-                // Address fields (NOT NULL: inflAdd3, district, inflPinC)
-                var inflAdd1_50 = Cut(request.Address, 50);
-                var inflAdd2_100 = "";
-                var inflAdd3_30 = "";
-                var inflCity_255 = "";
-
-                // Bank fields
-                var bankName100 = Cut(request.BankName, 100);
-                var branchName100 = Cut(request.BranchName, 100);
-                var acctHolder40 = Cut(request.AccountHolderName, 40);
-
-                // New 255 columns
-                var contrtyp255 = Cut(request.ContractorType, 255);
-                var frstname255 = Cut(request.FirstName, 255);
-                var middname255 = Cut(request.MiddleName, 255);
-                var lastname255 = Cut(request.LastName, 255);
-                var emirates255 = Cut(request.Emirates, 255);
-
-                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
-                var vatfrmnm255 = Cut(request.FirmName, 255);
-                var vatraddr255 = Cut(request.VatAddress, 255);
-                var vattxreg255 = Cut(request.TaxRegistrationNumber, 255);
-                var vatefdt255 = Cut(request.VatEffectiveDate, 255);
-                var comlcnno255 = Cut(request.LicenseNumber, 255);
-                var comissau255 = Cut(request.IssuingAuthority, 255);
-                var comlctyp255 = Cut(request.LicenseType, 255);
-                var comestdt255 = Cut(request.EstablishmentDate, 255);
-                var comexpdt255 = Cut(request.LicenseExpiryDate, 255);
-                var comtrdnm255 = Cut(request.TradeName, 255);
-                var comrespn255 = Cut(request.ResponsiblePerson, 255);
-                var comraddr255 = Cut(request.LicenseAddress, 255);
-                var comeffdt255 = Cut(request.EffectiveDate, 255);
-
-                // Build parameter bag: supply EVERYTHING used in INSERT
-                var p = new Dictionary<string, object?>
-                {
-                    ["@inflCode"] = inflCode,
-                    ["@inflType"] = inflType,
-                    ["@inflName"] = inflName256,
-                    ["@contName"] = contName40,
-
-                    ["@inflAdd1"] = inflAdd1_50,
-                    ["@inflAdd2"] = inflAdd2_100,
-                    ["@inflAdd3"] = inflAdd3_30,
-                    ["@inflCity"] = inflCity_255,
-                    ["@district"] = "",
-                    ["@inflPinC"] = "",
-
-                    ["@mobileNo"] = mobile11,
-                    ["@emailAdd"] = "",
-                    ["@busSttYr"] = "",
-                    ["@birthDat"] = DBNull.Value,
-                    ["@inflQual"] = "",
-                    ["@expertis"] = "",
-                    ["@wrkrDetl"] = "",
-                    ["@anniDate"] = DBNull.Value,
-                    ["@landLnNo"] = "",
-                    ["@inflLevl"] = "",
-                    ["@isActive"] = "T",
-                    ["@createId"] = "API",
-                    ["@updateId"] = DBNull.Value,
-                    ["@updateDt"] = DBNull.Value,
-                    ["@needMaru"] = "N",
-                    ["@refDocNo"] = DBNull.Value,
-                    ["@areaCode"] = areaCode,
-
-                    ["@itxPanNo"] = "",
-                    ["@locStxNo"] = "",
-
-                    ["@bankAcNo"] = "",
-                    ["@bankBnNm"] = bankName100,
-                    ["@bankBnDs"] = branchName100,
-                    ["@bankBnNo"] = "",
-                    ["@bankIFSC"] = "",
-
-                    ["@kycVerFl"] = "",
-                    ["@kycVerDt"] = DBNull.Value,
-                    ["@idCardTy"] = "",
-                    ["@idCardNo"] = "",
-                    ["@inDocCnt"] = DBNull.Value,
-                    ["@rjcRemrk"] = "",
-                    ["@entrBySg"] = "",
-                    ["@kycVrTyp"] = "",
-                    ["@adhrName"] = "",
-                    ["@panCName"] = "",
-                    ["@sapInsDt"] = DBNull.Value,
-                    ["@sapUpdDt"] = DBNull.Value,
-                    ["@urbRurFl"] = "",
-
-                    ["@bankApNm"] = acctHolder40,
-
-                    ["@infAddP1"] = "",
-                    ["@infAddP2"] = "",
-                    ["@infAddP3"] = "",
-                    ["@infPCity"] = "",
-                    ["@distrctP"] = "",
-                    ["@infPinCP"] = "",
-
-                    ["@adhOtpFl"] = "",
-                    ["@concEmpl"] = "",
-                    ["@bnkKycFl"] = "",
-                    ["@bnkKycDt"] = DBNull.Value,
-                    ["@inflPinL"] = "",
-                    ["@adhCpUId"] = "",
-                    ["@adhCpUDt"] = DBNull.Value,
-                    ["@panCpUId"] = "",
-                    ["@panCpUDt"] = DBNull.Value,
-                    ["@bnkCpUId"] = "",
-                    ["@bnkCpUDt"] = DBNull.Value,
-                    ["@randNmSt"] = "",
-                    ["@kycStats"] = "",
-                    ["@inflTyOl"] = "",
-                    ["@kycAprBy"] = "",
-                    ["@blkStuts"] = "",
-                    ["@blkStDat"] = DBNull.Value,
-                    ["@cntrApFl"] = "",
-                    ["@frstScDt"] = DBNull.Value,
-                    ["@sourceCnt"] = "",
-                    ["@promoteNm"] = "",
-                    ["@pmobilen"] = "",
-                    ["@isTDSEli"] = "",
-                    ["@panAdhLk"] = "",
-                    ["@panVldIn"] = "",
-                    ["@panCatgF"] = "",
-
-                    ["@contrtyp"] = contrtyp255,
-                    ["@frstname"] = frstname255,
-                    ["@middname"] = middname255,
-                    ["@lastname"] = lastname255,
-                    ["@emirates"] = emirates255,
-
-                    ["@ibannumb"] = ibannumb255,
-                    ["@vatfrmnm"] = vatfrmnm255,
-                    ["@vatraddr"] = vatraddr255,
-                    ["@vattxreg"] = vattxreg255,
-                    ["@vatefdt"] = vatefdt255,
-                    ["@comlcnno"] = comlcnno255,
-                    ["@comissau"] = comissau255,
-                    ["@comlctyp"] = comlctyp255,
-                    ["@comestdt"] = comestdt255,
-                    ["@comexpdt"] = comexpdt255,
-                    ["@comtrdnm"] = comtrdnm255,
-                    ["@comrespn"] = comrespn255,
-                    ["@comraddr"] = comraddr255,
-                    ["@comeffdt"] = comeffdt255
+                    Timeout = TimeSpan.FromSeconds(fwd.TimeoutSeconds <= 0 ? 30 : fwd.TimeoutSeconds)
                 };
 
-                var sql = @"
-INSERT INTO dbo.ctmInfluncr
-(
-    inflCode, inflType, inflName, contName,
-    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
-    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
-    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
-    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
-    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
-    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
-    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
-    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
-    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
-    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
-    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
-
-    contrtyp, frstname, middname, lastname, emirates,  ibannumb,
-    vatfrmnm, vatraddr, vattxreg, vatefdt,
-    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt
-)
-VALUES
-(
-    @inflCode, @inflType, @inflName, @contName,
-    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
-    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
-    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
-    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
-    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
-    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
-    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
-    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
-    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
-    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
-    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
-
-    @contrtyp, @frstname, @middname, @lastname, @emirates,  @ibannumb,
-    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
-    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt
-);
-
-SELECT @inflCode AS InflCode;
-";
-
-                var result = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
-                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
-
-                return Ok(new
+                // Serialize with camelCase to match external API keys
+                var json = JsonSerializer.Serialize(req, new JsonSerializerOptions
                 {
-                    success = true,
-                    message = "Registration saved",
-                    influencerCode = savedCode,
-                    timestamp = DateTime.Now
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
                 });
+
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                var resp = await http.PostAsync(fwd.TargetUrl, content, ct);
+                var respBody = await resp.Content.ReadAsStringAsync(ct);
+
+                // Pass-through style response (plus meta for debugging)
+                return StatusCode((int)resp.StatusCode, new
+                {
+                    success = resp.IsSuccessStatusCode,
+                    statusCode = (int)resp.StatusCode,
+                    forwardedTo = fwd.TargetUrl,
+                    requestBody = req,          // echoes what we sent
+                    response = respBody
+                });
+            }
+            catch (TaskCanceledException tex) when (!ct.IsCancellationRequested)
+            {
+                // Timeout
+                _log.LogError(tex, "SmsUaeController.send timed out");
+                return StatusCode(504, new { success = false, message = "Upstream timeout.", error = tex.Message });
             }
             catch (Exception ex)
             {
-                return BadRequest(new
-                {
-                    success = false,
-                    message = "Registration failed",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
+                _log.LogError(ex, "SmsUaeController.send failed");
+                return StatusCode(500, new { success = false, message = "Error forwarding SMS.", error = ex.Message });
             }
         }
 
-        // Duplicate mobile (GET /api/Contractor/check-mobile?mobileNumber=...)
-        [HttpGet("check-mobile")]
-        public IActionResult CheckDuplicateMobile([FromQuery] string mobileNumber)
+        // ===== 4) Verify + Send (Kyoto form-post): /api/SmsUae/send-if-registered =====
+        [HttpPost("send-if-registered")]
+        public async Task<IActionResult> SendIfRegistered([FromBody] SmsUaeRequest req, CancellationToken ct)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(mobileNumber))
-                    return BadRequest(new { success = false, message = "Mobile number is required." });
+                if (req is null || string.IsNullOrWhiteSpace(req.MobileNo) || string.IsNullOrWhiteSpace(req.Message))
+                    return BadRequest(new { success = false, message = "MobileNo and Message are required." });
 
-                var formattedMobile = FormatMobile11(mobileNumber);
-                bool exists = IsMobileExists(formattedMobile);
+                // 1) verify
+                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
+                if (!found)
+                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
 
+                // 2) normalize to MSISDN for Kyoto (971 + last 9)
+                var msisdn = NormalizeToMsisdn(req.MobileNo);
+
+                // forward to Kyoto with normalized number
+                var toSend = new SmsUaeRequest
+                {
+                    MobileNo = msisdn,
+                    Message = req.Message,
+                    Priority = string.IsNullOrWhiteSpace(req.Priority) ? "High" : req.Priority,
+                    CountryCode = string.IsNullOrWhiteSpace(req.CountryCode) ? "ALL" : req.CountryCode
+                };
+
+                var opt = LoadOptions();
+
+                static string FormEnc(string s) => Uri.EscapeDataString(s ?? string.Empty);
+                var sb = new StringBuilder();
+                sb.Append("user=").Append(FormEnc(opt.User))
+                  .Append("&pwd=").Append(FormEnc(opt.Password))
+                  .Append("&senderid=").Append(FormEnc(opt.SenderId))
+                  .Append("&mobileno=").Append(FormEnc(toSend.MobileNo))
+                  .Append("&msgtext=").Append(FormEnc(toSend.Message))
+                  .Append("&priority=").Append(FormEnc(toSend.Priority))
+                  .Append("&CountryCode=").Append(FormEnc(toSend.CountryCode));
+                var formBody = sb.ToString();
+
+                var handler = new HttpClientHandler();
+                if (opt.UseProxy && !string.IsNullOrWhiteSpace(opt.ProxyHost))
+                {
+                    var proxy = new WebProxy(opt.ProxyHost, opt.ProxyPort)
+                    {
+                        BypassProxyOnLocal = false,
+                        Credentials = new NetworkCredential(opt.ProxyUser, opt.ProxyPassword)
+                    };
+                    handler.Proxy = proxy;
+                    handler.UseProxy = true;
+                }
+                if (opt.TrustAllSsl)
+                {
+                    handler.ServerCertificateCustomValidationCallback =
+                        HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+                }
+
+                using var http = new HttpClient(handler, disposeHandler: true);
+                using var content = new StringContent(formBody, Encoding.UTF8, "application/x-www-form-urlencoded");
+                var resp = await http.PostAsync(opt.BaseUrl, content, ct);
+                var body = await resp.Content.ReadAsStringAsync(ct);
+
+                var route = inflType == "PN" ? "painter" : "contractor";
                 return Ok(new
                 {
                     success = true,
-                    exists,
-                    message = exists ? "Mobile number already registered." : "Mobile number is available.",
-                    timestamp = DateTime.Now
+                    exists = true,
+                    inflType,
+                    route,
+                    kyotoStatus = (int)resp.StatusCode,
+                    kyotoResponse = body
                 });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new
-                {
-                    success = false,
-                    message = "Error checking mobile number.",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
-                });
+                _log.LogError(ex, "send-if-registered failed");
+                return StatusCode(500, new { success = false, message = "Error sending SMS.", error = ex.Message });
             }
         }
-
-        // ----------------- helpers -----------------
-        private string GetNextInfluencerCode(string inflType)
-        {
-            string newCode;
-            int attempts = 0;
-            const int maxAttempts = 100;
-
-            do
-            {
-                int nextNumber = GetNextInfluencerSequence();
-                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
-                attempts++;
-                if (attempts >= maxAttempts)
-                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
-            }
-            while (IsInfluencerCodeExists(newCode));
-
-            return newCode;
-        }
-
-        private int GetNextInfluencerSequence()
-        {
-            var sql = @"
-                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
-                FROM dbo.ctmInfluncr
-                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
-
-            var result = _db.QaEWebBean(sql, new Dictionary<string, object?>());
-            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
-            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
-        }
-
-        private bool IsInfluencerCodeExists(string influencerCode)
-        {
-            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
-            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
-            var result = _db.QaEWebBean(sql, parameters);
-            var count = result?.FirstOrDefault()?["Count"];
-            return count != null && Convert.ToInt32(count) > 0;
-        }
-
-        // NEW: shared duplicate checker
-        private bool IsMobileExists(string mobile11)
-        {
-            const string sql = @"
-                SELECT COUNT(1) AS Cnt
-                FROM dbo.ctmInfluncr WITH (NOLOCK)
-                WHERE mobileNo = @mobileNo;";
-
-            var prms = new Dictionary<string, object?> { ["@mobileNo"] = mobile11 };
-            var res = _db.QaEWebBean(sql, prms);
-            var cnt = res?.FirstOrDefault()?["Cnt"];
-            return cnt != null && Convert.ToInt32(cnt) > 0;
-        }
-
-        private static string? Left(string? s, int n)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return null;
-            var t = s.Trim();
-            return t.Length <= n ? t : t.Substring(0, n);
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
-
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return new string(s.Where(char.IsDigit).ToArray());
-        }
-
-        // keep last 11 digits if user typed country code
-        private static string FormatMobile11(string? s)
-        {
-            var d = Digits(s);
-            if (d.Length <= 11) return d;
-            return d.Substring(d.Length - 11);
-        }
-
-        private static string? FormatIban(string? s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return s;
-            return s.Replace(" ", "").ToUpperInvariant();
-        }
-    }
-
-    // ----------------- request model (matches Flutter) -----------------
-    public class ContractorRegistrationRequest
-    {
-        // Personal
-        public string? ContractorType { get; set; }
-        public string? FirstName { get; set; }
-        public string? MiddleName { get; set; }
-        public string? LastName { get; set; }
-        public string? MobileNumber { get; set; }
-        public string? Address { get; set; }
-        public string? Area { get; set; }
-        public string? Emirates { get; set; }
-        public string? ProfilePhoto { get; set; }
-
-        // Bank
-        public string? AccountHolderName { get; set; }
-        public string? IbanNumber { get; set; }
-        public string? BankName { get; set; }
-        public string? BranchName { get; set; }
-        public string? BankAddress { get; set; }
-
-        // VAT
-        public string? VatCertificate { get; set; }
-        public string? FirmName { get; set; }
-        public string? VatAddress { get; set; }
-        public string? TaxRegistrationNumber { get; set; }
-        public string? VatEffectiveDate { get; set; }
-
-        // License
-        public string? LicenseDocument { get; set; }
-        public string? LicenseNumber { get; set; }
-        public string? IssuingAuthority { get; set; }
-        public string? LicenseType { get; set; }
-        public string? EstablishmentDate { get; set; }
-        public string? LicenseExpiryDate { get; set; }
-        public string? TradeName { get; set; }
-        public string? ResponsiblePerson { get; set; }
-        public string? LicenseAddress { get; set; }
-        public string? EffectiveDate { get; set; }
     }
 }
-
-
