@@ -1,347 +1,193 @@
-// Controllers/SmsUaeController.cs
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
-using sparshWebService.DataAccess; // DatabaseHelper
+using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Net;
-using System.Net.Http;
-using System.Text;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace sparshWebService.Controllers
 {
-    [ApiController]
     [Route("api/[controller]")]
-    public sealed class SmsUaeController : ControllerBase
+    [ApiController]
+    public class ImageUploadController : ControllerBase
     {
-        private readonly IConfiguration _cfg;
-        private readonly ILogger<SmsUaeController> _log;
-        private readonly DatabaseHelper _db;
+        private readonly DatabaseHelper _dbHelper;
 
-        public SmsUaeController(IConfiguration cfg, ILogger<SmsUaeController> log, DatabaseHelper db)
+        public ImageUploadController(DatabaseHelper dbHelper)
         {
-            _cfg = cfg;
-            _log = log;
-            _db = db;
+            _dbHelper = dbHelper;
         }
 
-        // ===== Request models =====
-        public sealed class SmsUaeRequest
+        /// <summary>
+        /// Upload an image/PDF into cotGenAttch with a client-supplied key.
+        /// attFilKy MUST come from the client (e.g., "John_Doe_971501234567").
+        /// We sanitize to allow only [A-Za-z0-9 _ . - @ +] and trim to 50 chars.
+        /// If attFilKy already exists, we UPDATE the row; else we INSERT.
+        /// </summary>
+        [HttpPost("upload")]
+        [DisableRequestSizeLimit]
+        [RequestFormLimits(MultipartBodyLengthLimit = 50_000_000)]
+        [Consumes("multipart/form-data")]
+        public IActionResult Upload(
+            [FromForm] IFormFile file,
+            [FromQuery] string? attFilKy = null,          // Prefer query
+            [FromQuery] string? attFilTy = "01",
+            [FromQuery] string? createId = "SYSTEM")
         {
-            public string MobileNo { get; set; } = "";   // e.g. "971521302203" or "521302203"
-            public string Message { get; set; } = "";    // e.g. "Dear User Your OTP is : 123456 Birla White (RAK)"
-            public string Priority { get; set; } = "High";
-            public string CountryCode { get; set; } = "ALL";
-        }
-
-        public sealed class RouteByMobileRequest
-        {
-            public string MobileNo { get; set; } = "";
-        }
-
-        // ===== Kyoto options (override via appsettings:SmsUae) =====
-        private sealed class SmsUaeOptions
-        {
-            public string BaseUrl { get; set; } = "http://sms.kyoto-tech.com/sendurl.aspx";
-            public string User { get; set; } = "RAK1976487";
-            public string Password { get; set; } = "ybsjy19u";
-            public string SenderId { get; set; } = "RAKWHITE";
-
-            public bool UseProxy { get; set; } = true;
-            public string ProxyHost { get; set; } = "185.46.212.90";
-            public int ProxyPort { get; set; } = 80;
-            public string ProxyUser { get; set; } = "rajendra.sikhwal";
-            public string ProxyPassword { get; set; } = "Raju@45103";
-
-            // Only relevant if you switch BaseUrl to HTTPS
-            public bool TrustAllSsl { get; set; } = true;
-        }
-
-        private SmsUaeOptions LoadOptions()
-        {
-            var opt = new SmsUaeOptions();
-            var section = _cfg.GetSection("SmsUae");
-            if (section.Exists()) section.Bind(opt);
-            return opt;
-        }
-
-        // --- Forwarding options (override via appsettings:SmsForward) ---
-        private sealed class SmsForwardOptions
-        {
-            public string TargetUrl { get; set; } =
-                "https://www.birlawhite.com:55230/api/SmsUae/send";
-
-
-            // If your environment uses intercepting proxy/self-signed certs
-            public bool TrustAllSsl { get; set; } = false;
-            public int TimeoutSeconds { get; set; } = 30;
-        }
-
-        private SmsForwardOptions LoadForwardOptions()
-        {
-            var opt = new SmsForwardOptions();
-            var section = _cfg.GetSection("SmsForward");
-            if (section.Exists()) section.Bind(opt);
-            return opt;
-        }
-
-        // ===== Health =====
-        [HttpGet("health")]
-        public IActionResult Health() => Ok(new { status = "OK", utc = DateTime.UtcNow });
-
-        // ===== Helpers =====
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            var sb = new StringBuilder(s.Length);
-            foreach (var ch in s)
-                if (ch >= '0' && ch <= '9') sb.Append(ch);
-            return sb.ToString();
-        }
-
-        private static string LastNDigits(string s, int n)
-        {
-            var d = Digits(s);
-            return d.Length <= n ? d : d.Substring(d.Length - n);
-        }
-
-        private static string SqlDigitsExpr(string column)
-        {
-            // Remove space, +, -, (, ) in SQL side
-            return $"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL({column},''),' ',''),'-',''),'+',''),'(',''),')','')";
-        }
-
-        private static string NormalizeToMsisdn(string raw)
-        {
-            // For Kyoto: ensure "971" + 9 digits
-            var d9 = LastNDigits(raw, 9);
-            return "971" + d9;
-        }
-
-        private (bool found, string inflType) FindInflTypeByMobile(string mobileInput)
-        {
-            // Accept any input; compare on digits-only using 9 and 11 last digits
-            var m9 = LastNDigits(mobileInput, 9);
-            var m11 = LastNDigits(mobileInput, 11);
-            if (string.IsNullOrEmpty(m9)) return (false, "");
-
-            var digitsSql = SqlDigitsExpr("mobileNo");
-
-            // If your table truly stores ONLY 9-digit values, the equality on @m9 already covers it.
-            // RIGHT(...,11) handles stored 11-digit formats.
-            var sql = $@"
-SELECT TOP 1 inflType
-FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE RIGHT({digitsSql}, 9)  = @m9
-   OR RIGHT({digitsSql}, 11) = @m11
-   OR mobileNo = @m9
-   OR mobileNo = @m11
-ORDER BY ISNULL(createDt, '1900-01-01') DESC;";
-
-            var prms = new Dictionary<string, object?>
+            // Fallback: allow attFilKy via form if not present in query
+            if (string.IsNullOrWhiteSpace(attFilKy) && Request?.Form?.ContainsKey("attFilKy") == true)
             {
-                ["@m9"] = m9,
-                ["@m11"] = m11
-            };
-
-            var rows = _db.QaEWebBean(sql, prms) ?? new List<Dictionary<string, object>>();
-            if (rows.Count == 0) return (false, "");
-
-            var inflType = (rows[0]["inflType"]?.ToString() ?? "").Trim().ToUpperInvariant();
-            return (true, inflType);
-        }
-
-        // ===== 1) Verify: /api/SmsUae/verify-mobile =====
-        [HttpPost("verify-mobile")]
-        public IActionResult VerifyMobile([FromBody] RouteByMobileRequest req)
-        {
-            try
-            {
-                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
-                    return BadRequest(new { success = false, message = "MobileNo is required." });
-
-                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
-                if (!found)
-                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
-
-                return Ok(new { success = true, exists = true, inflType });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "verify-mobile failed");
-                return StatusCode(500, new { success = false, message = "Error verifying mobile.", error = ex.Message });
-            }
-        }
-
-        // ===== 2) Route: /api/SmsUae/route-by-mobile =====
-        [HttpPost("route-by-mobile")]
-        public IActionResult RouteByMobile([FromBody] RouteByMobileRequest req)
-        {
-            try
-            {
-                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
-                    return BadRequest(new { success = false, message = "MobileNo is required." });
-
-                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
-                if (!found)
-                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
-
-                var route = inflType == "PN" ? "painter" : "contractor";
-                var message = route == "painter" ? "navigate to painter screen" : "navigate to contractor screen";
-
-                return Ok(new { success = true, exists = true, inflType, route, message });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "route-by-mobile failed");
-                return StatusCode(500, new { success = false, message = "Error deciding route.", error = ex.Message });
-            }
-        }
-
-        // ===== 3) Direct Send (Forward JSON to external API): /api/SmsUae/send =====
-        [HttpPost("send")]
-        public async Task<IActionResult> Send([FromBody] SmsUaeRequest req, CancellationToken ct)
-        {
-            if (req is null ||
-                string.IsNullOrWhiteSpace(req.MobileNo) ||
-                string.IsNullOrWhiteSpace(req.Message))
-            {
-                return BadRequest(new { success = false, message = "mobileNo and message are required." });
+                attFilKy = Request.Form["attFilKy"].ToString();
             }
 
-            var fwd = LoadForwardOptions();
+            // --- Basic checks ---
+            if (file == null || file.Length == 0)
+                return BadRequest("No file uploaded.");
 
-            // Build HttpClient handler (proxy/trust settings if needed)
-            var handler = new HttpClientHandler();
+            if (!IsValidFile(file, out var reason))
+                return BadRequest(reason);
 
-            if (fwd.TrustAllSsl)
-            {
-                handler.ServerCertificateCustomValidationCallback =
-                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-            }
+            // --- attFilKy is REQUIRED and must come from Flutter (name+mobile) ---
+            attFilKy = SanitizeKey(attFilKy);
+            if (string.IsNullOrWhiteSpace(attFilKy))
+                return BadRequest("attFilKy is required (e.g., Name_MobileNumber) and must contain valid characters.");
 
             try
             {
-                using var http = new HttpClient(handler, disposeHandler: true)
+                // Derive metadata
+                var ext = Path.GetExtension(file.FileName).ToLowerInvariant(); // ".jpg" / ".pdf"
+                var baseName = Path.GetFileNameWithoutExtension(file.FileName);
+
+                // Read file bytes
+                byte[] bytes;
+                using (var ms = new MemoryStream())
                 {
-                    Timeout = TimeSpan.FromSeconds(fwd.TimeoutSeconds <= 0 ? 30 : fwd.TimeoutSeconds)
+                    file.CopyTo(ms);
+                    bytes = ms.ToArray();
+                }
+
+                var fileSizeDecimal = Convert.ToDecimal(file.Length);
+
+                // Common parameters
+                var parameters = new Dictionary<string, object>
+                {
+                    ["@attFilKy"] = attFilKy,
+                    ["@attFilTy"] = string.IsNullOrWhiteSpace(attFilTy) ? "01" : attFilTy,
+                    ["@fileName"] = baseName,
+                    ["@attachFl"] = bytes,
+                    ["@fileExtn"] = ext.TrimStart('.'),
+                    ["@fileSize"] = fileSizeDecimal,
+                    ["@createId"] = string.IsNullOrWhiteSpace(createId) ? "SYSTEM" : createId
                 };
 
-                // Serialize with camelCase to match external API keys
-                var json = JsonSerializer.Serialize(req, new JsonSerializerOptions
+                // Try UPDATE first (upsert pattern without needing a scalar count)
+                var sqlUpdate = @"
+UPDATE cotGenAttch
+   SET attFilTy = @attFilTy,
+       fileName = @fileName,
+       attachFl = @attachFl,
+       fileExtn = @fileExtn,
+       fileSize = @fileSize,
+       statFlag = 'A',
+       updateId = @createId,
+       updateDt = GETDATE()
+ WHERE attFilKy = @attFilKy";
+
+                var rows = _dbHelper.WebExecute(sqlUpdate, parameters);
+
+                bool updated = rows > 0;
+                if (!updated)
                 {
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-                });
+                    // Do INSERT if no existing row
+                    var sqlInsert = @"
+INSERT INTO cotGenAttch
+(attFilKy, attFilTy, fileName, attachFl, fileExtn, fileSize, statFlag, createId, createDt)
+VALUES
+(@attFilKy, @attFilTy, @fileName, @attachFl, @fileExtn, @fileSize, 'A', @createId, GETDATE())";
 
-                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                    rows = _dbHelper.WebExecute(sqlInsert, parameters);
+                }
 
-                var resp = await http.PostAsync(fwd.TargetUrl, content, ct);
-                var respBody = await resp.Content.ReadAsStringAsync(ct);
-
-                // Pass-through style response (plus meta for debugging)
-                return StatusCode((int)resp.StatusCode, new
+                if (rows > 0)
                 {
-                    success = resp.IsSuccessStatusCode,
-                    statusCode = (int)resp.StatusCode,
-                    forwardedTo = fwd.TargetUrl,
-                    requestBody = req,          // echoes what we sent
-                    response = respBody
-                });
-            }
-            catch (TaskCanceledException tex) when (!ct.IsCancellationRequested)
-            {
-                // Timeout
-                _log.LogError(tex, "SmsUaeController.send timed out");
-                return StatusCode(504, new { success = false, message = "Upstream timeout.", error = tex.Message });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "SmsUaeController.send failed");
-                return StatusCode(500, new { success = false, message = "Error forwarding SMS.", error = ex.Message });
-            }
-        }
-
-        // ===== 4) Verify + Send (Kyoto form-post): /api/SmsUae/send-if-registered =====
-        [HttpPost("send-if-registered")]
-        public async Task<IActionResult> SendIfRegistered([FromBody] SmsUaeRequest req, CancellationToken ct)
-        {
-            try
-            {
-                if (req is null || string.IsNullOrWhiteSpace(req.MobileNo) || string.IsNullOrWhiteSpace(req.Message))
-                    return BadRequest(new { success = false, message = "MobileNo and Message are required." });
-
-                // 1) verify
-                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
-                if (!found)
-                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
-
-                // 2) normalize to MSISDN for Kyoto (971 + last 9)
-                var msisdn = NormalizeToMsisdn(req.MobileNo);
-
-                // forward to Kyoto with normalized number
-                var toSend = new SmsUaeRequest
-                {
-                    MobileNo = msisdn,
-                    Message = req.Message,
-                    Priority = string.IsNullOrWhiteSpace(req.Priority) ? "High" : req.Priority,
-                    CountryCode = string.IsNullOrWhiteSpace(req.CountryCode) ? "ALL" : req.CountryCode
-                };
-
-                var opt = LoadOptions();
-
-                static string FormEnc(string s) => Uri.EscapeDataString(s ?? string.Empty);
-                var sb = new StringBuilder();
-                sb.Append("user=").Append(FormEnc(opt.User))
-                  .Append("&pwd=").Append(FormEnc(opt.Password))
-                  .Append("&senderid=").Append(FormEnc(opt.SenderId))
-                  .Append("&mobileno=").Append(FormEnc(toSend.MobileNo))
-                  .Append("&msgtext=").Append(FormEnc(toSend.Message))
-                  .Append("&priority=").Append(FormEnc(toSend.Priority))
-                  .Append("&CountryCode=").Append(FormEnc(toSend.CountryCode));
-                var formBody = sb.ToString();
-
-                var handler = new HttpClientHandler();
-                if (opt.UseProxy && !string.IsNullOrWhiteSpace(opt.ProxyHost))
-                {
-                    var proxy = new WebProxy(opt.ProxyHost, opt.ProxyPort)
+                    return Ok(new
                     {
-                        BypassProxyOnLocal = false,
-                        Credentials = new NetworkCredential(opt.ProxyUser, opt.ProxyPassword)
-                    };
-                    handler.Proxy = proxy;
-                    handler.UseProxy = true;
-                }
-                if (opt.TrustAllSsl)
-                {
-                    handler.ServerCertificateCustomValidationCallback =
-                        HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+                        msg = "File uploaded successfully",
+                        data = new
+                        {
+                            attFilKy,
+                            fileName = file.FileName,
+                            fileExtn = ext.TrimStart('.'),
+                            fileSizeBytes = file.Length,
+                            createId,
+                            upsertMode = (updated ? "updated" : "inserted")
+                        }
+                    });
                 }
 
-                using var http = new HttpClient(handler, disposeHandler: true);
-                using var content = new StringContent(formBody, Encoding.UTF8, "application/x-www-form-urlencoded");
-                var resp = await http.PostAsync(opt.BaseUrl, content, ct);
-                var body = await resp.Content.ReadAsStringAsync(ct);
-
-                var route = inflType == "PN" ? "painter" : "contractor";
-                return Ok(new
-                {
-                    success = true,
-                    exists = true,
-                    inflType,
-                    route,
-                    kyotoStatus = (int)resp.StatusCode,
-                    kyotoResponse = body
-                });
+                return StatusCode(500, "Failed to save file to database.");
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "send-if-registered failed");
-                return StatusCode(500, new { success = false, message = "Error sending SMS.", error = ex.Message });
+                try { _dbHelper.InsertIntoLog("SYSTEM", "/api/ImageUpload/upload", ex.ToString(), 500, null); } catch { }
+                return StatusCode(500, $"Internal server error: {ex.Message}");
             }
+        }
+
+        // --- Validation helper ---
+        private bool IsValidFile(IFormFile file, out string reason)
+        {
+            reason = string.Empty;
+            var allowedExts = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".pdf" };
+            var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+            var ct = (file.ContentType ?? string.Empty).ToLowerInvariant();
+
+            if (!allowedExts.Contains(ext))
+            {
+                reason = "Invalid file extension. Allowed: jpg, jpeg, png, gif, bmp, webp, pdf.";
+                return false;
+            }
+
+            if (!(ct.StartsWith("image/") || ct == "application/pdf" || ct == "" || ct == "application/octet-stream"))
+            {
+                reason = "Invalid content type. Only images or PDFs are allowed.";
+                return false;
+            }
+
+            if (file.Length > 50_000_000)
+            {
+                reason = "File too large. Max 50 MB.";
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Keep only safe characters and length for attFilKy.
+        /// Allowed: letters, digits, space, underscore, hyphen, dot, at, plus
+        /// Trim to max length 50 as per your column constraint.
+        /// </summary>
+        private static string SanitizeKey(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+
+            // Normalize spaces
+            raw = raw.Trim();
+
+            // Allow only these chars: A-Z a-z 0-9 _ - . @ + and space
+            var cleaned = Regex.Replace(raw, @"[^A-Za-z0-9_\-\.@+\s]", string.Empty);
+
+            // Collapse multiple spaces to single underscore
+            cleaned = Regex.Replace(cleaned, @"\s+", "_");
+
+            // Enforce max length 50
+            if (cleaned.Length > 50) cleaned = cleaned.Substring(0, 50);
+
+            return cleaned;
         }
     }
 }
