@@ -1,16 +1,7 @@
-// Controllers/SmsUaeController.cs
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
-using sparshWebService.DataAccess; // DatabaseHelper
+using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Net;
-using System.Net.Http;
-using System.Text;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Linq;
 
 #nullable enable
@@ -18,481 +9,250 @@ using System.Linq;
 namespace sparshWebService.Controllers
 {
     [ApiController]
+    [Produces("application/json")]
     [Route("api/[controller]")]
-    public sealed class SmsUaeController : ControllerBase
+    public sealed class UseUpdateController : ControllerBase
     {
-        private readonly IConfiguration _cfg;
-        private readonly ILogger<SmsUaeController> _log;
         private readonly DatabaseHelper _db;
+        public UseUpdateController(DatabaseHelper dbHelper) => _db = dbHelper;
 
-        public SmsUaeController(IConfiguration cfg, ILogger<SmsUaeController> log, DatabaseHelper db)
+        // ----------------- GET: /api/UseUpdate/by-inflcode/{inflCode} -----------------
+        [HttpGet("by-inflcode/{inflCode}")]
+        public IActionResult GetByInflCode([FromRoute] string inflCode)
         {
-            _cfg = cfg;
-            _log = log;
-            _db = db;
-        }
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required." });
 
-        // ===== Request models =====
-        public sealed class SmsUaeRequest
-        {
-            public string MobileNo { get; set; } = "";   // e.g. "971521302203" or "521302203"
-            public string Message { get; set; } = "";   // e.g. "Dear User Your OTP is : 123456 Birla White (RAK)"
-            public string Priority { get; set; } = "High";
-            public string CountryCode { get; set; } = "ALL";
-        }
-
-        public sealed class RouteByMobileRequest
-        {
-            public string MobileNo { get; set; } = "";
-        }
-
-        public sealed class InfluencerDetailsResponse
-        {
-            // Core
-            public string? InflCode { get; set; }
-            public string? InflType { get; set; }   // "PN" = Painter, else Contractor
-            public string? Route { get; set; }      // "painter" | "contractor"
-            public string? AreaCode { get; set; }
-
-            // Names / contact
-            public string? FirstName { get; set; }
-            public string? MiddleName { get; set; }
-            public string? LastName { get; set; }
-            public string? MobileNumber { get; set; }
-            public string? Address { get; set; }    // inflAdd1
-            public string? Emirates { get; set; }
-
-            // Painter-specific (varchar 255)
-            public string? EmiratesIdNumber { get; set; } // emiridno
-            public string? IdName { get; set; }           // idholder
-            public string? Nationality { get; set; }      // nationty
-            public string? CompanyDetails { get; set; }   // employer
-            public string? IssueDate { get; set; }        // issudate
-            public string? ExpiryDate { get; set; }       // expirydt
-            public string? Occupation { get; set; }       // occupatn
-            public string? BankAddress { get; set; }      // bankaddr
-
-            // Contractor/shared 255s
-            public string? ContractorType { get; set; }    // contrtyp
-            public string? AccountHolderName { get; set; } // bankApNm
-            public string? IbanNumber { get; set; }        // ibannumb
-            public string? BankName { get; set; }          // bankBnNm
-            public string? BranchName { get; set; }        // bankBnDs
-
-            // VAT
-            public string? FirmName { get; set; }               // vatfrmnm
-            public string? VatAddress { get; set; }             // vatraddr
-            public string? TaxRegistrationNumber { get; set; }  // vattxreg
-            public string? VatEffectiveDate { get; set; }       // vatefdt
-
-            // License cluster
-            public string? LicenseNumber { get; set; }     // comlcnno
-            public string? IssuingAuthority { get; set; }  // comissau
-            public string? LicenseType { get; set; }       // comlctyp
-            public string? EstablishmentDate { get; set; } // comestdt
-            public string? LicenseExpiryDate { get; set; } // comexpdt
-            public string? TradeName { get; set; }         // comtrdnm
-            public string? ResponsiblePerson { get; set; } // comrespn
-            public string? LicenseAddress { get; set; }    // comraddr
-            public string? EffectiveDate { get; set; }     // comeffdt
-        }
-
-        // ===== Kyoto options (override via appsettings:SmsUae) =====
-        private sealed class SmsUaeOptions
-        {
-            public string BaseUrl { get; set; } = "http://sms.kyoto-tech.com/sendurl.aspx";
-            public string User { get; set; } = "RAK1976487";
-            public string Password { get; set; } = "******";
-            public string SenderId { get; set; } = "RAKWHITE";
-
-            public bool UseProxy { get; set; } = true;
-            public string ProxyHost { get; set; } = "185.46.212.90";
-            public int ProxyPort { get; set; } = 80;
-            public string ProxyUser { get; set; } = "******";
-            public string ProxyPassword { get; set; } = "******";
-
-            // Only relevant if you switch BaseUrl to HTTPS
-            public bool TrustAllSsl { get; set; } = true;
-        }
-
-        private SmsUaeOptions LoadOptions()
-        {
-            var opt = new SmsUaeOptions();
-            var section = _cfg.GetSection("SmsUae");
-            if (section.Exists()) section.Bind(opt);
-            return opt;
-        }
-
-        // --- Forwarding options (override via appsettings:SmsForward) ---
-        private sealed class SmsForwardOptions
-        {
-            public string TargetUrl { get; set; } =
-                "https://www.birlawhite.com:55230/api/SmsUae/send";
-
-            public bool TrustAllSsl { get; set; } = false;
-            public int TimeoutSeconds { get; set; } = 30;
-        }
-
-        private SmsForwardOptions LoadForwardOptions()
-        {
-            var opt = new SmsForwardOptions();
-            var section = _cfg.GetSection("SmsForward");
-            if (section.Exists()) section.Bind(opt);
-            return opt;
-        }
-
-        // ===== Health =====
-        [HttpGet("health")]
-        public IActionResult Health() => Ok(new { status = "OK", utc = DateTime.UtcNow });
-
-        // ===== Helpers =====
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            var sb = new StringBuilder(s.Length);
-            foreach (var ch in s)
-                if (ch >= '0' && ch <= '9') sb.Append(ch);
-            return sb.ToString();
-        }
-
-        private static string LastNDigits(string s, int n)
-        {
-            var d = Digits(s);
-            return d.Length <= n ? d : d.Substring(d.Length - n);
-        }
-
-        private static string SqlDigitsExpr(string column)
-        {
-            // Remove space, +, -, (, ) in SQL side
-            return $"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL({column},''),' ',''),'-',''),'+',''),'(',''),')','')";
-        }
-
-        private static string NormalizeToMsisdn(string raw)
-        {
-            // For Kyoto: ensure "971" + 9 digits
-            var d9 = LastNDigits(raw, 9);
-            return "971" + d9;
-        }
-
-        private (bool found, string inflType) FindInflTypeByMobile(string mobileInput)
-        {
-            // Accept any input; compare on digits-only using 9 and 11 last digits
-            var m9 = LastNDigits(mobileInput, 9);
-            var m11 = LastNDigits(mobileInput, 11);
-            if (string.IsNullOrEmpty(m9)) return (false, "");
-
-            var digitsSql = SqlDigitsExpr("mobileNo");
-
-            var sql = $@"
-SELECT TOP 1 inflType
-FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE RIGHT({digitsSql}, 9)  = @m9
-   OR RIGHT({digitsSql}, 11) = @m11
-   OR mobileNo = @m9
-   OR mobileNo = @m11
-ORDER BY ISNULL(createDt, '1900-01-01') DESC;";
-
-            var prms = new Dictionary<string, object?>
-            {
-                ["@m9"] = m9,
-                ["@m11"] = m11
-            };
-
-            var rows = _db.QaEWebBean(sql, prms) ?? new List<Dictionary<string, object>>();
-            if (rows.Count == 0) return (false, "");
-
-            var inflType = (rows[0]["inflType"]?.ToString() ?? "").Trim().ToUpperInvariant();
-            return (true, inflType);
-        }
-
-        private InfluencerDetailsResponse? FetchFullDetailsByMobile(string mobileInput, string routeFromType)
-        {
-            var m9 = LastNDigits(mobileInput, 9);
-            var m11 = LastNDigits(mobileInput, 11);
-            var digitsSql = SqlDigitsExpr("mobileNo");
-
-            var sql = $@"
+            const string sql = @"
 SELECT TOP 1
-    inflCode, inflType, areaCode,
+    inflCode, areaCode, inflType, inflName, contName,
+    -- name cluster
     frstname, middname, lastname,
-    mobileNo, inflAdd1, emirates,
-
-    -- painter 255s
-    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr,
-
-    -- contractor/shared 255s
-    contrtyp, bankApNm, ibannumb, bankBnNm, bankBnDs,
-
-    -- VAT
+    -- address / contact
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    emirates, mobileNo, emailAdd,
+    -- bank
+    bankApNm, ibannumb, bankBnNm, bankBnDs, bankaddr, bankAcNo, bankIFSC,
+    -- VAT / license / extras
     vatfrmnm, vatraddr, vattxreg, vatefdt,
-
-    -- license cluster
-    comlcnno, comissau, comlctyp, comestdt, comexpdt,
-    comtrdnm, comrespn, comraddr, comeffdt
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
+    -- ID/KYC
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, kycVrTyp, inDocCnt, rjcRemrk,
+    -- misc
+    birthDat, busSttYr, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    isActive, createId, createDt, updateId, updateDt
 FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE RIGHT({digitsSql}, 9)  = @m9
-   OR RIGHT({digitsSql}, 11) = @m11
-   OR mobileNo = @m9
-   OR mobileNo = @m11
-ORDER BY ISNULL(updateDt, createDt) DESC, createDt DESC;";
+WHERE inflCode = @inflCode;";
 
-            var rows = _db.QaEWebBean(sql, new Dictionary<string, object?>
-            {
-                ["@m9"] = m9,
-                ["@m11"] = m11
-            });
-
+            var rows = _db.QaEWebBean(sql, new Dictionary<string, object?> { ["@inflCode"] = inflCode });
             var row = rows?.FirstOrDefault();
-            if (row == null) return null;
+            if (row == null)
+                return NotFound(new { success = false, message = "No record found for inflCode." });
 
-            return new InfluencerDetailsResponse
-            {
-                InflCode = row["inflCode"]?.ToString(),
-                InflType = (row["inflType"]?.ToString() ?? "").Trim().ToUpperInvariant(),
-                Route = routeFromType,
-                AreaCode = row["areaCode"]?.ToString(),
-
-                FirstName = row["frstname"]?.ToString(),
-                MiddleName = row["middname"]?.ToString(),
-                LastName = row["lastname"]?.ToString(),
-                MobileNumber = row["mobileNo"]?.ToString(),
-                Address = row["inflAdd1"]?.ToString(),
-                Emirates = row["emirates"]?.ToString(),
-
-                EmiratesIdNumber = row["emiridno"]?.ToString(),
-                IdName = row["idholder"]?.ToString(),
-                Nationality = row["nationty"]?.ToString(),
-                CompanyDetails = row["employer"]?.ToString(),
-                IssueDate = row["issudate"]?.ToString(),
-                ExpiryDate = row["expirydt"]?.ToString(),
-                Occupation = row["occupatn"]?.ToString(),
-                BankAddress = row["bankaddr"]?.ToString(),
-
-                ContractorType = row["contrtyp"]?.ToString(),
-                AccountHolderName = row["bankApNm"]?.ToString(),
-                IbanNumber = row["ibannumb"]?.ToString(),
-                BankName = row["bankBnNm"]?.ToString(),
-                BranchName = row["bankBnDs"]?.ToString(),
-
-                FirmName = row["vatfrmnm"]?.ToString(),
-                VatAddress = row["vatraddr"]?.ToString(),
-                TaxRegistrationNumber = row["vattxreg"]?.ToString(),
-                VatEffectiveDate = row["vatefdt"]?.ToString(),
-
-                LicenseNumber = row["comlcnno"]?.ToString(),
-                IssuingAuthority = row["comissau"]?.ToString(),
-                LicenseType = row["comlctyp"]?.ToString(),
-                EstablishmentDate = row["comestdt"]?.ToString(),
-                LicenseExpiryDate = row["comexpdt"]?.ToString(),
-                TradeName = row["comtrdnm"]?.ToString(),
-                ResponsiblePerson = row["comrespn"]?.ToString(),
-                LicenseAddress = row["comraddr"]?.ToString(),
-                EffectiveDate = row["comeffdt"]?.ToString()
-            };
+            return Ok(new { success = true, data = row });
         }
 
-        // ===== 1) Verify: /api/SmsUae/verify-mobile =====
-        [HttpPost("verify-mobile")]
-        public IActionResult VerifyMobile([FromBody] RouteByMobileRequest req)
+        // ------------- POST: /api/UseUpdate/update-by-inflcode/{inflCode} -------------
+        // Patch-like: update only provided fields; ignores nulls.
+        [HttpPost("update-by-inflcode/{inflCode}")]
+        [Consumes("application/json")]
+        public IActionResult UpdateByInflCode([FromRoute] string inflCode, [FromBody] UseUpdatePatch body)
         {
-            try
-            {
-                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
-                    return BadRequest(new { success = false, message = "MobileNo is required." });
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required." });
 
-                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
-                if (!found)
-                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
+            // Ensure record exists
+            const string chk = "SELECT COUNT(1) AS Cnt FROM dbo.ctmInfluncr WHERE inflCode = @inflCode;";
+            var exists = Convert.ToInt32(_db.QaEWebBean(chk, new() { ["@inflCode"] = inflCode })?.FirstOrDefault()?["Cnt"] ?? 0) > 0;
+            if (!exists)
+                return NotFound(new { success = false, message = "No record found for inflCode." });
 
-                return Ok(new { success = true, exists = true, inflType });
-            }
-            catch (Exception ex)
+            // Build SET using only non-null properties from body
+            var set = new List<string>();
+            var p = new Dictionary<string, object?> { ["@inflCode"] = inflCode };
+
+            void Add(string col, object? val)
             {
-                _log.LogError(ex, "verify-mobile failed");
-                return StatusCode(500, new { success = false, message = "Error verifying mobile.", error = ex.Message });
+                if (val == null) return;
+                var param = "@p_" + col;
+                set.Add($"{col} = {param}");
+                p[param] = val;
             }
+
+            // Names
+            Add("frstname", body.FirstName);
+            Add("middname", body.MiddleName);
+            Add("lastname", body.LastName);
+            Add("inflName", body.FullName);   // optional if you also populate a combined name
+            Add("contName", body.ContactName);
+
+            // Address / contact
+            Add("inflAdd1", body.Address1);
+            Add("inflAdd2", body.Address2);
+            Add("inflAdd3", body.Address3);
+            Add("inflCity", body.City);
+            Add("district", body.District);
+            Add("inflPinC", body.Pincode);
+            Add("emirates", body.Emirates);
+            Add("emailAdd", body.Email);
+            // NOTE: mobileNo is usually locked. If you must allow, uncomment:
+            // Add("mobileNo", body.MobileNumber);
+
+            // Bank
+            Add("bankApNm", body.AccountHolderName);
+            Add("ibannumb", NormalizeIban(body.IbanNumber));
+            Add("bankBnNm", body.BankName);
+            Add("bankBnDs", body.BranchName);
+            Add("bankaddr", body.BankAddress);
+            Add("bankAcNo", body.BankAccountNo);
+            Add("bankIFSC", body.BankIFSC);
+
+            // VAT / license
+            Add("vatfrmnm", body.FirmName);
+            Add("vatraddr", body.VatAddress);
+            Add("vattxreg", body.TaxRegistrationNumber);
+            Add("vatefdt", body.VatEffectiveDate);
+
+            Add("comlcnno", body.LicenseNumber);
+            Add("comissau", body.IssuingAuthority);
+            Add("comlctyp", body.LicenseType);
+            Add("comestdt", body.EstablishmentDate);
+            Add("comexpdt", body.LicenseExpiryDate);
+            Add("comtrdnm", body.TradeName);
+            Add("comrespn", body.ResponsiblePerson);
+            Add("comraddr", body.LicenseAddress);
+            Add("comeffdt", body.EffectiveDate);
+
+            // ID/KYC
+            Add("emiridno", body.EmiratesIdNumber);
+            Add("idholder", body.IdName);
+            Add("nationty", body.Nationality);
+            Add("employer", body.Employer);
+            Add("issudate", body.IssueDate);
+            Add("expirydt", body.ExpiryDate);
+            Add("occupatn", body.Occupation);
+
+            Add("kycVerFl", body.KycVerifiedFlag);
+            Add("kycVerDt", body.KycVerifiedDate);
+            Add("idCardTy", body.IdCardType);
+            Add("idCardNo", body.IdCardNo);
+            Add("kycVrTyp", body.KycVerifyType);
+            Add("inDocCnt", body.InDocCount);
+            Add("rjcRemrk", body.RejectRemark);
+
+            // Misc
+            Add("birthDat", body.DateOfBirth);
+            Add("busSttYr", body.BusinessStartYear);
+            Add("inflQual", body.Qualification);
+            Add("expertis", body.Expertise);
+            Add("wrkrDetl", body.WorkerDetail);
+            Add("anniDate", body.AnniversaryDate);
+            Add("landLnNo", body.Landline);
+            Add("isActive", body.IsActive);
+            Add("areaCode", body.AreaCode);
+            Add("inflType", body.InfluencerType);
+
+            if (set.Count == 0)
+                return BadRequest(new { success = false, message = "No updatable fields provided." });
+
+            set.Add("updateId = 'API'");
+            set.Add("updateDt = GETDATE()");
+
+            var sql = $@"
+UPDATE dbo.ctmInfluncr
+SET {string.Join(", ", set)}
+WHERE inflCode = @inflCode;
+
+SELECT TOP 1 *
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE inflCode = @inflCode;";
+
+            var rows = _db.QaEWebBean(sql, p);
+            var row = rows?.FirstOrDefault();
+
+            return Ok(new { success = true, message = "Updated.", data = row });
         }
 
-        // ===== 2) Route + FULL DETAILS: /api/SmsUae/route-by-mobile =====
-        [HttpPost("route-by-mobile")]
-        public IActionResult RouteByMobile([FromBody] RouteByMobileRequest req)
-        {
-            try
-            {
-                if (req == null || string.IsNullOrWhiteSpace(req.MobileNo))
-                    return BadRequest(new { success = false, message = "MobileNo is required." });
+        // ----------------- helpers -----------------
+        private static string? NormalizeIban(string? s) =>
+            string.IsNullOrWhiteSpace(s) ? s : s.Replace(" ", "").ToUpperInvariant();
+    }
 
-                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
-                if (!found)
-                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
+    // ----------------- DTO (patch) -----------------
+    // Only send fields you want to change. Nulls are ignored.
+    public sealed class UseUpdatePatch
+    {
+        // Names
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? FullName { get; set; }     // if you also maintain inflName
+        public string? ContactName { get; set; }  // contName
 
-                var route = inflType == "PN" ? "painter" : "contractor";
-                var data = FetchFullDetailsByMobile(req.MobileNo, route);
-                if (data == null)
-                    return NotFound(new { success = false, exists = false, message = "Mobile found but profile not resolved." });
+        // Address / contact
+        public string? Address1 { get; set; }     // inflAdd1
+        public string? Address2 { get; set; }     // inflAdd2
+        public string? Address3 { get; set; }     // inflAdd3
+        public string? City { get; set; }         // inflCity
+        public string? District { get; set; }
+        public string? Pincode { get; set; }      // inflPinC
+        public string? Emirates { get; set; }
+        public string? Email { get; set; }
+        public string? MobileNumber { get; set; } // usually locked; keep null unless you want to allow
 
-                return Ok(new
-                {
-                    success = true,
-                    exists = true,
-                    inflType = data.InflType,
-                    route = data.Route,
-                    data
-                });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "route-by-mobile (details) failed");
-                return StatusCode(500, new { success = false, message = "Error deciding route / fetching details.", error = ex.Message });
-            }
-        }
+        // Bank
+        public string? AccountHolderName { get; set; } // bankApNm
+        public string? IbanNumber { get; set; }        // ibannumb
+        public string? BankName { get; set; }          // bankBnNm
+        public string? BranchName { get; set; }        // bankBnDs
+        public string? BankAddress { get; set; }       // bankaddr
+        public string? BankAccountNo { get; set; }     // bankAcNo
+        public string? BankIFSC { get; set; }          // bankIFSC
 
-        // ===== 3) Direct Send (Forward JSON to external API): /api/SmsUae/send =====
-        [HttpPost("send")]
-        public async Task<IActionResult> Send([FromBody] SmsUaeRequest req, CancellationToken ct)
-        {
-            if (req is null ||
-                string.IsNullOrWhiteSpace(req.MobileNo) ||
-                string.IsNullOrWhiteSpace(req.Message))
-            {
-                return BadRequest(new { success = false, message = "mobileNo and message are required." });
-            }
+        // VAT / license
+        public string? FirmName { get; set; }              // vatfrmnm
+        public string? VatAddress { get; set; }            // vatraddr
+        public string? TaxRegistrationNumber { get; set; } // vattxreg
+        public string? VatEffectiveDate { get; set; }      // vatefdt
 
-            var fwd = LoadForwardOptions();
+        public string? LicenseNumber { get; set; }     // comlcnno
+        public string? IssuingAuthority { get; set; }  // comissau
+        public string? LicenseType { get; set; }       // comlctyp
+        public string? EstablishmentDate { get; set; } // comestdt
+        public string? LicenseExpiryDate { get; set; } // comexpdt
+        public string? TradeName { get; set; }         // comtrdnm
+        public string? ResponsiblePerson { get; set; } // comrespn
+        public string? LicenseAddress { get; set; }    // comraddr
+        public string? EffectiveDate { get; set; }     // comeffdt
 
-            // Build HttpClient handler (proxy/trust settings if needed)
-            var handler = new HttpClientHandler();
-            if (fwd.TrustAllSsl)
-            {
-                handler.ServerCertificateCustomValidationCallback =
-                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-            }
+        // ID/KYC
+        public string? EmiratesIdNumber { get; set; }  // emiridno
+        public string? IdName { get; set; }            // idholder
+        public string? Nationality { get; set; }       // nationty
+        public string? Employer { get; set; }          // employer
+        public string? IssueDate { get; set; }         // issudate
+        public string? ExpiryDate { get; set; }        // expirydt
+        public string? Occupation { get; set; }        // occupatn
 
-            try
-            {
-                using var http = new HttpClient(handler, disposeHandler: true)
-                {
-                    Timeout = TimeSpan.FromSeconds(fwd.TimeoutSeconds <= 0 ? 30 : fwd.TimeoutSeconds)
-                };
+        public string? KycVerifiedFlag { get; set; }   // kycVerFl
+        public string? KycVerifiedDate { get; set; }   // kycVerDt
+        public string? IdCardType { get; set; }        // idCardTy
+        public string? IdCardNo { get; set; }          // idCardNo
+        public string? KycVerifyType { get; set; }     // kycVrTyp
+        public string? InDocCount { get; set; }        // inDocCnt
+        public string? RejectRemark { get; set; }      // rjcRemrk
 
-                // Serialize with camelCase to match external API keys
-                var json = JsonSerializer.Serialize(req, new JsonSerializerOptions
-                {
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-                });
-
-                // Use explicit request + headers (helps avoid WAF 406)
-                using var msg = new HttpRequestMessage(HttpMethod.Post, fwd.TargetUrl)
-                {
-                    Content = new StringContent(json, Encoding.UTF8, "application/json")
-                };
-                msg.Headers.TryAddWithoutValidation("User-Agent", "BW-QA-Gateway/1.0");
-                msg.Headers.TryAddWithoutValidation("Accept", "application/json, */*;q=0.8");
-                msg.Headers.ExpectContinue = false;
-
-                var resp = await http.SendAsync(msg, ct);
-                var respBody = await resp.Content.ReadAsStringAsync(ct);
-
-                // Pass-through style response (plus meta for debugging)
-                return StatusCode((int)resp.StatusCode, new
-                {
-                    success = resp.IsSuccessStatusCode,
-                    statusCode = (int)resp.StatusCode,
-                    forwardedTo = fwd.TargetUrl,
-                    requestBody = req,          // echoes what we sent
-                    response = respBody
-                });
-            }
-            catch (TaskCanceledException tex) when (!ct.IsCancellationRequested)
-            {
-                // Timeout
-                _log.LogError(tex, "SmsUaeController.send timed out");
-                return StatusCode(504, new { success = false, message = "Upstream timeout.", error = tex.Message });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "SmsUaeController.send failed");
-                return StatusCode(500, new { success = false, message = "Error forwarding SMS.", error = ex.Message });
-            }
-        }
-
-        // ===== 4) Verify + Send (Kyoto form-post): /api/SmsUae/send-if-registered =====
-        [HttpPost("send-if-registered")]
-        public async Task<IActionResult> SendIfRegistered([FromBody] SmsUaeRequest req, CancellationToken ct)
-        {
-            try
-            {
-                if (req is null || string.IsNullOrWhiteSpace(req.MobileNo) || string.IsNullOrWhiteSpace(req.Message))
-                    return BadRequest(new { success = false, message = "MobileNo and Message are required." });
-
-                // 1) verify
-                var (found, inflType) = FindInflTypeByMobile(req.MobileNo);
-                if (!found)
-                    return NotFound(new { success = false, exists = false, message = "Mobile not registered." });
-
-                // 2) normalize to MSISDN for Kyoto (971 + last 9)
-                var msisdn = NormalizeToMsisdn(req.MobileNo);
-
-                // forward to Kyoto with normalized number
-                var toSend = new SmsUaeRequest
-                {
-                    MobileNo = msisdn,
-                    Message = req.Message,
-                    Priority = string.IsNullOrWhiteSpace(req.Priority) ? "High" : req.Priority,
-                    CountryCode = string.IsNullOrWhiteSpace(req.CountryCode) ? "ALL" : req.CountryCode
-                };
-
-                var opt = LoadOptions();
-
-                static string FormEnc(string s) => Uri.EscapeDataString(s ?? string.Empty);
-                var sb = new StringBuilder();
-                sb.Append("user=").Append(FormEnc(opt.User))
-                  .Append("&pwd=").Append(FormEnc(opt.Password))
-                  .Append("&senderid=").Append(FormEnc(opt.SenderId))
-                  .Append("&mobileno=").Append(FormEnc(toSend.MobileNo))
-                  .Append("&msgtext=").Append(FormEnc(toSend.Message))
-                  .Append("&priority=").Append(FormEnc(toSend.Priority))
-                  .Append("&CountryCode=").Append(FormEnc(toSend.CountryCode));
-                var formBody = sb.ToString();
-
-                var handler = new HttpClientHandler();
-                if (opt.UseProxy && !string.IsNullOrWhiteSpace(opt.ProxyHost))
-                {
-                    var proxy = new WebProxy(opt.ProxyHost, opt.ProxyPort)
-                    {
-                        BypassProxyOnLocal = false,
-                        Credentials = new NetworkCredential(opt.ProxyUser, opt.ProxyPassword)
-                    };
-                    handler.Proxy = proxy;
-                    handler.UseProxy = true;
-                }
-                if (opt.TrustAllSsl)
-                {
-                    handler.ServerCertificateCustomValidationCallback =
-                        HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-                }
-
-                using var http = new HttpClient(handler, disposeHandler: true);
-                using var content = new StringContent(formBody, Encoding.UTF8, "application/x-www-form-urlencoded");
-                var resp = await http.PostAsync(opt.BaseUrl, content, ct);
-                var body = await resp.Content.ReadAsStringAsync(ct);
-
-                var route = inflType == "PN" ? "painter" : "contractor";
-                return Ok(new
-                {
-                    success = true,
-                    exists = true,
-                    inflType,
-                    route,
-                    kyotoStatus = (int)resp.StatusCode,
-                    kyotoResponse = body
-                });
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "send-if-registered failed");
-                return StatusCode(500, new { success = false, message = "Error sending SMS.", error = ex.Message });
-            }
-        }
+        // Misc
+        public string? DateOfBirth { get; set; }       // birthDat
+        public string? BusinessStartYear { get; set; } // busSttYr
+        public string? Qualification { get; set; }     // inflQual
+        public string? Expertise { get; set; }         // expertis
+        public string? WorkerDetail { get; set; }      // wrkrDetl
+        public string? AnniversaryDate { get; set; }   // anniDate
+        public string? Landline { get; set; }          // landLnNo
+        public string? IsActive { get; set; }          // isActive (Y/N/T etc.)
+        public string? AreaCode { get; set; }          // areaCode
+        public string? InfluencerType { get; set; }    // inflType (PN / 2IK / etc.)
     }
 }
