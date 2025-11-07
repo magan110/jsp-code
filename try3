@@ -19,6 +19,135 @@ namespace sparshWebService.Controllers
         public UseUpdateController(DatabaseHelper db) => _db = db;
 
         // =========================================================================
+        // GET: /api/UseUpdate/search?q=...&limit=10&includeInactive=false&area=...
+        // Flexible typeahead by inflCode/name/mobile; ranked prefix > contains
+        // =========================================================================
+        [HttpGet("search")]
+        public IActionResult Search(
+            [FromQuery] string? q,
+            [FromQuery] int limit = 10,
+            [FromQuery] bool includeInactive = false,
+            [FromQuery] string? area = null
+        )
+        {
+            try
+            {
+                var needle = (q ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(needle))
+                    return Ok(new { success = true, data = Array.Empty<SuggestItem>() });
+
+                if (limit <= 0 || limit > 50) limit = 10;
+
+                var likeContains = $"%{needle}%";
+                var likePrefix = $"{needle}%";
+
+                string digitsOnly = new string(needle.Where(char.IsDigit).ToArray());
+                string? mobContains = string.IsNullOrEmpty(digitsOnly) ? null : $"%{digitsOnly}%";
+                string? mobPrefix = string.IsNullOrEmpty(digitsOnly) ? null : $"{digitsOnly}%";
+
+                const string sql = @"
+DECLARE @limit int = @p_limit;
+
+WITH base AS
+(
+    SELECT TOP (@limit * 5)
+        inflCode,
+        inflType,
+        isActive,
+        COALESCE(
+            NULLIF(LTRIM(RTRIM(inflName)), ''),
+            NULLIF(LTRIM(RTRIM(frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname, ''))), ''),
+            NULLIF(LTRIM(RTRIM(contName)), '')
+        ) AS dispName,
+        frstname, middname, lastname,
+        contName,
+        mobileNo,
+        areaCode,
+        updateDt,
+        createDt,
+        Score =
+            (CASE WHEN inflCode LIKE @p_prefix THEN 120
+                  WHEN inflCode LIKE @p_contains THEN 80 ELSE 0 END) +
+            (CASE WHEN (inflName LIKE @p_prefix OR 
+                        (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname,'')) LIKE @p_prefix OR
+                        contName LIKE @p_prefix) THEN 70
+                  WHEN (inflName LIKE @p_contains OR 
+                        (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname,'')) LIKE @p_contains OR
+                        contName LIKE @p_contains) THEN 40
+                  ELSE 0 END) +
+            (CASE WHEN (@p_mob_prefix IS NOT NULL AND mobileNo LIKE @p_mob_prefix) THEN 60
+                  WHEN (@p_mob_contains IS NOT NULL AND mobileNo LIKE @p_mob_contains) THEN 30
+                  ELSE 0 END) +
+            (CASE WHEN isActive = 'Y' THEN 5 ELSE 0 END)
+    FROM dbo.ctmInfluncr WITH (NOLOCK)
+    WHERE
+        (@p_inc = 1 OR isActive = 'Y')
+        AND (@p_area IS NULL OR areaCode = @p_area)
+        AND (
+               inflCode LIKE @p_contains
+            OR inflName LIKE @p_contains
+            OR (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname,'')) LIKE @p_contains
+            OR contName LIKE @p_contains
+            OR (@p_mob_contains IS NOT NULL AND mobileNo LIKE @p_mob_contains)
+        )
+)
+SELECT TOP (@limit)
+    inflCode,
+    COALESCE(NULLIF(dispName,''), inflCode) AS dispName,
+    mobileNo,
+    areaCode,
+    inflType,
+    isActive
+FROM base
+ORDER BY Score DESC, updateDt DESC, createDt DESC;";
+
+                var rows = _db.QaEWebBean(sql, new Dictionary<string, object?>
+                {
+                    ["@p_limit"] = limit,
+                    ["@p_prefix"] = likePrefix,
+                    ["@p_contains"] = likeContains,
+                    ["@p_mob_prefix"] = (object?)mobPrefix ?? DBNull.Value,
+                    ["@p_mob_contains"] = (object?)mobContains ?? DBNull.Value,
+                    ["@p_inc"] = includeInactive ? 1 : 0,
+                    ["@p_area"] = string.IsNullOrWhiteSpace(area) ? DBNull.Value : area!.Trim()
+                }) ?? new List<Dictionary<string, object>>();
+
+                var list = rows.Select(r =>
+                {
+                    var code = r["inflCode"]?.ToString() ?? "";
+                    var name = r["dispName"]?.ToString();
+                    var mob = r["mobileNo"]?.ToString();
+                    var aCode = r["areaCode"]?.ToString();
+                    var type = r["inflType"]?.ToString();
+                    var active = r["isActive"]?.ToString();
+
+                    var label = string.IsNullOrWhiteSpace(name) ? code : name;
+                    var parts = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(code)) parts.Add($"Code: {code}");
+                    if (!string.IsNullOrWhiteSpace(mob)) parts.Add($"Mob: {mob}");
+                    if (!string.IsNullOrWhiteSpace(aCode)) parts.Add($"Area: {aCode}");
+                    if (!string.IsNullOrWhiteSpace(type)) parts.Add($"Type: {type}");
+                    if (!string.IsNullOrWhiteSpace(active) && active != "Y") parts.Add("Inactive");
+
+                    return new SuggestItem
+                    {
+                        value = code,
+                        label = label,
+                        subLabel = parts.Count > 0 ? string.Join(" • ", parts) : null
+                    };
+                })
+                .Take(limit)
+                .ToList();
+
+                return Ok(new { success = true, data = list });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // =========================================================================
         // GET: /api/UseUpdate/by-inflcode/{inflCode}
         // =========================================================================
         [HttpGet("by-inflcode/{inflCode}")]
@@ -111,7 +240,7 @@ ORDER BY updateDt DESC, createDt DESC;";
                     ["@emailAdd"] = ToDbOrNull(Cut(body.EmailAddress, 40)),
                     ["@inflAdd1"] = ToDbOrNull(Cut(body.Address, 50)),
                     ["@inflAdd2"] = ToDbOrNull(Cut(body.Address2, 100)),
-                    ["@inflAdd3"] = ToDbOrNull(Cut(body.Address3, 30)), // only send if you intend to change
+                    ["@inflAdd3"] = ToDbOrNull(Cut(body.Address3, 30)),
                     ["@inflCity"] = ToDbOrNull(Cut(body.City, 255)),
                     ["@district"] = ToDbOrNull(Cut(body.District, 30)),
                     ["@inflPinC"] = ToDbOrNull(Cut(body.PinCode, 6)),
@@ -159,13 +288,11 @@ ORDER BY updateDt DESC, createDt DESC;";
                 const string upd = @"
 UPDATE dbo.ctmInfluncr
 SET
-    -- names / basic
     contrtyp = COALESCE(@contrtyp, contrtyp),
     frstname = COALESCE(@frstname, frstname),
     middname = COALESCE(@middname, middname),
     lastname = COALESCE(@lastname, lastname),
 
-    -- contact & address
     mobileNo = COALESCE(@mobileNo, mobileNo),
     emailAdd = COALESCE(@emailAdd, emailAdd),
     inflAdd1 = COALESCE(@inflAdd1, inflAdd1),
@@ -178,7 +305,6 @@ SET
     emirates = COALESCE(@emirates, emirates),
     referenc = COALESCE(@referenc, referenc),
 
-    -- bank
     bankAcNo = COALESCE(@bankAcNo, bankAcNo),
     bankApNm = COALESCE(@bankApNm, bankApNm),
     bankBnNm = COALESCE(@bankBnNm, bankBnNm),
@@ -188,13 +314,11 @@ SET
     bankaddr = COALESCE(@bankaddr, bankaddr),
     ibannumb = COALESCE(@ibannumb, ibannumb),
 
-    -- VAT
     vatfrmnm = COALESCE(@vatfrmnm, vatfrmnm),
     vatraddr = COALESCE(@vatraddr, vatraddr),
     vattxreg = COALESCE(@vattxreg, vattxreg),
     vatefdt  = COALESCE(@vatefdt,  vatefdt),
 
-    -- license
     comlcnno = COALESCE(@comlcnno, comlcnno),
     comissau = COALESCE(@comissau, comissau),
     comlctyp = COALESCE(@comlctyp, comlctyp),
@@ -205,7 +329,6 @@ SET
     comraddr = COALESCE(@comraddr, comraddr),
     comeffdt = COALESCE(@comeffdt, comeffdt),
 
-    -- ID / painter cluster
     emiridno = COALESCE(@emiridno, emiridno),
     idholder = COALESCE(@idholder, idholder),
     nationty = COALESCE(@nationty, nationty),
@@ -343,6 +466,13 @@ ORDER BY updateDt DESC, createDt DESC;";
     }
 
     // ===================== DTOs =====================
+    public sealed class SuggestItem
+    {
+        public string value { get; set; } = "";    // inflCode (unique key to fetch details)
+        public string label { get; set; } = "";    // display text in dropdown
+        public string? subLabel { get; set; }      // extra info (mobile/area/type)
+    }
+
     public sealed class UseUpdateView
     {
         // keys/basic
