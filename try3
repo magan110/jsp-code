@@ -20,7 +20,8 @@ namespace sparshWebService.Controllers
 
         // =========================================================================
         // GET: /api/UseUpdate/search?q=...&limit=10&includeInactive=false&area=...
-        // Flexible typeahead by inflCode/name/mobile; ranked prefix > contains
+        // Matches inflCode, inflName, idholder, first/middle/last (both individual
+        // and concatenated), contName, and mobileNo. Ranked: prefix > contains.
         // =========================================================================
         [HttpGet("search")]
         public IActionResult Search(
@@ -54,30 +55,46 @@ WITH base AS
         inflCode,
         inflType,
         isActive,
+
+        -- display name preference order includes idholder and concatenated name
         COALESCE(
             NULLIF(LTRIM(RTRIM(inflName)), ''),
             NULLIF(LTRIM(RTRIM(frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname, ''))), ''),
+            NULLIF(LTRIM(RTRIM(idholder)), ''),
             NULLIF(LTRIM(RTRIM(contName)), '')
         ) AS dispName,
+
         frstname, middname, lastname,
+        idholder,
         contName,
         mobileNo,
         areaCode,
         updateDt,
         createDt,
+
+        -- scoring: code > (name/cont/id) > individual parts > mobile > active
         Score =
-            (CASE WHEN inflCode LIKE @p_prefix THEN 120
-                  WHEN inflCode LIKE @p_contains THEN 80 ELSE 0 END) +
-            (CASE WHEN (inflName LIKE @p_prefix OR 
-                        (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname,'')) LIKE @p_prefix OR
-                        contName LIKE @p_prefix) THEN 70
-                  WHEN (inflName LIKE @p_contains OR 
-                        (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname,'')) LIKE @p_contains OR
-                        contName LIKE @p_contains) THEN 40
+            (CASE WHEN inflCode LIKE @p_prefix THEN 130
+                  WHEN inflCode LIKE @p_contains THEN 90 ELSE 0 END) +
+
+            (CASE WHEN (inflName LIKE @p_prefix
+                        OR (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname, '')) LIKE @p_prefix
+                        OR contName LIKE @p_prefix
+                        OR idholder LIKE @p_prefix) THEN 80
+                  WHEN (inflName LIKE @p_contains
+                        OR (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname, '')) LIKE @p_contains
+                        OR contName LIKE @p_contains
+                        OR idholder LIKE @p_contains) THEN 50
                   ELSE 0 END) +
+
+            (CASE WHEN (frstname LIKE @p_prefix OR middname LIKE @p_prefix OR lastname LIKE @p_prefix) THEN 35
+                  WHEN (frstname LIKE @p_contains OR middname LIKE @p_contains OR lastname LIKE @p_contains) THEN 20
+                  ELSE 0 END) +
+
             (CASE WHEN (@p_mob_prefix IS NOT NULL AND mobileNo LIKE @p_mob_prefix) THEN 60
                   WHEN (@p_mob_contains IS NOT NULL AND mobileNo LIKE @p_mob_contains) THEN 30
                   ELSE 0 END) +
+
             (CASE WHEN isActive = 'Y' THEN 5 ELSE 0 END)
     FROM dbo.ctmInfluncr WITH (NOLOCK)
     WHERE
@@ -86,7 +103,11 @@ WITH base AS
         AND (
                inflCode LIKE @p_contains
             OR inflName LIKE @p_contains
+            OR idholder LIKE @p_contains
             OR (frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname,'')) LIKE @p_contains
+            OR frstname LIKE @p_contains
+            OR middname LIKE @p_contains
+            OR lastname LIKE @p_contains
             OR contName LIKE @p_contains
             OR (@p_mob_contains IS NOT NULL AND mobileNo LIKE @p_mob_contains)
         )
@@ -94,6 +115,8 @@ WITH base AS
 SELECT TOP (@limit)
     inflCode,
     COALESCE(NULLIF(dispName,''), inflCode) AS dispName,
+    idholder,
+    frstname, middname, lastname,
     mobileNo,
     areaCode,
     inflType,
@@ -120,10 +143,13 @@ ORDER BY Score DESC, updateDt DESC, createDt DESC;";
                     var aCode = r["areaCode"]?.ToString();
                     var type = r["inflType"]?.ToString();
                     var active = r["isActive"]?.ToString();
+                    var idName = r["idholder"]?.ToString();
 
                     var label = string.IsNullOrWhiteSpace(name) ? code : name;
+
                     var parts = new List<string>();
                     if (!string.IsNullOrWhiteSpace(code)) parts.Add($"Code: {code}");
+                    if (!string.IsNullOrWhiteSpace(idName)) parts.Add($"ID: {idName}");
                     if (!string.IsNullOrWhiteSpace(mob)) parts.Add($"Mob: {mob}");
                     if (!string.IsNullOrWhiteSpace(aCode)) parts.Add($"Area: {aCode}");
                     if (!string.IsNullOrWhiteSpace(type)) parts.Add($"Type: {type}");
@@ -468,9 +494,9 @@ ORDER BY updateDt DESC, createDt DESC;";
     // ===================== DTOs =====================
     public sealed class SuggestItem
     {
-        public string value { get; set; } = "";    // inflCode (unique key to fetch details)
-        public string label { get; set; } = "";    // display text in dropdown
-        public string? subLabel { get; set; }      // extra info (mobile/area/type)
+        public string value { get; set; } = "";    // inflCode (unique)
+        public string label { get; set; } = "";    // shown in dropdown
+        public string? subLabel { get; set; }      // extra info (ID/Mob/Area/Type)
     }
 
     public sealed class UseUpdateView
@@ -600,3 +626,167 @@ ORDER BY updateDt DESC, createDt DESC;";
         public string? Occupation { get; set; }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+#nullable enable
+
+/*
+SQL
+----
+CREATE TABLE dbo.rakundrmntc (
+    undrmntc BIT NOT NULL
+);
+
+-- Optional seed:
+-- INSERT INTO dbo.rakundrmntc(undrmntc) VALUES (0);
+*/
+
+namespace sparshWebService.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public sealed class RakUnderMaintainanceController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public RakUnderMaintainanceController(DatabaseHelper db) => _db = db;
+
+        /// <summary>
+        /// GET: /api/RakUnderMaintainance/status
+        /// Reads dbo.rakundrmntc.undrmntc (BIT).
+        /// 1 => running, 0 => under maintenance.
+        /// If no row exists, defaults to maintenance with a note.
+        /// </summary>
+        [HttpGet("status")]
+        public IActionResult GetStatus()
+        {
+            try
+            {
+                const string sql = @"
+SELECT TOP 1 CAST(undrmntc AS INT) AS undrmntc
+FROM dbo.rakundrmntc;";
+
+                // Always pass a non-null dictionary to DatabaseHelper
+                var row = _db.QaEWebBean(sql, new Dictionary<string, object?>())?.FirstOrDefault();
+
+                var hasRow = row != null
+                             && row.ContainsKey("undrmntc")
+                             && row["undrmntc"] != null
+                             && row["undrmntc"] != DBNull.Value;
+
+                var isRunning = false;
+                if (hasRow)
+                {
+                    var v = row!["undrmntc"];
+                    if (v is bool b) isRunning = b;                                  // some providers map BIT to bool
+                    else if (int.TryParse(v.ToString(), out var i)) isRunning = i == 1; // or int 0/1
+                }
+
+                var message = hasRow
+                    ? (isRunning ? "RAK app is running." : "RAK app is under maintenance.")
+                    : "RAK app is under maintenance (flag not configured).";
+
+                return Ok(new
+                {
+                    success = true,
+                    running = isRunning,
+                    message
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// POST: /api/RakUnderMaintainance/set?running=true|false
+        /// Optional admin helper to set the flag.
+        /// running=true  => undrmntc = 1 (app is running)
+        /// running=false => undrmntc = 0 (under maintenance)
+        /// Ensures exactly one row exists (insert if missing, else update).
+        /// </summary>
+        [HttpPost("set")]
+        public IActionResult SetStatus([FromQuery] bool running = false)
+        {
+            try
+            {
+                const string ensureSql = @"
+IF NOT EXISTS (SELECT 1 FROM dbo.rakundrmntc)
+BEGIN
+    INSERT INTO dbo.rakundrmntc(undrmntc) VALUES (@p_val);
+END
+ELSE
+BEGIN
+    UPDATE TOP (1) dbo.rakundrmntc
+       SET undrmntc = @p_val;
+END;
+
+SELECT TOP 1 CAST(undrmntc AS INT) AS undrmntc
+FROM dbo.rakundrmntc;";
+
+                var rows = _db.QaEWebBean(ensureSql, new Dictionary<string, object?>
+                {
+                    ["@p_val"] = running ? 1 : 0
+                });
+
+                var row = rows?.FirstOrDefault();
+
+                var isRunning = false;
+                if (row != null
+                    && row.ContainsKey("undrmntc")
+                    && row["undrmntc"] != null
+                    && row["undrmntc"] != DBNull.Value)
+                {
+                    var v = row["undrmntc"];
+                    if (v is bool b) isRunning = b;
+                    else if (int.TryParse(v.ToString(), out var i)) isRunning = i == 1;
+                }
+
+                return Ok(new
+                {
+                    success = true,
+                    running = isRunning,
+                    message = isRunning ? "RAK app is running." : "RAK app is under maintenance."
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+    }
+}
+
+
