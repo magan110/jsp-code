@@ -1,55 +1,103 @@
 @page
-@model ItadminPortal.Pages.Assets.AssetReportModel
-@{
-    ViewData["Title"] = "Asset Report";
-}
+@model ItadminPortal.Pages.Assets.ModifyModel
 
 @await Html.PartialAsync("_Header")
 
+<!-- Ensure jQuery loads first -->
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 
 <div class="container mt-5">
-    <h2 class="text-center mb-4 fw-bold">📊 Asset Report</h2>
+    <h2 class="text-center mb-4 fw-bold">🛠️ Asset Modification</h2>
 
     <div class="card shadow p-4 rounded-4">
-        @if (Model.Assets.Count == 0)
+        @if (!string.IsNullOrEmpty(Model.SuccessMessage))
         {
-            <p class="text-center">No assets found.</p>
+            <div class="alert alert-success">@Model.SuccessMessage</div>
         }
-        else
-        {
-            <table class="table table-striped table-bordered">
-                <thead class="thead-dark">
-                    <tr>
-                        <th>Asset ID</th>
-                        <th>Name</th>
-                        <th>Type</th>
-                        <th>Serial No</th>
-                        <th>Purchase Date</th>
-                        <th>Warranty Expiry</th>
-                        <th>Status</th>
-                        <th>Assigned To</th>
-                    </tr>
-                </thead>
-                <tbody>
+
+        <form method="post">
+            <div class="mb-3">
+                <label class="form-label">Select Asset</label>
+                <select asp-for="Input.AssetId" class="form-select" required>
+                    <option value="">-- Choose Asset --</option>
                     @foreach (var asset in Model.Assets)
                     {
-                        <tr>
-                            <td>@asset["AssetID"]</td>
-                            <td>@asset["AssetName"]</td>
-                            <td>@asset["AssetType"]</td>
-                            <td>@asset["SerialNo"]</td>
-                            <td>@((asset["PurchaseDate"] as DateTime?)?.ToShortDateString())</td>
-                            <td>@((asset["WarrantyExpiry"] as DateTime?)?.ToShortDateString())</td>
-                            <td>@asset["Status"]</td>
-                            <td>@asset["AssignedTo"]</td>
-                        </tr>
+                        <option value="@asset["AssetID"]">@asset["AssetName"] (@asset["SerialNo"])</option>
                     }
-                </tbody>
-            </table>
-        }
+                </select>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">New Status</label>
+                <select asp-for="Input.NewStatus" class="form-select" required>
+                    <option value="">-- Select Status --</option>
+                    <option value="In Use">In Use</option>
+                    <option value="Spare">Spare</option>
+                    <option value="Ready for Discard">Ready for Discard</option>
+                    <!-- Add more statuses as needed -->
+                </select>
+            </div>
+
+            <div class="mb-3 position-relative">
+                <label class="form-label">Reassign To (Optional)</label>
+                <input id="employeeSearch" type="text" class="form-control" placeholder="Type employee name or login ID..." autocomplete="off" />
+                <input type="hidden" asp-for="Input.NewAssignedTo" />
+                <div id="searchResults" class="list-group mt-1"></div>
+            </div>
+
+            <button type="submit" class="btn btn-warning w-100">Modify Asset</button>
+        </form>
     </div>
 </div>
+
+<style>
+    .btn-warning {
+        border-radius: 10px;
+    }
+
+    #searchResults {
+        position: absolute;
+        z-index: 1000;
+        width: 100%;
+    }
+</style>
+
+<script>
+    $(document).ready(function () {
+        $('#employeeSearch').keyup(function () {
+            var query = $(this).val();
+            if (query.length > 1) {
+                $.ajax({
+                    url: '/api/employee/search',
+                    type: 'GET',
+                    data: { q: query },
+                    success: function (data) {
+                        $('#searchResults').empty();
+                        if (data.length > 0) {
+                            data.forEach(emp => {
+                                $('#searchResults').append('<button type="button" class="list-group-item list-group-item-action" onclick="selectEmployee(\'' + emp.loginIdn + '\', \'' + emp.emplName + ' (' + emp.loginIdn + ')\')">' + emp.emplName + ' (' + emp.loginIdn + ')</button>');
+                            });
+                        } else {
+                            $('#searchResults').append('<div class="list-group-item">No employees found</div>');
+                        }
+                    },
+                    error: function () {
+                        $('#searchResults').html('<div class="list-group-item text-danger">Error fetching results</div>');
+                    }
+                });
+            } else {
+                $('#searchResults').empty();
+            }
+        });
+    });
+
+    function selectEmployee(loginIdn, text) {
+        $('#employeeSearch').val(text);
+        $('input[name="Input.NewAssignedTo"]').val(loginIdn);
+        $('#searchResults').empty();
+    }
+</script>
 
 @await Html.PartialAsync("_Footer")
 
@@ -62,27 +110,66 @@
 
 
 
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 using AdminPortal.DataAccess;
+using System.Collections.Generic;
+using System;
 
 namespace ItadminPortal.Pages.Assets
 {
-    public class AssetReportModel : PageModel
+    public class ModifyModel : PageModel
     {
         private readonly DatabaseHelper _db;
 
-        public AssetReportModel(DatabaseHelper db)
+        public ModifyModel(DatabaseHelper db)
         {
             _db = db;
         }
 
         public List<Dictionary<string, object>> Assets { get; set; } = new List<Dictionary<string, object>>();
 
+        [BindProperty]
+        public ModifyInput Input { get; set; } = new ModifyInput();
+
+        public string SuccessMessage { get; set; } = string.Empty;
+
         public void OnGet()
         {
+            LoadAssets();
+        }
+
+        public IActionResult OnPost()
+        {
+            if (!ModelState.IsValid)
+            {
+                LoadAssets();
+                return Page();
+            }
+
+            // TODO: Implement update logic
+
+            LoadAssets();
+            return Page();
+        }
+
+        private void LoadAssets()
+        {
             string query = "SELECT AssetID, AssetName, AssetType, SerialNo, PurchaseDate, WarrantyExpiry, Status, AssignedTo FROM Assets";
-            Assets = _db.SessBean(query, null);
+            Assets = _db.SessBean(query, new Dictionary<string, object>());
         }
     }
-}
 
+    public class ModifyInput
+    {
+        public int AssetId { get; set; }
+        public string NewStatus { get; set; } = "";
+        public string NewAssignedTo { get; set; } = "";
+    }
+}
