@@ -1,299 +1,764 @@
-@page
-@model ItadminPortal.Pages.Assets.ModifyModel
-
-@await Html.PartialAsync("_Header")
-
-<!-- Ensure jQuery loads first -->
-<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-
-<div class="container mt-5">
-    <h2 class="text-center mb-4 fw-bold">🛠️ Asset Modification</h2>
-
-    <div class="card shadow p-4 rounded-4">
-        @if (!string.IsNullOrEmpty(Model.SuccessMessage))
-        {
-            <div class="alert alert-success">@Model.SuccessMessage</div>
-        }
-
-        <form method="post">
-            <div class="mb-3">
-                <label class="form-label">Select Asset to Modify</label>
-                <select id="assetSelect" class="form-select" onchange="loadAsset(this.value)">
-                    <option value="">-- Choose Asset --</option>
-                    @foreach (var asset in Model.Assets)
-                    {
-                        <option value="@asset["AssetID"]" @(Model.Input.AssetId == (int)asset["AssetID"] ? "selected" : "")>@asset["AssetName"] (@asset["SerialNo"])</option>
-                    }
-                </select>
-            </div>
-
-            @if (Model.SelectedAsset.Count > 0)
-            {
-                <input type="hidden" asp-for="Input.AssetId" />
-
-                <div class="mb-3">
-                    <label asp-for="Input.AssetName" class="form-label">Asset Name</label>
-                    <input asp-for="Input.AssetName" class="form-control" required />
-                </div>
-
-                <div class="mb-3">
-                    <label asp-for="Input.AssetType" class="form-label">Asset Type</label>
-                    <input asp-for="Input.AssetType" class="form-control" required />
-                </div>
-
-                <div class="mb-3">
-                    <label asp-for="Input.SerialNo" class="form-label">Serial Number</label>
-                    <input asp-for="Input.SerialNo" class="form-control" required />
-                </div>
-
-                <div class="mb-3">
-                    <label asp-for="Input.PurchaseDate" class="form-label">Purchase Date</label>
-                    <input asp-for="Input.PurchaseDate" type="date" class="form-control" />
-                </div>
-
-                <div class="mb-3">
-                    <label asp-for="Input.WarrantyExpiry" class="form-label">Warranty Expiry</label>
-                    <input asp-for="Input.WarrantyExpiry" type="date" class="form-control" />
-                </div>
-
-                <div class="mb-3">
-                    <label asp-for="Input.Status" class="form-label">Status</label>
-                    <select asp-for="Input.Status" class="form-select" required>
-                        <option value="In Use">In Use</option>
-                        <option value="Spare">Spare</option>
-                        <option value="Ready for Discard">Ready for Discard</option>
-                        <!-- Add more statuses as needed -->
-                    </select>
-                </div>
-
-                <div class="mb-3 position-relative">
-                    <label asp-for="Input.AssignedTo" class="form-label">Assigned To (Optional)</label>
-                    <input id="employeeSearch" type="text" class="form-control" placeholder="Type employee name or login ID..." autocomplete="off" value="@(Model.Input.AssignedTo != "" ? Model.Input.AssignedTo : "")" />
-                    <input type="hidden" asp-for="Input.AssignedTo" />
-                    <div id="searchResults" class="list-group mt-1"></div>
-                </div>
-
-                <button type="submit" class="btn btn-warning w-100">Update Asset</button>
-            }
-        </form>
-    </div>
-</div>
-
-<style>
-    .btn-warning {
-        border-radius: 10px;
-    }
-
-    #searchResults {
-        position: absolute;
-        z-index: 1000;
-        width: 100%;
-    }
-</style>
-
-<script>
-    $(document).ready(function () {
-        $('#employeeSearch').keyup(function () {
-            var query = $(this).val();
-            if (query.length > 1) {
-                $.ajax({
-                    url: '/api/employee/search',
-                    type: 'GET',
-                    data: { q: query },
-                    success: function (data) {
-                        $('#searchResults').empty();
-                        if (data.length > 0) {
-                            data.forEach(emp => {
-                                $('#searchResults').append('<button type="button" class="list-group-item list-group-item-action" onclick="selectEmployee(\'' + emp.loginIdn + '\', \'' + emp.emplName + ' (' + emp.loginIdn + ')\')">' + emp.emplName + ' (' + emp.loginIdn + ')</button>');
-                            });
-                        } else {
-                            $('#searchResults').append('<div class="list-group-item">No employees found</div>');
-                        }
-                    },
-                    error: function () {
-                        $('#searchResults').html('<div class="list-group-item text-danger">Error fetching results</div>');
-                    }
-                });
-            } else {
-                $('#searchResults').empty();
-            }
-        });
-    });
-
-    function selectEmployee(loginIdn, text) {
-        $('#employeeSearch').val(text);
-        $('input[name="Input.NewAssignedTo"]').val(loginIdn);
-        $('#searchResults').empty();
-    }
-
-    function loadAsset(id) {
-        if (id) {
-            window.location.href = '?id=' + id;
-        }
-    }
-</script>
-
-@await Html.PartialAsync("_Footer")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Mvc.RazorPages;
-using AdminPortal.DataAccess;
-using System.Collections.Generic;
+using sparshWebService.DataAccess;
 using System;
-using System.ComponentModel.DataAnnotations;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
 
-namespace ItadminPortal.Pages.Assets
+namespace sparshWebService.Controllers
 {
-    public class ModifyModel : PageModel
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class ApprovalController : ControllerBase
     {
         private readonly DatabaseHelper _db;
 
-        public ModifyModel(DatabaseHelper db)
+        public ApprovalController(DatabaseHelper dbHelper) => _db = dbHelper;
+
+        // ------------------------------------------------------------
+        // 1) PENDING LIST (paged + search + filter by type)
+        // GET: /api/Approval/pending?search=&type=All&page=1&pageSize=20&sort=createDt_desc
+        // ------------------------------------------------------------
+        [HttpGet("pending")]
+        public IActionResult GetPending(
+            [FromQuery] string? search = "",
+            [FromQuery] string? type = "All",
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 20,
+            [FromQuery] string? sort = "createDt_desc")
         {
-            _db = db;
-        }
-
-        public List<Dictionary<string, object>> Assets { get; set; } = new List<Dictionary<string, object>>();
-
-        [BindProperty]
-        public ModifyInput Input { get; set; } = new ModifyInput();
-
-        public string SuccessMessage { get; set; } = string.Empty;
-
-        public void OnGet(int? id)
-        {
-            LoadAssets();
-            if (id.HasValue)
-            {
-                SelectedAsset = LoadAssetById(id.Value);
-                if (SelectedAsset.Count > 0)
-                {
-                    Input.AssetId = (int)SelectedAsset["AssetID"];
-                    Input.AssetName = (string)SelectedAsset["AssetName"];
-                    Input.AssetType = (string)SelectedAsset["AssetType"];
-                    Input.SerialNo = (string)SelectedAsset["SerialNo"];
-                    Input.PurchaseDate = SelectedAsset["PurchaseDate"] as DateTime?;
-                    Input.WarrantyExpiry = SelectedAsset["WarrantyExpiry"] as DateTime?;
-                    Input.Status = (string)SelectedAsset["Status"];
-                    Input.AssignedTo = SelectedAsset["AssignedTo"] as string ?? "";
-                }
-            }
-        }
-
-        public IActionResult OnPost()
-        {
-            if (!ModelState.IsValid)
-            {
-                LoadAssets();
-                return Page();
-            }
-
             try
             {
-                var query = "UPDATE Assets SET AssetName = @AssetName, AssetType = @AssetType, SerialNo = @SerialNo, PurchaseDate = @PurchaseDate, WarrantyExpiry = @WarrantyExpiry, Status = @Status";
-                var parameters = new Dictionary<string, object>
+                page = page <= 0 ? 1 : page;
+                pageSize = pageSize <= 0 ? 20 : Math.Min(pageSize, 100);
+                var skip = (page - 1) * pageSize;
+
+                if (!string.IsNullOrWhiteSpace(search))
+                    search = Regex.Replace(search.Trim(), @"\s+", " ");
+
+                var where = @"
+WHERE 
+    ISNULL(blkStuts,'N') <> 'Y'
+    AND ISNULL(isActive,'') NOT IN ('Y','R')
+";
+                var p = new Dictionary<string, object?>();
+
+                if (!string.IsNullOrWhiteSpace(type) && !type.Equals("All", StringComparison.OrdinalIgnoreCase))
                 {
-                    { "@AssetName", Input.AssetName },
-                    { "@AssetType", Input.AssetType },
-                    { "@SerialNo", Input.SerialNo },
-                    { "@PurchaseDate", Input.PurchaseDate ?? (object)DBNull.Value },
-                    { "@WarrantyExpiry", Input.WarrantyExpiry ?? (object)DBNull.Value },
-                    { "@Status", Input.Status },
-                    { "@AssetId", Input.AssetId }
+                    where += "  AND (contrtyp = @type OR inflType = @typeShort)\n";
+                    p["@type"] = type;
+                    p["@typeShort"] = (type.Length >= 2 ? type[..2] : type).ToUpperInvariant();
+                }
+
+                if (!string.IsNullOrWhiteSpace(search))
+                {
+                    where += @"
+  AND (
+        inflName LIKE @kw 
+        OR (LTRIM(RTRIM(ISNULL(frstname,''))) + ' ' + LTRIM(RTRIM(ISNULL(middname,''))) + ' ' + LTRIM(RTRIM(ISNULL(lastname,'')))) LIKE @kw
+        OR mobileNo LIKE @kw
+        OR areaCode LIKE @kw
+        OR inflCode LIKE @kw
+        OR contrtyp LIKE @kw
+      )
+";
+                    p["@kw"] = $"%{search}%";
+                }
+
+                string orderBy = (sort ?? "").ToLowerInvariant() switch
+                {
+                    "name_asc" => "ORDER BY name ASC, id ASC",
+                    "name_desc" => "ORDER BY name DESC, id ASC",
+                    "type_asc" => "ORDER BY type ASC, id ASC",
+                    "type_desc" => "ORDER BY type DESC, id ASC",
+                    "date_asc" => "ORDER BY dt ASC, id ASC",
+                    _ => "ORDER BY dt DESC, id ASC",
                 };
 
-                if (!string.IsNullOrEmpty(Input.AssignedTo))
-                {
-                    query += ", AssignedTo = @AssignedTo";
-                    parameters.Add("@AssignedTo", Input.AssignedTo);
-                }
-                else if (Input.Status != "In Use")
-                {
-                    query += ", AssignedTo = NULL";
-                }
+                var sql = $@"
+;WITH base AS
+(
+    SELECT
+        inflCode,
+        LTRIM(RTRIM(
+            NULLIF(
+                CONCAT(
+                    NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+                ), '  ')
+        )) AS compositeName,
+        inflName,
+        ISNULL(contrtyp, '') AS contrtyp,
+        ISNULL(inflType, '') AS inflType,
+        ISNULL(isActive,'') AS isActive,
+        COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS dt
+    FROM dbo.ctmInfluncr WITH (NOLOCK)
+    {where}
+)
+, shaped AS
+(
+    SELECT
+        inflCode AS id,
+        CAST(NULLIF(LTRIM(RTRIM(CASE WHEN ISNULL(compositeName,'') <> '' THEN compositeName ELSE inflName END)), '') AS NVARCHAR(256)) AS name,
+        CAST(NULLIF(LTRIM(RTRIM(CASE WHEN ISNULL(contrtyp,'') <> '' THEN contrtyp ELSE inflType END)), '') AS NVARCHAR(255)) AS type,
+        dt,
+        CASE 
+            WHEN isActive = 'Y' THEN 'Approved'
+            WHEN isActive = 'R' THEN 'Rejected'
+            WHEN isActive = 'E' THEN 'EID Approved'
+            ELSE 'Pending'
+        END AS status
+    FROM base
+)
+SELECT
+    id,
+    ISNULL(name,'') AS name,
+    CASE WHEN ISNULL(type,'')='' THEN 'Contractor' ELSE type END AS type,
+    CONVERT(VARCHAR(10), dt, 120) AS [date], -- yyyy-MM-dd
+    status,
+    COUNT(1) OVER() AS total
+FROM shaped
+{orderBy}
+OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY;
+";
+                p["@skip"] = skip;
+                p["@take"] = pageSize;
 
-                query += " WHERE AssetID = @AssetId";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
 
-                var rowsAffected = _db.SessBeanExecute(query, parameters);
+                int total = 0;
+                if (rows.Count > 0)
+                    _ = int.TryParse(rows[0].GetValueOrDefault("total")?.ToString(), out total);
 
-                if (rowsAffected > 0)
+                var items = rows.Select(r =>
                 {
-                    SuccessMessage = "✅ Asset updated successfully!";
-                    Input = new ModifyInput();
-                }
-                else
-                {
-                    ModelState.AddModelError("", "Failed to update asset. It may have been deleted or modified.");
-                }
+                    var id = r.GetValueOrDefault("id")?.ToString() ?? "";
+                    var name = r.GetValueOrDefault("name")?.ToString() ?? "";
+                    var typeOut = r.GetValueOrDefault("type")?.ToString() ?? "Contractor";
+                    var date = r.GetValueOrDefault("date")?.ToString() ?? "";
+                    var status = r.GetValueOrDefault("status")?.ToString() ?? "Pending";
+                    return new
+                    {
+                        id,
+                        name,
+                        type = typeOut,
+                        date,
+                        status,
+                        avatar = MakeAvatar(name, id)
+                    };
+                });
+
+                return Ok(new { success = true, page, pageSize, total, items });
             }
             catch (Exception ex)
             {
-                ModelState.AddModelError("", $"An error occurred: {ex.Message}");
+                return StatusCode(500, new { success = false, message = "Failed to fetch pending list.", error = ex.Message });
             }
-
-            LoadAssets();
-            return Page();
         }
 
-        private void LoadAssets()
+        // ------------------------------------------------------------
+        // 2) STATS
+        // GET: /api/Approval/stats
+        // ------------------------------------------------------------
+        [HttpGet("stats")]
+        public IActionResult GetStats()
         {
-            string query = "SELECT AssetID, AssetName, AssetType, SerialNo, PurchaseDate, WarrantyExpiry, Status, AssignedTo FROM Assets";
-            Assets = _db.SessBean(query, new Dictionary<string, object>());
+            try
+            {
+                var sql = @"
+;WITH base AS
+(
+    SELECT
+        ISNULL(isActive,'') AS ia,
+        ISNULL(contrtyp,'') AS contrtyp,
+        ISNULL(inflType,'') AS inflType
+    FROM dbo.ctmInfluncr WITH (NOLOCK)
+    WHERE ISNULL(blkStuts,'N') <> 'Y'
+)
+SELECT 
+    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R')) AS totalPending,  -- includes 'E'
+    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R') AND (contrtyp LIKE '%Contractor%' OR inflType = 'CO')) AS contractors,
+    (SELECT COUNT(1) FROM base WHERE ia NOT IN ('Y','R') AND (contrtyp LIKE '%Painter%' OR inflType = 'PA')) AS painters;
+";
+                var rows = _db.QaEWebBean(sql, new Dictionary<string, object?>()) ?? new List<Dictionary<string, object>>();
+                var r = rows.FirstOrDefault() ?? new Dictionary<string, object>();
+                int Tot(string k) => int.TryParse(r.GetValueOrDefault(k)?.ToString(), out var v) ? v : 0;
+
+                return Ok(new
+                {
+                    success = true,
+                    totalPending = Tot("totalPending"),
+                    contractors = Tot("contractors"),
+                    painters = Tot("painters"),
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Failed to fetch stats.", error = ex.Message });
+            }
         }
 
-        public Dictionary<string, object> SelectedAsset { get; set; } = new Dictionary<string, object>();
-
-        private Dictionary<string, object> LoadAssetById(int id)
+        // ------------------------------------------------------------
+        // 3) LEGACY FINAL APPROVE (kept) - sets isActive='Y'
+        // POST: /api/Approval/approve  { inflCode, actorId }
+        // ------------------------------------------------------------
+        [HttpPost("approve")]
+        public IActionResult Approve([FromBody] ApprovalActionRequest req)
         {
-            string query = "SELECT AssetID, AssetName, AssetType, SerialNo, PurchaseDate, WarrantyExpiry, Status, AssignedTo FROM Assets WHERE AssetID = @id";
-            var parameters = new Dictionary<string, object> { { "@id", id } };
-            var results = _db.SessBean(query, parameters);
-            return results.FirstOrDefault() ?? new Dictionary<string, object>();
+            if (string.IsNullOrWhiteSpace(req?.InflCode))
+                return BadRequest(new { success = false, message = "InflCode is required" });
+
+            try
+            {
+                var p = new Dictionary<string, object?>
+                {
+                    ["@code"] = req.InflCode.Trim(),
+                    ["@usr"] = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10)
+                };
+
+                var sql = @"
+UPDATE dbo.ctmInfluncr
+   SET isActive = 'Y',
+       rjcRemrk = NULL,
+       updateId = @usr,
+       updateDt = GETDATE()
+ WHERE inflCode = @code
+   AND ISNULL(isActive,'') NOT IN ('Y','R');   -- idempotent
+SELECT @@ROWCOUNT AS rc;
+
+IF @@ROWCOUNT = 0
+    SELECT TOP 1 ISNULL(isActive,'') AS ia FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE inflCode = @code;
+";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                if (rows.Count == 0) return NotFound(new { success = false, message = "Not found" });
+
+                var rcStr = rows[0].GetValueOrDefault("rc")?.ToString();
+                if (rcStr == "1")
+                    return Ok(new { success = true, message = "Full ID is approved", stage = "FINAL", influencerCode = req.InflCode });
+
+                var ia = rows.Last().GetValueOrDefault("ia")?.ToString()?.Trim().ToUpperInvariant();
+                var status = MapStatus(ia);
+                return Conflict(new { success = false, message = $"Already {status}.", status, influencerCode = req.InflCode });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Approval failed.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 4) REJECT: set isActive = 'R'
+        // POST: /api/Approval/reject  { inflCode, reason, actorId }
+        // ------------------------------------------------------------
+        [HttpPost("reject")]
+        public IActionResult Reject([FromBody] RejectionActionRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(req?.InflCode))
+                return BadRequest(new { success = false, message = "InflCode is required" });
+
+            try
+            {
+                var p = new Dictionary<string, object?>
+                {
+                    ["@code"] = req.InflCode.Trim(),
+                    ["@usr"] = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10),
+                    ["@rem"] = Cut(req.Reason ?? "", 1000)
+                };
+
+                var sql = @"
+UPDATE dbo.ctmInfluncr
+   SET isActive = 'R',
+       rjcRemrk = @rem,
+       updateId = @usr,
+       updateDt = GETDATE()
+ WHERE inflCode = @code
+   AND ISNULL(isActive,'') NOT IN ('Y','R');   -- block after final approve
+SELECT @@ROWCOUNT AS rc;
+
+IF @@ROWCOUNT = 0
+    SELECT TOP 1 ISNULL(isActive,'') AS ia FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE inflCode = @code;
+";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                if (rows.Count == 0) return NotFound(new { success = false, message = "Not found" });
+
+                var rcStr = rows[0].GetValueOrDefault("rc")?.ToString();
+                if (rcStr == "1")
+                    return Ok(new { success = true, message = "Rejected", influencerCode = req.InflCode });
+
+                var ia = rows.Last().GetValueOrDefault("ia")?.ToString()?.Trim().ToUpperInvariant();
+                var status = MapStatus(ia);
+                return Conflict(new { success = false, message = $"Already {status}.", status, influencerCode = req.InflCode });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Rejection failed.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 5) STEP-1: APPROVE EMIRATES ID ONLY (no schema change)
+        // Sets isActive='E' if currently pending
+        // POST: /api/Approval/approve/eid  { inflCode, actorId }
+        // ------------------------------------------------------------
+        [HttpPost("approve/eid")]
+        public IActionResult ApproveEmiratesId([FromBody] ApprovalActionRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(req?.InflCode))
+                return BadRequest(new { success = false, message = "InflCode is required" });
+
+            try
+            {
+                var code = req.InflCode.Trim();
+                var actor = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10);
+
+                var sql = @"
+UPDATE dbo.ctmInfluncr
+   SET isActive = 'E',            -- mark EID-approved stage
+       updateId  = @usr,
+       updateDt  = GETDATE()
+ WHERE inflCode = @code
+   AND ISNULL(isActive,'') NOT IN ('Y','R')    -- only if not final or rejected
+   AND ISNULL(isActive,'') <> 'E';             -- idempotent
+
+SELECT @@ROWCOUNT AS rc;
+
+-- if not updated, return current state
+IF @@ROWCOUNT = 0
+    SELECT TOP 1 ISNULL(isActive,'') AS ia FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE inflCode = @code;
+";
+                var p = new Dictionary<string, object?> { ["@code"] = code, ["@usr"] = actor };
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                if (rows.Count == 0) return NotFound(new { success = false, message = "Not found" });
+
+                var rcStr = rows[0].GetValueOrDefault("rc")?.ToString();
+                if (rcStr == "1")
+                    return Ok(new { success = true, message = "Emirates ID is approved", stage = "EID", influencerCode = code });
+
+                var ia = rows.Last().GetValueOrDefault("ia")?.ToString()?.Trim().ToUpperInvariant();
+                var status = MapStatus(ia);
+                if (ia == "E")
+                    return Conflict(new { success = false, message = "Emirates ID already approved.", stage = "EID", influencerCode = code });
+                return Conflict(new { success = false, message = $"Already {status}.", status, influencerCode = code });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "EID approval failed.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 6) STEP-2: FINAL APPROVAL (requires stage 'E')
+        // POST: /api/Approval/approve/final  { inflCode, actorId }
+        // ------------------------------------------------------------
+        [HttpPost("approve/final")]
+        public IActionResult ApproveFinal([FromBody] ApprovalActionRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(req?.InflCode))
+                return BadRequest(new { success = false, message = "InflCode is required" });
+
+            try
+            {
+                var code = req.InflCode.Trim();
+                var actor = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10);
+
+                var sql = @"
+UPDATE dbo.ctmInfluncr
+   SET isActive = 'Y',
+       rjcRemrk = NULL,
+       updateId = @usr,
+       updateDt = GETDATE()
+ WHERE inflCode = @code
+   AND ISNULL(isActive,'') = 'E';  -- enforce step-wise: only from EID-approved
+
+SELECT @@ROWCOUNT AS rc;
+
+IF @@ROWCOUNT = 0
+    SELECT TOP 1 ISNULL(isActive,'') AS ia FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE inflCode = @code;
+";
+                var p = new Dictionary<string, object?> { ["@code"] = code, ["@usr"] = actor };
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                if (rows.Count == 0) return NotFound(new { success = false, message = "Not found" });
+
+                var rcStr = rows[0].GetValueOrDefault("rc")?.ToString();
+                if (rcStr == "1")
+                    return Ok(new { success = true, message = "Full ID is approved", stage = "FINAL", influencerCode = code });
+
+                var ia = rows.Last().GetValueOrDefault("ia")?.ToString()?.Trim().ToUpperInvariant();
+                if (ia == "Y")
+                    return Conflict(new { success = false, message = "Already Approved.", status = "Approved", influencerCode = code });
+                if (ia == "R")
+                    return Conflict(new { success = false, message = "Already Rejected.", status = "Rejected", influencerCode = code });
+                if (string.IsNullOrWhiteSpace(ia) || ia == "")
+                    return Conflict(new { success = false, message = "Emirates ID must be approved first.", stage = "EID_PENDING", influencerCode = code });
+
+                return Conflict(new { success = false, message = $"Cannot finalize from state '{ia}'.", status = MapStatus(ia), influencerCode = code });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Final approval failed.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 7) COMPACT DETAILS
+        // GET: /api/Approval/details/{inflCode}
+        // ------------------------------------------------------------
+        [HttpGet("details/{inflCode}")]
+        public IActionResult GetCompactDetails([FromRoute] string inflCode)
+        {
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required" });
+
+            try
+            {
+                var p = new Dictionary<string, object?> { ["@code"] = inflCode.Trim() };
+
+                var sql = @"
+SELECT TOP 1
+    inflCode,
+    ISNULL(isActive,'')            AS isActive,
+    ISNULL(contrtyp,'')            AS contrtyp,
+    ISNULL(inflType,'')            AS inflType,
+    CONVERT(VARCHAR(10), COALESCE(createDt, sapInsDt, frstScDt, GETDATE()), 120) AS submittedDate,        
+    LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
+    LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
+    LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
+    LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
+    ISNULL(mobileNo,'')            AS mobileNo,
+    ISNULL(emailAdd,'')            AS emailAdd,
+    ISNULL(referenc,'')            AS referenc,
+    ISNULL(inflAdd1,'')            AS inflAdd1,
+    ISNULL(inflAdd2,'')            AS inflAdd2,
+    ISNULL(inflAdd3,'')            AS inflAdd3,
+    ISNULL(inflCity,'')            AS inflCity,
+    ISNULL(district,'')            AS district,
+    ISNULL(inflPinC,'')            AS inflPinC,
+    ISNULL(comtrdnm,'')            AS comtrdnm,
+    ISNULL(vatfrmnm,'')            AS vatfrmnm,
+    ISNULL(comlcnno,'')            AS comlcnno,
+    ISNULL(vattxreg,'')            AS vattxreg,
+    ISNULL(bankApNm,'')            AS bankApNm,
+    ISNULL(ibannumb,'')            AS ibannumb,
+    ISNULL(bankBnNm,'')            AS bankBnNm,
+    ISNULL(bankBnDs,'')            AS bankBnDs
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE inflCode = @code;
+";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var r = rows.FirstOrDefault();
+
+                if (r == null)
+                    return NotFound(new { success = false, message = "Registration not found" });
+
+                string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+
+                var fullName = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
+                var name = string.IsNullOrWhiteSpace(fullName) ? G("inflName") : fullName;
+
+                var typeRaw = string.IsNullOrWhiteSpace(G("contrtyp")) ? G("inflType") : G("contrtyp");
+                var type = string.IsNullOrWhiteSpace(typeRaw) ? "Contractor" : typeRaw;
+
+                string AddressLine(params string[] parts)
+                {
+                    var clean = parts
+                        .Select(x => (x ?? "").Trim())
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .ToList();
+                    return string.Join(", ", clean);
+                }
+
+                var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"), G("inflCity"), G("district"), G("inflPinC"));
+
+                var ia = (G("isActive") ?? "").Trim().ToUpperInvariant();
+                var status = MapStatus(ia);
+                var stage = ia switch
+                {
+                    "Y" => "FINAL",
+                    "E" => "EID_APPROVED",
+                    "R" => "REJECTED",
+                    _ => "EID_PENDING"
+                };
+
+                return Ok(new
+                {
+                    success = true,
+                    id = G("inflCode"),
+                    name,
+                    type,
+                    mobile = G("mobileNo"),
+                    email = G("emailAdd"),
+                    submittedDate = G("submittedDate"),
+                    status,
+                    stage,
+                    fullName = name,
+                    address,
+                    reference = G("referenc"),
+                    companyName = string.IsNullOrWhiteSpace(G("comtrdnm")) ? G("vatfrmnm") : G("comtrdnm"),
+                    licenseNumber = G("comlcnno"),
+                    trnNumber = G("vattxreg"),
+                    accountHolder = G("bankApNm"),
+                    iban = G("ibannumb"),
+                    bankName = G("bankBnNm"),
+                    branch = G("bankBnDs"),
+                    avatar = MakeAvatar(name, G("inflCode"))
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Failed to fetch details.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 8) FULL REGISTRATION DETAILS
+        // GET: /api/Approval/{inflCode}
+        // ------------------------------------------------------------
+        [HttpGet("{inflCode}")]
+        public IActionResult GetRegistrationDetails([FromRoute] string inflCode)
+        {
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required" });
+
+            try
+            {
+                var p = new Dictionary<string, object?> { ["@code"] = inflCode.Trim() };
+
+                var sql = @"
+SELECT TOP 1
+    inflCode,
+    ISNULL(isActive,'')            AS isActive,
+    ISNULL(contrtyp,'')            AS contrtyp,
+    ISNULL(inflType,'')            AS inflType,
+    COALESCE(createDt, sapInsDt, frstScDt, GETDATE()) AS submittedDateDt,
+    LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
+    LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
+    LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
+    LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
+    ISNULL(mobileNo,'')            AS mobileNo,
+    ISNULL(emailAdd,'')            AS emailAdd,
+    ISNULL(referenc,'')            AS referenc,
+    ISNULL(inflAdd1,'')            AS inflAdd1,
+    ISNULL(inflAdd2,'')            AS inflAdd2,
+    ISNULL(inflAdd3,'')            AS inflAdd3,
+    ISNULL(inflCity,'')            AS inflCity,
+    ISNULL(district,'')            AS district,
+    ISNULL(inflPinC,'')            AS inflPinC,
+    ISNULL(comtrdnm,'')            AS comtrdnm,
+    ISNULL(vatfrmnm,'')            AS vatfrmnm,
+    ISNULL(comlcnno,'')            AS comlcnno,
+    ISNULL(vattxreg,'')            AS vattxreg,
+    ISNULL(bankApNm,'')            AS bankApNm,
+    ISNULL(ibannumb,'')            AS ibannumb,
+    ISNULL(bankBnNm,'')            AS bankBnNm,
+    ISNULL(bankBnDs,'')            AS bankBnDs
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE inflCode = @code;
+";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var r = rows.FirstOrDefault();
+                if (r == null) return NotFound(new { success = false, message = "Not found" });
+
+                string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+
+                var fullName = ComposeName(G("frstname"), G("middname"), G("lastname"), G("inflName"));
+                var name = string.IsNullOrWhiteSpace(fullName) ? G("inflName") : fullName;
+
+                var typeRaw = string.IsNullOrWhiteSpace(G("contrtyp")) ? G("inflType") : G("contrtyp");
+                var type = string.IsNullOrWhiteSpace(typeRaw) ? "Contractor" : typeRaw;
+
+                string AddressLine(params string[] parts) =>
+                    string.Join(", ", parts.Where(x => !string.IsNullOrWhiteSpace(x?.Trim()))
+                                          .Select(x => x!.Trim()));
+
+                var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"),
+                                          G("inflCity"), G("district"), G("inflPinC"));
+
+                var submittedDate = DateTime.TryParse(r.GetValueOrDefault("submittedDateDt")?.ToString(), out var dt)
+                                    ? dt.ToString("yyyy-MM-dd")
+                                    : DateTime.Now.ToString("yyyy-MM-dd");
+
+                var ia = (G("isActive") ?? "").Trim().ToUpperInvariant();
+                var status = MapStatus(ia);
+                var stage = ia switch
+                {
+                    "Y" => "FINAL",
+                    "E" => "EID_APPROVED",
+                    "R" => "REJECTED",
+                    _ => "EID_PENDING"
+                };
+
+                return Ok(new
+                {
+                    success = true,
+                    id = G("inflCode"),
+                    name,
+                    type,
+                    mobile = G("mobileNo"),
+                    email = G("emailAdd"),
+                    submittedDate,
+                    status,
+                    stage,
+                    fullName = name,
+                    address,
+                    reference = G("referenc"),
+                    companyName = string.IsNullOrWhiteSpace(G("comtrdnm")) ? G("vatfrmnm") : G("comtrdnm"),
+                    licenseNumber = G("comlcnno"),
+                    trnNumber = G("vattxreg"),
+                    accountHolder = G("bankApNm"),
+                    iban = G("ibannumb"),
+                    bankName = G("bankBnNm"),
+                    branch = G("bankBnDs"),
+                    avatar = MakeAvatar(name, G("inflCode"))
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Failed to fetch registration.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 9) LOOKUP by identifier (code, name, mobile, email)
+        // GET: /api/Approval/lookup/{identifier}
+        // ------------------------------------------------------------
+        [HttpGet("lookup/{identifier}")]
+        public IActionResult GetInflCodeByIdentifier([FromRoute] string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+                return BadRequest(new { success = false, message = "identifier is required" });
+
+            try
+            {
+                identifier = identifier.Trim();
+                var p = new Dictionary<string, object?> { ["@identifier"] = identifier, ["@like"] = $"%{identifier}%" };
+
+                var sql = @"
+SELECT TOP 1
+    inflCode,
+    LTRIM(RTRIM(
+        NULLIF(
+            CONCAT(
+                NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+            ), '  ')
+    )) AS compositeName,
+    inflName,
+    mobileNo,
+    emailAdd
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE ISNULL(blkStuts,'N') <> 'Y'
+  AND (
+        inflCode = @identifier
+     OR inflName = @identifier
+     OR mobileNo = @identifier
+     OR emailAdd = @identifier
+     OR (LTRIM(RTRIM(
+            NULLIF(
+                CONCAT(
+                    NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+                ), '  ')
+        )) = @identifier)
+     OR inflName LIKE @like
+     OR mobileNo LIKE @like
+     OR emailAdd LIKE @like
+     OR (LTRIM(RTRIM(
+            NULLIF(
+                CONCAT(
+                    NULLIF(LTRIM(RTRIM(ISNULL(frstname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(middname,''))),''), ' ',
+                    NULLIF(LTRIM(RTRIM(ISNULL(lastname,''))),'')
+                ), '  ')
+        )) LIKE @like)
+  );
+";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var r = rows.FirstOrDefault();
+
+                if (r == null)
+                    return NotFound(new { success = false, message = "Person not found" });
+
+                string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+                var name = string.IsNullOrWhiteSpace(G("compositeName")) ? G("inflName") : G("compositeName");
+
+                return Ok(new
+                {
+                    success = true,
+                    inflCode = G("inflCode"),
+                    name,
+                    mobile = G("mobileNo"),
+                    email = G("emailAdd")
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Lookup failed.", error = ex.Message });
+            }
+        }
+
+        // ========================= Helpers =========================
+
+        private static string MapStatus(string? ia) => (ia ?? "").Trim().ToUpperInvariant() switch
+        {
+            "Y" => "Approved",
+            "R" => "Rejected",
+            "E" => "EID Approved",   // <- new mapped state (still shown under Pending bucket)
+            _ => "Pending"
+        };
+
+        private static string MakeAvatar(string? name, string? fallbackId)
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                var parts = Regex.Split(name.Trim(), @"\s+")
+                                 .Where(s => !string.IsNullOrWhiteSpace(s))
+                                 .ToList();
+                if (parts.Count == 1)
+                    return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpperInvariant();
+                if (parts.Count >= 2)
+                {
+                    var a = parts[0][0];
+                    var b = parts[^1][0];
+                    return $"{char.ToUpperInvariant(a)}{char.ToUpperInvariant(b)}";
+                }
+            }
+            var f = (fallbackId ?? "ID");
+            return f.Length >= 2 ? f.Substring(0, 2).ToUpperInvariant() : f.ToUpperInvariant();
+        }
+
+        private static string ComposeName(string? f, string? m, string? l, string? fallback)
+        {
+            var list = new[] { f, m, l }
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!.Trim());
+            var joined = string.Join(" ", list).Trim();
+            if (!string.IsNullOrWhiteSpace(joined)) return joined;
+            return (fallback ?? "").Trim();
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
         }
     }
 
-    public class ModifyInput
+    // ========================= Request Models =========================
+
+    public class ApprovalActionRequest
     {
-        public int AssetId { get; set; }
+        public string? InflCode { get; set; }
+        public string? ActorId { get; set; }   // loginId to set updateId
+    }
 
-        [Required(ErrorMessage = "Asset Name is required")]
-        [StringLength(100, ErrorMessage = "Asset Name cannot exceed 100 characters")]
-        public string AssetName { get; set; } = "";
-
-        [Required(ErrorMessage = "Asset Type is required")]
-        [StringLength(50, ErrorMessage = "Asset Type cannot exceed 50 characters")]
-        public string AssetType { get; set; } = "";
-
-        [Required(ErrorMessage = "Serial Number is required")]
-        [StringLength(50, ErrorMessage = "Serial Number cannot exceed 50 characters")]
-        public string SerialNo { get; set; } = "";
-
-        [DataType(DataType.Date)]
-        public DateTime? PurchaseDate { get; set; }
-
-        [DataType(DataType.Date)]
-        public DateTime? WarrantyExpiry { get; set; }
-
-        [Required(ErrorMessage = "Status is required")]
-        public string Status { get; set; } = "";
-
-        [StringLength(50, ErrorMessage = "Assigned To cannot exceed 50 characters")]
-        public string AssignedTo { get; set; } = "";
+    public class RejectionActionRequest : ApprovalActionRequest
+    {
+        public string? Reason { get; set; }    // goes to rjcRemrk
     }
 }
