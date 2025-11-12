@@ -17,6 +17,62 @@ namespace sparshWebService.Controllers
         public ApprovalController(DatabaseHelper dbHelper) => _db = dbHelper;
 
         // ------------------------------------------------------------
+        // 0) Helpers
+        // ------------------------------------------------------------
+        private static string MapStatus(string? ia) => (ia ?? "").Trim().ToUpperInvariant() switch
+        {
+            "Y" => "Approved",
+            "R" => "Rejected",
+            "E" => "EID Approved",   // intermediate state
+            _   => "Pending"
+        };
+
+        private static string MakeAvatar(string? name, string? fallbackId)
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                var parts = Regex.Split(name.Trim(), @"\s+")
+                                 .Where(s => !string.IsNullOrWhiteSpace(s))
+                                 .ToList();
+                if (parts.Count == 1)
+                    return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpperInvariant();
+                if (parts.Count >= 2)
+                {
+                    var a = parts[0][0];
+                    var b = parts[^1][0];
+                    return $"{char.ToUpperInvariant(a)}{char.ToUpperInvariant(b)}";
+                }
+            }
+            var f = (fallbackId ?? "ID");
+            return f.Length >= 2 ? f.Substring(0, 2).ToUpperInvariant() : f.ToUpperInvariant();
+        }
+
+        private static string ComposeName(string? f, string? m, string? l, string? fallback)
+        {
+            var list = new[] { f, m, l }
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!.Trim());
+            var joined = string.Join(" ", list).Trim();
+            if (!string.IsNullOrWhiteSpace(joined)) return joined;
+            return (fallback ?? "").Trim();
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        // Formats SQL-ish date to yyyy-MM-dd (or returns "" if not parseable)
+        private static string SqlDate(object? v)
+        {
+            var s = v?.ToString();
+            if (DateTime.TryParse(s, out var dt)) return dt.ToString("yyyy-MM-dd");
+            return string.IsNullOrWhiteSpace(s) ? "" : s!;
+        }
+
+        // ------------------------------------------------------------
         // 1) PENDING LIST (paged + search + filter by type)
         // GET: /api/Approval/pending?search=&type=All&page=1&pageSize=20&sort=createDt_desc
         // ------------------------------------------------------------
@@ -68,12 +124,12 @@ WHERE
 
                 string orderBy = (sort ?? "").ToLowerInvariant() switch
                 {
-                    "name_asc" => "ORDER BY name ASC, id ASC",
+                    "name_asc"  => "ORDER BY name ASC, id ASC",
                     "name_desc" => "ORDER BY name DESC, id ASC",
-                    "type_asc" => "ORDER BY type ASC, id ASC",
+                    "type_asc"  => "ORDER BY type ASC, id ASC",
                     "type_desc" => "ORDER BY type DESC, id ASC",
-                    "date_asc" => "ORDER BY dt ASC, id ASC",
-                    _ => "ORDER BY dt DESC, id ASC",
+                    "date_asc"  => "ORDER BY dt ASC, id ASC",
+                    _           => "ORDER BY dt DESC, id ASC",
                 };
 
                 var sql = $@"
@@ -216,7 +272,7 @@ SELECT
                 var p = new Dictionary<string, object?>
                 {
                     ["@code"] = req.InflCode.Trim(),
-                    ["@usr"] = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10)
+                    ["@usr"]  = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10)
                 };
 
                 var sql = @"
@@ -264,8 +320,8 @@ IF @@ROWCOUNT = 0
                 var p = new Dictionary<string, object?>
                 {
                     ["@code"] = req.InflCode.Trim(),
-                    ["@usr"] = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10),
-                    ["@rem"] = Cut(req.Reason ?? "", 1000)
+                    ["@usr"]  = Cut(req.ActorId ?? User?.Identity?.Name ?? "API", 10),
+                    ["@rem"]  = Cut(req.Reason ?? "", 1000)
                 };
 
                 var sql = @"
@@ -403,7 +459,93 @@ IF @@ROWCOUNT = 0
         }
 
         // ------------------------------------------------------------
-        // 7) COMPACT DETAILS
+        // 7) EID-ONLY DETAILS
+        // GET: /api/Approval/eid/{inflCode}
+        // ------------------------------------------------------------
+        [HttpGet("eid/{inflCode}")]
+        public IActionResult GetEmiratesIdDetails([FromRoute] string inflCode)
+        {
+            if (string.IsNullOrWhiteSpace(inflCode))
+                return BadRequest(new { success = false, message = "inflCode is required" });
+
+            try
+            {
+                var p = new Dictionary<string, object?> { ["@code"] = inflCode.Trim() };
+
+                var sql = @"
+SELECT TOP 1
+    inflCode,
+    ISNULL(isActive,'') AS isActive,
+    -- Emirates ID block
+    ISNULL(emiridno,'') AS emiridno,
+    ISNULL(idholder,'') AS idholder,
+    ISNULL(nationty,'') AS nationty,
+    ISNULL(employer,'') AS employer,
+    issudate,
+    expirydt,
+    ISNULL(occupatn,'') AS occupatn,
+    ISNULL(emirates,'') AS emirates,
+    -- optional context
+    ISNULL(frstname,'') AS frstname,
+    ISNULL(middname,'') AS middname,
+    ISNULL(lastname,'') AS lastname,
+    ISNULL(inflName,'') AS inflName,
+    kycVerFl,
+    kycVerDt
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE inflCode = @code;
+";
+                var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var r = rows.FirstOrDefault();
+                if (r == null) return NotFound(new { success = false, message = "Not found" });
+
+                string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
+                var ia = (G("isActive") ?? "").Trim().ToUpperInvariant();
+
+                var nameParts = new[] { G("frstname"), G("middname"), G("lastname") }
+                                .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim());
+                var displayName = string.Join(" ", nameParts);
+                if (string.IsNullOrWhiteSpace(displayName)) displayName = G("inflName");
+
+                return Ok(new
+                {
+                    success = true,
+                    inflCode = G("inflCode"),
+                    status = MapStatus(ia),
+                    stage  = ia switch
+                    {
+                        "Y" => "FINAL",
+                        "E" => "EID_APPROVED",
+                        "R" => "REJECTED",
+                        _   => "EID_PENDING"
+                    },
+                    holderName  = displayName,
+                    emiratesId  = new
+                    {
+                        number      = G("emiridno"),
+                        idHolder    = G("idholder"),
+                        nationality = G("nationty"),
+                        employer    = G("employer"),
+                        issueDate   = SqlDate(r.GetValueOrDefault("issudate")),
+                        expiryDate  = SqlDate(r.GetValueOrDefault("expirydt")),
+                        occupation  = G("occupatn"),
+                        emirate     = G("emirates")
+                    },
+                    kyc = new
+                    {
+                        verifiedFlag = G("kycVerFl"),
+                        verifiedDate = SqlDate(r.GetValueOrDefault("kycVerDt"))
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = "Failed to fetch Emirates ID details.", error = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 8) COMPACT DETAILS (includes EID block)
         // GET: /api/Approval/details/{inflCode}
         // ------------------------------------------------------------
         [HttpGet("details/{inflCode}")]
@@ -418,32 +560,55 @@ IF @@ROWCOUNT = 0
 
                 var sql = @"
 SELECT TOP 1
+    -- keys / status / typing
     inflCode,
     ISNULL(isActive,'')            AS isActive,
     ISNULL(contrtyp,'')            AS contrtyp,
     ISNULL(inflType,'')            AS inflType,
-    CONVERT(VARCHAR(10), COALESCE(createDt, sapInsDt, frstScDt, GETDATE()), 120) AS submittedDate,        
+    CONVERT(VARCHAR(10), COALESCE(createDt, sapInsDt, frstScDt, GETDATE()), 120) AS submittedDate,
+
+    -- names
     LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
     LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
     LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
     LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
+
+    -- contact
     ISNULL(mobileNo,'')            AS mobileNo,
     ISNULL(emailAdd,'')            AS emailAdd,
+
+    -- reference
     ISNULL(referenc,'')            AS referenc,
+
+    -- address (present)
     ISNULL(inflAdd1,'')            AS inflAdd1,
     ISNULL(inflAdd2,'')            AS inflAdd2,
     ISNULL(inflAdd3,'')            AS inflAdd3,
     ISNULL(inflCity,'')            AS inflCity,
     ISNULL(district,'')            AS district,
     ISNULL(inflPinC,'')            AS inflPinC,
+
+    -- business / VAT / license
     ISNULL(comtrdnm,'')            AS comtrdnm,
     ISNULL(vatfrmnm,'')            AS vatfrmnm,
     ISNULL(comlcnno,'')            AS comlcnno,
     ISNULL(vattxreg,'')            AS vattxreg,
+
+    -- bank
     ISNULL(bankApNm,'')            AS bankApNm,
     ISNULL(ibannumb,'')            AS ibannumb,
     ISNULL(bankBnNm,'')            AS bankBnNm,
-    ISNULL(bankBnDs,'')            AS bankBnDs
+    ISNULL(bankBnDs,'')            AS bankBnDs,
+
+    -- Emirates ID block
+    ISNULL(emiridno,'')            AS emiridno,
+    ISNULL(idholder,'')            AS idholder,
+    ISNULL(nationty,'')            AS nationty,
+    ISNULL(employer,'')            AS employer,
+    issudate,
+    expirydt,
+    ISNULL(occupatn,'')            AS occupatn,
+    ISNULL(emirates,'')            AS emirates
 FROM dbo.ctmInfluncr WITH (NOLOCK)
 WHERE inflCode = @code;
 ";
@@ -479,7 +644,19 @@ WHERE inflCode = @code;
                     "Y" => "FINAL",
                     "E" => "EID_APPROVED",
                     "R" => "REJECTED",
-                    _ => "EID_PENDING"
+                    _   => "EID_PENDING"
+                };
+
+                var eidBlock = new
+                {
+                    number      = G("emiridno"),
+                    idHolder    = G("idholder"),
+                    nationality = G("nationty"),
+                    employer    = G("employer"),
+                    issueDate   = SqlDate(r.GetValueOrDefault("issudate")),
+                    expiryDate  = SqlDate(r.GetValueOrDefault("expirydt")),
+                    occupation  = G("occupatn"),
+                    emirate     = G("emirates")
                 };
 
                 return Ok(new
@@ -503,6 +680,7 @@ WHERE inflCode = @code;
                     iban = G("ibannumb"),
                     bankName = G("bankBnNm"),
                     branch = G("bankBnDs"),
+                    emiratesId = eidBlock,
                     avatar = MakeAvatar(name, G("inflCode"))
                 });
             }
@@ -513,7 +691,7 @@ WHERE inflCode = @code;
         }
 
         // ------------------------------------------------------------
-        // 8) FULL REGISTRATION DETAILS
+        // 9) FULL REGISTRATION DETAILS (includes EID block)
         // GET: /api/Approval/{inflCode}
         // ------------------------------------------------------------
         [HttpGet("{inflCode}")]
@@ -553,7 +731,16 @@ SELECT TOP 1
     ISNULL(bankApNm,'')            AS bankApNm,
     ISNULL(ibannumb,'')            AS ibannumb,
     ISNULL(bankBnNm,'')            AS bankBnNm,
-    ISNULL(bankBnDs,'')            AS bankBnDs
+    ISNULL(bankBnDs,'')            AS bankBnDs,
+    -- Emirates ID block
+    ISNULL(emiridno,'')            AS emiridno,
+    ISNULL(idholder,'')            AS idholder,
+    ISNULL(nationty,'')            AS nationty,
+    ISNULL(employer,'')            AS employer,
+    issudate,
+    expirydt,
+    ISNULL(occupatn,'')            AS occupatn,
+    ISNULL(emirates,'')            AS emirates
 FROM dbo.ctmInfluncr WITH (NOLOCK)
 WHERE inflCode = @code;
 ";
@@ -576,10 +763,7 @@ WHERE inflCode = @code;
                 var address = AddressLine(G("inflAdd1"), G("inflAdd2"), G("inflAdd3"),
                                           G("inflCity"), G("district"), G("inflPinC"));
 
-                var submittedDate = DateTime.TryParse(r.GetValueOrDefault("submittedDateDt")?.ToString(), out var dt)
-                                    ? dt.ToString("yyyy-MM-dd")
-                                    : DateTime.Now.ToString("yyyy-MM-dd");
-
+                var submittedDate = SqlDate(r.GetValueOrDefault("submittedDateDt"));
                 var ia = (G("isActive") ?? "").Trim().ToUpperInvariant();
                 var status = MapStatus(ia);
                 var stage = ia switch
@@ -587,7 +771,19 @@ WHERE inflCode = @code;
                     "Y" => "FINAL",
                     "E" => "EID_APPROVED",
                     "R" => "REJECTED",
-                    _ => "EID_PENDING"
+                    _   => "EID_PENDING"
+                };
+
+                var eidBlock = new
+                {
+                    number      = G("emiridno"),
+                    idHolder    = G("idholder"),
+                    nationality = G("nationty"),
+                    employer    = G("employer"),
+                    issueDate   = SqlDate(r.GetValueOrDefault("issudate")),
+                    expiryDate  = SqlDate(r.GetValueOrDefault("expirydt")),
+                    occupation  = G("occupatn"),
+                    emirate     = G("emirates")
                 };
 
                 return Ok(new
@@ -611,6 +807,7 @@ WHERE inflCode = @code;
                     iban = G("ibannumb"),
                     bankName = G("bankBnNm"),
                     branch = G("bankBnDs"),
+                    emiratesId = eidBlock,
                     avatar = MakeAvatar(name, G("inflCode"))
                 });
             }
@@ -621,7 +818,7 @@ WHERE inflCode = @code;
         }
 
         // ------------------------------------------------------------
-        // 9) LOOKUP by identifier (code, name, mobile, email)
+        // 10) LOOKUP by identifier (code, name, mobile, email)
         // GET: /api/Approval/lookup/{identifier}
         // ------------------------------------------------------------
         [HttpGet("lookup/{identifier}")]
@@ -700,57 +897,9 @@ WHERE ISNULL(blkStuts,'N') <> 'Y'
                 return StatusCode(500, new { success = false, message = "Lookup failed.", error = ex.Message });
             }
         }
-
-        // ========================= Helpers =========================
-
-        private static string MapStatus(string? ia) => (ia ?? "").Trim().ToUpperInvariant() switch
-        {
-            "Y" => "Approved",
-            "R" => "Rejected",
-            "E" => "EID Approved",   // <- new mapped state (still shown under Pending bucket)
-            _ => "Pending"
-        };
-
-        private static string MakeAvatar(string? name, string? fallbackId)
-        {
-            if (!string.IsNullOrWhiteSpace(name))
-            {
-                var parts = Regex.Split(name.Trim(), @"\s+")
-                                 .Where(s => !string.IsNullOrWhiteSpace(s))
-                                 .ToList();
-                if (parts.Count == 1)
-                    return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpperInvariant();
-                if (parts.Count >= 2)
-                {
-                    var a = parts[0][0];
-                    var b = parts[^1][0];
-                    return $"{char.ToUpperInvariant(a)}{char.ToUpperInvariant(b)}";
-                }
-            }
-            var f = (fallbackId ?? "ID");
-            return f.Length >= 2 ? f.Substring(0, 2).ToUpperInvariant() : f.ToUpperInvariant();
-        }
-
-        private static string ComposeName(string? f, string? m, string? l, string? fallback)
-        {
-            var list = new[] { f, m, l }
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .Select(x => x!.Trim());
-            var joined = string.Join(" ", list).Trim();
-            if (!string.IsNullOrWhiteSpace(joined)) return joined;
-            return (fallback ?? "").Trim();
-        }
-
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
-        }
     }
 
     // ========================= Request Models =========================
-
     public class ApprovalActionRequest
     {
         public string? InflCode { get; set; }
