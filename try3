@@ -9,396 +9,76 @@ namespace sparshWebService.Controllers
     [Route("api/[controller]")]
     [ApiController]
     [Produces("application/json")]
-    public sealed class KycController : ControllerBase
+    public sealed class KycStatusController : ControllerBase
     {
         private readonly DatabaseHelper _db;
-        public KycController(DatabaseHelper db) => _db = db;
+        public KycStatusController(DatabaseHelper db) => _db = db;
 
         // ------------------------------------------------------------
-        // GET: /api/Kyc/status/{inflCode}  (fetch by inflCode)
+        // GET: /api/KycStatus/mobile/{mobile}
         // ------------------------------------------------------------
-        [HttpGet("status/{inflCode}")]
-        public IActionResult GetKycStatusByInflCode([FromRoute] string inflCode)
-        {
-            if (string.IsNullOrWhiteSpace(inflCode))
-                return BadRequest(new { success = false, message = "inflCode is required" });
-
-            var row = LoadRowByInflCode(inflCode.Trim());
-            if (row == null) return NotFound(new { success = false, message = "Not found" });
-
-            return Ok(BuildKycResponse(row));
-        }
-
-        // ------------------------------------------------------------
-        // GET: /api/Kyc/status/mobile/{mobile}  (fetch by mobile no.)
-        // UAE-aware: +971… → use last 9 digits core
-        // ------------------------------------------------------------
-        [HttpGet("status/mobile/{mobile}")]
-        public IActionResult GetKycStatusByMobile([FromRoute] string mobile)
+        [HttpGet("mobile/{mobile}")]
+        public IActionResult GetStatusByMobile([FromRoute] string mobile)
         {
             if (string.IsNullOrWhiteSpace(mobile))
                 return BadRequest(new { success = false, message = "mobile is required" });
 
-            var normalized = NormalizeMobile(mobile);   // core digits (UAE → 9 digits; otherwise right 10)
-            var core9 = Right9(normalized);
-            var r10 = Right10(normalized);
-
-            var candidates = FindCandidatesByMobile(normalized, core9, r10);
-            if (candidates.Count == 0)
-                return NotFound(new { success = false, message = "No record found for given mobile." });
-
-            if (candidates.Count > 1)
-            {
-                var lite = candidates.Select(c => new
-                {
-                    inflCode = c.GetValueOrDefault("inflCode")?.ToString(),
-                    name = ComposeName(
-                        c.GetValueOrDefault("frstname")?.ToString(),
-                        c.GetValueOrDefault("middname")?.ToString(),
-                        c.GetValueOrDefault("lastname")?.ToString(),
-                        c.GetValueOrDefault("inflName")?.ToString()
-                    ),
-                    mobile = c.GetValueOrDefault("mobileNo")?.ToString(),
-                    pmobilen = c.GetValueOrDefault("pmobilen")?.ToString()
-                });
-                return StatusCode(409, new
-                {
-                    success = false,
-                    message = "Multiple matches found for this mobile; please select inflCode.",
-                    candidates = lite
-                });
-            }
-
-            var inflCode = candidates[0].GetValueOrDefault("inflCode")?.ToString();
-            if (string.IsNullOrWhiteSpace(inflCode))
-                return StatusCode(500, new { success = false, message = "Unexpected data: inflCode missing." });
-
-            var row = LoadRowByInflCode(inflCode!);
-            if (row == null) return NotFound(new { success = false, message = "Not found" });
-            return Ok(BuildKycResponse(row));
-        }
-
-        // ======================= Data access helpers =======================
-
-        private Dictionary<string, object>? LoadRowByInflCode(string inflCode)
-        {
-            var p = new Dictionary<string, object?> { ["@code"] = inflCode };
-            var sql = BaseSelectSql() + " WHERE inflCode = @code;";
-            var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
-            return rows.FirstOrDefault();
-        }
-
-        private List<Dictionary<string, object>> FindCandidatesByMobile(string normalized, string core9, string r10)
-        {
-            // We compare multiple ways inside SQL after stripping non-digits:
-            // - exact stripped match
-            // - UAE core match (last 9 digits)
-            // - generic right-10 match for non-UAE data
-            var p = new Dictionary<string, object?>
-            {
-                ["@raw"]  = normalized,
-                ["@core9"] = core9,
-                ["@r10"]  = r10
-            };
+            string normalized = NormalizeMobile(mobile);
 
             var sql = @"
-;WITH base AS
-(
-    SELECT
-        inflCode,
-        LTRIM(RTRIM(ISNULL(frstname,''))) AS frstname,
-        LTRIM(RTRIM(ISNULL(middname,''))) AS middname,
-        LTRIM(RTRIM(ISNULL(lastname,''))) AS lastname,
-        LTRIM(RTRIM(ISNULL(inflName,''))) AS inflName,
-        ISNULL(mobileNo,'') AS mobileNo,
-        ISNULL(pmobilen,'') AS pmobilen
-    FROM dbo.ctmInfluncr WITH (NOLOCK)
-),
-norm AS
-(
-    SELECT *,
-           -- strip +, spaces, dashes, brackets to digits
-           REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(mobileNo, '+',''), ' ',''),'-',''), '(', ''), ')','') AS mob_raw,
-           REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(pmobilen, '+',''), ' ',''),'-',''), '(', ''), ')','') AS pmob_raw
-    FROM base
-),
-calc AS
-(
-    SELECT *,
-           RIGHT(mob_raw, 9)  AS mob_r9,
-           RIGHT(pmob_raw, 9) AS pmob_r9,
-           RIGHT(mob_raw, 10) AS mob_r10,
-           RIGHT(pmob_raw,10) AS pmob_r10
-    FROM norm
-)
-SELECT TOP 5 *
-FROM calc
-WHERE
-      mob_raw  = @raw OR pmob_raw = @raw
-   OR mob_r9  = @core9 OR pmob_r9 = @core9
-   OR mob_r10 = @r10   OR pmob_r10 = @r10;
-";
-            var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
-            return rows;
-        }
-
-        private static string BaseSelectSql() => @"
-SELECT TOP 1
-    -- identity / stage / blocking
-    inflCode,
-    ISNULL(isActive,'') AS isActive,
-    ISNULL(blkStuts,'N') AS blkStuts,
-    blkStDat,
-    ISNULL(rjcRemrk,'') AS rjcRemrk,
-
-    -- overall KYC
-    ISNULL(kycVerFl,'') AS kycVerFl,
-    kycVerDt,
-    ISNULL(kycVrTyp,'') AS kycVrTyp,
-    ISNULL(kycStats,'') AS kycStats,
-    ISNULL(kycAprBy,'') AS kycAprBy,
-
-    -- PAN / Aadhaar
-    ISNULL(itxPanNo,'') AS itxPanNo,
-    ISNULL(panCName,'') AS panCName,
-    ISNULL(panAdhLk,'') AS panAdhLk,
-    ISNULL(panVldIn,'') AS panVldIn,
-    ISNULL(panCatgF,'') AS panCatgF,
-    ISNULL(adhrName,'') AS adhrName,
-    ISNULL(adhOtpFl,'') AS adhOtpFl,
-
-    -- Bank / IBAN / IFSC / KYC
-    ISNULL(bankAcNo,'') AS bankAcNo,
-    ISNULL(ibannumb,'') AS ibannumb,
-    ISNULL(bankIFSC,'') AS bankIFSC,
-    ISNULL(bankBnNm,'') AS bankBnNm,
-    ISNULL(bankBnDs,'') AS bankBnDs,
-    ISNULL(bankBnNo,'') AS bankBnNo,
-    ISNULL(bankApNm,'') AS bankApNm,
-    ISNULL(bnkKycFl,'') AS bnkKycFl,
-    bnkKycDt,
-
-    -- Emirates ID block
-    ISNULL(emiridno,'') AS emiridno,
-    ISNULL(idholder,'') AS idholder,
-    ISNULL(nationty,'') AS nationty,
-    ISNULL(employer,'') AS employer,
-    issudate,
-    expirydt,
-    ISNULL(occupatn,'') AS occupatn,
-    ISNULL(emirates,'') AS emirates,
-
-    -- display fields
-    ISNULL(frstname,'') AS frstname,
-    ISNULL(middname,'') AS middname,
-    ISNULL(lastname,'') AS lastname,
-    ISNULL(inflName,'') AS inflName,
-
-    -- mobiles (for response)
-    ISNULL(mobileNo,'') AS mobileNo,
-    ISNULL(pmobilen,'') AS pmobilen
+SELECT TOP 1 inflCode, inflName, isActive
 FROM dbo.ctmInfluncr WITH (NOLOCK)
-";
+WHERE 
+    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(mobileNo,'+',''),' ',''),'-',''), '(', ''), ')','') LIKE '%' + @mob + '%'
+    OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(pmobilen,'+',''),' ',''),'-',''), '(', ''), ')','') LIKE '%' + @mob + '%';";
 
-        // ======================= Response builder =======================
+            var p = new Dictionary<string, object?> { ["@mob"] = normalized };
+            var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+            if (rows.Count == 0)
+                return NotFound(new { success = false, message = "No record found for given mobile number." });
 
-        private object BuildKycResponse(Dictionary<string, object> r)
-        {
-            string G(string k) => r.GetValueOrDefault(k)?.ToString() ?? "";
-            DateTime? D(object o) => DateTime.TryParse(o?.ToString(), out var dt) ? dt : (DateTime?)null;
-            string F(object o) => DateTime.TryParse(o?.ToString(), out var dt) ? dt.ToString("yyyy-MM-dd") : "";
+            var r = rows.First();
+            string inflCode = r.GetValueOrDefault("inflCode")?.ToString() ?? "";
+            string inflName = r.GetValueOrDefault("inflName")?.ToString() ?? "";
+            string isActive = r.GetValueOrDefault("isActive")?.ToString()?.Trim().ToUpperInvariant() ?? "";
 
-            // Stage mapping (Pending / EID Approved / Approved / Rejected)
-            var ia = G("isActive").Trim().ToUpperInvariant();
-            string Stage() => ia switch
+            // Map status
+            string status = isActive switch
             {
-                "Y" => "FINAL",
+                "Y" => "FULLY_APPROVED",
                 "E" => "EID_APPROVED",
                 "R" => "REJECTED",
-                _   => "EID_PENDING"
+                _   => "PENDING"
             };
-            string StageText() => ia switch
+            string statusText = isActive switch
             {
-                "Y" => "Approved",
+                "Y" => "Full KYC Approved",
+                "E" => "Emirates ID Approved (Step 1)",
                 "R" => "Rejected",
-                "E" => "EID Approved",
-                _   => "Pending"
+                _   => "Pending Approval"
             };
 
-            // Display name
-            var nm = new[] { G("frstname"), G("middname"), G("lastname") }
-                     .Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim());
-            var displayName = string.Join(" ", nm);
-            if (string.IsNullOrWhiteSpace(displayName)) displayName = G("inflName");
-
-            // Emirates ID
-            var eidNum = G("emiridno");
-            var eidIssue = D(r.GetValueOrDefault("issudate"));
-            var eidExpiry = D(r.GetValueOrDefault("expirydt"));
-            var today = DateTime.Today;
-            var eidExpired = eidExpiry.HasValue && eidExpiry.Value.Date < today;
-            var eidDaysToExpiry = eidExpiry.HasValue ? (eidExpiry.Value.Date - today).Days : (int?)null;
-            var eidNearExpiry = eidDaysToExpiry.HasValue && eidDaysToExpiry.Value >= 0 && eidDaysToExpiry.Value <= 60;
-
-            // PAN / Aadhaar
-            var pan = G("itxPanNo");
-            var panValidInIT = G("panVldIn").Equals("Y", StringComparison.OrdinalIgnoreCase);
-            var panAadhaarLinked = G("panAdhLk").Equals("Y", StringComparison.OrdinalIgnoreCase);
-            var aadhaarName = G("adhrName");
-            var aadhaarOtpVerified = G("adhOtpFl").Equals("Y", StringComparison.OrdinalIgnoreCase);
-
-            // Bank KYC
-            var bankPresent = !string.IsNullOrWhiteSpace(G("bankAcNo")) || !string.IsNullOrWhiteSpace(G("ibannumb"));
-            var bankKycVerified = G("bnkKycFl").Equals("Y", StringComparison.OrdinalIgnoreCase);
-
-            // Overall KYC
-            var kycVerified = G("kycVerFl").Equals("Y", StringComparison.OrdinalIgnoreCase);
-
-            return new
+            return Ok(new
             {
                 success = true,
-                inflCode = G("inflCode"),
-                holderName = displayName,
-
-                overall = new
-                {
-                    stage = Stage(),
-                    stageText = StageText(),
-                    kyc = new
-                    {
-                        verified = kycVerified,
-                        verifiedDate = F(r.GetValueOrDefault("kycVerDt")),
-                        type = G("kycVrTyp"),
-                        statusText = G("kycStats"),
-                        approvedBy = G("kycAprBy")
-                    },
-                    blocked = G("blkStuts").Equals("Y", StringComparison.OrdinalIgnoreCase),
-                    blockedDate = F(r.GetValueOrDefault("blkStDat")),
-                    rejectRemark = G("rjcRemrk")
-                },
-
-                emiratesId = new
-                {
-                    present = !string.IsNullOrWhiteSpace(eidNum),
-                    number = eidNum,
-                    idHolder = G("idholder"),
-                    nationality = G("nationty"),
-                    employer = G("employer"),
-                    occupation = G("occupatn"),
-                    emirate = G("emirates"),
-                    issueDate = F(r.GetValueOrDefault("issudate")),
-                    expiryDate = F(r.GetValueOrDefault("expirydt")),
-                    expired = eidExpired,
-                    daysToExpiry = eidDaysToExpiry,
-                    nearExpiry = eidNearExpiry,
-                    eidApproved = ia == "E" || ia == "Y",
-                    message = BuildEidMessage(eidNum, ia, eidExpired, eidNearExpiry, eidDaysToExpiry)
-                },
-
-                pan = new
-                {
-                    present = !string.IsNullOrWhiteSpace(pan),
-                    number = pan,
-                    holderName = G("panCName"),
-                    validInIT = panValidInIT,
-                    aadhaarLinked = panAadhaarLinked,
-                    categoryFlag = G("panCatgF"),
-                    message = BuildPanMessage(pan, panValidInIT, panAadhaarLinked)
-                },
-
-                aadhaar = new
-                {
-                    present = !string.IsNullOrWhiteSpace(aadhaarName),
-                    name = aadhaarName,
-                    otpVerified = aadhaarOtpVerified,
-                    panLinked = panAadhaarLinked,
-                    message = BuildAadhaarMessage(aadhaarName, aadhaarOtpVerified, panAadhaarLinked)
-                },
-
-                bank = new
-                {
-                    present = bankPresent,
-                    accountNo = Mask(G("bankAcNo")),
-                    iban = Mask(G("ibannumb")),
-                    ifsc = G("bankIFSC"),
-                    bankName = G("bankBnNm"),
-                    branchName = G("bankBnDs"),
-                    branchNo = G("bankBnNo"),
-                    accountHolder = G("bankApNm"),
-                    kycVerified = bankKycVerified,
-                    kycVerifiedDate = F(r.GetValueOrDefault("bnkKycDt")),
-                    message = BuildBankMessage(bankPresent, bankKycVerified)
-                }
-            };
+                inflCode,
+                inflName,
+                status,
+                statusText
+            });
         }
 
-        // ======================= Small helpers =======================
-
-        // UAE-first normalizer:
-        // - strip non-digits
-        // - if starts with 971 and length > 9 → keep last 9 (UAE core)
-        // - else if longer than 10 → keep last 10 (generic fallback)
+        // ------------------------------------------------------------
+        // Helper: Normalize UAE number (+971 → last 9 digits)
+        // ------------------------------------------------------------
         private static string NormalizeMobile(string mobile)
         {
             var digits = new string(mobile.Where(char.IsDigit).ToArray());
             if (digits.StartsWith("971") && digits.Length > 9)
-                return digits[^9..]; // UAE mobile core (e.g., 5XXXXXXXX)
+                return digits[^9..]; // UAE mobile core (e.g. 5XXXXXXXX)
             if (digits.Length > 10)
-                return digits[^10..]; // generic fallback
+                return digits[^10..]; // fallback for other formats
             return digits;
-        }
-
-        private static string Right9(string s)  => s.Length <= 9  ? s : s[^9..];
-        private static string Right10(string s) => s.Length <= 10 ? s : s[^10..];
-
-        private static string Mask(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            s = s.Trim();
-            if (s.Length <= 4) return new string('*', s.Length);
-            return new string('*', Math.Max(0, s.Length - 4)) + s[^4..];
-        }
-
-        private static string BuildEidMessage(string eid, string ia, bool expired, bool near, int? days)
-        {
-            if (string.IsNullOrWhiteSpace(eid)) return "Emirates ID not provided.";
-            if (expired) return "Emirates ID is expired.";
-            if (ia == "E") return "Emirates ID approved (step 1).";
-            if (ia == "Y") return "Full KYC approved.";
-            if (near) return $"Emirates ID will expire in {days} day(s).";
-            return "Emirates ID captured.";
-        }
-
-        private static string BuildPanMessage(string pan, bool validIT, bool linked)
-        {
-            if (string.IsNullOrWhiteSpace(pan)) return "PAN not provided.";
-            if (validIT && linked) return "PAN is valid and linked with Aadhaar.";
-            if (validIT && !linked) return "PAN is valid; Aadhaar link pending.";
-            if (!validIT && linked) return "PAN appears linked with Aadhaar; validity check pending.";
-            return "PAN captured; validation/linking pending.";
-        }
-
-        private static string BuildAadhaarMessage(string name, bool otp, bool linked)
-        {
-            if (string.IsNullOrWhiteSpace(name)) return "Aadhaar details not provided.";
-            if (otp && linked) return "Aadhaar verified via OTP and linked with PAN.";
-            if (otp && !linked) return "Aadhaar verified via OTP; PAN link pending.";
-            if (!otp && linked) return "Aadhaar is linked with PAN; OTP verification pending.";
-            return "Aadhaar captured; verification/linking pending.";
-        }
-
-        private static string BuildBankMessage(bool present, bool kyc)
-        {
-            if (!present) return "Bank details not provided.";
-            if (kyc) return "Bank KYC verified.";
-            return "Bank details captured; KYC verification pending.";
-        }
-
-        private static string ComposeName(string? f, string? m, string? l, string? fallback)
-        {
-            var parts = new[] { f, m, l }.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim());
-            var s = string.Join(" ", parts);
-            return string.IsNullOrWhiteSpace(s) ? (fallback ?? "").Trim() : s;
         }
     }
 }
