@@ -4,81 +4,359 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+#nullable enable
+
 namespace sparshWebService.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
     [Produces("application/json")]
-    public sealed class KycStatusController : ControllerBase
+    public sealed class ProfileDetailsController : ControllerBase
     {
         private readonly DatabaseHelper _db;
-        public KycStatusController(DatabaseHelper db) => _db = db;
 
-        // ------------------------------------------------------------
-        // GET: /api/KycStatus/mobile/{mobile}
-        // ------------------------------------------------------------
-        [HttpGet("mobile/{mobile}")]
-        public IActionResult GetStatusByMobile([FromRoute] string mobile)
+        public ProfileDetailsController(DatabaseHelper db)
         {
-            if (string.IsNullOrWhiteSpace(mobile))
-                return BadRequest(new { success = false, message = "mobile is required" });
+            _db = db;
+        }
 
-            string normalized = NormalizeMobile(mobile);
+        // =========================================================================
+        // GET: /api/ProfileDetails/by-mobile?mobile=...
+        //
+        // Accepts any mobile format:
+        //   - keeps only digits
+        //   - keeps last 11 digits if longer (same as UseUpdateController)
+        //   - matches ctmInfluncr.mobileNo exactly
+        // =========================================================================
+        [HttpGet("by-mobile")]
+        public IActionResult GetByMobile([FromQuery] string? mobile)
+        {
+            try
+            {
+                var digits = Digits(mobile);
+                if (string.IsNullOrWhiteSpace(digits))
+                    return BadRequest(new { success = false, message = "Valid mobile number is required." });
 
-            var sql = @"
-SELECT TOP 1 inflCode, inflName, isActive
+                var mobKey = FormatMobile11(digits);
+                if (string.IsNullOrWhiteSpace(mobKey))
+                    return BadRequest(new { success = false, message = "Valid mobile number is required." });
+
+                const string sql = @"
+SELECT TOP 1
+    -- keys
+    inflCode, inflType, isActive, createId, createDt, updateId, updateDt,
+
+    -- names & basic
+    inflName, contName, contrtyp, frstname, middname, lastname,
+
+    -- contact & address
+    mobileNo, emailAdd, inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    areaCode, emirates, referenc,
+
+    -- bank (legacy + addr)
+    bankAcNo, bankApNm, bankBnNm, bankBnDs, bankBnNo, bankIFSC, bankaddr, ibannumb,
+
+    -- VAT cluster
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+
+    -- license cluster
+    comlcnno, comissau, comlctyp, comestdt, comexpdt,
+    comtrdnm, comrespn, comraddr, comeffdt,
+
+    -- ID / painter cluster
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn
 FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE 
-    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(mobileNo,'+',''),' ',''),'-',''), '(', ''), ')','') LIKE '%' + @mob + '%'
-    OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(pmobilen,'+',''),' ',''),'-',''), '(', ''), ')','') LIKE '%' + @mob + '%';";
+WHERE mobileNo = @mobileNo
+ORDER BY updateDt DESC, createDt DESC;";
 
-            var p = new Dictionary<string, object?> { ["@mob"] = normalized };
-            var rows = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
-            if (rows.Count == 0)
-                return NotFound(new { success = false, message = "No record found for given mobile number." });
+                var row = _db.QaEWebBean(sql, new Dictionary<string, object?>
+                {
+                    ["@mobileNo"] = mobKey
+                })?.FirstOrDefault();
 
-            var r = rows.First();
-            string inflCode = r.GetValueOrDefault("inflCode")?.ToString() ?? "";
-            string inflName = r.GetValueOrDefault("inflName")?.ToString() ?? "";
-            string isActive = r.GetValueOrDefault("isActive")?.ToString()?.Trim().ToUpperInvariant() ?? "";
+                if (row == null)
+                    return NotFound(new { success = false, message = "No record found for this mobile number." });
 
-            // Map status
-            string status = isActive switch
+                var resp = MapRowToDto(row);
+                return Ok(new { success = true, data = resp });
+            }
+            catch (Exception ex)
             {
-                "Y" => "FULLY_APPROVED",
-                "E" => "EID_APPROVED",
-                "R" => "REJECTED",
-                _   => "PENDING"
-            };
-            string statusText = isActive switch
-            {
-                "Y" => "Full KYC Approved",
-                "E" => "Emirates ID Approved (Step 1)",
-                "R" => "Rejected",
-                _   => "Pending Approval"
-            };
-
-            return Ok(new
-            {
-                success = true,
-                inflCode,
-                inflName,
-                status,
-                statusText
-            });
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
         }
 
-        // ------------------------------------------------------------
-        // Helper: Normalize UAE number (+971 → last 9 digits)
-        // ------------------------------------------------------------
-        private static string NormalizeMobile(string mobile)
+        // =========================================================================
+        // POST: /api/ProfileDetails/update-by-mobile/{mobile}
+        //
+        // Patch-like update using mobile number key.
+        // - mobile in route is normalized (digits only, last 11 digits)
+        // - Only non-null fields from UseUpdatePatch overwrite existing values.
+        // =========================================================================
+        [HttpPost("update-by-mobile/{mobile}")]
+        [Consumes("application/json")]
+        public IActionResult UpdateByMobile([FromRoute] string mobile, [FromBody] UseUpdatePatch body)
         {
-            var digits = new string(mobile.Where(char.IsDigit).ToArray());
-            if (digits.StartsWith("971") && digits.Length > 9)
-                return digits[^9..]; // UAE mobile core (e.g. 5XXXXXXXX)
-            if (digits.Length > 10)
-                return digits[^10..]; // fallback for other formats
-            return digits;
+            try
+            {
+                var digits = Digits(mobile);
+                if (string.IsNullOrWhiteSpace(digits))
+                    return BadRequest(new { success = false, message = "Valid mobile number is required." });
+
+                var mobKey = FormatMobile11(digits);
+                if (string.IsNullOrWhiteSpace(mobKey))
+                    return BadRequest(new { success = false, message = "Valid mobile number is required." });
+
+                // Ensure record exists
+                const string chk = @"SELECT COUNT(1) AS Cnt FROM dbo.ctmInfluncr WHERE mobileNo = @mobileNo;";
+                var exists = Convert.ToInt32(
+                    _db.QaEWebBean(chk, new Dictionary<string, object?> { ["@mobileNo"] = mobKey })
+                      ?.FirstOrDefault()?["Cnt"] ?? 0
+                ) > 0;
+
+                if (!exists)
+                    return NotFound(new { success = false, message = "No record found for this mobile number." });
+
+                // Normalize/limit incoming fields; null => keep existing (via COALESCE)
+                var p = new Dictionary<string, object?>
+                {
+                    ["@mobileKey"] = mobKey,
+
+                    // names & basic
+                    ["@contrtyp"] = ToDbOrNull(Cut(body.ContractorType, 255)),
+                    ["@frstname"] = ToDbOrNull(Cut(body.FirstName, 255)),
+                    ["@middname"] = ToDbOrNull(Cut(body.MiddleName, 255)),
+                    ["@lastname"] = ToDbOrNull(Cut(body.LastName, 255)),
+
+                    // contact & address
+                    ["@mobileNo"] = ToDbOrNull(Cut(FormatMobile11(body.MobileNumber), 11)),
+                    ["@emailAdd"] = ToDbOrNull(Cut(body.EmailAddress, 40)),
+                    ["@inflAdd1"] = ToDbOrNull(Cut(body.Address, 50)),
+                    ["@inflAdd2"] = ToDbOrNull(Cut(body.Address2, 100)),
+                    ["@inflAdd3"] = ToDbOrNull(Cut(body.Address3, 30)),
+                    ["@inflCity"] = ToDbOrNull(Cut(body.City, 255)),
+                    ["@district"] = ToDbOrNull(Cut(body.District, 30)),
+                    ["@inflPinC"] = ToDbOrNull(Cut(body.PinCode, 6)),
+                    ["@areaCode"] = ToDbOrNull(Cut(body.AreaCode, 3)),
+                    ["@emirates"] = ToDbOrNull(Cut(body.Emirates, 255)),
+                    ["@referenc"] = ToDbOrNull(Cut(body.Reference, 255)),
+
+                    // bank
+                    ["@bankAcNo"] = ToDbOrNull(Cut(body.BankAccountNo, 30)),
+                    ["@bankApNm"] = ToDbOrNull(Cut(body.AccountHolderName, 40)),
+                    ["@bankBnNm"] = ToDbOrNull(Cut(body.BankName, 100)),
+                    ["@bankBnDs"] = ToDbOrNull(Cut(body.BranchName, 100)),
+                    ["@bankBnNo"] = ToDbOrNull(Cut(body.BankBranchNo, 30)),
+                    ["@bankIFSC"] = ToDbOrNull(Cut(body.BankIfscCode, 20)),
+                    ["@bankaddr"] = ToDbOrNull(Cut(body.BankAddress, 255)),
+                    ["@ibannumb"] = ToDbOrNull(Cut(FormatIban(body.IbanNumber), 255)),
+
+                    // VAT
+                    ["@vatfrmnm"] = ToDbOrNull(Cut(body.FirmName, 255)),
+                    ["@vatraddr"] = ToDbOrNull(Cut(body.VatAddress, 255)),
+                    ["@vattxreg"] = ToDbOrNull(Cut(body.TaxRegistrationNumber, 255)),
+                    ["@vatefdt"] = ToDbOrNull(Cut(body.VatEffectiveDate, 255)),
+
+                    // license
+                    ["@comlcnno"] = ToDbOrNull(Cut(body.LicenseNumber, 255)),
+                    ["@comissau"] = ToDbOrNull(Cut(body.IssuingAuthority, 255)),
+                    ["@comlctyp"] = ToDbOrNull(Cut(body.LicenseType, 255)),
+                    ["@comestdt"] = ToDbOrNull(Cut(body.EstablishmentDate, 255)),
+                    ["@comexpdt"] = ToDbOrNull(Cut(body.LicenseExpiryDate, 255)),
+                    ["@comtrdnm"] = ToDbOrNull(Cut(body.TradeName, 255)),
+                    ["@comrespn"] = ToDbOrNull(Cut(body.ResponsiblePerson, 255)),
+                    ["@comraddr"] = ToDbOrNull(Cut(body.LicenseAddress, 255)),
+                    ["@comeffdt"] = ToDbOrNull(Cut(body.EffectiveDate, 255)),
+
+                    // ID / painter cluster
+                    ["@emiridno"] = ToDbOrNull(Cut(body.EmiratesIdNumber, 255)),
+                    ["@idholder"] = ToDbOrNull(Cut(body.IdName, 255)),
+                    ["@nationty"] = ToDbOrNull(Cut(body.Nationality, 255)),
+                    ["@employer"] = ToDbOrNull(Cut(body.Employer, 255)),
+                    ["@issudate"] = ToDbOrNull(Cut(body.IssueDate, 255)),
+                    ["@expirydt"] = ToDbOrNull(Cut(body.ExpiryDate, 255)),
+                    ["@occupatn"] = ToDbOrNull(Cut(body.Occupation, 255)),
+                };
+
+                const string upd = @"
+UPDATE dbo.ctmInfluncr
+SET
+    contrtyp = COALESCE(@contrtyp, contrtyp),
+    frstname = COALESCE(@frstname, frstname),
+    middname = COALESCE(@middname, middname),
+    lastname = COALESCE(@lastname, lastname),
+
+    mobileNo = COALESCE(@mobileNo, mobileNo),
+    emailAdd = COALESCE(@emailAdd, emailAdd),
+    inflAdd1 = COALESCE(@inflAdd1, inflAdd1),
+    inflAdd2 = COALESCE(@inflAdd2, inflAdd2),
+    inflAdd3 = COALESCE(@inflAdd3, inflAdd3),
+    inflCity = COALESCE(@inflCity, inflCity),
+    district = COALESCE(@district, district),
+    inflPinC = COALESCE(@inflPinC, inflPinC),
+    areaCode = COALESCE(@areaCode, areaCode),
+    emirates = COALESCE(@emirates, emirates),
+    referenc = COALESCE(@referenc, referenc),
+
+    bankAcNo = COALESCE(@bankAcNo, bankAcNo),
+    bankApNm = COALESCE(@bankApNm, bankApNm),
+    bankBnNm = COALESCE(@bankBnNm, bankBnNm),
+    bankBnDs = COALESCE(@bankBnDs, bankBnDs),
+    bankBnNo = COALESCE(@bankBnNo, bankBnNo),
+    bankIFSC = COALESCE(@bankIFSC, bankIFSC),
+    bankaddr = COALESCE(@bankaddr, bankaddr),
+    ibannumb = COALESCE(@ibannumb, ibannumb),
+
+    vatfrmnm = COALESCE(@vatfrmnm, vatfrmnm),
+    vatraddr = COALESCE(@vatraddr, vatraddr),
+    vattxreg = COALESCE(@vattxreg, vattxreg),
+    vatefdt  = COALESCE(@vatefdt,  vatefdt),
+
+    comlcnno = COALESCE(@comlcnno, comlcnno),
+    comissau = COALESCE(@comissau, comissau),
+    comlctyp = COALESCE(@comlctyp, comlctyp),
+    comestdt = COALESCE(@comestdt, comestdt),
+    comexpdt = COALESCE(@comexpdt, comexpdt),
+    comtrdnm = COALESCE(@comtrdnm, comtrdnm),
+    comrespn = COALESCE(@comrespn, comrespn),
+    comraddr = COALESCE(@comraddr, comraddr),
+    comeffdt = COALESCE(@comeffdt, comeffdt),
+
+    emiridno = COALESCE(@emiridno, emiridno),
+    idholder = COALESCE(@idholder, idholder),
+    nationty = COALESCE(@nationty, nationty),
+    employer = COALESCE(@employer, employer),
+    issudate = COALESCE(@issudate, issudate),
+    expirydt = COALESCE(@expirydt, expirydt),
+    occupatn = COALESCE(@occupatn, occupatn),
+
+    updateId = 'API',
+    updateDt = GETDATE()
+WHERE mobileNo = @mobileKey;
+
+SELECT TOP 1
+    inflCode, inflType, isActive, createId, createDt, updateId, updateDt,
+    inflName, contName, contrtyp, frstname, middname, lastname,
+    mobileNo, emailAdd, inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    areaCode, emirates, referenc,
+    bankAcNo, bankApNm, bankBnNm, bankBnDs, bankBnNo, bankIFSC, bankaddr, ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt,
+    comtrdnm, comrespn, comraddr, comeffdt,
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE mobileNo = @mobileKey
+ORDER BY updateDt DESC, createDt DESC;";
+
+                var rows = _db.QaEWebBean(upd, p);
+                var row = rows?.FirstOrDefault();
+
+                if (row == null)
+                    return Ok(new { success = true, message = "Updated." });
+
+                var resp = MapRowToDto(row);
+                return Ok(new { success = true, message = "Updated.", data = resp });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
         }
+
+        // ===================== helpers =====================
+
+        private static object? ToDbOrNull(string? s) =>
+            string.IsNullOrWhiteSpace(s) ? DBNull.Value : s;
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+
+        // keep last 11 digits if country code present
+        private static string? FormatMobile11(string? s)
+        {
+            var d = Digits(s);
+            if (string.IsNullOrEmpty(d)) return null;
+            if (d.Length <= 11) return d;
+            return d[^11..];
+        }
+
+        private static UseUpdateView MapRowToDto(Dictionary<string, object> row) => new UseUpdateView
+        {
+            InflCode = row["inflCode"]?.ToString(),
+            InflType = row["inflType"]?.ToString(),
+            IsActive = row["isActive"]?.ToString(),
+
+            InflName = row["inflName"]?.ToString(),
+            ContName = row["contName"]?.ToString(),
+            ContractorType = row["contrtyp"]?.ToString(),
+            FirstName = row["frstname"]?.ToString(),
+            MiddleName = row["middname"]?.ToString(),
+            LastName = row["lastname"]?.ToString(),
+
+            MobileNumber = row["mobileNo"]?.ToString(),
+            EmailAddress = row["emailAdd"]?.ToString(),
+            Address = row["inflAdd1"]?.ToString(),
+            Address2 = row["inflAdd2"]?.ToString(),
+            Address3 = row["inflAdd3"]?.ToString(),
+            City = row["inflCity"]?.ToString(),
+            District = row["district"]?.ToString(),
+            PinCode = row["inflPinC"]?.ToString(),
+            AreaCode = row["areaCode"]?.ToString(),
+            Emirates = row["emirates"]?.ToString(),
+            Reference = row["referenc"]?.ToString(),
+
+            BankAccountNo = row["bankAcNo"]?.ToString(),
+            AccountHolderName = row["bankApNm"]?.ToString(),
+            BankName = row["bankBnNm"]?.ToString(),
+            BranchName = row["bankBnDs"]?.ToString(),
+            BankBranchNo = row["bankBnNo"]?.ToString(),
+            BankIfscCode = row["bankIFSC"]?.ToString(),
+            BankAddress = row["bankaddr"]?.ToString(),
+            IbanNumber = row["ibannumb"]?.ToString(),
+
+            FirmName = row["vatfrmnm"]?.ToString(),
+            VatAddress = row["vatraddr"]?.ToString(),
+            TaxRegistrationNumber = row["vattxreg"]?.ToString(),
+            VatEffectiveDate = row["vatefdt"]?.ToString(),
+
+            LicenseNumber = row["comlcnno"]?.ToString(),
+            IssuingAuthority = row["comissau"]?.ToString(),
+            LicenseType = row["comlctyp"]?.ToString(),
+            EstablishmentDate = row["comestdt"]?.ToString(),
+            LicenseExpiryDate = row["comexpdt"]?.ToString(),
+            TradeName = row["comtrdnm"]?.ToString(),
+            ResponsiblePerson = row["comrespn"]?.ToString(),
+            LicenseAddress = row["comraddr"]?.ToString(),
+            EffectiveDate = row["comeffdt"]?.ToString(),
+
+            EmiratesIdNumber = row["emiridno"]?.ToString(),
+            IdName = row["idholder"]?.ToString(),
+            Nationality = row["nationty"]?.ToString(),
+            Employer = row["employer"]?.ToString(),
+            IssueDate = row["issudate"]?.ToString(),
+            ExpiryDate = row["expirydt"]?.ToString(),
+            Occupation = row["occupatn"]?.ToString(),
+
+            CreateId = row["createId"]?.ToString(),
+            UpdateId = row["updateId"]?.ToString(),
+            CreateDt = row["createDt"]?.ToString(),
+            UpdateDt = row["updateDt"]?.ToString()
+        };
     }
 }
