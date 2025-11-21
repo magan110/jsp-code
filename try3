@@ -1,639 +1,181 @@
-using Microsoft.AspNetCore.Mvc;
+// --------------------------------------------------------------------------------------
+// PREREQUISITES:
+// 1. Install NuGet: 'Tesseract'
+// 2. Install NuGet: 'PdfiumViewer'
+// 3. Install NuGet: 'PdfiumViewer.Native.x86_64.v8-xfa'
+// 4. Install NuGet: 'System.Drawing.Common'
+// 5. Ensure 'tessdata/eng.traineddata' exists and is set to "Copy if newer".
+// --------------------------------------------------------------------------------------
+
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
-using sparshWebService.DataAccess;
+using Microsoft.AspNetCore.Mvc;
+using PdfiumViewer;
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text.Json;
-using System.Text.RegularExpressions;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions; // Required for Key-Value extraction
+using Tesseract;
 
-#nullable enable
-
-namespace sparshWebService.Controllers
+namespace ocr.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    [Produces("application/json")]
-    public sealed class UsersController : ControllerBase
+    public class OCRController : ControllerBase
     {
-        private readonly DatabaseHelper _db;
+        private readonly IWebHostEnvironment _env;
 
-        public UsersController(DatabaseHelper db) => _db = db;
-
-        // =========================================================================
-        // 1) GET: /api/Users/all
-        // Query:
-        //   search  (by name, Emirates ID, registration ID)
-        //   type    (Contractor / Painter → inflType)
-        //
-        // Response:
-        // {
-        //   success: true,
-        //   page: 1,
-        //   pageSize: <total>,
-        //   total: <total>,
-        //   items: [...]
-        // }
-        // =========================================================================
-        [HttpGet("all")]
-        public IActionResult GetAll(
-            [FromQuery] string? search = null,
-            [FromQuery] string? type = null // Contractor / Painter / your codes
-        )
+        public OCRController(IWebHostEnvironment env)
         {
-            try
-            {
-                var whereParts = new List<string> { "1 = 1" };
-                var param = new Dictionary<string, object?>();
-
-                // type filter → inflType
-                if (!string.IsNullOrWhiteSpace(type))
-                {
-                    whereParts.Add("inflType = @p_type");
-                    param["@p_type"] = type.Trim();
-                }
-
-                // search: by name, Emirates ID, registrationId (using inflCode)
-                if (!string.IsNullOrWhiteSpace(search))
-                {
-                    var term = search.Trim().ToLowerInvariant();
-                    whereParts.Add(@"
-(
-    LOWER(ISNULL(inflCode, ''))   LIKE @p_search
- OR LOWER(ISNULL(inflName, ''))   LIKE @p_search
- OR LOWER(ISNULL(frstname, ''))   LIKE @p_search
- OR LOWER(ISNULL(middname, ''))   LIKE @p_search
- OR LOWER(ISNULL(lastname, ''))   LIKE @p_search
- OR LOWER(ISNULL(emiridno, ''))   LIKE @p_search
-)");
-                    param["@p_search"] = $"%{term}%";
-                }
-                else
-                {
-                    param["@p_search"] = DBNull.Value;
-                }
-
-                var whereClause = string.Join(" AND ", whereParts);
-
-                // ---------- Single query, NO TOP, NO OFFSET: returns ALL ----------
-                var sql = $@"
-SELECT
-    inflCode,
-    inflType,
-    isActive,
-
-    COALESCE(
-        NULLIF(LTRIM(RTRIM(inflName)), ''),
-        NULLIF(LTRIM(RTRIM(frstname + ' ' + ISNULL(middname + ' ', '') + ISNULL(lastname, ''))), ''),
-        NULLIF(LTRIM(RTRIM(contName)), '')
-    ) AS dispName,
-
-    emiridno,
-    mobileNo,
-    emailAdd,
-    areaCode,
-    vatfrmnm,
-    comtrdnm,
-    comlcnno,
-    updateDt,
-    createDt
-FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE {whereClause}
-ORDER BY updateDt DESC, createDt DESC, inflCode;";
-
-                var rows = _db.QaEWebBean(sql, param) ?? new List<Dictionary<string, object>>();
-
-                var items = rows.Select(r =>
-                {
-                    var inflCode = r["inflCode"]?.ToString() ?? "";
-                    var inflType = r["inflType"]?.ToString();
-                    var isActive = r["isActive"]?.ToString();
-                    var dispName = r["dispName"]?.ToString();
-                    var emirId = r["emiridno"]?.ToString();
-                    var mobile = r["mobileNo"]?.ToString();
-                    var email = r["emailAdd"]?.ToString();
-                    var vatFirm = r["vatfrmnm"]?.ToString();
-                    var tradeName = r["comtrdnm"]?.ToString();
-                    var licenseNo = r["comlcnno"]?.ToString();
-
-                    string? companyName = !string.IsNullOrWhiteSpace(vatFirm)
-                        ? vatFirm
-                        : (!string.IsNullOrWhiteSpace(tradeName)
-                            ? tradeName
-                            : dispName);
-
-                    return new UserListItem
-                    {
-                        id = inflCode,
-                        name = string.IsNullOrWhiteSpace(dispName) ? inflCode : dispName,
-                        type = inflType,
-                        emiratesId = emirId,
-                        registrationId = inflCode, // use another column if you have one
-                        mobile = mobile,
-                        email = email,
-                        status = isActive == "Y" ? "Active" : "Inactive",
-                        avatar = null,
-                        companyName = companyName,
-                        licenseNumber = licenseNo
-                    };
-                }).ToList();
-
-                var total = items.Count;
-
-                return Ok(new
-                {
-                    success = true,
-                    page = 1,
-                    pageSize = total,
-                    total,
-                    items
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
+            _env = env;
         }
 
-        // =========================================================================
-        // 2) GET: /api/Users/{userId}  (userId = inflCode)
-        // =========================================================================
-        [HttpGet("{userId}")]
-        public IActionResult GetById([FromRoute] string userId)
+        [HttpPost("upload")]
+        public IActionResult UploadAndExtract(IFormFile file)
         {
+            if (file == null || file.Length == 0)
+            {
+                return BadRequest("Please upload a valid file.");
+            }
+
             try
             {
-                if (string.IsNullOrWhiteSpace(userId))
-                    return BadRequest(new { success = false, message = "userId is required." });
+                string tessDataPath = Path.Combine(_env.ContentRootPath, "tessdata");
 
-                const string sql = @"
-SELECT TOP 1
-    inflCode,
-    inflType,
-    isActive,
-
-    contrtyp, frstname, middname, lastname,
-    mobileNo, inflAdd1, areaCode, emirates, emiridno, idholder, birthDat,
-    nationty, comtrdnm,
-    issudate, expirydt, occupatn,
-
-    bankApNm, ibannumb, bankBnNm, bankBnDs, bankaddr,
-
-    comlcnno, comissau, comlctyp, comestdt, comexpdt,
-    comtrdnm, comrespn, comraddr, comeffdt,
-
-    vatfrmnm, vatraddr, vattxreg, vatefdt
-FROM dbo.ctmInfluncr WITH (NOLOCK)
-WHERE inflCode = @inflCode
-ORDER BY updateDt DESC, createDt DESC;";
-
-                var row = _db.QaEWebBean(sql, new Dictionary<string, object?>
+                if (!Directory.Exists(tessDataPath))
                 {
-                    ["@inflCode"] = userId
-                })?.FirstOrDefault();
+                    return StatusCode(500, $"Server Error: 'tessdata' folder missing at: {tessDataPath}.");
+                }
 
-                if (row == null)
-                    return NotFound(new { success = false, message = "User not found." });
-
-                var dto = MapRowToDetail(row);
-                return Ok(new { success = true, data = dto });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { success = false, message = ex.Message });
-            }
-        }
-
-        // =========================================================================
-        // 3) PUT: /api/Users/update/{userId}
-        // =========================================================================
-        [HttpPut("update/{userId}")]
-        [Consumes("application/json")]
-        public IActionResult UpdateUser([FromRoute] string userId, [FromBody] UserUpdateRequest body)
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(userId))
-                    return BadRequest(new { success = false, message = "userId is required." });
-
-                const string chkSql = @"
-SELECT TOP 1 inflCode, inflType, isActive
-FROM dbo.ctmInfluncr
-WHERE inflCode = @inflCode;";
-
-                var existing = _db.QaEWebBean(chkSql, new Dictionary<string, object?>
+                // Initialize Tesseract
+                using (var engine = new TesseractEngine(tessDataPath, "eng", EngineMode.Default))
                 {
-                    ["@inflCode"] = userId
-                })?.FirstOrDefault();
+                    var resultText = new StringBuilder();
+                    float totalConfidence = 0;
+                    int pageCount = 0;
 
-                if (existing == null)
-                    return NotFound(new { success = false, message = "User not found." });
-
-                var inflType = existing["inflType"]?.ToString();
-                bool isContractor = !string.IsNullOrWhiteSpace(inflType) &&
-                                    inflType.StartsWith("C", StringComparison.OrdinalIgnoreCase);
-
-                var errors = ValidateUser(body, isContractor);
-                if (errors.Count > 0)
-                {
-                    return BadRequest(new
+                    using (var memoryStream = new MemoryStream())
                     {
-                        success = false,
-                        message = "Validation failed.",
-                        errors
+                        file.CopyTo(memoryStream);
+                        byte[] fileBytes = memoryStream.ToArray();
+
+                        memoryStream.Position = 0;
+
+                        var extension = Path.GetExtension(file.FileName).ToLower();
+
+                        if (extension == ".pdf")
+                        {
+                            // --- PDF HANDLING ---
+                            using (var pdfDocument = PdfDocument.Load(memoryStream))
+                            {
+                                pageCount = pdfDocument.PageCount;
+
+                                for (int i = 0; i < pageCount; i++)
+                                {
+                                    var size = pdfDocument.PageSizes[i];
+                                    int width = (int)(size.Width / 72.0 * 300);
+                                    int height = (int)(size.Height / 72.0 * 300);
+
+                                    using (var bitmap = pdfDocument.Render(i, width, height, 300, 300, true))
+                                    {
+                                        using (var imageStream = new MemoryStream())
+                                        {
+                                            bitmap.Save(imageStream, System.Drawing.Imaging.ImageFormat.Png);
+                                            byte[] pageBytes = imageStream.ToArray();
+
+                                            using (var img = Pix.LoadFromMemory(pageBytes))
+                                            using (var page = engine.Process(img))
+                                            {
+                                                // Append text with newlines to help regex parser
+                                                resultText.AppendLine(page.GetText());
+                                                totalConfidence += page.GetMeanConfidence();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // --- IMAGE HANDLING ---
+                            pageCount = 1;
+                            using (var img = Pix.LoadFromMemory(fileBytes))
+                            using (var page = engine.Process(img))
+                            {
+                                resultText.Append(page.GetText());
+                                totalConfidence = page.GetMeanConfidence();
+                            }
+                        }
+                    }
+
+                    string rawString = resultText.ToString();
+
+                    // --- NEW: Extract Key-Value Pairs ---
+                    var kvPairs = ExtractKeyValuePairs(rawString);
+
+                    return Ok(new
+                    {
+                        FileName = file.FileName,
+                        PageCount = pageCount,
+                        AverageConfidence = pageCount > 0 ? (totalConfidence / pageCount) : 0,
+                        KeyValuePairs = kvPairs, // Returns Dictionary<string, string>
+                        RawText = rawString
                     });
                 }
-
-                var mobileDigits = Digits(body.mobileNumber);
-                if (mobileDigits.Length > 9)
-                    mobileDigits = mobileDigits[^9..];
-                string? mobileNorm = string.IsNullOrEmpty(mobileDigits) ? null : mobileDigits;
-
-                string? ibanNorm = null;
-                if (!string.IsNullOrWhiteSpace(body.ibanNumber))
-                    ibanNorm = body.ibanNumber.Replace(" ", "").ToUpperInvariant();
-
-                string? statusText = string.IsNullOrWhiteSpace(body.status)
-                    ? null
-                    : (body.status!.Equals("Inactive", StringComparison.OrdinalIgnoreCase)
-                        ? "Inactive"
-                        : "Active");
-
-                var p = new Dictionary<string, object?>
-                {
-                    ["@inflCode"] = userId,
-                    ["@contrtyp"] = ToDbOrNull(body.contractorType),
-                    ["@frstname"] = ToDbOrNull(body.firstName),
-                    ["@middname"] = ToDbOrNull(body.middleName),
-                    ["@lastname"] = ToDbOrNull(body.lastName),
-
-                    ["@mobileNo"] = ToDbOrNull(mobileNorm),
-                    ["@inflAdd1"] = ToDbOrNull(body.address),
-                    ["@areaCode"] = ToDbOrNull(body.area),
-                    ["@emirates"] = ToDbOrNull(body.emirates),
-                    ["@emiridno"] = ToDbOrNull(body.emiratesIdNumber),
-                    ["@idholder"] = ToDbOrNull(body.idName),
-                    ["@birthDat"] = ToDbOrNull(body.dateOfBirth),
-                    ["@nationty"] = ToDbOrNull(body.nationality),
-                    ["@comtrdnm"] = ToDbOrNull(body.companyDetails),
-
-                    ["@issudate"] = ToDbOrNull(body.issueDate),
-                    ["@expirydt"] = ToDbOrNull(body.expiryDate),
-                    ["@occupatn"] = ToDbOrNull(body.occupation),
-
-                    ["@bankApNm"] = ToDbOrNull(body.accountHolderName),
-                    ["@ibannumb"] = ToDbOrNull(ibanNorm),
-                    ["@bankBnNm"] = ToDbOrNull(body.bankName),
-                    ["@bankBnDs"] = ToDbOrNull(body.branchName),
-                    ["@bankaddr"] = ToDbOrNull(body.bankAddress),
-
-                    ["@comlcnno"] = ToDbOrNull(body.licenseNumber),
-                    ["@comissau"] = ToDbOrNull(body.issuingAuthority),
-                    ["@comlctyp"] = ToDbOrNull(body.licenseType),
-                    ["@comestdt"] = ToDbOrNull(body.establishmentDate),
-                    ["@comexpdt"] = ToDbOrNull(body.licenseExpiryDate),
-                    ["@tradeName"] = ToDbOrNull(body.tradeName),
-                    ["@comrespn"] = ToDbOrNull(body.responsiblePerson),
-                    ["@comraddr"] = ToDbOrNull(body.licenseAddress),
-                    ["@comeffdt"] = ToDbOrNull(body.effectiveDate),
-
-                    ["@vatfrmnm"] = ToDbOrNull(body.firmName),
-                    ["@vatraddr"] = ToDbOrNull(body.vatAddress),
-                    ["@vattxreg"] = ToDbOrNull(body.taxRegistrationNumber),
-                    ["@vatefdt"] = ToDbOrNull(body.vatEffectiveDate),
-
-                    ["@p_status"] = ToDbOrNull(statusText),
-                    ["@p_updateId"] = User?.Identity?.Name ?? "API"
-                };
-
-                const string updSql = @"
-UPDATE dbo.ctmInfluncr
-SET
-    contrtyp = COALESCE(@contrtyp, contrtyp),
-    frstname = COALESCE(@frstname, frstname),
-    middname = COALESCE(@middname, middname),
-    lastname = COALESCE(@lastname, lastname),
-
-    mobileNo = COALESCE(@mobileNo, mobileNo),
-    inflAdd1 = COALESCE(@inflAdd1, inflAdd1),
-    areaCode = COALESCE(@areaCode, areaCode),
-    emirates = COALESCE(@emirates, emirates),
-    emiridno = COALESCE(@emiridno, emiridno),
-    idholder = COALESCE(@idholder, idholder),
-    birthDat = COALESCE(@birthDat, birthDat),
-    nationty = COALESCE(@nationty, nationty),
-    comtrdnm = COALESCE(@comtrdnm, comtrdnm),
-
-    issudate = COALESCE(@issudate, issudate),
-    expirydt = COALESCE(@expirydt, expirydt),
-    occupatn = COALESCE(@occupatn, occupatn),
-
-    bankApNm = COALESCE(@bankApNm, bankApNm),
-    ibannumb = COALESCE(@ibannumb, ibannumb),
-    bankBnNm = COALESCE(@bankBnNm, bankBnNm),
-    bankBnDs = COALESCE(@bankBnDs, bankBnDs),
-    bankaddr = COALESCE(@bankaddr, bankaddr),
-
-    comlcnno = COALESCE(@comlcnno, comlcnno),
-    comissau = COALESCE(@comissau, comissau),
-    comlctyp = COALESCE(@comlctyp, comlctyp),
-    comestdt = COALESCE(@comestdt, comestdt),
-    comexpdt = COALESCE(@comexpdt, comexpdt),
-    comtrdnm = COALESCE(@tradeName, comtrdnm),
-    comrespn = COALESCE(@comrespn, comrespn),
-    comraddr = COALESCE(@comraddr, comraddr),
-    comeffdt = COALESCE(@comeffdt, comeffdt),
-
-    vatfrmnm = COALESCE(@vatfrmnm, vatfrmnm),
-    vatraddr = COALESCE(@vatraddr, vatraddr),
-    vattxreg = COALESCE(@vattxreg, vattxreg),
-    vatefdt  = COALESCE(@vatefdt, vatefdt),
-
-    isActive = CASE 
-                 WHEN @p_status = 'Active' THEN 'Y'
-                 WHEN @p_status = 'Inactive' THEN 'N'
-                 ELSE isActive
-               END,
-
-    updateId = @p_updateId,
-    updateDt = GETDATE()
-WHERE inflCode = @inflCode;";
-
-                _db.QaEWebBean(updSql, p);
-
-                // Audit (best-effort)
-                try
-                {
-                    InsertAuditLog(userId, "UserUpdate", body);
-                }
-                catch
-                {
-                    // ignore
-                }
-
-                return Ok(new { success = true, message = "User updated successfully." });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new { success = false, message = ex.Message });
+                return StatusCode(500, $"Internal Server Error: {ex.Message}");
             }
         }
 
-        // ===================== Helpers =====================
-
-        private static object? ToDbOrNull(string? s) =>
-            string.IsNullOrWhiteSpace(s) ? DBNull.Value : s.Trim();
-
-        private static string Digits(string? s) =>
-            string.IsNullOrEmpty(s) ? "" : new string(s.Where(char.IsDigit).ToArray());
-
-        private static UserDetailDto MapRowToDetail(Dictionary<string, object> row) =>
-            new UserDetailDto
-            {
-                userId = row["inflCode"]?.ToString(),
-                type = row["inflType"]?.ToString(),
-                status = row["isActive"]?.ToString() == "Y" ? "Active" : "Inactive",
-
-                contractorType = row["contrtyp"]?.ToString(),
-                firstName = row["frstname"]?.ToString(),
-                middleName = row["middname"]?.ToString(),
-                lastName = row["lastname"]?.ToString(),
-
-                mobileNumber = row["mobileNo"]?.ToString(),
-                address = row["inflAdd1"]?.ToString(),
-                area = row["areaCode"]?.ToString(),
-                emirates = row["emirates"]?.ToString(),
-                emiratesIdNumber = row["emiridno"]?.ToString(),
-                idName = row["idholder"]?.ToString(),
-                dateOfBirth = row["birthDat"]?.ToString(),
-                nationality = row["nationty"]?.ToString(),
-                companyDetails = row["comtrdnm"]?.ToString(),
-
-                issueDate = row["issudate"]?.ToString(),
-                expiryDate = row["expirydt"]?.ToString(),
-                occupation = row["occupatn"]?.ToString(),
-
-                accountHolderName = row["bankApNm"]?.ToString(),
-                ibanNumber = row["ibannumb"]?.ToString(),
-                bankName = row["bankBnNm"]?.ToString(),
-                branchName = row["bankBnDs"]?.ToString(),
-                bankAddress = row["bankaddr"]?.ToString(),
-
-                licenseNumber = row["comlcnno"]?.ToString(),
-                issuingAuthority = row["comissau"]?.ToString(),
-                licenseType = row["comlctyp"]?.ToString(),
-                establishmentDate = row["comestdt"]?.ToString(),
-                licenseExpiryDate = row["comexpdt"]?.ToString(),
-                tradeName = row["comtrdnm"]?.ToString(),
-                responsiblePerson = row["comrespn"]?.ToString(),
-                licenseAddress = row["comraddr"]?.ToString(),
-                effectiveDate = row["comeffdt"]?.ToString(),
-
-                firmName = row["vatfrmnm"]?.ToString(),
-                vatAddress = row["vatraddr"]?.ToString(),
-                taxRegistrationNumber = row["vattxreg"]?.ToString(),
-                vatEffectiveDate = row["vatefdt"]?.ToString()
-            };
-
-        private void InsertAuditLog(string inflCode, string action, UserUpdateRequest body)
+        /// <summary>
+        /// Parses raw text line-by-line looking for "Key: Value" patterns.
+        /// </summary>
+        private Dictionary<string, string> ExtractKeyValuePairs(string text)
         {
-            const string sql = @"
-INSERT INTO dbo.UserAuditLog
-    (inflCode, action, payloadJson, updateId, updateDt)
-VALUES
-    (@inflCode, @action, @payload, @updateId, GETDATE());";
+            var kvPairs = new Dictionary<string, string>();
 
-            var payload = JsonSerializer.Serialize(body);
-            var p = new Dictionary<string, object?>
+            if (string.IsNullOrWhiteSpace(text))
+                return kvPairs;
+
+            // Split text into lines to process them individually
+            var lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+            // Regex explanation:
+            // ^        -> Start of line
+            // (.+?)    -> Group 1 (Key): Match 1 or more chars, lazy (stops at first colon)
+            // \s*:\s* -> Separator: A colon surrounded by optional whitespace
+            // (.+)     -> Group 2 (Value): Match the rest of the line
+            // $        -> End of line
+            var regex = new Regex(@"^(.+?)\s*[:]\s*(.+)$");
+
+            foreach (var line in lines)
             {
-                ["@inflCode"] = inflCode,
-                ["@action"] = action,
-                ["@payload"] = payload,
-                ["@updateId"] = User?.Identity?.Name ?? "API"
-            };
+                var cleanLine = line.Trim();
+                var match = regex.Match(cleanLine);
 
-            _db.QaEWebBean(sql, p);
-        }
-
-        private static List<string> ValidateUser(UserUpdateRequest body, bool isContractor)
-        {
-            var errors = new List<string>();
-
-            if (string.IsNullOrWhiteSpace(body.firstName))
-                errors.Add("firstName is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.lastName))
-                errors.Add("lastName is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.mobileNumber))
-                errors.Add("mobileNumber is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.address))
-                errors.Add("address is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.emirates))
-                errors.Add("emirates is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.emiratesIdNumber))
-                errors.Add("emiratesIdNumber is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.idName))
-                errors.Add("idName is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.nationality))
-                errors.Add("nationality is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.companyDetails))
-                errors.Add("companyDetails is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.issueDate))
-                errors.Add("issueDate is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.expiryDate))
-                errors.Add("expiryDate is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.accountHolderName))
-                errors.Add("accountHolderName is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.ibanNumber))
-                errors.Add("ibanNumber is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.bankName))
-                errors.Add("bankName is mandatory.");
-            if (string.IsNullOrWhiteSpace(body.branchName))
-                errors.Add("branchName is mandatory.");
-
-            if (isContractor && string.IsNullOrWhiteSpace(body.licenseNumber))
-                errors.Add("licenseNumber is mandatory for contractors.");
-
-            var digits = Digits(body.mobileNumber);
-            if (digits.Length > 9)
-                digits = digits[^9..];
-            if (digits.Length != 9)
-                errors.Add("mobileNumber must be a 9-digit UAE number (without country code).");
-
-            if (!string.IsNullOrWhiteSpace(body.ibanNumber))
-            {
-                var iban = body.ibanNumber.Replace(" ", "").ToUpperInvariant();
-                var ibanRegex = new Regex(@"^AE\d{21}$");
-                if (!ibanRegex.IsMatch(iban))
-                    errors.Add("ibanNumber must be a valid UAE IBAN (AE + 21 digits).");
-            }
-
-            if (!string.IsNullOrWhiteSpace(body.taxRegistrationNumber))
-            {
-                var trnRegex = new Regex(@"^\d{3}-\d{9}-\d{3}$");
-                if (!trnRegex.IsMatch(body.taxRegistrationNumber.Trim()))
-                    errors.Add("taxRegistrationNumber must be in the format XXX-XXXXXXXXX-XXX (digits only).");
-            }
-
-            if (!string.IsNullOrWhiteSpace(body.status))
-            {
-                var s = body.status.Trim();
-                if (!s.Equals("Active", StringComparison.OrdinalIgnoreCase) &&
-                    !s.Equals("Inactive", StringComparison.OrdinalIgnoreCase))
+                if (match.Success)
                 {
-                    errors.Add("status must be 'Active' or 'Inactive'.");
+                    var key = match.Groups[1].Value.Trim();
+                    var value = match.Groups[2].Value.Trim();
+
+                    // Basic filtering:
+                    // 1. Ensure key isn't too long (likely garbage OCR)
+                    // 2. Ensure key doesn't already exist
+                    if (key.Length < 50 && !string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(value))
+                    {
+                        if (!kvPairs.ContainsKey(key))
+                        {
+                            kvPairs.Add(key, value);
+                        }
+                    }
                 }
             }
 
-            return errors;
+            return kvPairs;
         }
-    }
-
-    // ===================== DTOs =====================
-
-    public sealed class UserListItem
-    {
-        public string id { get; set; } = "";
-        public string? name { get; set; }
-        public string? type { get; set; }
-        public string? emiratesId { get; set; }
-        public string? registrationId { get; set; }
-        public string? mobile { get; set; }
-        public string? email { get; set; }
-        public string? status { get; set; }
-        public string? avatar { get; set; }
-        public string? companyName { get; set; }
-        public string? licenseNumber { get; set; }
-    }
-
-    public sealed class UserDetailDto
-    {
-        public string? userId { get; set; }
-        public string? type { get; set; }
-        public string? status { get; set; }
-
-        public string? contractorType { get; set; }
-        public string? firstName { get; set; }
-        public string? middleName { get; set; }
-        public string? lastName { get; set; }
-
-        public string? mobileNumber { get; set; }
-        public string? address { get; set; }
-        public string? area { get; set; }
-        public string? emirates { get; set; }
-        public string? emiratesIdNumber { get; set; }
-        public string? idName { get; set; }
-        public string? dateOfBirth { get; set; }
-        public string? nationality { get; set; }
-        public string? companyDetails { get; set; }
-
-        public string? issueDate { get; set; }
-        public string? expiryDate { get; set; }
-        public string? occupation { get; set; }
-
-        public string? accountHolderName { get; set; }
-        public string? ibanNumber { get; set; }
-        public string? bankName { get; set; }
-        public string? branchName { get; set; }
-        public string? bankAddress { get; set; }
-
-        public string? licenseNumber { get; set; }
-        public string? issuingAuthority { get; set; }
-        public string? licenseType { get; set; }
-        public string? establishmentDate { get; set; }
-        public string? licenseExpiryDate { get; set; }
-        public string? tradeName { get; set; }
-        public string? responsiblePerson { get; set; }
-        public string? licenseAddress { get; set; }
-        public string? effectiveDate { get; set; }
-
-        public string? firmName { get; set; }
-        public string? vatAddress { get; set; }
-        public string? taxRegistrationNumber { get; set; }
-        public string? vatEffectiveDate { get; set; }
-    }
-
-    public sealed class UserUpdateRequest
-    {
-        public string? status { get; set; }
-
-        public string? contractorType { get; set; }
-        public string? firstName { get; set; }
-        public string? middleName { get; set; }
-        public string? lastName { get; set; }
-
-        public string? mobileNumber { get; set; }
-        public string? address { get; set; }
-        public string? area { get; set; }
-        public string? emirates { get; set; }
-        public string? emiratesIdNumber { get; set; }
-        public string? idName { get; set; }
-        public string? dateOfBirth { get; set; }
-        public string? nationality { get; set; }
-        public string? companyDetails { get; set; }
-
-        public string? issueDate { get; set; }
-        public string? expiryDate { get; set; }
-        public string? occupation { get; set; }
-
-        public string? accountHolderName { get; set; }
-        public string? ibanNumber { get; set; }
-        public string? bankName { get; set; }
-        public string? branchName { get; set; }
-        public string? bankAddress { get; set; }
-
-        public string? licenseNumber { get; set; }
-        public string? issuingAuthority { get; set; }
-        public string? licenseType { get; set; }
-        public string? establishmentDate { get; set; }
-        public string? licenseExpiryDate { get; set; }
-        public string? tradeName { get; set; }
-        public string? responsiblePerson { get; set; }
-        public string? licenseAddress { get; set; }
-        public string? effectiveDate { get; set; }
-
-        public string? firmName { get; set; }
-        public string? vatAddress { get; set; }
-        public string? taxRegistrationNumber { get; set; }
-        public string? vatEffectiveDate { get; set; }
     }
 }
