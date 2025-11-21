@@ -1,23 +1,19 @@
-// --------------------------------------------------------------------------------------
-// PREREQUISITES:
-// 1. Install NuGet: 'Tesseract'
-// 2. Install NuGet: 'PdfiumViewer'
-// 3. Install NuGet: 'PdfiumViewer.Native.x86_64.v8-xfa'
-// 4. Install NuGet: 'System.Drawing.Common'
-// 5. Ensure 'tessdata/eng.traineddata' exists and is set to "Copy if newer".
-// --------------------------------------------------------------------------------------
-
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using PdfiumViewer;
 using System;
 using System.Collections.Generic;
-using System.Drawing.Imaging;
+using System.Drawing.Imaging; // For ImageFormat
 using System.IO;
+using System.Net.Http;
 using System.Text;
-using System.Text.RegularExpressions; // Required for Key-Value extraction
+using System.Text.Json;
+using System.Threading.Tasks;
 using Tesseract;
+
+// Resolve conflict between Tesseract.ImageFormat and System.Drawing.Imaging.ImageFormat
+using SysDrawFmt = System.Drawing.Imaging.ImageFormat;
 
 namespace ocr.Controllers
 {
@@ -27,103 +23,114 @@ namespace ocr.Controllers
     {
         private readonly IWebHostEnvironment _env;
 
+        // --- CONFIGURATION ---
+        // Port 8080 (As confirmed by your "ollama serve" logs)
+        private const string OllamaEndpoint = "http://localhost:8080/api/generate";
+
+        // Faster 1B Model (As downloaded)
+        private const string OllamaModel = "qwen2.5:1.5b";
+
+        // Increased timeout to 10 minutes to prevent "Task Canceled" errors on CPU
+        private static readonly HttpClient _httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(600)
+        };
+
         public OCRController(IWebHostEnvironment env)
         {
             _env = env;
         }
 
         [HttpPost("upload")]
-        public IActionResult UploadAndExtract(IFormFile file)
+        public async Task<IActionResult> UploadAndExtract(IFormFile file)
         {
-            if (file == null || file.Length == 0)
-            {
-                return BadRequest("Please upload a valid file.");
-            }
+            if (file == null || file.Length == 0) return BadRequest("Invalid file.");
 
             try
             {
                 string tessDataPath = Path.Combine(_env.ContentRootPath, "tessdata");
-
                 if (!Directory.Exists(tessDataPath))
-                {
-                    return StatusCode(500, $"Server Error: 'tessdata' folder missing at: {tessDataPath}.");
-                }
+                    return StatusCode(500, $"Server Error: 'tessdata' folder missing at: {tessDataPath}");
 
-                // Initialize Tesseract
-                using (var engine = new TesseractEngine(tessDataPath, "eng", EngineMode.Default))
+                // 1. Run Tesseract OCR
+                var sbRawText = new StringBuilder();
+                float totalConfidence = 0;
+                int pageCount = 0;
+
+                using (var engine = new TesseractEngine(tessDataPath, "eng", EngineMode.LstmOnly))
                 {
-                    var resultText = new StringBuilder();
-                    float totalConfidence = 0;
-                    int pageCount = 0;
+                    engine.DefaultPageSegMode = PageSegMode.Auto;
 
                     using (var memoryStream = new MemoryStream())
                     {
-                        file.CopyTo(memoryStream);
+                        await file.CopyToAsync(memoryStream);
                         byte[] fileBytes = memoryStream.ToArray();
-
                         memoryStream.Position = 0;
 
                         var extension = Path.GetExtension(file.FileName).ToLower();
 
                         if (extension == ".pdf")
                         {
-                            // --- PDF HANDLING ---
-                            using (var pdfDocument = PdfDocument.Load(memoryStream))
+                            try
                             {
-                                pageCount = pdfDocument.PageCount;
-
-                                for (int i = 0; i < pageCount; i++)
+                                using (var pdfDocument = PdfDocument.Load(memoryStream))
                                 {
-                                    var size = pdfDocument.PageSizes[i];
-                                    int width = (int)(size.Width / 72.0 * 300);
-                                    int height = (int)(size.Height / 72.0 * 300);
-
-                                    using (var bitmap = pdfDocument.Render(i, width, height, 300, 300, true))
+                                    pageCount = pdfDocument.PageCount;
+                                    for (int i = 0; i < pageCount; i++)
                                     {
+                                        // Render PDF to Image (300 DPI)
+                                        var size = pdfDocument.PageSizes[i];
+                                        int width = (int)(size.Width / 72.0 * 300);
+                                        int height = (int)(size.Height / 72.0 * 300);
+
+                                        using (var bitmap = pdfDocument.Render(i, width, height, 300, 300, true))
                                         using (var imageStream = new MemoryStream())
                                         {
-                                            bitmap.Save(imageStream, System.Drawing.Imaging.ImageFormat.Png);
-                                            byte[] pageBytes = imageStream.ToArray();
-
-                                            using (var img = Pix.LoadFromMemory(pageBytes))
-                                            using (var page = engine.Process(img))
-                                            {
-                                                // Append text with newlines to help regex parser
-                                                resultText.AppendLine(page.GetText());
-                                                totalConfidence += page.GetMeanConfidence();
-                                            }
+                                            // Explicitly use System.Drawing.Imaging via alias
+                                            bitmap.Save(imageStream, SysDrawFmt.Png);
+                                            ProcessImage(engine, imageStream.ToArray(), sbRawText, ref totalConfidence);
                                         }
                                     }
                                 }
                             }
+                            catch (Exception ex)
+                            {
+                                return BadRequest($"PDF Error: {ex.Message}. Ensure PdfiumViewer native DLLs are installed.");
+                            }
                         }
                         else
                         {
-                            // --- IMAGE HANDLING ---
+                            // Image files
                             pageCount = 1;
-                            using (var img = Pix.LoadFromMemory(fileBytes))
-                            using (var page = engine.Process(img))
-                            {
-                                resultText.Append(page.GetText());
-                                totalConfidence = page.GetMeanConfidence();
-                            }
+                            ProcessImage(engine, fileBytes, sbRawText, ref totalConfidence);
                         }
                     }
-
-                    string rawString = resultText.ToString();
-
-                    // --- NEW: Extract Key-Value Pairs ---
-                    var kvPairs = ExtractKeyValuePairs(rawString);
-
-                    return Ok(new
-                    {
-                        FileName = file.FileName,
-                        PageCount = pageCount,
-                        AverageConfidence = pageCount > 0 ? (totalConfidence / pageCount) : 0,
-                        KeyValuePairs = kvPairs, // Returns Dictionary<string, string>
-                        RawText = rawString
-                    });
                 }
+
+                string rawString = sbRawText.ToString();
+
+                // 2. Extract Structured Data with AI
+                Dictionary<string, string> kvPairs;
+                try
+                {
+                    kvPairs = await ExtractKeyValuePairsWithOllama(rawString);
+                }
+                catch (Exception ex)
+                {
+                    kvPairs = new Dictionary<string, string> {
+                        { "Error", "AI Extraction Failed" },
+                        { "Details", ex.Message }
+                    };
+                }
+
+                return Ok(new
+                {
+                    FileName = file.FileName,
+                    PageCount = pageCount,
+                    AverageConfidence = pageCount > 0 ? (totalConfidence / pageCount) : 0,
+                    ExtractedData = kvPairs,
+                    RawText = rawString
+                });
             }
             catch (Exception ex)
             {
@@ -131,51 +138,102 @@ namespace ocr.Controllers
             }
         }
 
-        /// <summary>
-        /// Parses raw text line-by-line looking for "Key: Value" patterns.
-        /// </summary>
-        private Dictionary<string, string> ExtractKeyValuePairs(string text)
+        private async Task<Dictionary<string, string>> ExtractKeyValuePairsWithOllama(string text)
         {
-            var kvPairs = new Dictionary<string, string>();
+            if (string.IsNullOrWhiteSpace(text)) return new Dictionary<string, string>();
 
-            if (string.IsNullOrWhiteSpace(text))
-                return kvPairs;
+            // Clean the text to help the 1B model understand it better
+            string cleanText = text.Replace("\r", " ").Replace("\n", " ");
+            while (cleanText.Contains("  ")) { cleanText = cleanText.Replace("  ", " "); }
+            if (cleanText.Length > 2500) cleanText = cleanText.Substring(0, 2500);
 
-            // Split text into lines to process them individually
-            var lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            // --- SIMPLE "EXTRACT ALL" PROMPT ---
+            var prompt = $@"
+        Analyze the OCR text.
+        Extract all meaningful data fields into a single JSON object.
+        
+        STRUCTURAL RULES:
+        1. Return a FLAT object (Key: Value). 
+        2. Do NOT use nested objects, arrays, or Schema.org formats.
+        3. Values must be simple strings or numbers only.
+        4. Use the exact labels found in the text as Keys where possible.
 
-            // Regex explanation:
-            // ^        -> Start of line
-            // (.+?)    -> Group 1 (Key): Match 1 or more chars, lazy (stops at first colon)
-            // \s*:\s* -> Separator: A colon surrounded by optional whitespace
-            // (.+)     -> Group 2 (Value): Match the rest of the line
-            // $        -> End of line
-            var regex = new Regex(@"^(.+?)\s*[:]\s*(.+)$");
+        OCR TEXT:
+        {cleanText}
+    ";
 
-            foreach (var line in lines)
+            var requestBody = new
             {
-                var cleanLine = line.Trim();
-                var match = regex.Match(cleanLine);
+                model = OllamaModel,
+                prompt = prompt,
+                stream = false,
+                format = "json",
+                temperature = 0.1
+            };
 
-                if (match.Success)
+            var jsonContent = new StringContent(
+                JsonSerializer.Serialize(requestBody),
+                Encoding.UTF8,
+                "application/json");
+
+            var response = await _httpClient.PostAsync(OllamaEndpoint, jsonContent);
+            response.EnsureSuccessStatusCode();
+
+            var responseString = await response.Content.ReadAsStringAsync();
+
+            using (JsonDocument doc = JsonDocument.Parse(responseString))
+            {
+                if (doc.RootElement.TryGetProperty("response", out var responseElement))
                 {
-                    var key = match.Groups[1].Value.Trim();
-                    var value = match.Groups[2].Value.Trim();
+                    string innerJson = responseElement.GetString();
+                    innerJson = innerJson.Replace("```json", "").Replace("```", "").Trim();
 
-                    // Basic filtering:
-                    // 1. Ensure key isn't too long (likely garbage OCR)
-                    // 2. Ensure key doesn't already exist
-                    if (key.Length < 50 && !string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(value))
+                    // --- CRITICAL: Handle Dynamic Keys ---
+                    // Since we don't know what keys the AI will invent, we must use <string, object>
+                    // to catch numbers, booleans, and strings without crashing.
+                    var safeDict = JsonSerializer.Deserialize<Dictionary<string, object>>(innerJson);
+
+                    var resultDict = new Dictionary<string, string>();
+                    foreach (var kvp in safeDict)
                     {
-                        if (!kvPairs.ContainsKey(key))
+                        // Safely convert whatever the AI found into a string
+                        resultDict[kvp.Key] = kvp.Value?.ToString();
+                    }
+                    return resultDict;
+                }
+            }
+
+            return new Dictionary<string, string>();
+        }
+
+        private void ProcessImage(TesseractEngine engine, byte[] imageBytes, StringBuilder resultText, ref float totalConfidence)
+        {
+            try
+            {
+                using (var img = Pix.LoadFromMemory(imageBytes))
+                using (var deskewed = img.Deskew())
+                {
+                    var imageToProcess = deskewed ?? img;
+                    using (var page = engine.Process(imageToProcess))
+                    {
+                        var text = page.GetText();
+                        var conf = page.GetMeanConfidence();
+
+                        if (!string.IsNullOrWhiteSpace(text))
                         {
-                            kvPairs.Add(key, value);
+                            resultText.AppendLine(text);
+                        }
+                        if (conf > 0.0f)
+                        {
+                            totalConfidence += conf;
                         }
                     }
                 }
             }
-
-            return kvPairs;
+            catch (Exception ex)
+            {
+                resultText.AppendLine($"[Error: {ex.Message}]");
+            }
         }
     }
 }
