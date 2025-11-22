@@ -1,19 +1,16 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using PdfiumViewer;
+using PdfiumViewer; // Keep this for PDF->Image conversion
 using System;
 using System.Collections.Generic;
-using System.Drawing.Imaging; // For ImageFormat
+using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Tesseract;
-
-// Resolve conflict between Tesseract.ImageFormat and System.Drawing.Imaging.ImageFormat
-using SysDrawFmt = System.Drawing.Imaging.ImageFormat;
 
 namespace ocr.Controllers
 {
@@ -21,24 +18,16 @@ namespace ocr.Controllers
     [ApiController]
     public class OCRController : ControllerBase
     {
-        private readonly IWebHostEnvironment _env;
+        // REPLACE THIS WITH YOUR ACTUAL GOOGLE API KEY
+        private const string GoogleApiKey = "AIzaSyDJmNF3BQQ4HWtzuX80j6IvCshwQZPBgjk";
 
-        // --- CONFIGURATION ---
-        // Port 8080 (As confirmed by your "ollama serve" logs)
-        private const string OllamaEndpoint = "http://localhost:8080/api/generate";
+        // Gemini 1.5 Flash or 2.0 Flash are best for speed/cost with Vision
+        private const string GeminiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 
-        // Faster 1B Model (As downloaded)
-        private const string OllamaModel = "qwen2.5:1.5b";
+        private static readonly HttpClient _httpClient = new HttpClient();
 
-        // Increased timeout to 10 minutes to prevent "Task Canceled" errors on CPU
-        private static readonly HttpClient _httpClient = new HttpClient
+        public OCRController()
         {
-            Timeout = TimeSpan.FromSeconds(600)
-        };
-
-        public OCRController(IWebHostEnvironment env)
-        {
-            _env = env;
         }
 
         [HttpPost("upload")]
@@ -48,88 +37,65 @@ namespace ocr.Controllers
 
             try
             {
-                string tessDataPath = Path.Combine(_env.ContentRootPath, "tessdata");
-                if (!Directory.Exists(tessDataPath))
-                    return StatusCode(500, $"Server Error: 'tessdata' folder missing at: {tessDataPath}");
+                List<byte[]> imagesToSend = new List<byte[]>();
+                string mimeType = "image/jpeg"; // Default extraction format
 
-                // 1. Run Tesseract OCR
-                var sbRawText = new StringBuilder();
-                float totalConfidence = 0;
-                int pageCount = 0;
+                var extension = Path.GetExtension(file.FileName).ToLower();
 
-                using (var engine = new TesseractEngine(tessDataPath, "eng", EngineMode.LstmOnly))
+                // 1. PREPARE IMAGES (Handle PDF vs Image)
+                using (var memoryStream = new MemoryStream())
                 {
-                    engine.DefaultPageSegMode = PageSegMode.Auto;
+                    await file.CopyToAsync(memoryStream);
+                    byte[] fileBytes = memoryStream.ToArray();
 
-                    using (var memoryStream = new MemoryStream())
+                    if (extension == ".pdf")
                     {
-                        await file.CopyToAsync(memoryStream);
-                        byte[] fileBytes = memoryStream.ToArray();
-                        memoryStream.Position = 0;
-
-                        var extension = Path.GetExtension(file.FileName).ToLower();
-
-                        if (extension == ".pdf")
+                        // Convert PDF pages to Images so Gemini can "see" them
+                        // Note: Gemini API accepts PDFs directly in some workflows, 
+                        // but converting to Image ensures consistency across all file types.
+                        using (var pdfDocument = PdfDocument.Load(new MemoryStream(fileBytes)))
                         {
-                            try
-                            {
-                                using (var pdfDocument = PdfDocument.Load(memoryStream))
-                                {
-                                    pageCount = pdfDocument.PageCount;
-                                    for (int i = 0; i < pageCount; i++)
-                                    {
-                                        // Render PDF to Image (300 DPI)
-                                        var size = pdfDocument.PageSizes[i];
-                                        int width = (int)(size.Width / 72.0 * 300);
-                                        int height = (int)(size.Height / 72.0 * 300);
+                            // Only processing the first page for the bill to save tokens/complexity.
+                            // If bills are multi-page, loop this.
+                            int pageIndex = 0;
+                            var size = pdfDocument.PageSizes[pageIndex];
+                            int width = (int)(size.Width / 72.0 * 300); // 300 DPI
+                            int height = (int)(size.Height / 72.0 * 300);
 
-                                        using (var bitmap = pdfDocument.Render(i, width, height, 300, 300, true))
-                                        using (var imageStream = new MemoryStream())
-                                        {
-                                            // Explicitly use System.Drawing.Imaging via alias
-                                            bitmap.Save(imageStream, SysDrawFmt.Png);
-                                            ProcessImage(engine, imageStream.ToArray(), sbRawText, ref totalConfidence);
-                                        }
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
+                            using (var bitmap = pdfDocument.Render(pageIndex, width, height, 300, 300, true))
+                            using (var imageStream = new MemoryStream())
                             {
-                                return BadRequest($"PDF Error: {ex.Message}. Ensure PdfiumViewer native DLLs are installed.");
+                                bitmap.Save(imageStream, ImageFormat.Jpeg);
+                                imagesToSend.Add(imageStream.ToArray());
                             }
                         }
-                        else
-                        {
-                            // Image files
-                            pageCount = 1;
-                            ProcessImage(engine, fileBytes, sbRawText, ref totalConfidence);
-                        }
+                    }
+                    else
+                    {
+                        // It's already an image (jpg, png, etc)
+                        imagesToSend.Add(fileBytes);
+                        if (extension == ".png") mimeType = "image/png";
                     }
                 }
 
-                string rawString = sbRawText.ToString();
-
-                // 2. Extract Structured Data with AI
-                Dictionary<string, string> kvPairs;
+                // 2. SEND IMAGE DIRECTLY TO GEMINI (Vision API)
+                // We skip Tesseract entirely. Gemini reads the handwriting.
+                Dictionary<string, object> kvPairs;
                 try
                 {
-                    kvPairs = await ExtractKeyValuePairsWithOllama(rawString);
+                    // We only send the first image found.
+                    kvPairs = await AnalyzeImageWithGemini(imagesToSend.First(), mimeType);
                 }
                 catch (Exception ex)
                 {
-                    kvPairs = new Dictionary<string, string> {
-                        { "Error", "AI Extraction Failed" },
-                        { "Details", ex.Message }
-                    };
+                    return StatusCode(500, $"AI Processing Error: {ex.Message}");
                 }
 
                 return Ok(new
                 {
                     FileName = file.FileName,
-                    PageCount = pageCount,
-                    AverageConfidence = pageCount > 0 ? (totalConfidence / pageCount) : 0,
-                    ExtractedData = kvPairs,
-                    RawText = rawString
+                    ExtractionMethod = "Gemini Vision (Handwriting Supported)",
+                    Data = kvPairs
                 });
             }
             catch (Exception ex)
@@ -138,37 +104,53 @@ namespace ocr.Controllers
             }
         }
 
-        private async Task<Dictionary<string, string>> ExtractKeyValuePairsWithOllama(string text)
+        private async Task<Dictionary<string, object>> AnalyzeImageWithGemini(byte[] imageBytes, string mimeType)
         {
-            if (string.IsNullOrWhiteSpace(text)) return new Dictionary<string, string>();
+            string base64Image = Convert.ToBase64String(imageBytes);
 
-            // Clean the text to help the 1B model understand it better
-            string cleanText = text.Replace("\r", " ").Replace("\n", " ");
-            while (cleanText.Contains("  ")) { cleanText = cleanText.Replace("  ", " "); }
-            if (cleanText.Length > 2500) cleanText = cleanText.Substring(0, 2500);
+            // 1. The Prompt
+            // We specifically ask it to handle handwriting.
+            string promptText = @"
+    You are an expert AI specialized in digitizing handwritten documents.
+    
+    TASK: 
+    Analyze the image and extract EVERY meaningful field you see as a Key-Value pair. 
+    There is no fixed schema. You must discover the fields dynamically based on the document content.
 
-            // --- SIMPLE "EXTRACT ALL" PROMPT ---
-            var prompt = $@"
-        Analyze the OCR text.
-        Extract all meaningful data fields into a single JSON object.
-        
-        STRUCTURAL RULES:
-        1. Return a FLAT object (Key: Value). 
-        2. Do NOT use nested objects, arrays, or Schema.org formats.
-        3. Values must be simple strings or numbers only.
-        4. Use the exact labels found in the text as Keys where possible.
+    RULES FOR KEYS (The Labels):
+    1. Look for labels on the paper (e.g., 'Date:', 'Guest Name', 'Bill No.', 'G. Total').
+    2. Convert these labels into clean snake_case JSON keys (e.g., 'Bill No.' -> ""bill_no"", 'Room #' -> ""room_number"").
+    3. If a field has no clear label but is obvious (like the Hotel Name at the top), create a logical key like ""merchant_name"".
 
-        OCR TEXT:
-        {cleanText}
-    ";
+    RULES FOR VALUES (The Content):
+    1. Transcribe handwriting with extreme accuracy.
+    2. Maintain original formatting for values (do not strip currency symbols or change date formats).
+    3. If a value is crossed out, ignore it. Read the final valid value.
+    4. Capture ALL specific details found (e.g., Check-in Time, GSTIN, Pax, Advance, Remarks).
 
+    RETURN RAW JSON ONLY.";
+
+            // 2. Construct Payload for Multimodal Request
             var requestBody = new
             {
-                model = OllamaModel,
-                prompt = prompt,
-                stream = false,
-                format = "json",
-                temperature = 0.1
+                contents = new[]
+                {
+                    new
+                    {
+                        parts = new object[]
+                        {
+                            new { text = promptText },
+                            new
+                            {
+                                inline_data = new
+                                {
+                                    mime_type = mimeType,
+                                    data = base64Image
+                                }
+                            }
+                        }
+                    }
+                }
             };
 
             var jsonContent = new StringContent(
@@ -176,63 +158,38 @@ namespace ocr.Controllers
                 Encoding.UTF8,
                 "application/json");
 
-            var response = await _httpClient.PostAsync(OllamaEndpoint, jsonContent);
-            response.EnsureSuccessStatusCode();
+            // 3. Call API
+            var response = await _httpClient.PostAsync($"{GeminiEndpoint}?key={GoogleApiKey}", jsonContent);
 
             var responseString = await response.Content.ReadAsStringAsync();
 
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception($"Google API Error: {response.StatusCode} - {responseString}");
+            }
+
+            // 4. Parse Response
             using (JsonDocument doc = JsonDocument.Parse(responseString))
             {
-                if (doc.RootElement.TryGetProperty("response", out var responseElement))
+                try
                 {
-                    string innerJson = responseElement.GetString();
-                    innerJson = innerJson.Replace("```json", "").Replace("```", "").Trim();
+                    var root = doc.RootElement;
+                    var textPart = root
+                        .GetProperty("candidates")[0]
+                        .GetProperty("content")
+                        .GetProperty("parts")[0]
+                        .GetProperty("text")
+                        .GetString();
 
-                    // --- CRITICAL: Handle Dynamic Keys ---
-                    // Since we don't know what keys the AI will invent, we must use <string, object>
-                    // to catch numbers, booleans, and strings without crashing.
-                    var safeDict = JsonSerializer.Deserialize<Dictionary<string, object>>(innerJson);
+                    // Clean Markdown
+                    textPart = textPart.Replace("```json", "").Replace("```", "").Trim();
 
-                    var resultDict = new Dictionary<string, string>();
-                    foreach (var kvp in safeDict)
-                    {
-                        // Safely convert whatever the AI found into a string
-                        resultDict[kvp.Key] = kvp.Value?.ToString();
-                    }
-                    return resultDict;
+                    return JsonSerializer.Deserialize<Dictionary<string, object>>(textPart);
                 }
-            }
-
-            return new Dictionary<string, string>();
-        }
-
-        private void ProcessImage(TesseractEngine engine, byte[] imageBytes, StringBuilder resultText, ref float totalConfidence)
-        {
-            try
-            {
-                using (var img = Pix.LoadFromMemory(imageBytes))
-                using (var deskewed = img.Deskew())
+                catch
                 {
-                    var imageToProcess = deskewed ?? img;
-                    using (var page = engine.Process(imageToProcess))
-                    {
-                        var text = page.GetText();
-                        var conf = page.GetMeanConfidence();
-
-                        if (!string.IsNullOrWhiteSpace(text))
-                        {
-                            resultText.AppendLine(text);
-                        }
-                        if (conf > 0.0f)
-                        {
-                            totalConfidence += conf;
-                        }
-                    }
+                    return new Dictionary<string, object> { { "RawResponse", responseString }, { "Error", "Failed to parse JSON" } };
                 }
-            }
-            catch (Exception ex)
-            {
-                resultText.AppendLine($"[Error: {ex.Message}]");
             }
         }
     }
