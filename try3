@@ -1,196 +1,132 @@
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
-using PdfiumViewer; // Keep this for PDF->Image conversion
-using System;
-using System.Collections.Generic;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Text;
-using System.Text.Json;
-using System.Threading.Tasks;
-
-namespace ocr.Controllers
-{
-    [Route("api/[controller]")]
-    [ApiController]
-    public class OCRController : ControllerBase
-    {
-        // REPLACE THIS WITH YOUR ACTUAL GOOGLE API KEY
-        private const string GoogleApiKey = "AIzaSyDJmNF3BQQ4HWtzuX80j6IvCshwQZPBgjk";
-
-        // Gemini 1.5 Flash or 2.0 Flash are best for speed/cost with Vision
-        private const string GeminiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
-
-        private static readonly HttpClient _httpClient = new HttpClient();
-
-        public OCRController()
-        {
-        }
-
-        [HttpPost("upload")]
-        public async Task<IActionResult> UploadAndExtract(IFormFile file)
-        {
-            if (file == null || file.Length == 0) return BadRequest("Invalid file.");
-
-            try
-            {
-                List<byte[]> imagesToSend = new List<byte[]>();
-                string mimeType = "image/jpeg"; // Default extraction format
-
-                var extension = Path.GetExtension(file.FileName).ToLower();
-
-                // 1. PREPARE IMAGES (Handle PDF vs Image)
-                using (var memoryStream = new MemoryStream())
-                {
-                    await file.CopyToAsync(memoryStream);
-                    byte[] fileBytes = memoryStream.ToArray();
-
-                    if (extension == ".pdf")
-                    {
-                        // Convert PDF pages to Images so Gemini can "see" them
-                        // Note: Gemini API accepts PDFs directly in some workflows, 
-                        // but converting to Image ensures consistency across all file types.
-                        using (var pdfDocument = PdfDocument.Load(new MemoryStream(fileBytes)))
-                        {
-                            // Only processing the first page for the bill to save tokens/complexity.
-                            // If bills are multi-page, loop this.
-                            int pageIndex = 0;
-                            var size = pdfDocument.PageSizes[pageIndex];
-                            int width = (int)(size.Width / 72.0 * 300); // 300 DPI
-                            int height = (int)(size.Height / 72.0 * 300);
-
-                            using (var bitmap = pdfDocument.Render(pageIndex, width, height, 300, 300, true))
-                            using (var imageStream = new MemoryStream())
-                            {
-                                bitmap.Save(imageStream, ImageFormat.Jpeg);
-                                imagesToSend.Add(imageStream.ToArray());
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // It's already an image (jpg, png, etc)
-                        imagesToSend.Add(fileBytes);
-                        if (extension == ".png") mimeType = "image/png";
-                    }
-                }
-
-                // 2. SEND IMAGE DIRECTLY TO GEMINI (Vision API)
-                // We skip Tesseract entirely. Gemini reads the handwriting.
-                Dictionary<string, object> kvPairs;
-                try
-                {
-                    // We only send the first image found.
-                    kvPairs = await AnalyzeImageWithGemini(imagesToSend.First(), mimeType);
-                }
-                catch (Exception ex)
-                {
-                    return StatusCode(500, $"AI Processing Error: {ex.Message}");
-                }
-
-                return Ok(new
-                {
-                    FileName = file.FileName,
-                    ExtractionMethod = "Gemini Vision (Handwriting Supported)",
-                    Data = kvPairs
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, $"Internal Server Error: {ex.Message}");
-            }
-        }
-
-        private async Task<Dictionary<string, object>> AnalyzeImageWithGemini(byte[] imageBytes, string mimeType)
-        {
-            string base64Image = Convert.ToBase64String(imageBytes);
-
-            // 1. The Prompt
-            // We specifically ask it to handle handwriting.
-            string promptText = @"
-    You are an expert AI specialized in digitizing handwritten documents.
+-- ===============================================
+-- STEP COUNTER APP - DATABASE SCHEMA
+-- ===============================================
+-- Naming Convention:
+-- Table Names: Exactly 11 characters (ALPHABETIC ONLY)
+-- Column Names: Exactly 8 characters (ALPHABETIC ONLY)
+-- No Numbers, No Underscores Allowed
+-- ===============================================
+-- Integration: Links to existing covLoginMas employee table
+-- ===============================================
+-- ===============================================
+-- TABLE 1: DAILY STEP RECORDS
+-- Table Name: steprecords (11 characters)
+-- Stores: Daily step activity data
+-- Links to: covLoginMas.emplCode
+-- ===============================================
+CREATE TABLE steprecords (
+    recordid INT PRIMARY KEY AUTO_INCREMENT,
+    emplCode INT NOT NULL,           -- Employee code (FK to covLoginMas)
+    stepdate DATE NOT NULL,          -- Record date
+    stepstot INT DEFAULT 0,          -- Total steps
+    calories DECIMAL(8,2) DEFAULT 0, -- Calories burned
+    distance DECIMAL(8,2) DEFAULT 0, -- Distance in km
+    duration INT DEFAULT 0,          -- Duration in minutes
+    activity VARCHAR(20),             -- Activity status (walking/running/still/cycling)
+    walkstps INT DEFAULT 0,          -- Steps while walking
+    runsteps INT DEFAULT 0,          -- Steps while running
+    peakrate INT DEFAULT 0,          -- Peak steps per minute
+    avgrate_ DECIMAL(5,2) DEFAULT 0, -- Average steps per minute
+    createat DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updateat DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniquedt (emplCode, stepdate),
+    FOREIGN KEY (emplCode) REFERENCES covLoginMas(emplCode)
+);
+-- ===============================================
+-- TABLE 2: USER DATA & GOALS (Combined)
+-- Table Name: usrgoalstbl (11 characters)
+-- Stores: User goals, settings, achievements, leaderboard
+-- Links to: covLoginMas.emplCode
+-- Note: User profile data comes from covLoginMas
+-- ===============================================
+CREATE TABLE usrgoalstbl (
+    goalidno INT PRIMARY KEY AUTO_INCREMENT,
+    emplCode INT NOT NULL UNIQUE,    -- Employee code (FK to covLoginMas)
     
-    TASK: 
-    Analyze the image and extract EVERY meaningful field you see as a Key-Value pair. 
-    There is no fixed schema. You must discover the fields dynamically based on the document content.
-
-    RULES FOR KEYS (The Labels):
-    1. Look for labels on the paper (e.g., 'Date:', 'Guest Name', 'Bill No.', 'G. Total').
-    2. Convert these labels into clean snake_case JSON keys (e.g., 'Bill No.' -> ""bill_no"", 'Room #' -> ""room_number"").
-    3. If a field has no clear label but is obvious (like the Hotel Name at the top), create a logical key like ""merchant_name"".
-
-    RULES FOR VALUES (The Content):
-    1. Transcribe handwriting with extreme accuracy.
-    2. Maintain original formatting for values (do not strip currency symbols or change date formats).
-    3. If a value is crossed out, ignore it. Read the final valid value.
-    4. Capture ALL specific details found (e.g., Check-in Time, GSTIN, Pax, Advance, Remarks).
-
-    RETURN RAW JSON ONLY.";
-
-            // 2. Construct Payload for Multimodal Request
-            var requestBody = new
-            {
-                contents = new[]
-                {
-                    new
-                    {
-                        parts = new object[]
-                        {
-                            new { text = promptText },
-                            new
-                            {
-                                inline_data = new
-                                {
-                                    mime_type = mimeType,
-                                    data = base64Image
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            var jsonContent = new StringContent(
-                JsonSerializer.Serialize(requestBody),
-                Encoding.UTF8,
-                "application/json");
-
-            // 3. Call API
-            var response = await _httpClient.PostAsync($"{GeminiEndpoint}?key={GoogleApiKey}", jsonContent);
-
-            var responseString = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                throw new Exception($"Google API Error: {response.StatusCode} - {responseString}");
-            }
-
-            // 4. Parse Response
-            using (JsonDocument doc = JsonDocument.Parse(responseString))
-            {
-                try
-                {
-                    var root = doc.RootElement;
-                    var textPart = root
-                        .GetProperty("candidates")[0]
-                        .GetProperty("content")
-                        .GetProperty("parts")[0]
-                        .GetProperty("text")
-                        .GetString();
-
-                    // Clean Markdown
-                    textPart = textPart.Replace("```json", "").Replace("```", "").Trim();
-
-                    return JsonSerializer.Deserialize<Dictionary<string, object>>(textPart);
-                }
-                catch
-                {
-                    return new Dictionary<string, object> { { "RawResponse", responseString }, { "Error", "Failed to parse JSON" } };
-                }
-            }
-        }
-    }
-}
+    -- GOAL SETTINGS
+    dailygoal INT NOT NULL DEFAULT 10000, -- Daily step target
+    weeklygl INT DEFAULT 70000,      -- Weekly step target
+    caltargt DECIMAL(8,2) DEFAULT 500.00, -- Calorie target
+    disttarg DECIMAL(8,2) DEFAULT 8.00, -- Distance target in km
+    isactive BOOLEAN DEFAULT TRUE,   -- Is goal active
+    
+    -- APP SETTINGS
+    notifyon BOOLEAN DEFAULT TRUE,   -- Notifications enabled
+    apptheme VARCHAR(10) DEFAULT 'light', -- App theme (light/dark)
+    unitsys_ VARCHAR(10) DEFAULT 'metric', -- Unit system (metric/imperial)
+    applang_ VARCHAR(5) DEFAULT 'en', -- App language
+    privmode BOOLEAN DEFAULT FALSE,  -- Privacy mode
+    
+    -- ACHIEVEMENT DATA
+    achvstot INT DEFAULT 0,          -- Total achievements unlocked
+    achvbdge VARCHAR(200),            -- Comma-separated badge IDs
+    maxsteak INT DEFAULT 0,          -- Max daily streak
+    curstrek INT DEFAULT 0,          -- Current streak
+    lifetime BIGINT DEFAULT 0,       -- Lifetime total steps
+    
+    -- LEADERBOARD DATA
+    dailyrnk INT,                    -- Daily leaderboard rank
+    weekrank INT,                    -- Weekly leaderboard rank
+    monthrk_ INT,                    -- Monthly leaderboard rank
+    lastsync DATETIME,               -- Last sync timestamp
+    
+    -- TIMESTAMPS
+    createat DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updateat DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (emplCode) REFERENCES covLoginMas(emplCode)
+);
+-- ===============================================
+-- INDEXES FOR PERFORMANCE OPTIMIZATION
+-- ===============================================
+-- Index on steprecords for date-based queries
+CREATE INDEX idxdate ON steprecords(stepdate);
+-- Index on steprecords for employee queries
+CREATE INDEX idxempl ON steprecords(emplCode);
+-- Index on steprecords for activity filtering
+CREATE INDEX idxactiv ON steprecords(activity);
+-- Index on goals for employee queries
+CREATE INDEX idxgoal ON usrgoalstbl(emplCode);
+-- Index on goals for leaderboard rankings
+CREATE INDEX idxdaily ON usrgoalstbl(dailyrnk);
+CREATE INDEX idxweekl ON usrgoalstbl(weekrank);
+-- ===============================================
+-- SAMPLE QUERIES
+-- ===============================================
+-- Insert a daily step record for an employee
+-- INSERT INTO steprecords (emplCode, stepdate, stepstot, calories, distance, duration, activity, walkstps, runsteps)
+-- VALUES (12345, '2025-11-24', 10000, 450.00, 8.50, 120, 'walking', 8500, 1500);
+-- Insert/Initialize goals for an employee
+-- INSERT INTO usrgoalstbl (emplCode, dailygoal, weeklygl, caltargt, disttarg, notifyon, apptheme)
+-- VALUES (12345, 10000, 70000, 500.00, 10.00, TRUE, 'dark');
+-- Update achievement data
+-- UPDATE usrgoalstbl 
+-- SET achvstot = 5, achvbdge = 'badge1,badge2,badge3', maxsteak = 15, curstrek = 7, lifetime = 250000
+-- WHERE emplCode = 12345;
+-- Update leaderboard rankings
+-- UPDATE usrgoalstbl 
+-- SET dailyrnk = 12, weekrank = 8, monthrk_ = 25, lastsync = NOW()
+-- WHERE emplCode = 12345;
+-- Get employee step data with profile info (JOIN example)
+-- SELECT 
+--     e.emplCode, e.emplName, e.emailAdd, e.mobileNo, e.deptDesc,
+--     s.stepdate, s.stepstot, s.calories, s.distance, s.activity,
+--     g.dailygoal, g.curstrek, g.dailyrnk
+-- FROM covLoginMas e
+-- LEFT JOIN steprecords s ON e.emplCode = s.emplCode
+-- LEFT JOIN usrgoalstbl g ON e.emplCode = g.emplCode
+-- WHERE e.emplCode = 12345 AND s.stepdate >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+-- ORDER BY s.stepdate DESC;
+-- Get daily leaderboard
+-- SELECT 
+--     e.emplCode, e.emplName, e.deptDesc,
+--     SUM(s.stepstot) as totalstps, SUM(s.calories) as totcals, SUM(s.distance) as totdist
+-- FROM covLoginMas e
+-- JOIN steprecords s ON e.emplCode = s.emplCode
+-- WHERE s.stepdate = CURDATE() AND e.isActive = 'Y'
+-- GROUP BY e.emplCode, e.emplName, e.deptDesc
+-- ORDER BY totalstps DESC
+-- LIMIT 100;
+-- ===============================================
+-- END OF SCHEMA
+-- ===============================================
