@@ -2,8 +2,6 @@ using Microsoft.AspNetCore.Mvc;
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Data.SqlClient;
 using System.Globalization;
 using System.Linq;
 
@@ -45,7 +43,6 @@ namespace sparshWebService.Controllers
                         DateTimeStyles.None,
                         out var actvDate))
                 {
-                    // Try generic parse if format is different
                     if (!DateTime.TryParse(request.ActivityDate, out actvDate))
                         return BadRequest(new { success = false, message = "Invalid ActivityDate format." });
                 }
@@ -54,9 +51,9 @@ namespace sparshWebService.Controllers
                     ? request.LoginIdn.Trim()
                     : (User?.Identity?.Name ?? "SYSTEM");
 
-                // derive month (yyyymm)
+                // derive month (yyyymm) and meetDate
                 var docuMnth = actvDate.ToString("yyyyMM");
-                var meetDate = actvDate; // using same date for meetDate
+                var meetDate = actvDate;
 
                 int empCount = request.Employees?.Count ?? 0;
                 int painterCount = request.Painters?.Count ?? 0;
@@ -66,7 +63,7 @@ namespace sparshWebService.Controllers
                     ? request.TotalParticipants
                     : empCount + painterCount + chPartnerCount;
 
-                // header helper strings
+                // header strings with Cut
                 string actvName = Cut(request.ActivityName, 100);
                 string cityName = Cut(request.CityName, 100);
                 string district = Cut(request.District, 100);   // Emirates
@@ -76,21 +73,20 @@ namespace sparshWebService.Controllers
                 string latitude = Cut(request.Latitude, 50);
                 string longtude = Cut(request.Longitude, 50);
 
-                // empPrsLs: list of employee codes/names (simple concatenation)
+                // empPrsLs: concat employeeCode-name
                 string empPrsLs = request.Employees != null && request.Employees.Count > 0
                     ? string.Join(" | ", request.Employees.Select(e =>
                         $"{(e.EmployeeCode ?? "").Trim()}-{(e.Name ?? "").Trim()}"))
                     : "";
 
-                // Some mandatory fields in catActPreSl which you don't have from Flutter
-                // -> giving default values (adjust as per your business rules)
-                string caaActTy = "01";        // Activity Type
+                // Default / mandatory fields
+                string caaActTy = "01";        // Activity Type (tune as per business)
                 string caaObjTy = "01";        // Objective Type
-                string pinCodeN = "";          // Not captured from UI
+                string pinCodeN = "";          // Not captured in UI
                 int noOfEnqu = 0;
                 int noOfVist = 0;
                 string caaPrjTy = "01";        // Project Type
-                string mobileNo = "";          // header contact (optional)
+                string mobileNo = "";          // header-level contact
                 string emailAdd = "";
                 string contPers = "";
                 int potnInMT = 0;
@@ -103,9 +99,11 @@ namespace sparshWebService.Controllers
                 int chnlCont = chPartnerCount;
                 int totlCont = totalParticipants;
 
-                // Build atchNmId from image IDs if required
+                // Build atchNmId from image IDs (if needed)
                 string atchNmId = (request.ImageIds != null && request.ImageIds.Count > 0)
-                    ? string.Join(",", request.ImageIds.Select(x => x?.Trim()).Where(x => !string.IsNullOrEmpty(x)))
+                    ? string.Join(",", request.ImageIds
+                        .Select(x => x?.Trim())
+                        .Where(x => !string.IsNullOrEmpty(x)))
                     : "";
 
                 bool isAdd = string.Equals(request.ProcessType, "Add", StringComparison.OrdinalIgnoreCase)
@@ -113,49 +111,40 @@ namespace sparshWebService.Controllers
 
                 string docuNumb = request.DocuNumb?.Trim() ?? "";
 
-                using var conn = _db.GetConnectionbwlive();
-                conn.Open();
-                using var tran = conn.BeginTransaction();
-
-                try
+                // ===================================
+                // 1) Generate docuNumb if Add
+                // ===================================
+                if (isAdd)
                 {
-                    // ==============
-                    // DOC NUMBER GEN
-                    // ==============
-                    if (isAdd)
+                    const string docSql = @"
+DECLARE @docuNumb CHAR(20);
+EXEC dbo.wcpDocNoGen @docuType = @docuType, @docuNumb = @docuNumb OUTPUT;
+SELECT @docuNumb AS docuNumb;";
+
+                    var docParams = new Dictionary<string, object?>
                     {
-                        using var cmdDoc = new SqlCommand("wcpDocNoGen", conn, tran)
-                        {
-                            CommandType = CommandType.StoredProcedure
-                        };
+                        ["@docuType"] = "ACTPRESL"   // change if your docuType is different
+                    };
 
-                        // Adjust @docuType / @docuNumb names to your actual SP definition
-                        cmdDoc.Parameters.AddWithValue("@docuType", "ACTPRESL");
+                    var docResult = _db.QaEWebBean(docSql, docParams);
+                    var docRow = docResult?.FirstOrDefault();
+                    docuNumb = docRow?["docuNumb"]?.ToString()?.Trim() ?? "";
 
-                        var outDoc = new SqlParameter("@docuNumb", SqlDbType.Char, 20)
-                        {
-                            Direction = ParameterDirection.Output
-                        };
-                        cmdDoc.Parameters.Add(outDoc);
+                    if (string.IsNullOrWhiteSpace(docuNumb))
+                        return BadRequest(new { success = false, message = "Document number generation failed." });
+                }
+                else
+                {
+                    if (string.IsNullOrWhiteSpace(docuNumb))
+                        return BadRequest(new { success = false, message = "DocuNumb is required for Update." });
+                }
 
-                        cmdDoc.ExecuteNonQuery();
-
-                        docuNumb = (outDoc.Value ?? "").ToString()?.Trim() ?? "";
-                        if (string.IsNullOrWhiteSpace(docuNumb))
-                            throw new Exception("Document number generation failed.");
-                    }
-                    else
-                    {
-                        if (string.IsNullOrWhiteSpace(docuNumb))
-                            throw new Exception("DocuNumb is required for Update.");
-                    }
-
-                    // ======================
-                    // INSERT / UPDATE HEADER
-                    // ======================
-                    if (isAdd)
-                    {
-                        const string insertHeaderSql = @"
+                // ===================================
+                // 2) Insert / Update header
+                // ===================================
+                if (isAdd)
+                {
+                    const string insertHeaderSql = @"
 INSERT INTO catActPreSl
 (
     docuNumb, docuMnth, actvDate, meetDate, actvName,
@@ -177,49 +166,53 @@ VALUES
     @maturtMn, @rejcRmrk, @statFlag, @createId, GETDATE(),
     @latitude, @longtude, @atchNmId,
     @userRole, @emplCont, @chnlCont, @inflCont, @totlCont
-);";
+);
 
-                        using var cmdIns = new SqlCommand(insertHeaderSql, conn, tran);
-                        cmdIns.Parameters.AddWithValue("@docuNumb", docuNumb);
-                        cmdIns.Parameters.AddWithValue("@docuMnth", docuMnth);
-                        cmdIns.Parameters.AddWithValue("@actvDate", actvDate);
-                        cmdIns.Parameters.AddWithValue("@meetDate", meetDate);
-                        cmdIns.Parameters.AddWithValue("@actvName", actvName);
-                        cmdIns.Parameters.AddWithValue("@caaActTy", caaActTy);
-                        cmdIns.Parameters.AddWithValue("@caaObjTy", caaObjTy);
-                        cmdIns.Parameters.AddWithValue("@actvCity", cityName);
-                        cmdIns.Parameters.AddWithValue("@district", district);
-                        cmdIns.Parameters.AddWithValue("@pinCodeN", pinCodeN);
-                        cmdIns.Parameters.AddWithValue("@noOfPart", totlCont);
-                        cmdIns.Parameters.AddWithValue("@noOfEnqu", noOfEnqu);
-                        cmdIns.Parameters.AddWithValue("@noOfVist", noOfVist);
-                        cmdIns.Parameters.AddWithValue("@prodCtLs", prodCtLs);
-                        cmdIns.Parameters.AddWithValue("@empPrsLs", empPrsLs);
-                        cmdIns.Parameters.AddWithValue("@actvRmrk", actvRmrk);
-                        cmdIns.Parameters.AddWithValue("@meetVenu", meetVenu);
-                        cmdIns.Parameters.AddWithValue("@caaPrjTy", caaPrjTy);
-                        cmdIns.Parameters.AddWithValue("@mobileNo", mobileNo);
-                        cmdIns.Parameters.AddWithValue("@emailAdd", emailAdd);
-                        cmdIns.Parameters.AddWithValue("@contPers", contPers);
-                        cmdIns.Parameters.AddWithValue("@potnInMT", potnInMT);
-                        cmdIns.Parameters.AddWithValue("@maturtMn", maturtMn);
-                        cmdIns.Parameters.AddWithValue("@rejcRmrk", rejcRmrk);
-                        cmdIns.Parameters.AddWithValue("@statFlag", statFlag);
-                        cmdIns.Parameters.AddWithValue("@createId", loginIdn);
-                        cmdIns.Parameters.AddWithValue("@latitude", latitude);
-                        cmdIns.Parameters.AddWithValue("@longtude", longtude);
-                        cmdIns.Parameters.AddWithValue("@atchNmId", (object)atchNmId ?? DBNull.Value);
-                        cmdIns.Parameters.AddWithValue("@userRole", (object?)request.UserRole ?? DBNull.Value);
-                        cmdIns.Parameters.AddWithValue("@emplCont", emplCont);
-                        cmdIns.Parameters.AddWithValue("@chnlCont", chnlCont);
-                        cmdIns.Parameters.AddWithValue("@inflCont", inflCont);
-                        cmdIns.Parameters.AddWithValue("@totlCont", totlCont);
+SELECT @docuNumb AS docuNumb;";
 
-                        cmdIns.ExecuteNonQuery();
-                    }
-                    else
+                    var p = new Dictionary<string, object?>
                     {
-                        const string updateHeaderSql = @"
+                        ["@docuNumb"] = docuNumb,
+                        ["@docuMnth"] = docuMnth,
+                        ["@actvDate"] = actvDate,
+                        ["@meetDate"] = meetDate,
+                        ["@actvName"] = actvName,
+                        ["@caaActTy"] = caaActTy,
+                        ["@caaObjTy"] = caaObjTy,
+                        ["@actvCity"] = cityName,
+                        ["@district"] = district,
+                        ["@pinCodeN"] = pinCodeN,
+                        ["@noOfPart"] = totlCont,
+                        ["@noOfEnqu"] = noOfEnqu,
+                        ["@noOfVist"] = noOfVist,
+                        ["@prodCtLs"] = prodCtLs,
+                        ["@empPrsLs"] = empPrsLs,
+                        ["@actvRmrk"] = actvRmrk,
+                        ["@meetVenu"] = meetVenu,
+                        ["@caaPrjTy"] = caaPrjTy,
+                        ["@mobileNo"] = mobileNo,
+                        ["@emailAdd"] = emailAdd,
+                        ["@contPers"] = contPers,
+                        ["@potnInMT"] = potnInMT,
+                        ["@maturtMn"] = maturtMn,
+                        ["@rejcRmrk"] = rejcRmrk,
+                        ["@statFlag"] = statFlag,
+                        ["@createId"] = loginIdn,
+                        ["@latitude"] = latitude,
+                        ["@longtude"] = longtude,
+                        ["@atchNmId"] = string.IsNullOrEmpty(atchNmId) ? DBNull.Value : atchNmId,
+                        ["@userRole"] = (object?)request.UserRole ?? DBNull.Value,
+                        ["@emplCont"] = emplCont,
+                        ["@chnlCont"] = chnlCont,
+                        ["@inflCont"] = inflCont,
+                        ["@totlCont"] = totlCont
+                    };
+
+                    _db.QaEWebBean(insertHeaderSql, p);
+                }
+                else
+                {
+                    const string updateHeaderSql = @"
 UPDATE catActPreSl
 SET
     actvDate   = @actvDate,
@@ -253,51 +246,51 @@ SET
     updateDt   = GETDATE()
 WHERE docuNumb = @docuNumb;";
 
-                        using var cmdUpd = new SqlCommand(updateHeaderSql, conn, tran);
-                        cmdUpd.Parameters.AddWithValue("@docuNumb", docuNumb);
-                        cmdUpd.Parameters.AddWithValue("@actvDate", actvDate);
-                        cmdUpd.Parameters.AddWithValue("@meetDate", meetDate);
-                        cmdUpd.Parameters.AddWithValue("@actvName", actvName);
-                        cmdUpd.Parameters.AddWithValue("@actvCity", cityName);
-                        cmdUpd.Parameters.AddWithValue("@district", district);
-                        cmdUpd.Parameters.AddWithValue("@pinCodeN", pinCodeN);
-                        cmdUpd.Parameters.AddWithValue("@noOfPart", totlCont);
-                        cmdUpd.Parameters.AddWithValue("@noOfEnqu", noOfEnqu);
-                        cmdUpd.Parameters.AddWithValue("@noOfVist", noOfVist);
-                        cmdUpd.Parameters.AddWithValue("@prodCtLs", prodCtLs);
-                        cmdUpd.Parameters.AddWithValue("@empPrsLs", empPrsLs);
-                        cmdUpd.Parameters.AddWithValue("@actvRmrk", actvRmrk);
-                        cmdUpd.Parameters.AddWithValue("@meetVenu", meetVenu);
-                        cmdUpd.Parameters.AddWithValue("@mobileNo", mobileNo);
-                        cmdUpd.Parameters.AddWithValue("@emailAdd", emailAdd);
-                        cmdUpd.Parameters.AddWithValue("@contPers", contPers);
-                        cmdUpd.Parameters.AddWithValue("@potnInMT", potnInMT);
-                        cmdUpd.Parameters.AddWithValue("@maturtMn", maturtMn);
-                        cmdUpd.Parameters.AddWithValue("@rejcRmrk", rejcRmrk);
-                        cmdUpd.Parameters.AddWithValue("@latitude", latitude);
-                        cmdUpd.Parameters.AddWithValue("@longtude", longtude);
-                        cmdUpd.Parameters.AddWithValue("@atchNmId", (object)atchNmId ?? DBNull.Value);
-                        cmdUpd.Parameters.AddWithValue("@userRole", (object?)request.UserRole ?? DBNull.Value);
-                        cmdUpd.Parameters.AddWithValue("@emplCont", emplCont);
-                        cmdUpd.Parameters.AddWithValue("@chnlCont", chnlCont);
-                        cmdUpd.Parameters.AddWithValue("@inflCont", inflCont);
-                        cmdUpd.Parameters.AddWithValue("@totlCont", totlCont);
-                        cmdUpd.Parameters.AddWithValue("@updateId", loginIdn);
+                    var p = new Dictionary<string, object?>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@actvDate"] = actvDate,
+                        ["@meetDate"] = meetDate,
+                        ["@actvName"] = actvName,
+                        ["@actvCity"] = cityName,
+                        ["@district"] = district,
+                        ["@pinCodeN"] = pinCodeN,
+                        ["@noOfPart"] = totlCont,
+                        ["@noOfEnqu"] = noOfEnqu,
+                        ["@noOfVist"] = noOfVist,
+                        ["@prodCtLs"] = prodCtLs,
+                        ["@empPrsLs"] = empPrsLs,
+                        ["@actvRmrk"] = actvRmrk,
+                        ["@meetVenu"] = meetVenu,
+                        ["@mobileNo"] = mobileNo,
+                        ["@emailAdd"] = emailAdd,
+                        ["@contPers"] = contPers,
+                        ["@potnInMT"] = potnInMT,
+                        ["@maturtMn"] = maturtMn,
+                        ["@rejcRmrk"] = rejcRmrk,
+                        ["@latitude"] = latitude,
+                        ["@longtude"] = longtude,
+                        ["@atchNmId"] = string.IsNullOrEmpty(atchNmId) ? DBNull.Value : atchNmId,
+                        ["@userRole"] = (object?)request.UserRole ?? DBNull.Value,
+                        ["@emplCont"] = emplCont,
+                        ["@chnlCont"] = chnlCont,
+                        ["@inflCont"] = inflCont,
+                        ["@totlCont"] = totlCont,
+                        ["@updateId"] = loginIdn
+                    };
 
-                        cmdUpd.ExecuteNonQuery();
+                    _db.QaEWebBean(updateHeaderSql, p);
 
-                        // delete existing details for this docuNumb (we will re-insert)
-                        using var cmdDelDtl = new SqlCommand(
-                            "DELETE FROM catActPreSlDtl WHERE docuNumb = @docuNumb;",
-                            conn, tran);
-                        cmdDelDtl.Parameters.AddWithValue("@docuNumb", docuNumb);
-                        cmdDelDtl.ExecuteNonQuery();
-                    }
+                    // Delete old details for this docuNumb
+                    const string deleteDtlSql = @"DELETE FROM catActPreSlDtl WHERE docuNumb = @docuNumb;";
+                    _db.QaEWebBean(deleteDtlSql,
+                        new Dictionary<string, object?> { ["@docuNumb"] = docuNumb });
+                }
 
-                    // ======================
-                    // INSERT DETAIL ROWS
-                    // ======================
-                    const string insertDtlSql = @"
+                // ===================================
+                // 3) Insert detail rows (QaEWebBean)
+                // ===================================
+                const string insertDtlSql = @"
 INSERT INTO catActPreSlDtl
 (
     docuNumb, attnType, attnCode,
@@ -311,105 +304,96 @@ VALUES
     @retlCode, @dsrRem06, @dsrRem07, @dsrRem08, @dsrRem09
 );";
 
-                    // Employees
-                    if (request.Employees != null)
-                    {
-                        foreach (var emp in request.Employees)
-                        {
-                            using var cmdEmp = new SqlCommand(insertDtlSql, conn, tran);
-                            cmdEmp.Parameters.AddWithValue("@docuNumb", docuNumb);
-                            cmdEmp.Parameters.AddWithValue("@attnType", "E"); // Employee
-                            cmdEmp.Parameters.AddWithValue("@attnCode", (object?)emp.EmployeeCode ?? "");
-                            cmdEmp.Parameters.AddWithValue("@statFlag", "N");
-                            cmdEmp.Parameters.AddWithValue("@createId", loginIdn);
-                            cmdEmp.Parameters.AddWithValue("@retlCode", DBNull.Value);
-                            cmdEmp.Parameters.AddWithValue("@dsrRem06", (object?)emp.Name ?? "");
-                            cmdEmp.Parameters.AddWithValue("@dsrRem07", (object?)emp.Mobile ?? "");
-                            cmdEmp.Parameters.AddWithValue("@dsrRem08", DBNull.Value);
-                            cmdEmp.Parameters.AddWithValue("@dsrRem09", DBNull.Value);
-                            cmdEmp.ExecuteNonQuery();
-                        }
-                    }
-
-                    // Painters / Contractors / Applicators
-                    if (request.Painters != null)
-                    {
-                        foreach (var p in request.Painters)
-                        {
-                            // Map type from text to a single char (adjust as needed)
-                            string attnType = "P"; // default Painter
-                            var t = (p.Type ?? "").Trim().ToUpperInvariant();
-                            if (t.Contains("CONTRACTOR")) attnType = "C";
-                            else if (t.Contains("APPLICATOR")) attnType = "A";
-
-                            using var cmdP = new SqlCommand(insertDtlSql, conn, tran);
-                            cmdP.Parameters.AddWithValue("@docuNumb", docuNumb);
-                            cmdP.Parameters.AddWithValue("@attnType", attnType);
-                            cmdP.Parameters.AddWithValue("@attnCode", (object?)p.Mobile ?? "");
-                            cmdP.Parameters.AddWithValue("@statFlag", "N");
-                            cmdP.Parameters.AddWithValue("@createId", loginIdn);
-                            cmdP.Parameters.AddWithValue("@retlCode", DBNull.Value);
-                            cmdP.Parameters.AddWithValue("@dsrRem06", (object?)p.Name ?? "");
-                            cmdP.Parameters.AddWithValue("@dsrRem07", (object?)p.Type ?? "");
-                            cmdP.Parameters.AddWithValue("@dsrRem08", DBNull.Value);
-                            cmdP.Parameters.AddWithValue("@dsrRem09", DBNull.Value);
-                            cmdP.ExecuteNonQuery();
-                        }
-                    }
-
-                    // Channel Partners
-                    if (request.ChannelPartners != null)
-                    {
-                        foreach (var cp in request.ChannelPartners)
-                        {
-                            using var cmdCp = new SqlCommand(insertDtlSql, conn, tran);
-                            cmdCp.Parameters.AddWithValue("@docuNumb", docuNumb);
-                            cmdCp.Parameters.AddWithValue("@attnType", "H"); // Channel/Dealer (adjust code as required)
-                            cmdCp.Parameters.AddWithValue("@attnCode", (object?)cp.PurchaserCode ?? "");
-                            cmdCp.Parameters.AddWithValue("@statFlag", "N");
-                            cmdCp.Parameters.AddWithValue("@createId", loginIdn);
-                            cmdCp.Parameters.AddWithValue("@retlCode", (object?)cp.PurchaserCode ?? "");
-                            cmdCp.Parameters.AddWithValue("@dsrRem06", (object?)cp.Name ?? "");
-                            cmdCp.Parameters.AddWithValue("@dsrRem07", (object?)cp.Mobile ?? "");
-                            cmdCp.Parameters.AddWithValue("@dsrRem08", (object?)cp.Type ?? "");
-                            cmdCp.Parameters.AddWithValue("@dsrRem09", DBNull.Value);
-                            cmdCp.ExecuteNonQuery();
-                        }
-                    }
-
-                    tran.Commit();
-
-                    return Ok(new
-                    {
-                        success = true,
-                        message = isAdd ? "Activity created successfully." : "Activity updated successfully.",
-                        docuNumb,
-                        processType = isAdd ? "Add" : "Update",
-                        totalParticipants = totlCont,
-                        employeesCount = empCount,
-                        paintersCount = painterCount,
-                        channelPartnersCount = chPartnerCount,
-                        timestamp = DateTime.Now
-                    });
-                }
-                catch (Exception exInner)
+                // Employees
+                if (request.Employees != null)
                 {
-                    tran.Rollback();
-                    return BadRequest(new
+                    foreach (var emp in request.Employees)
                     {
-                        success = false,
-                        message = "Error while saving activity.",
-                        error = exInner.Message,
-                        timestamp = DateTime.Now
-                    });
+                        var pEmp = new Dictionary<string, object?>
+                        {
+                            ["@docuNumb"] = docuNumb,
+                            ["@attnType"] = "E", // Employee
+                            ["@attnCode"] = emp.EmployeeCode ?? "",
+                            ["@statFlag"] = "N",
+                            ["@createId"] = loginIdn,
+                            ["@retlCode"] = DBNull.Value,
+                            ["@dsrRem06"] = emp.Name ?? "",
+                            ["@dsrRem07"] = emp.Mobile ?? "",
+                            ["@dsrRem08"] = DBNull.Value,
+                            ["@dsrRem09"] = DBNull.Value
+                        };
+                        _db.QaEWebBean(insertDtlSql, pEmp);
+                    }
                 }
+
+                // Painters / Contractors / Applicators
+                if (request.Painters != null)
+                {
+                    foreach (var p in request.Painters)
+                    {
+                        string attnType = "P"; // Painter default
+                        var t = (p.Type ?? "").Trim().ToUpperInvariant();
+                        if (t.Contains("CONTRACTOR")) attnType = "C";
+                        else if (t.Contains("APPLICATOR")) attnType = "A";
+
+                        var pPain = new Dictionary<string, object?>
+                        {
+                            ["@docuNumb"] = docuNumb,
+                            ["@attnType"] = attnType,
+                            ["@attnCode"] = p.Mobile ?? "",
+                            ["@statFlag"] = "N",
+                            ["@createId"] = loginIdn,
+                            ["@retlCode"] = DBNull.Value,
+                            ["@dsrRem06"] = p.Name ?? "",
+                            ["@dsrRem07"] = p.Type ?? "",
+                            ["@dsrRem08"] = DBNull.Value,
+                            ["@dsrRem09"] = DBNull.Value
+                        };
+                        _db.QaEWebBean(insertDtlSql, pPain);
+                    }
+                }
+
+                // Channel Partners
+                if (request.ChannelPartners != null)
+                {
+                    foreach (var cp in request.ChannelPartners)
+                    {
+                        var pCp = new Dictionary<string, object?>
+                        {
+                            ["@docuNumb"] = docuNumb,
+                            ["@attnType"] = "H", // Code for Channel Partner / Dealer (adjust as per your logic)
+                            ["@attnCode"] = cp.PurchaserCode ?? "",
+                            ["@statFlag"] = "N",
+                            ["@createId"] = loginIdn,
+                            ["@retlCode"] = cp.PurchaserCode ?? "",
+                            ["@dsrRem06"] = cp.Name ?? "",
+                            ["@dsrRem07"] = cp.Mobile ?? "",
+                            ["@dsrRem08"] = cp.Type ?? "",
+                            ["@dsrRem09"] = DBNull.Value
+                        };
+                        _db.QaEWebBean(insertDtlSql, pCp);
+                    }
+                }
+
+                return Ok(new
+                {
+                    success = true,
+                    message = isAdd ? "Activity created successfully." : "Activity updated successfully.",
+                    docuNumb,
+                    processType = isAdd ? "Add" : "Update",
+                    totalParticipants = totlCont,
+                    employeesCount = empCount,
+                    paintersCount = painterCount,
+                    channelPartnersCount = chPartnerCount,
+                    timestamp = DateTime.Now
+                });
             }
             catch (Exception ex)
             {
                 return StatusCode(500, new
                 {
                     success = false,
-                    message = "Unexpected error.",
+                    message = "Error while saving activity.",
                     error = ex.Message,
                     timestamp = DateTime.Now
                 });
@@ -463,15 +447,15 @@ VALUES
 
         // Header fields from Flutter
         public string? ActivityName { get; set; }        // Painter Meet / Contractor Meet / Applicator Meet
-        public string? Description { get; set; }         // Description (actvRmrk)
+        public string? Description { get; set; }         // actvRmrk
         public string? ActivityDate { get; set; }        // yyyy-MM-dd
         public string? MeetingVenue { get; set; }        // Address
         public string? CityName { get; set; }
         public string? District { get; set; }            // Emirates
         public string? Product { get; set; }             // Wall Care Putty
 
-        public int NoOfEmployees { get; set; }           // from employeesCountController (optional)
-        public int TotalParticipants { get; set; }       // optional, otherwise computed
+        public int NoOfEmployees { get; set; }           // optional
+        public int TotalParticipants { get; set; }       // optional, else computed
 
         public string? Latitude { get; set; }
         public string? Longitude { get; set; }
@@ -485,7 +469,7 @@ VALUES
         public List<ActivityPainterDto> Painters { get; set; } = new();
         public List<ActivityChannelPartnerDto> ChannelPartners { get; set; } = new();
 
-        // Optional: Upload IDs / file names
+        // Optional: Upload IDs / file names for atchNmId
         public List<string> ImageIds { get; set; } = new();
     }
 }
