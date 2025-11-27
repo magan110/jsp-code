@@ -2,535 +2,259 @@ using Microsoft.AspNetCore.Mvc;
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace sparshWebService.Controllers
 {
-    [Route("api/[controller]")]
     [ApiController]
-    [Produces("application/json")]
-    public class ActivityEntryController : ControllerBase
+    [Route("api/[controller]")]
+    public class SampleDistributionController : ControllerBase
     {
-        private readonly DatabaseHelper _db;
-        private const string DocuTypeActivity = "AEF";
+        private readonly DatabaseHelper _dbHelper;
 
-        public ActivityEntryController(DatabaseHelper db)
+        public SampleDistributionController(DatabaseHelper dbHelper)
         {
-            _db = db;
+            _dbHelper = dbHelper;
         }
 
-        // ======================================
-        // POST: /api/ActivityEntry/save
-        // ======================================
-        [HttpPost("save")]
-        [Consumes("application/json")]
-        public IActionResult Save([FromBody] ActivityEntryRequest? request)
+        // ----------------------------
+        // 1) Emirates dropdown (Areas)
+        // ----------------------------
+        [HttpGet("areas")]
+        public ActionResult<IEnumerable<AreaItem>> GetAreas([FromQuery] bool onlyActive = true)
         {
-            if (request == null)
-                return BadRequest(new { success = false, message = "Request body is required." });
-
             try
             {
-                if (string.IsNullOrWhiteSpace(request.ProcessType))
-                    return BadRequest(new { success = false, message = "processType is required." });
+                const string sql = @"
+SELECT areaCode, areaDesc
+FROM dbo.bkmAreaMast WITH (NOLOCK)
+WHERE (@onlyActive = 0 OR isActive = 'Y')
+ORDER BY areaDesc;";
 
-                if (string.IsNullOrWhiteSpace(request.ActivityName))
-                    return BadRequest(new { success = false, message = "activityName is required." });
-
-                if (string.IsNullOrWhiteSpace(request.ActivityDate))
-                    return BadRequest(new { success = false, message = "activityDate is required." });
-
-                if (string.IsNullOrWhiteSpace(request.MeetingVenue))
-                    return BadRequest(new { success = false, message = "meetingVenue is required." });
-
-                if (string.IsNullOrWhiteSpace(request.CityName))
-                    return BadRequest(new { success = false, message = "cityName is required." });
-
-                if (string.IsNullOrWhiteSpace(request.LoginId))
-                    return BadRequest(new { success = false, message = "loginId is required." });
-
-                var processType = request.ProcessType.Trim();
-                var loginId = Cut(request.LoginId, 10);
-                var userRole = Cut(request.UserRole, 1);
-
-                if (processType.Equals("Add", StringComparison.OrdinalIgnoreCase) &&
-                    string.IsNullOrWhiteSpace(request.AreaCode))
+                var parameters = new Dictionary<string, object>
                 {
-                    return BadRequest(new { success = false, message = "areaCode is required for Add." });
-                }
+                    { "@onlyActive", onlyActive ? 1 : 0 }
+                };
 
-                string docuNumb;
+                var result = _dbHelper.QaEWebBean(sql, parameters);
+                var list = new List<AreaItem>();
 
-                if (processType.Equals("Add", StringComparison.OrdinalIgnoreCase))
+                if (result != null)
                 {
-                    // Generate new docuNumb from wcpDocNoGen (NO fincYear in C#)
-                    string? genDoc = GenerateDocuNumb(DocuTypeActivity, request.AreaCode ?? "");
-
-                    if (string.IsNullOrWhiteSpace(genDoc))
-                        return StatusCode(500, new { success = false, message = "Could not generate document number." });
-
-                    docuNumb = genDoc.Trim();
-                }
-                else
-                {
-                    if (string.IsNullOrWhiteSpace(request.DocuNumb))
-                        return BadRequest(new { success = false, message = "docuNumb is required for Update." });
-
-                    docuNumb = request.DocuNumb.Trim();
-                }
-
-                // ---------- Common mapping ----------
-                DateTime actvDate = ParseDateOrToday(request.ActivityDate);
-                DateTime meetDate = actvDate;
-
-                string docuMnth = actvDate.ToString("yyyyMM"); // char(6)
-                string maturtMn = docuMnth;
-
-                int empCnt = SafeToInt(request.EmployeesCount);
-                int chnCnt = SafeToInt(request.ChannelPartnerCount);
-                int infCnt = SafeToInt(request.InfluencerCount);
-                int totalCnt = SafeToInt(request.TotalParticipants);
-
-                if (totalCnt <= 0)
-                    totalCnt = empCnt + chnCnt + infCnt;
-
-                int noOfPart = totalCnt;
-                int noOfEnqu = 0;
-                int noOfVist = 0;
-                int potnInMT = 0;
-
-                string empPrsLs = "";
-                if (request.Employees != null && request.Employees.Any())
-                {
-                    empPrsLs = string.Join(",",
-                        request.Employees
-                            .Select(e => e?.EmployeeCode ?? e?.Name)
-                            .Where(s => !string.IsNullOrWhiteSpace(s))
-                            .Select(s => s!.Trim()));
-                }
-
-                string prodCtLs = request.Product ?? "";
-                string actvRmrk = request.Description ?? "";
-
-                string actvCity = request.CityName ?? "";
-                string district = request.District ?? "";
-                string pinCodeN = request.PinCode ?? "";
-
-                string meetVenu = request.MeetingVenue ?? "";
-                string mobileNo = "";   // not present in Flutter now
-                string emailAdd = "";   // not present in Flutter now
-                string contPers = "";   // not present in Flutter now
-                string rejcRmrk = "";
-                string statFlag = "N";
-
-                string locaCapr = meetVenu; // can store venue as caption
-                string latitute = request.Latitude ?? "";
-                string lgtitute = request.Longitude ?? "";
-                string areaCode = request.AreaCode ?? "";
-
-                // Emp present as one string (limit to DB length)
-                empPrsLs = Cut(empPrsLs, 100);
-                prodCtLs = Cut(prodCtLs, 50);
-                actvRmrk = Cut(actvRmrk, 200);
-                actvCity = Cut(actvCity, 40);
-                district = Cut(district, 30);
-                pinCodeN = Cut(pinCodeN, 6);
-                meetVenu = Cut(meetVenu, 50);
-                locaCapr = Cut(locaCapr, 250);
-                latitute = Cut(latitute, 50);
-                lgtitute = Cut(lgtitute, 50);
-                areaCode = Cut(areaCode, 3);
-
-                // ---------- Insert / Update header ----------
-                if (processType.Equals("Add", StringComparison.OrdinalIgnoreCase))
-                {
-                    const string insertHeaderSql = @"
-INSERT INTO dbo.catActPreSl
-(
-    docuNumb, docuMnth, actvDate, meetDate,
-    actvName, caaActTy, caaObjTy,
-    actvCity, district, pinCodeN,
-    noOfPart, noOfEnqu, noOfVist,
-    prodCtLs, empPrsLs, actvRmrk,
-    meetVenu, caaPrjTy,
-    mobileNo, emailAdd, contPers,
-    potnInMT, maturtMn, rejcRmrk,
-    statFlag, createId, createDt,
-    locaCapr, latitute, lgtitute,
-    areaCode, userRole
-)
-VALUES
-(
-    @docuNumb, @docuMnth, @actvDate, @meetDate,
-    @actvName, @caaActTy, @caaObjTy,
-    @actvCity, @district, @pinCodeN,
-    @noOfPart, @noOfEnqu, @noOfVist,
-    @prodCtLs, @empPrsLs, @actvRmrk,
-    @meetVenu, @caaPrjTy,
-    @mobileNo, @emailAdd, @contPers,
-    @potnInMT, @maturtMn, @rejcRmrk,
-    @statFlag, @createId, GETDATE(),
-    @locaCapr, @latitute, @lgtitute,
-    @areaCode, @userRole
-);";
-
-                    var headerParams = new Dictionary<string, object?>
+                    foreach (var row in result)
                     {
-                        ["@docuNumb"] = Cut(docuNumb, 16),
-                        ["@docuMnth"] = Cut(docuMnth, 6),
-                        ["@actvDate"] = actvDate,
-                        ["@meetDate"] = meetDate,
-                        ["@actvName"] = Cut(request.ActivityName ?? "", 100),
-
-                        ["@caaActTy"] = "",   // no mapping from Flutter now
-                        ["@caaObjTy"] = "",   // no mapping from Flutter now
-
-                        ["@actvCity"] = actvCity,
-                        ["@district"] = district,
-                        ["@pinCodeN"] = pinCodeN,
-
-                        ["@noOfPart"] = noOfPart,
-                        ["@noOfEnqu"] = noOfEnqu,
-                        ["@noOfVist"] = noOfVist,
-
-                        ["@prodCtLs"] = prodCtLs,
-                        ["@empPrsLs"] = empPrsLs,
-                        ["@actvRmrk"] = actvRmrk,
-
-                        ["@meetVenu"] = meetVenu,
-                        ["@caaPrjTy"] = "",   // no mapping
-
-                        ["@mobileNo"] = mobileNo,
-                        ["@emailAdd"] = emailAdd,
-                        ["@contPers"] = contPers,
-
-                        ["@potnInMT"] = potnInMT,
-                        ["@maturtMn"] = Cut(maturtMn, 6),
-                        ["@rejcRmrk"] = rejcRmrk,
-
-                        ["@statFlag"] = statFlag,
-                        ["@createId"] = loginId,
-
-                        ["@locaCapr"] = locaCapr,
-                        ["@latitute"] = latitute,
-                        ["@lgtitute"] = lgtitute,
-                        ["@areaCode"] = areaCode,
-                        ["@userRole"] = userRole
-                    };
-
-                    _db.QaEWebBean(insertHeaderSql, headerParams);
+                        list.Add(new AreaItem
+                        {
+                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
+                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
+                        });
+                    }
                 }
-                else
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // -----------------------------------------
+        // 2) Submit the Sample Distribution payload
+        // -----------------------------------------
+        [HttpPost("submit")]
+        public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
+        {
+            try
+            {
+                // Basic validations
+                if (req == null) return BadRequest("Empty request.");
+                if (string.IsNullOrWhiteSpace(req.emirate)) return BadRequest("Emirate (areaCode) is required.");
+                if (string.IsNullOrWhiteSpace(req.retailerName)) return BadRequest("Retailer Name is required.");
+                if (string.IsNullOrWhiteSpace(req.distributor)) return BadRequest("Concern Distributor is required.");
+                if (string.IsNullOrWhiteSpace(req.painterName)) return BadRequest("Painter/Contractor Name is required.");
+                if (string.IsNullOrWhiteSpace(req.distributionDate)) return BadRequest("Date of distribution is required.");
+
+                if (!DateTime.TryParse(req.distributionDate, out var sampDate))
+                    return BadRequest("Invalid distribution date.");
+
+                // Set default packSize & prodName
+                string packSize = null;
+                string prodName = null;
+
+                // CreateId from header or request (max 6 chars)
+                var loginId = Request.Headers.ContainsKey("LoginID")
+                    ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
+                    : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
+                loginId = (loginId ?? "SYSTEM").Trim();
+                if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
+
+                var areaCode = req.emirate.Trim();
+
+                // --- Generate the document number ---
+                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
+                var genParams = new Dictionary<string, object>
                 {
-                    // UPDATE
-                    const string updateHeaderSql = @"
-UPDATE dbo.catActPreSl
-SET
-    actvDate = @actvDate,
-    meetDate = @meetDate,
-    actvName = @actvName,
-    actvCity = @actvCity,
-    district = @district,
-    pinCodeN = @pinCodeN,
-    noOfPart = @noOfPart,
-    noOfEnqu = @noOfEnqu,
-    noOfVist = @noOfVist,
-    prodCtLs = @prodCtLs,
-    empPrsLs = @empPrsLs,
-    actvRmrk = @actvRmrk,
-    meetVenu = @meetVenu,
-    latitute = @latitute,
-    lgtitute = @lgtitute,
-    areaCode = @areaCode,
-    userRole = @userRole,
-    updateId = @updateId,
-    updateDt = GETDATE()
-WHERE docuNumb = @docuNumb;";
+                    ["@DocType"] = "SDE",
+                    ["@AreaCode"] = areaCode
+                };
 
-                    var updParams = new Dictionary<string, object?>
+                var genRows = _dbHelper.QaEWebBean(genSql, genParams) as List<Dictionary<string, object>>;
+                string docuNumb = null;
+                if (genRows != null && genRows.Count > 0)
+                {
+                    var row = genRows.First();
+                    var candidates = new[] { "docuNumb", "DocuNumb", "DOCUNUMB", "DocNo", "DocumentNo" };
+                    foreach (var key in candidates)
                     {
-                        ["@docuNumb"] = Cut(docuNumb,16),
-                        ["@actvDate"] = actvDate,
-                        ["@meetDate"] = meetDate,
-                        ["@actvName"] = Cut(request.ActivityName ?? "", 100),
-                        ["@actvCity"] = actvCity,
-                        ["@district"] = district,
-                        ["@pinCodeN"] = pinCodeN,
-                        ["@noOfPart"] = noOfPart,
-                        ["@noOfEnqu"] = noOfEnqu,
-                        ["@noOfVist"] = noOfVist,
-                        ["@prodCtLs"] = prodCtLs,
-                        ["@empPrsLs"] = empPrsLs,
-                        ["@actvRmrk"] = actvRmrk,
-                        ["@meetVenu"] = meetVenu,
-                        ["@latitute"] = latitute,
-                        ["@lgtitute"] = lgtitute,
-                        ["@areaCode"] = areaCode,
-                        ["@userRole"] = userRole,
-                        ["@updateId"] = loginId
-                    };
+                        if (row.TryGetValue(key, out var val) && val != null)
+                        {
+                            docuNumb = val.ToString();
+                            break;
+                        }
+                    }
+                    if (string.IsNullOrWhiteSpace(docuNumb) && row.Count > 0)
+                        docuNumb = row.First().Value?.ToString();
+                }
 
-                    _db.QaEWebBean(updateHeaderSql, updParams);
-
-                    // delete old detail and reinsert
-                    const string deleteDtlSql = @"DELETE FROM dbo.catActPreSlDtl WHERE docuNumb = @docuNumb;";
-                    _db.QaEWebBean(deleteDtlSql, new Dictionary<string, object?>
+                if (string.IsNullOrWhiteSpace(docuNumb))
+                {
+                    return StatusCode(500, new SubmitResponse
                     {
-                        ["@docuNumb"] = Cut(docuNumb,16)
+                        success = false,
+                        message = $"Failed to generate document number for area '{areaCode}'.",
+                        docuNumb = null
                     });
                 }
 
-                // ---------- Insert detail (employees, painters, channel partners) ----------
-                InsertDetails(docuNumb, loginId, request);
+                // --- Immediately advance the sequence ---
+                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
+                _dbHelper.QaEWebBean(updSql, genParams);
 
-                return Ok(new
+                // ================= HEADER: dbo.catsamplead =================
+                var insertHeaderSql = @"
+INSERT INTO dbo.catsamplead
+(
+  docuNumb, docuDate, areaCode, custName, contName, mobileNo,
+  concDist, sampDate, misdQnty, packSize, prodName, sampType,
+  statFlag, createId, createDt
+)
+VALUES
+(
+  @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo,
+  @concDist, @sampDate, @misdQnty, @packSize, @prodName, @sampType,
+  'N', @createId, GETDATE()
+);";
+
+                var headerParams = new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb,                         // varchar(16)
+                    ["@areaCode"] = areaCode,                         // varchar(20)
+                    ["@custName"] = req.retailerName?.Trim() ?? (object)DBNull.Value,  // varchar(50) null
+                    ["@contName"] = req.painterName?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
+                    ["@mobileNo"] = req.painterMobile?.Trim() ?? (object)DBNull.Value, // varchar(13) null
+                    ["@concDist"] = req.distributor?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
+                    ["@sampDate"] = sampDate,                         // smalldatetime null
+                    ["@misdQnty"] = (object)DBNull.Value,     // char(10) null
+                    ["@packSize"] = (object?)packSize ?? DBNull.Value,                  // char(3) null
+                    ["@prodName"] = (object?)prodName ?? DBNull.Value,                  // varchar(100) null
+                    ["@sampType"] = "SampleDistribution",             // varchar(20) null
+                    ["@createId"] = loginId                           // varchar(6) null
+                };
+
+                _dbHelper.QaEWebBean(insertHeaderSql, headerParams);
+
+                // ================ DETAIL: dbo.catsampleadDtl ================
+                // Required: serialNo (NOT NULL), docuNumb (NOT NULL), sampCnCl (NOT NULL, 1 char)
+                // We'll set serialNo = next value within this docuNumb, sampCnCl = 'S' (sample).
+                var nextSerialSql = @"
+SELECT ISNULL(MAX(serialNo), 0) + 1 AS nextSerial
+FROM dbo.catsampleadDtl WITH (NOLOCK)
+WHERE docuNumb = @docuNumb;";
+
+                var nextSerialRows = _dbHelper.QaEWebBean(nextSerialSql, new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb
+                }) as List<Dictionary<string, object>>;
+
+                int nextSerial = 1;
+                if (nextSerialRows != null && nextSerialRows.Count > 0)
+                {
+                    var v = nextSerialRows[0].Values?.FirstOrDefault()?.ToString();
+                    if (int.TryParse(v, out var parsed)) nextSerial = parsed;
+                }
+
+                var insertDetailSql = @"
+INSERT INTO dbo.catsampleadDtl
+(
+  docuNumb, sampDate, pouchCnt, sampCnCl, cusRtlCd,
+  statFlag, createId, createDt
+)
+VALUES
+(
+  @docuNumb, @sampDate, @pouchCnt, @sampCnCl, @cusRtlCd,
+  'N', @createId, GETDATE()
+);
+";
+
+                var detailParams = new Dictionary<string, object>
+                {
+                    ["@serialNo"] = nextSerial,                                     // int NOT NULL
+                    ["@docuNumb"] = docuNumb,                                       // varchar(16) NOT NULL
+                    ["@sampDate"] = sampDate,                                       // smalldatetime
+                    ["@pouchCnt"] = (object?)(req.materialQty?.Trim()) ?? DBNull.Value, // varchar(10) null
+                    ["@sampCnCl"] = "S",                                            // varchar(1) NOT NULL (set as Sample)
+                    ["@cusRtlCd"] = req.retailerCode?.Trim() ?? (object)DBNull.Value, // retailer code
+                    ["@createId"] = loginId
+                };
+
+                _dbHelper.QaEWebBean(insertDetailSql, detailParams);
+
+                return Ok(new SubmitResponse
                 {
                     success = true,
-                    message = "Activity saved successfully.",
-                    docuNumb,
-                    timestamp = DateTime.Now
+                    message = "Saved successfully.",
+                    docuNumb = docuNumb
                 });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new
+                return StatusCode(500, new SubmitResponse
                 {
                     success = false,
-                    message = "Error while saving activity.",
-                    error = ex.Message,
-                    timestamp = DateTime.Now
+                    message = ex.Message,
+                    docuNumb = null
                 });
             }
         }
 
-        // ======================================
-        // Helper: Insert detail rows (no transaction)
-        // ======================================
-        private void InsertDetails(string docuNumb, string createId, ActivityEntryRequest request)
-        {
-            const string insertDtlSql = @"
-INSERT INTO dbo.catActPreSlDtl
-(
-    docuNumb, attnType, attnCode,
-    statFlag, createId, createDt
-)
-VALUES
-(
-    @docuNumb, @attnType, @attnCode,
-    @statFlag, @createId, GETDATE()
-);";
-
-            string doc = Cut(docuNumb, 16);
-
-            // Employees -> attnType = 'E'
-            if (request.Employees != null)
-            {
-                foreach (var e in request.Employees)
-                {
-                    if (e == null) continue;
-                    if (string.IsNullOrWhiteSpace(e.EmployeeCode) &&
-                        string.IsNullOrWhiteSpace(e.Name))
-                        continue;
-
-                    string code = !string.IsNullOrWhiteSpace(e.EmployeeCode)
-                        ? e.EmployeeCode!
-                        : (e.Name ?? "");
-
-                    var p = new Dictionary<string, object?>
-                    {
-                        ["@docuNumb"] = doc,
-                        ["@attnType"] = "E",
-                        ["@attnCode"] = Cut(code, 10),
-                        ["@statFlag"] = "N",
-                        ["@createId"] = Cut(createId, 10)
-                    };
-
-                    _db.QaEWebBean(insertDtlSql, p);
-                }
-            }
-
-            // Channel Partners -> attnType = 'C'
-            if (request.ChannelPartners != null)
-            {
-                foreach (var c in request.ChannelPartners)
-                {
-                    if (c == null) continue;
-                    if (string.IsNullOrWhiteSpace(c.PurchaserCode) &&
-                        string.IsNullOrWhiteSpace(c.Mobile) &&
-                        string.IsNullOrWhiteSpace(c.Name))
-                        continue;
-
-                    string code = !string.IsNullOrWhiteSpace(c.PurchaserCode)
-                        ? c.PurchaserCode!
-                        : (!string.IsNullOrWhiteSpace(c.Mobile) ? c.Mobile! : (c.Name ?? ""));
-
-                    var p = new Dictionary<string, object?>
-                    {
-                        ["@docuNumb"] = doc,
-                        ["@attnType"] = "C",
-                        ["@attnCode"] = Cut(code, 10),
-                        ["@statFlag"] = "N",
-                        ["@createId"] = Cut(createId, 10)
-                    };
-
-                    _db.QaEWebBean(insertDtlSql, p);
-                }
-            }
-
-            // Painters / Contractors / Applicators -> attnType = 'I'
-            if (request.Painters != null)
-            {
-                foreach (var pnt in request.Painters)
-                {
-                    if (pnt == null) continue;
-                    if (string.IsNullOrWhiteSpace(pnt.Mobile) &&
-                        string.IsNullOrWhiteSpace(pnt.Name))
-                        continue;
-
-                    string code = !string.IsNullOrWhiteSpace(pnt.Mobile)
-                        ? pnt.Mobile!
-                        : (pnt.Name ?? "");
-
-                    var p = new Dictionary<string, object?>
-                    {
-                        ["@docuNumb"] = doc,
-                        ["@attnType"] = "I",
-                        ["@attnCode"] = Cut(code, 10),
-                        ["@statFlag"] = "N",
-                        ["@createId"] = Cut(createId, 10)
-                    };
-
-                    _db.QaEWebBean(insertDtlSql, p);
-                }
-            }
-        }
-
-        // ======================================
-        // Helper: Generate doc number via wcpDocNoGen (NO fincYear in C#)
-        // ======================================
-        private string? GenerateDocuNumb(string docuType, string areaCode)
-        {
-            const string sql = @"EXEC dbo.wcpDocNoGen @docuType, @areaCode;";
-
-            var p = new Dictionary<string, object?>
-            {
-                ["@docuType"] = docuType,
-                ["@areaCode"] = (areaCode ?? "").Trim()
-            };
-
-            var rows = _db.QaEWebBean(sql, p);
-            var row = rows?.FirstOrDefault();
-
-            if (row == null)
-                return null;
-
-            string? docuNumb = null;
-
-            if (row.ContainsKey("docuNumb"))
-            {
-                docuNumb = row["docuNumb"]?.ToString();
-            }
-            else
-            {
-                // Fallback: first non-null value
-                docuNumb = row.Values.FirstOrDefault(v => v != null)?.ToString();
-            }
-
-            return string.IsNullOrWhiteSpace(docuNumb) ? null : docuNumb.Trim();
-        }
-
-        // ======================================
-        // Small helpers
-        // ======================================
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t.Substring(0, max);
-        }
-
-        private static DateTime ParseDateOrToday(string? s)
-        {
-            if (string.IsNullOrWhiteSpace(s))
-                return DateTime.Today;
-
-            var formats = new[]
-            {
-                "yyyy-MM-dd","dd/MM/yyyy","MM/dd/yyyy",
-                "yyyy/MM/dd","dd-MM-yyyy","MM-dd-yyyy",
-                "yyyyMMdd","ddMMyyyy"
-            };
-
-            foreach (var f in formats)
-            {
-                if (DateTime.TryParseExact(s, f, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out var dt))
-                    return dt;
-            }
-
-            if (DateTime.TryParse(s, out var any))
-                return any;
-
-            return DateTime.Today;
-        }
-
-        private static int SafeToInt(int? v) => v ?? 0;
     }
 
-    // =========================
-    // DTOs (inside same file)
-    // =========================
-    public sealed class ActivityEntryRequest
+    // DTOs
+    public class AreaItem
     {
-        public string? ProcessType { get; set; }   // "Add" / "Update"
-        public string? DocuNumb { get; set; }      // For update
-
-        public string? ActivityName { get; set; }  // Painter Meet / Contractor Meet / Applicator Meet
-        public string? Description { get; set; }
-        public string? ActivityDate { get; set; }  // yyyy-MM-dd from Flutter
-        public string? MeetingVenue { get; set; }  // Address
-        public string? CityName { get; set; }
-        public string? District { get; set; }
-        public string? PinCode { get; set; }
-
-        public string? AreaCode { get; set; }      // e.g. DUB, RAK (code from dropdown)
-        public string? Product { get; set; }       // Wall Care Putty
-        public string? Latitude { get; set; }
-        public string? Longitude { get; set; }
-
-        public string? LoginId { get; set; }       // createId from Flutter
-        public string? UserRole { get; set; }      // 'S', 'P', etc.
-
-        public int? EmployeesCount { get; set; }
-        public int? ChannelPartnerCount { get; set; }
-        public int? InfluencerCount { get; set; }
-        public int? TotalParticipants { get; set; }
-
-        public List<EmployeeDto>? Employees { get; set; }
-        public List<PainterDto>? Painters { get; set; }
-        public List<ChannelPartnerDto>? ChannelPartners { get; set; }
+        public string code { get; set; }  // areaCode (char/varchar)
+        public string desc { get; set; }  // areaDesc
     }
 
-    public sealed class EmployeeDto
+    public class SampleDistributionRequest
     {
-        public string? EmployeeCode { get; set; }
-        public string? Name { get; set; }
-        public string? Mobile { get; set; }
+        public string? loginId { get; set; }          // optional; or via header: LoginID
+        public string emirate { get; set; }           // areaCode
+        public string retailerName { get; set; }      // custName
+        public string? retailerCode { get; set; }     // not used here
+        public string distributor { get; set; }       // concDist
+        public string painterName { get; set; }       // contName
+        public string? painterMobile { get; set; }    // mobileNo
+        public string? materialQty { get; set; }      // -> pouchCnt (Dtl)
+        public string distributionDate { get; set; }  // -> sampDate (yyyy-MM-dd)
     }
 
-    public sealed class PainterDto
+    public class SubmitResponse
     {
-        public string? Type { get; set; }   // Painter / Contractor / Applicator
-        public string? Mobile { get; set; }
-        public string? Name { get; set; }
-    }
-
-    public sealed class ChannelPartnerDto
-    {
-        public string? Type { get; set; }         // Authorised dealer / Stockist / etc.
-        public string? PurchaserCode { get; set; }
-        public string? Mobile { get; set; }
-        public string? Name { get; set; }
+        public bool success { get; set; }
+        public string message { get; set; }
+        public string? docuNumb { get; set; }
     }
 }
