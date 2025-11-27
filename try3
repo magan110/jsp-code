@@ -1,260 +1,322 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.ModelBinding;   // for [BindNever]
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
+using System.Globalization;
+using System.Linq;                              // for FirstOrDefault()
+using System.Text.Json.Serialization;
 
 namespace sparshWebService.Controllers
 {
     [ApiController]
     [Route("api/[controller]")]
-    public class SampleDistributionController : ControllerBase
+    [Produces("application/json")]
+    public class SamplingExecutionEntryController : ControllerBase
     {
-        private readonly DatabaseHelper _dbHelper;
+        private readonly DatabaseHelper _db;
+        public SamplingExecutionEntryController(DatabaseHelper dbHelper) => _db = dbHelper;
 
-        public SampleDistributionController(DatabaseHelper dbHelper)
+        // ---------------- Envelope ----------------
+        public sealed class ApiResponse<T>
         {
-            _dbHelper = dbHelper;
+            [JsonPropertyName("success")] public bool Success { get; set; }
+            [JsonPropertyName("data")] public T Data { get; set; }
+            [JsonPropertyName("error")] public string Error { get; set; }
+            public static ApiResponse<T> Ok(T d) => new() { Success = true, Data = d };
+            public static ApiResponse<T> Fail(string m) => new() { Success = false, Error = m };
         }
 
-        // ----------------------------
-        // 1) Emirates dropdown (Areas)
-        // ----------------------------
-        [HttpGet("areas")]
-        public ActionResult<IEnumerable<AreaItem>> GetAreas([FromQuery] bool onlyActive = true)
+        // -------------- DTO (UI fields ONLY) --------------
+        public class SamplingExecDto
+        {
+            // Server-generated: do NOT require/bind from client
+            [BindNever]
+            [JsonIgnore]
+            [JsonPropertyName("docuNumb")]
+            public string? DocuNumb { get; set; }
+
+            [JsonPropertyName("retailerName")] public string RetailerName { get; set; }
+            [JsonPropertyName("retailerCode")] public string RetailerCode { get; set; }
+            [JsonPropertyName("distributorName")] public string DistributorName { get; set; }
+            [JsonPropertyName("emirates")] public string Emirates { get; set; }
+            [JsonPropertyName("distributionDate")] public DateTime DistributionDate { get; set; }
+            [JsonPropertyName("painterName")] public string PainterName { get; set; }
+            [JsonPropertyName("painterMobile")] public string PainterMobile { get; set; }
+            [JsonPropertyName("qtyDistributedKg")] public double QtyDistributedKg { get; set; }
+            [JsonPropertyName("siteAddress")] public string SiteAddress { get; set; }
+            [JsonPropertyName("sampleDate")] public DateTime? SampleDate { get; set; }
+            [JsonPropertyName("product")] public string Product { get; set; }
+            [JsonPropertyName("photoImage")] public string? PhotoImage { get; set; }
+            [JsonPropertyName("reimbursementMode")] public string ReimbursementMode { get; set; }
+            [JsonPropertyName("reimbursementAmountAED")] public double ReimbursementAmountAED { get; set; }
+
+            [JsonPropertyName("sampleCancelFlag")]
+            public string SampleCancelFlag { get; set; }
+        }
+
+        // =================== GET: /top100 ===================
+        [HttpGet("top100")]
+        public ActionResult<ApiResponse<List<SamplingExecDto>>> Top100()
         {
             try
             {
                 const string sql = @"
-SELECT areaCode, areaDesc
-FROM dbo.bkmAreaMast WITH (NOLOCK)
-WHERE (@onlyActive = 0 OR isActive = 'Y')
-ORDER BY areaDesc;";
+SELECT TOP 100
+       a.docuNumb,
+       a.docuDate,
+       a.areaCode,               -- emirates
+       a.custName,               -- retailerName
+       ISNULL(d.cusRtlCd,'') AS retailerCode,
+       a.concDist,               -- distributorName
+       a.sampDate,               -- distribution/sample date
+       a.contName,               -- painterName
+       a.mobileNo,               -- painterMobile
+       a.prodName,               -- product
+       d.pouchCnt                -- qty distributed
+FROM dbo.catsamplead a WITH (NOLOCK)
+LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
+ORDER BY a.docuDate DESC, d.serialNo;";
 
-                var parameters = new Dictionary<string, object>
-                {
-                    { "@onlyActive", onlyActive ? 1 : 0 }
-                };
-
-                var result = _dbHelper.QaEWebBean(sql, parameters);
-                var list = new List<AreaItem>();
-
-                if (result != null)
-                {
-                    foreach (var row in result)
-                    {
-                        list.Add(new AreaItem
-                        {
-                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
-                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
-                        });
-                    }
-                }
-
-                return Ok(list);
+                var rows = _db.QaEWebBean(sql, new Dictionary<string, object>()) as List<Dictionary<string, object>>;
+                var list = MapRowsToExecDto(rows);
+                return Ok(ApiResponse<List<SamplingExecDto>>.Ok(list));
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new { success = false, message = ex.Message });
+                return StatusCode(500, ApiResponse<List<SamplingExecDto>>.Fail(ex.Message));
             }
         }
 
-        // -----------------------------------------
-        // 2) Submit the Sample Distribution payload
-        // -----------------------------------------
-        [HttpPost("submit")]
-        public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
+        // =================== GET: /search ===================
+        // Query: retailerCode / retailerName / painterNameFilter + optional start/end (yyyy-MM-dd) + top
+        [HttpGet("search")]
+        public ActionResult<ApiResponse<List<SamplingExecDto>>> Search(
+            [FromQuery] string retailerCode = null,
+            [FromQuery] string retailerName = null,
+            [FromQuery] string painterNameFilter = null,
+            [FromQuery] string start = null,
+            [FromQuery] string end = null,
+            [FromQuery] int top = 200)
         {
             try
             {
-                // Basic validations
-                if (req == null) return BadRequest("Empty request.");
-                if (string.IsNullOrWhiteSpace(req.emirate)) return BadRequest("Emirate (areaCode) is required.");
-                if (string.IsNullOrWhiteSpace(req.retailerName)) return BadRequest("Retailer Name is required.");
-                if (string.IsNullOrWhiteSpace(req.distributor)) return BadRequest("Concern Distributor is required.");
-                if (string.IsNullOrWhiteSpace(req.painterName)) return BadRequest("Painter/Contractor Name is required.");
-                if (string.IsNullOrWhiteSpace(req.distributionDate)) return BadRequest("Date of distribution is required.");
-
-                if (!DateTime.TryParse(req.distributionDate, out var sampDate))
-                    return BadRequest("Invalid distribution date.");
-
-                // Set default packSize & prodName
-                string packSize = null;
-                string prodName = null;
-
-                // CreateId from header or request (max 6 chars)
-                var loginId = Request.Headers.ContainsKey("LoginID")
-                    ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
-                    : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
-                loginId = (loginId ?? "SYSTEM").Trim();
-                if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
-
-                var areaCode = req.emirate.Trim();
-
-                // --- Generate the document number ---
-                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
-                var genParams = new Dictionary<string, object>
+                if (string.IsNullOrWhiteSpace(retailerCode) &&
+                    string.IsNullOrWhiteSpace(retailerName) &&
+                    string.IsNullOrWhiteSpace(painterNameFilter) &&
+                    string.IsNullOrWhiteSpace(start) &&
+                    string.IsNullOrWhiteSpace(end))
                 {
-                    ["@DocType"] = "SDE",
-                    ["@AreaCode"] = areaCode
-                };
-
-                var genRows = _dbHelper.QaEWebBean(genSql, genParams) as List<Dictionary<string, object>>;
-                string docuNumb = null;
-                if (genRows != null && genRows.Count > 0)
-                {
-                    var row = genRows.First();
-                    var candidates = new[] { "docuNumb", "DocuNumb", "DOCUNUMB", "DocNo", "DocumentNo" };
-                    foreach (var key in candidates)
-                    {
-                        if (row.TryGetValue(key, out var val) && val != null)
-                        {
-                            docuNumb = val.ToString();
-                            break;
-                        }
-                    }
-                    if (string.IsNullOrWhiteSpace(docuNumb) && row.Count > 0)
-                        docuNumb = row.First().Value?.ToString();
+                    return BadRequest(ApiResponse<List<SamplingExecDto>>.Fail(
+                        "Provide at least one filter (retailerCode/retailerName/painterNameFilter/start/end)."));
                 }
 
-                if (string.IsNullOrWhiteSpace(docuNumb))
+                DateTime? startDate = TryParseDate(start);
+                DateTime? endDate = TryParseDate(end);
+
+                var where = new List<string> { "1=1" };
+                var p = new Dictionary<string, object> { ["@top"] = top };
+
+                if (!string.IsNullOrWhiteSpace(retailerCode))
                 {
-                    return StatusCode(500, new SubmitResponse
-                    {
-                        success = false,
-                        message = $"Failed to generate document number for area '{areaCode}'.",
-                        docuNumb = null
-                    });
+                    where.Add("(ISNULL(d.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
+                    p["@retailerCode"] = retailerCode.Trim();
                 }
-
-                // --- Immediately advance the sequence ---
-                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
-                _dbHelper.QaEWebBean(updSql, genParams);
-
-                // ================= HEADER: dbo.catsamplead =================
-                var insertHeaderSql = @"
-INSERT INTO dbo.catsamplead
-(
-  docuNumb, docuDate, areaCode, custName, contName, mobileNo,
-  concDist, sampDate, misdQnty, packSize, prodName, sampType,
-  statFlag, createId, createDt
-)
-VALUES
-(
-  @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo,
-  @concDist, @sampDate, @misdQnty, @packSize, @prodName, @sampType,
-  'N', @createId, GETDATE()
-);";
-
-                var headerParams = new Dictionary<string, object>
+                if (!string.IsNullOrWhiteSpace(retailerName))
                 {
-                    ["@docuNumb"] = docuNumb,                         // varchar(16)
-                    ["@areaCode"] = areaCode,                         // varchar(20)
-                    ["@custName"] = req.retailerName?.Trim() ?? (object)DBNull.Value,  // varchar(50) null
-                    ["@contName"] = req.painterName?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
-                    ["@mobileNo"] = req.painterMobile?.Trim() ?? (object)DBNull.Value, // varchar(13) null
-                    ["@concDist"] = req.distributor?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
-                    ["@sampDate"] = sampDate,                         // smalldatetime null
-                    ["@misdQnty"] = (object)DBNull.Value,     // char(10) null
-                    ["@packSize"] = (object?)packSize ?? DBNull.Value,                  // char(3) null
-                    ["@prodName"] = (object?)prodName ?? DBNull.Value,                  // varchar(100) null
-                    ["@sampType"] = "SampleDistribution",             // varchar(20) null
-                    ["@createId"] = loginId                           // varchar(6) null
-                };
-
-                _dbHelper.QaEWebBean(insertHeaderSql, headerParams);
-
-                // ================ DETAIL: dbo.catsampleadDtl ================
-                // Required: serialNo (NOT NULL), docuNumb (NOT NULL), sampCnCl (NOT NULL, 1 char)
-                // We'll set serialNo = next value within this docuNumb, sampCnCl = 'S' (sample).
-                var nextSerialSql = @"
-SELECT ISNULL(MAX(serialNo), 0) + 1 AS nextSerial
-FROM dbo.catsampleadDtl WITH (NOLOCK)
-WHERE docuNumb = @docuNumb;";
-
-                var nextSerialRows = _dbHelper.QaEWebBean(nextSerialSql, new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = docuNumb
-                }) as List<Dictionary<string, object>>;
-
-                int nextSerial = 1;
-                if (nextSerialRows != null && nextSerialRows.Count > 0)
-                {
-                    var v = nextSerialRows[0].Values?.FirstOrDefault()?.ToString();
-                    if (int.TryParse(v, out var parsed)) nextSerial = parsed;
+                    where.Add("ISNULL(a.custName,'') LIKE '%' + @retailerName + '%'");
+                    p["@retailerName"] = retailerName.Trim();
                 }
-
-                var insertDetailSql = @"
-INSERT INTO dbo.catsampleadDtl
-(
-  docuNumb, sampDate, pouchCnt, sampCnCl, cusRtlCd,
-  statFlag, createId, createDt
-)
-VALUES
-(
-  @docuNumb, @sampDate, @pouchCnt, @sampCnCl, @cusRtlCd,
-  'N', @createId, GETDATE()
-);
-";
-
-                var detailParams = new Dictionary<string, object>
+                if (!string.IsNullOrWhiteSpace(painterNameFilter))
                 {
-                    ["@serialNo"] = nextSerial,                                     // int NOT NULL
-                    ["@docuNumb"] = docuNumb,                                       // varchar(16) NOT NULL
-                    ["@sampDate"] = sampDate,                                       // smalldatetime
-                    ["@pouchCnt"] = (object?)(req.materialQty?.Trim()) ?? DBNull.Value, // varchar(10) null
-                    ["@sampCnCl"] = "S",                                            // varchar(1) NOT NULL (set as Sample)
-                    ["@cusRtlCd"] = req.retailerCode?.Trim() ?? (object)DBNull.Value, // retailer code
-                    ["@createId"] = loginId
-                };
+                    where.Add("ISNULL(a.contName,'') LIKE '%' + @painterName + '%'");
+                    p["@painterName"] = painterNameFilter.Trim();
+                }
+                if (startDate.HasValue) { where.Add("a.sampDate >= @start"); p["@start"] = startDate.Value; }
+                if (endDate.HasValue) { where.Add("a.sampDate < DATEADD(DAY,1,@end)"); p["@end"] = endDate.Value; }
 
-                _dbHelper.QaEWebBean(insertDetailSql, detailParams);
+                var sql = $@"
+SELECT TOP (@top)
+       a.docuNumb,
+       a.docuDate,
+       a.areaCode,               -- emirates
+       a.custName,               -- retailerName
+       ISNULL(d.cusRtlCd,'') AS retailerCode,
+       a.concDist,               -- distributorName
+       a.sampDate,               -- distribution/sample date
+       a.contName,               -- painterName
+       a.mobileNo,               -- painterMobile
+       a.prodName,               -- product
+       d.pouchCnt                -- qty distributed
+FROM dbo.catsamplead a WITH (NOLOCK)
+LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
+WHERE {string.Join(" AND ", where)}
+ORDER BY a.docuDate DESC, d.serialNo;";
 
-                return Ok(new SubmitResponse
-                {
-                    success = true,
-                    message = "Saved successfully.",
-                    docuNumb = docuNumb
-                });
+                var rows = _db.QaEWebBean(sql, p) as List<Dictionary<string, object>>;
+                var list = MapRowsToExecDto(rows);
+                return Ok(ApiResponse<List<SamplingExecDto>>.Ok(list));
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new SubmitResponse
-                {
-                    success = false,
-                    message = ex.Message,
-                    docuNumb = null
-                });
+                return StatusCode(500, ApiResponse<List<SamplingExecDto>>.Fail(ex.Message));
             }
         }
 
-    }
+        // =================== POST: /submit ===================
+        // Saves one entry. Header -> catsamplead, Detail -> catsampleadDtl
+        [HttpPost("submit")]
+        public ActionResult<ApiResponse<string>> Create([FromBody] SamplingExecDto dto)
+        {
+            if (dto == null) return BadRequest(ApiResponse<string>.Fail("Request body is missing."));
+            if (string.IsNullOrWhiteSpace(dto.Emirates)) return BadRequest(ApiResponse<string>.Fail("Emirates (areaCode) is required."));
+            if (string.IsNullOrWhiteSpace(dto.RetailerName)) return BadRequest(ApiResponse<string>.Fail("Retailer Name is required."));
+            if (string.IsNullOrWhiteSpace(dto.DistributorName)) return BadRequest(ApiResponse<string>.Fail("Concern Distributor is required."));
+            if (string.IsNullOrWhiteSpace(dto.PainterName)) return BadRequest(ApiResponse<string>.Fail("Painter/Contractor Name is required."));
+            if (dto.DistributionDate == default) return BadRequest(ApiResponse<string>.Fail("Distribution date is required."));
 
-    // DTOs
-    public class AreaItem
-    {
-        public string code { get; set; }  // areaCode (char/varchar)
-        public string desc { get; set; }  // areaDesc
-    }
+            try
+            {
+                // 1) Get document number from procedure
+                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
+                var genParams = new Dictionary<string, object>
+                {
+                    ["@DocType"] = "SEE",
+                    ["@AreaCode"] = dto.Emirates.Trim()
+                };
 
-    public class SampleDistributionRequest
-    {
-        public string? loginId { get; set; }          // optional; or via header: LoginID
-        public string emirate { get; set; }           // areaCode
-        public string retailerName { get; set; }      // custName
-        public string? retailerCode { get; set; }     // not used here
-        public string distributor { get; set; }       // concDist
-        public string painterName { get; set; }       // contName
-        public string? painterMobile { get; set; }    // mobileNo
-        public string? materialQty { get; set; }      // -> pouchCnt (Dtl)
-        public string distributionDate { get; set; }  // -> sampDate (yyyy-MM-dd)
-    }
+                var rows = _db.QaEWebBean(genSql, genParams) as List<Dictionary<string, object>>;
+                if (rows == null || rows.Count == 0)
+                    return StatusCode(500, ApiResponse<string>.Fail("Doc number proc returned no rows."));
 
-    public class SubmitResponse
-    {
-        public bool success { get; set; }
-        public string message { get; set; }
-        public string? docuNumb { get; set; }
+                string docuNumb = null;
+                var row = rows[0];
+                // prefer known keys, otherwise first column value
+                if (!row.TryGetValue("docuNumb", out var v) &&
+                    !row.TryGetValue("DocuNumb", out v) &&
+                    !row.TryGetValue("DOCUNUMB", out v) &&
+                    !row.TryGetValue("DocNo", out v) &&
+                    !row.TryGetValue("DocumentNo", out v))
+                {
+                    v = row.Values.FirstOrDefault();
+                }
+                docuNumb = v?.ToString();
+
+                if (string.IsNullOrWhiteSpace(docuNumb))
+                    return StatusCode(500, ApiResponse<string>.Fail("Failed to read document number from proc."));
+
+                // Server owns this field
+                dto.DocuNumb = docuNumb;
+
+                // 2) Insert header
+                const string sqlHeader = @"
+INSERT INTO dbo.catsamplead
+( docuNumb, docuDate, areaCode, custName, contName, mobileNo, concDist, sampDate, prodName )
+VALUES
+( @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo, @concDist, @sampDate, @prodName );";
+
+                _db.QaEWebBean(sqlHeader, new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = dto.DocuNumb,
+                    ["@areaCode"] = dto.Emirates,
+                    ["@custName"] = (object?)dto.RetailerName ?? DBNull.Value,
+                    ["@contName"] = (object?)dto.PainterName ?? DBNull.Value,
+                    ["@mobileNo"] = (object?)dto.PainterMobile ?? DBNull.Value,
+                    ["@concDist"] = (object?)dto.DistributorName ?? DBNull.Value,
+                    ["@sampDate"] = dto.DistributionDate,
+                    ["@prodName"] = (object?)dto.Product ?? DBNull.Value
+                });
+
+                // 3) Insert detail
+                const string sqlDetail = @"
+INSERT INTO dbo.catsampleadDtl
+( docuNumb, sampDate, pouchCnt, sampCnCl, cusRtlCd )
+VALUES
+( @docuNumb, @sampDate, @pouchCnt, @sampCnCl, @cusRtlCd );";
+
+                _db.QaEWebBean(sqlDetail, new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = dto.DocuNumb,
+                    ["@sampDate"] = dto.DistributionDate,
+                    ["@pouchCnt"] = dto.QtyDistributedKg,
+                    ["@sampCnCl"] = string.IsNullOrEmpty(dto.SampleCancelFlag) ? "S" : dto.SampleCancelFlag,
+                    ["@cusRtlCd"] = (object?)dto.RetailerCode ?? DBNull.Value
+                });
+
+                // 4) Advance the sequence AFTER successful inserts
+                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
+                _db.QaEWebBean(updSql, genParams);
+
+                return Ok(ApiResponse<string>.Ok(dto.DocuNumb));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<string>.Fail(ex.Message));
+            }
+        }
+
+        // ---------------- Mapping (only UI fields) ----------------
+        private static List<SamplingExecDto> MapRowsToExecDto(List<Dictionary<string, object>> rows)
+        {
+            var list = new List<SamplingExecDto>();
+            if (rows == null) return list;
+
+            foreach (var r in rows)
+            {
+                var sampDate = ToDate(GetObj(r, "sampDate")) ?? DateTime.UtcNow;
+
+                list.Add(new SamplingExecDto
+                {
+                    // DocuNumb is server-only in API input; safe to expose in GET mapping if needed
+                    DocuNumb = GetStr(r, "docuNumb"),
+                    RetailerName = GetStr(r, "custName"),
+                    RetailerCode = GetStr(r, "retailerCode"),
+                    DistributorName = GetStr(r, "concDist"),
+                    Emirates = GetStr(r, "areaCode"),
+                    DistributionDate = sampDate,
+                    PainterName = GetStr(r, "contName"),
+                    PainterMobile = GetStr(r, "mobileNo"),
+                    QtyDistributedKg = ToDouble(GetObj(r, "pouchCnt")),
+                    SiteAddress = "",                           // placeholder
+                    SampleDate = sampDate,                      // for now
+                    Product = GetStr(r, "prodName"),
+                    PhotoImage = null,                          // placeholder
+                    ReimbursementMode = "",                     // placeholder
+                    ReimbursementAmountAED = 0.0                // placeholder
+                });
+            }
+            return list;
+        }
+
+        // ---------------- Util helpers ----------------
+        private static object GetObj(Dictionary<string, object> row, string k)
+            => row.TryGetValue(k, out var v) ? v : null;
+
+        private static string GetStr(Dictionary<string, object> row, string k)
+            => row.TryGetValue(k, out var v) && v != null && v != DBNull.Value ? v.ToString() : "";
+
+        private static DateTime? TryParseDate(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            if (DateTime.TryParseExact(s.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)) return dt;
+            if (DateTime.TryParse(s, out var any)) return any;
+            return null;
+        }
+
+        private static DateTime? ToDate(object o)
+        {
+            if (o == null || o == DBNull.Value) return (DateTime?)null;
+            if (o is DateTime dt) return dt;
+            return DateTime.TryParse(o.ToString(), out var d) ? d : (DateTime?)null;
+        }
+
+        private static double ToDouble(object o)
+        {
+            if (o == null || o == DBNull.Value) return 0d;
+            if (o is double d) return d;
+            if (o is decimal m) return (double)m;
+            if (o is float f) return f;
+            return double.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var v) ? v : 0d;
+        }
     }
 }
