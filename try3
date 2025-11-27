@@ -1,177 +1,260 @@
--- ===============================================
--- STEP COUNTER APP - DATABASE SCHEMA (SQL SERVER)
--- ===============================================
--- Naming Convention:
--- Table Names: Exactly 11 characters (ALPHABETIC ONLY)
--- Column Names: Exactly 8 characters (ALPHABETIC ONLY)
--- No Numbers, No Underscores Allowed
--- ===============================================
--- Integration: Links to existing covLoginMas employee table
--- Note: Foreign keys commented out - add them later after confirming covLoginMas exists
--- ===============================================
--- ===============================================
--- TABLE 1: DAILY STEP RECORDS
--- Table Name: steprecords (11 characters)
--- Stores: Daily step activity data
--- Links to: covLoginMas.emplCode
--- ===============================================
-CREATE TABLE steprecords (
-    recordid INT PRIMARY KEY IDENTITY(1,1),
-    emplCode INT NOT NULL,           -- Employee code (links to covLoginMas)
-    stepdate DATE NOT NULL,          -- Record date
-    stepstot INT DEFAULT 0,          -- Total steps
-    calories DECIMAL(8,2) DEFAULT 0, -- Calories burned
-    distance DECIMAL(8,2) DEFAULT 0, -- Distance in km
-    duration INT DEFAULT 0,          -- Duration in minutes
-    activity VARCHAR(20),             -- Activity status (walking/running/still/cycling)
-    walkstps INT DEFAULT 0,          -- Steps while walking
-    runsteps INT DEFAULT 0,          -- Steps while running
-    peakrate INT DEFAULT 0,          -- Peak steps per minute
-    avgrate_ DECIMAL(5,2) DEFAULT 0, -- Average steps per minute
-    createat DATETIME DEFAULT GETDATE(),
-    updateat DATETIME DEFAULT GETDATE(),
-    CONSTRAINT UQ_steprecords_emplCode_stepdate UNIQUE (emplCode, stepdate)
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace sparshWebService.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class SampleDistributionController : ControllerBase
+    {
+        private readonly DatabaseHelper _dbHelper;
+
+        public SampleDistributionController(DatabaseHelper dbHelper)
+        {
+            _dbHelper = dbHelper;
+        }
+
+        // ----------------------------
+        // 1) Emirates dropdown (Areas)
+        // ----------------------------
+        [HttpGet("areas")]
+        public ActionResult<IEnumerable<AreaItem>> GetAreas([FromQuery] bool onlyActive = true)
+        {
+            try
+            {
+                const string sql = @"
+SELECT areaCode, areaDesc
+FROM dbo.bkmAreaMast WITH (NOLOCK)
+WHERE (@onlyActive = 0 OR isActive = 'Y')
+ORDER BY areaDesc;";
+
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@onlyActive", onlyActive ? 1 : 0 }
+                };
+
+                var result = _dbHelper.QaEWebBean(sql, parameters);
+                var list = new List<AreaItem>();
+
+                if (result != null)
+                {
+                    foreach (var row in result)
+                    {
+                        list.Add(new AreaItem
+                        {
+                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
+                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
+                        });
+                    }
+                }
+
+                return Ok(list);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // -----------------------------------------
+        // 2) Submit the Sample Distribution payload
+        // -----------------------------------------
+        [HttpPost("submit")]
+        public ActionResult<SubmitResponse> Submit([FromBody] SampleDistributionRequest req)
+        {
+            try
+            {
+                // Basic validations
+                if (req == null) return BadRequest("Empty request.");
+                if (string.IsNullOrWhiteSpace(req.emirate)) return BadRequest("Emirate (areaCode) is required.");
+                if (string.IsNullOrWhiteSpace(req.retailerName)) return BadRequest("Retailer Name is required.");
+                if (string.IsNullOrWhiteSpace(req.distributor)) return BadRequest("Concern Distributor is required.");
+                if (string.IsNullOrWhiteSpace(req.painterName)) return BadRequest("Painter/Contractor Name is required.");
+                if (string.IsNullOrWhiteSpace(req.distributionDate)) return BadRequest("Date of distribution is required.");
+
+                if (!DateTime.TryParse(req.distributionDate, out var sampDate))
+                    return BadRequest("Invalid distribution date.");
+
+                // Set default packSize & prodName
+                string packSize = null;
+                string prodName = null;
+
+                // CreateId from header or request (max 6 chars)
+                var loginId = Request.Headers.ContainsKey("LoginID")
+                    ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
+                    : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
+                loginId = (loginId ?? "SYSTEM").Trim();
+                if (loginId.Length > 6) loginId = loginId.Substring(0, 6);
+
+                var areaCode = req.emirate.Trim();
+
+                // --- Generate the document number ---
+                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
+                var genParams = new Dictionary<string, object>
+                {
+                    ["@DocType"] = "SDE",
+                    ["@AreaCode"] = areaCode
+                };
+
+                var genRows = _dbHelper.QaEWebBean(genSql, genParams) as List<Dictionary<string, object>>;
+                string docuNumb = null;
+                if (genRows != null && genRows.Count > 0)
+                {
+                    var row = genRows.First();
+                    var candidates = new[] { "docuNumb", "DocuNumb", "DOCUNUMB", "DocNo", "DocumentNo" };
+                    foreach (var key in candidates)
+                    {
+                        if (row.TryGetValue(key, out var val) && val != null)
+                        {
+                            docuNumb = val.ToString();
+                            break;
+                        }
+                    }
+                    if (string.IsNullOrWhiteSpace(docuNumb) && row.Count > 0)
+                        docuNumb = row.First().Value?.ToString();
+                }
+
+                if (string.IsNullOrWhiteSpace(docuNumb))
+                {
+                    return StatusCode(500, new SubmitResponse
+                    {
+                        success = false,
+                        message = $"Failed to generate document number for area '{areaCode}'.",
+                        docuNumb = null
+                    });
+                }
+
+                // --- Immediately advance the sequence ---
+                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
+                _dbHelper.QaEWebBean(updSql, genParams);
+
+                // ================= HEADER: dbo.catsamplead =================
+                var insertHeaderSql = @"
+INSERT INTO dbo.catsamplead
+(
+  docuNumb, docuDate, areaCode, custName, contName, mobileNo,
+  concDist, sampDate, misdQnty, packSize, prodName, sampType,
+  statFlag, createId, createDt
+)
+VALUES
+(
+  @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo,
+  @concDist, @sampDate, @misdQnty, @packSize, @prodName, @sampType,
+  'N', @createId, GETDATE()
+);";
+
+                var headerParams = new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb,                         // varchar(16)
+                    ["@areaCode"] = areaCode,                         // varchar(20)
+                    ["@custName"] = req.retailerName?.Trim() ?? (object)DBNull.Value,  // varchar(50) null
+                    ["@contName"] = req.painterName?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
+                    ["@mobileNo"] = req.painterMobile?.Trim() ?? (object)DBNull.Value, // varchar(13) null
+                    ["@concDist"] = req.distributor?.Trim() ?? (object)DBNull.Value,   // varchar(50) null
+                    ["@sampDate"] = sampDate,                         // smalldatetime null
+                    ["@misdQnty"] = (object)DBNull.Value,     // char(10) null
+                    ["@packSize"] = (object?)packSize ?? DBNull.Value,                  // char(3) null
+                    ["@prodName"] = (object?)prodName ?? DBNull.Value,                  // varchar(100) null
+                    ["@sampType"] = "SampleDistribution",             // varchar(20) null
+                    ["@createId"] = loginId                           // varchar(6) null
+                };
+
+                _dbHelper.QaEWebBean(insertHeaderSql, headerParams);
+
+                // ================ DETAIL: dbo.catsampleadDtl ================
+                // Required: serialNo (NOT NULL), docuNumb (NOT NULL), sampCnCl (NOT NULL, 1 char)
+                // We'll set serialNo = next value within this docuNumb, sampCnCl = 'S' (sample).
+                var nextSerialSql = @"
+SELECT ISNULL(MAX(serialNo), 0) + 1 AS nextSerial
+FROM dbo.catsampleadDtl WITH (NOLOCK)
+WHERE docuNumb = @docuNumb;";
+
+                var nextSerialRows = _dbHelper.QaEWebBean(nextSerialSql, new Dictionary<string, object>
+                {
+                    ["@docuNumb"] = docuNumb
+                }) as List<Dictionary<string, object>>;
+
+                int nextSerial = 1;
+                if (nextSerialRows != null && nextSerialRows.Count > 0)
+                {
+                    var v = nextSerialRows[0].Values?.FirstOrDefault()?.ToString();
+                    if (int.TryParse(v, out var parsed)) nextSerial = parsed;
+                }
+
+                var insertDetailSql = @"
+INSERT INTO dbo.catsampleadDtl
+(
+  docuNumb, sampDate, pouchCnt, sampCnCl, cusRtlCd,
+  statFlag, createId, createDt
+)
+VALUES
+(
+  @docuNumb, @sampDate, @pouchCnt, @sampCnCl, @cusRtlCd,
+  'N', @createId, GETDATE()
 );
--- ===============================================
--- TABLE 2: USER DATA & GOALS (Combined)
--- Table Name: usrgoalstbl (11 characters)
--- Stores: User goals, settings, achievements, leaderboard
--- Links to: covLoginMas.emplCode
--- Note: User profile data comes from covLoginMas
--- ===============================================
-CREATE TABLE usrgoalstbl (
-    goalidno INT PRIMARY KEY IDENTITY(1,1),
-    emplCode INT NOT NULL UNIQUE,    -- Employee code (links to covLoginMas)
-    
-    -- GOAL SETTINGS
-    dailygoal INT NOT NULL DEFAULT 10000, -- Daily step target
-    weeklygl INT DEFAULT 70000,      -- Weekly step target
-    caltargt DECIMAL(8,2) DEFAULT 500.00, -- Calorie target
-    disttarg DECIMAL(8,2) DEFAULT 8.00, -- Distance target in km
-    isactive BIT DEFAULT 1,          -- Is goal active
-    
-    -- APP SETTINGS
-    notifyon BIT DEFAULT 1,          -- Notifications enabled
-    apptheme VARCHAR(10) DEFAULT 'light', -- App theme (light/dark)
-    unitsys_ VARCHAR(10) DEFAULT 'metric', -- Unit system (metric/imperial)
-    applang_ VARCHAR(5) DEFAULT 'en', -- App language
-    privmode BIT DEFAULT 0,          -- Privacy mode
-    
-    -- ACHIEVEMENT DATA
-    achvstot INT DEFAULT 0,          -- Total achievements unlocked
-    achvbdge VARCHAR(200),            -- Comma-separated badge IDs
-    maxsteak INT DEFAULT 0,          -- Max daily streak
-    curstrek INT DEFAULT 0,          -- Current streak
-    lifetime BIGINT DEFAULT 0,       -- Lifetime total steps
-    
-    -- LEADERBOARD DATA
-    dailyrnk INT,                    -- Daily leaderboard rank
-    weekrank INT,                    -- Weekly leaderboard rank
-    monthrk_ INT,                    -- Monthly leaderboard rank
-    lastsync DATETIME,               -- Last sync timestamp
-    
-    -- TIMESTAMPS
-    createat DATETIME DEFAULT GETDATE(),
-    updateat DATETIME DEFAULT GETDATE()
-);
-GO
--- ===============================================
--- TRIGGER FOR AUTO-UPDATE OF updateat COLUMN
--- ===============================================
--- Trigger for steprecords table
-CREATE TRIGGER TR_steprecords_updateat
-ON steprecords
-AFTER UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    UPDATE steprecords
-    SET updateat = GETDATE()
-    FROM steprecords s
-    INNER JOIN inserted i ON s.recordid = i.recordid;
-END;
-GO
--- Trigger for usrgoalstbl table
-CREATE TRIGGER TR_usrgoalstbl_updateat
-ON usrgoalstbl
-AFTER UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    UPDATE usrgoalstbl
-    SET updateat = GETDATE()
-    FROM usrgoalstbl u
-    INNER JOIN inserted i ON u.goalidno = i.goalidno;
-END;
-GO
--- ===============================================
--- INDEXES FOR PERFORMANCE OPTIMIZATION
--- ===============================================
--- Index on steprecords for date-based queries
-CREATE INDEX IX_steprecords_stepdate ON steprecords(stepdate);
--- Index on steprecords for employee queries
-CREATE INDEX IX_steprecords_emplCode ON steprecords(emplCode);
--- Index on steprecords for activity filtering
-CREATE INDEX IX_steprecords_activity ON steprecords(activity);
--- Index on goals for employee queries
-CREATE INDEX IX_usrgoalstbl_emplCode ON usrgoalstbl(emplCode);
--- Index on goals for leaderboard rankings
-CREATE INDEX IX_usrgoalstbl_dailyrnk ON usrgoalstbl(dailyrnk);
-CREATE INDEX IX_usrgoalstbl_weekrank ON usrgoalstbl(weekrank);
-GO
--- ===============================================
--- SAMPLE QUERIES
--- ===============================================
--- Insert a daily step record for an employee
--- INSERT INTO steprecords (emplCode, stepdate, stepstot, calories, distance, duration, activity, walkstps, runsteps)
--- VALUES (12345, '2025-11-24', 10000, 450.00, 8.50, 120, 'walking', 8500, 1500);
--- Insert/Initialize goals for an employee
--- INSERT INTO usrgoalstbl (emplCode, dailygoal, weeklygl, caltargt, disttarg, notifyon, apptheme)
--- VALUES (12345, 10000, 70000, 500.00, 10.00, 1, 'dark');
--- Update achievement data
--- UPDATE usrgoalstbl 
--- SET achvstot = 5, achvbdge = 'badge1,badge2,badge3', maxsteak = 15, curstrek = 7, lifetime = 250000
--- WHERE emplCode = 12345;
--- Update leaderboard rankings
--- UPDATE usrgoalstbl 
--- SET dailyrnk = 12, weekrank = 8, monthrk_ = 25, lastsync = GETDATE()
--- WHERE emplCode = 12345;
--- Get employee step data with profile info (JOIN example)
--- SELECT 
---     e.emplCode, e.emplName, e.emailAdd, e.mobileNo, e.deptDesc,
---     s.stepdate, s.stepstot, s.calories, s.distance, s.activity,
---     g.dailygoal, g.curstrek, g.dailyrnk
--- FROM covLoginMas e
--- LEFT JOIN steprecords s ON e.emplCode = s.emplCode
--- LEFT JOIN usrgoalstbl g ON e.emplCode = g.emplCode
--- WHERE e.emplCode = 12345 AND s.stepdate >= DATEADD(DAY, -7, GETDATE())
--- ORDER BY s.stepdate DESC;
--- Get daily leaderboard
--- SELECT 
---     e.emplCode, e.emplName, e.deptDesc,
---     SUM(s.stepstot) as totalstps, SUM(s.calories) as totcals, SUM(s.distance) as totdist
--- FROM covLoginMas e
--- JOIN steprecords s ON e.emplCode = s.emplCode
--- WHERE s.stepdate = CAST(GETDATE() AS DATE) AND e.isActive = 'Y'
--- GROUP BY e.emplCode, e.emplName, e.deptDesc
--- ORDER BY totalstps DESC;
--- ===============================================
--- OPTIONAL: ADD FOREIGN KEYS (Run after confirming covLoginMas exists)
--- ===============================================
--- Uncomment and run these after you have access to covLoginMas table
--- Add foreign key to steprecords
--- ALTER TABLE steprecords
--- ADD CONSTRAINT FK_steprecords_emplCode 
--- FOREIGN KEY (emplCode) REFERENCES covLoginMas(emplCode);
--- Add foreign key to usrgoalstbl
--- ALTER TABLE usrgoalstbl
--- ADD CONSTRAINT FK_usrgoalstbl_emplCode 
--- FOREIGN KEY (emplCode) REFERENCES covLoginMas(emplCode);
--- If covLoginMas is in a different schema, use:
--- FOREIGN KEY (emplCode) REFERENCES [SchemaName].covLoginMas(emplCode);
--- If covLoginMas is in a different database, use:
--- FOREIGN KEY (emplCode) REFERENCES [DatabaseName].[SchemaName].covLoginMas(emplCode);
-GO
--- ===============================================
--- END OF SCHEMA
--- ===============================================
+";
+
+                var detailParams = new Dictionary<string, object>
+                {
+                    ["@serialNo"] = nextSerial,                                     // int NOT NULL
+                    ["@docuNumb"] = docuNumb,                                       // varchar(16) NOT NULL
+                    ["@sampDate"] = sampDate,                                       // smalldatetime
+                    ["@pouchCnt"] = (object?)(req.materialQty?.Trim()) ?? DBNull.Value, // varchar(10) null
+                    ["@sampCnCl"] = "S",                                            // varchar(1) NOT NULL (set as Sample)
+                    ["@cusRtlCd"] = req.retailerCode?.Trim() ?? (object)DBNull.Value, // retailer code
+                    ["@createId"] = loginId
+                };
+
+                _dbHelper.QaEWebBean(insertDetailSql, detailParams);
+
+                return Ok(new SubmitResponse
+                {
+                    success = true,
+                    message = "Saved successfully.",
+                    docuNumb = docuNumb
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new SubmitResponse
+                {
+                    success = false,
+                    message = ex.Message,
+                    docuNumb = null
+                });
+            }
+        }
+
+    }
+
+    // DTOs
+    public class AreaItem
+    {
+        public string code { get; set; }  // areaCode (char/varchar)
+        public string desc { get; set; }  // areaDesc
+    }
+
+    public class SampleDistributionRequest
+    {
+        public string? loginId { get; set; }          // optional; or via header: LoginID
+        public string emirate { get; set; }           // areaCode
+        public string retailerName { get; set; }      // custName
+        public string? retailerCode { get; set; }     // not used here
+        public string distributor { get; set; }       // concDist
+        public string painterName { get; set; }       // contName
+        public string? painterMobile { get; set; }    // mobileNo
+        public string? materialQty { get; set; }      // -> pouchCnt (Dtl)
+        public string distributionDate { get; set; }  // -> sampDate (yyyy-MM-dd)
+    }
+
+    public class SubmitResponse
+    {
+        public bool success { get; set; }
+        public string message { get; set; }
+        public string? docuNumb { get; set; }
+    }
+}
