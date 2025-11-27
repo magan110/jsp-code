@@ -19,9 +19,16 @@ namespace sparshWebService.Controllers
             _db = db;
         }
 
-        // ============================================
+        // Quick ping to test routing
+        [HttpGet("ping")]
+        public IActionResult Ping()
+        {
+            return Ok(new { success = true, controller = "ActivityEntry", message = "Ping OK" });
+        }
+
+        // =========================
         // POST: /api/ActivityEntry/save
-        // ============================================
+        // =========================
         [HttpPost("save")]
         [Consumes("application/json")]
         public IActionResult Save([FromBody] ActivityEntryRequest? request = null)
@@ -30,100 +37,112 @@ namespace sparshWebService.Controllers
             {
                 request ??= new ActivityEntryRequest();
 
-                // ------- Basic validations -------
+                // -------- basic validations --------
+                if (string.IsNullOrWhiteSpace(request.ProcessType))
+                    return BadRequest(new { success = false, message = "ProcessType is required (Add / Update)." });
+
+                var mode = request.ProcessType.Trim().ToUpperInvariant();
+                bool isAdd = mode == "ADD";
+
+                if (!isAdd && string.IsNullOrWhiteSpace(request.DocuNumb))
+                    return BadRequest(new { success = false, message = "DocuNumb is required in Update mode." });
+
                 if (string.IsNullOrWhiteSpace(request.ActivityName))
                     return BadRequest(new { success = false, message = "ActivityName is required." });
 
                 if (string.IsNullOrWhiteSpace(request.ActivityDate))
                     return BadRequest(new { success = false, message = "ActivityDate is required." });
 
-                if (!DateTime.TryParseExact(request.ActivityDate.Trim(),
-                        "yyyy-MM-dd",
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.None,
-                        out var actvDate))
-                {
-                    if (!DateTime.TryParse(request.ActivityDate, out actvDate))
-                        return BadRequest(new { success = false, message = "Invalid ActivityDate format." });
-                }
+                if (string.IsNullOrWhiteSpace(request.MeetingVenue))
+                    return BadRequest(new { success = false, message = "MeetingVenue is required." });
 
-                var loginIdn = !string.IsNullOrWhiteSpace(request.LoginIdn)
-                    ? request.LoginIdn.Trim()
-                    : (User?.Identity?.Name ?? "SYSTEM");
+                if (string.IsNullOrWhiteSpace(request.CityName))
+                    return BadRequest(new { success = false, message = "CityName is required." });
 
-                // derive month (yyyymm) and meetDate
-                var docuMnth = actvDate.ToString("yyyyMM");
+                if (string.IsNullOrWhiteSpace(request.District))
+                    return BadRequest(new { success = false, message = "District (Emirates) is required." });
+
+                if (string.IsNullOrWhiteSpace(request.LoginIdn))
+                    return BadRequest(new { success = false, message = "LoginIdn (createId) is required." });
+
+                // -------- map Flutter → header fields --------
+                var actvName = Cut(request.ActivityName, 100);    // actvName
+                var actvRmrk = Cut(request.Description, 500);      // actvRmrk
+                var actvDate = SafeParseDate(request.ActivityDate) ?? DateTime.Now;
                 var meetDate = actvDate;
 
-                int empCount = request.Employees?.Count ?? 0;
-                int painterCount = request.Painters?.Count ?? 0;
-                int chPartnerCount = request.ChannelPartners?.Count ?? 0;
+                var docuMnth = actvDate.ToString("yyyyMM", CultureInfo.InvariantCulture);
 
-                int totalParticipants = request.TotalParticipants > 0
-                    ? request.TotalParticipants
-                    : empCount + painterCount + chPartnerCount;
+                var actvCity = Cut(request.CityName, 100);
+                var district = Cut(request.District, 50);   // Emirates
 
-                // header strings with Cut
-                string actvName = Cut(request.ActivityName, 100);
-                string cityName = Cut(request.CityName, 100);
-                string district = Cut(request.District, 100);   // Emirates
-                string meetVenu = Cut(request.MeetingVenue, 255);
-                string prodCtLs = Cut(request.Product, 255);
-                string actvRmrk = Cut(request.Description, 500);
-                string latitude = Cut(request.Latitude, 50);
-                string longtude = Cut(request.Longitude, 50);
+                // derive areaCode from Emirates (first 3 chars)
+                var areaCode = (Left(district, 3) ?? "UAE").ToUpperInvariant();
 
-                // empPrsLs: concat employeeCode-name
-                string empPrsLs = request.Employees != null && request.Employees.Count > 0
-                    ? string.Join(" | ", request.Employees.Select(e =>
-                        $"{(e.EmployeeCode ?? "").Trim()}-{(e.Name ?? "").Trim()}"))
-                    : "";
+                var prodCtLs = Cut(request.Product, 100);    // Product list
+                var meetVenu = Cut(request.MeetingVenue, 200);
 
-                // Default / mandatory fields
-                string caaActTy = "01";        // Activity Type (tune as per business)
-                string caaObjTy = "01";        // Objective Type
-                string pinCodeN = "";          // Not captured in UI
+                var loginIdn = request.LoginIdn!.Trim();
+                var userRole = Cut(request.UserRole, 10);
+
+                // counts
+                int emplCont = request.Employees?.Count ?? 0;
+                int inflCont = request.Painters?.Count ?? 0;
+                int chnlCont = request.ChannelPartners?.Count ?? 0;
+                int totlCont = emplCont + inflCont + chnlCont;
+
+                int noOfPart = request.TotalParticipants ?? totlCont;
                 int noOfEnqu = 0;
                 int noOfVist = 0;
-                string caaPrjTy = "01";        // Project Type
-                string mobileNo = "";          // header-level contact
+
+                // lat/long
+                var latitude = Cut(request.Latitude, 50);
+                var longtude = Cut(request.Longitude, 50);
+
+                // image attachment id list (comma separated)
+                string? atchNmId = null;
+                if (request.ImageIds != null && request.ImageIds.Any())
+                    atchNmId = string.Join(",", request.ImageIds.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim()));
+
+                // simple defaults
+                string docuNumb = request.DocuNumb?.Trim() ?? "";
+                string caaActTy = "M";  // Meeting (code assumption)
+                string caaObjTy = "";   // Not coming from UI currently
+                string pinCodeN = "";
+                string caaPrjTy = "";   // Not used
+                string mobileNo = "";   // contact mobile if needed
                 string emailAdd = "";
                 string contPers = "";
                 int potnInMT = 0;
-                string maturtMn = docuMnth;
+                string maturtMn = "";
                 string rejcRmrk = "";
                 string statFlag = "N";
 
-                int emplCont = empCount;
-                int inflCont = painterCount;
-                int chnlCont = chPartnerCount;
-                int totlCont = totalParticipants;
+                // compressed employees list for header
+                string empPrsLs = "";
+                if (request.Employees != null && request.Employees.Any())
+                {
+                    empPrsLs = string.Join(",",
+                        request.Employees
+                            .Where(e => !string.IsNullOrWhiteSpace(e.Name))
+                            .Select(e => Cut(e.Name, 50)));
+                }
 
-                // Build atchNmId from image IDs (if needed)
-                string atchNmId = (request.ImageIds != null && request.ImageIds.Count > 0)
-                    ? string.Join(",", request.ImageIds
-                        .Select(x => x?.Trim())
-                        .Where(x => !string.IsNullOrEmpty(x)))
-                    : "";
-
-                bool isAdd = string.Equals(request.ProcessType, "Add", StringComparison.OrdinalIgnoreCase)
-                             || string.IsNullOrWhiteSpace(request.DocuNumb);
-
-                string docuNumb = request.DocuNumb?.Trim() ?? "";
-
-                // ===================================
-                // 1) Generate docuNumb if Add
-                // ===================================
+                // -------- ADD MODE: generate docuNumb via wcpDocNoGen --------
                 if (isAdd)
                 {
                     const string docSql = @"
 DECLARE @docuNumb CHAR(20);
-EXEC dbo.wcpDocNoGen @docuType = @docuType, @docuNumb = @docuNumb OUTPUT;
+EXEC dbo.wcpDocNoGen 
+    @docuType = @docuType, 
+    @areaCode = @areaCode,
+    @docuNumb = @docuNumb OUTPUT;
 SELECT @docuNumb AS docuNumb;";
 
                     var docParams = new Dictionary<string, object?>
                     {
-                        ["@docuType"] = "ACTPRESL"   // change if your docuType is different
+                        ["@docuType"] = "ACTPRESL",
+                        ["@areaCode"] = areaCode
                     };
 
                     var docResult = _db.QaEWebBean(docSql, docParams);
@@ -133,19 +152,12 @@ SELECT @docuNumb AS docuNumb;";
                     if (string.IsNullOrWhiteSpace(docuNumb))
                         return BadRequest(new { success = false, message = "Document number generation failed." });
                 }
-                else
-                {
-                    if (string.IsNullOrWhiteSpace(docuNumb))
-                        return BadRequest(new { success = false, message = "DocuNumb is required for Update." });
-                }
 
-                // ===================================
-                // 2) Insert / Update header
-                // ===================================
+                // -------- INSERT / UPDATE HEADER (catActPreSl) --------
                 if (isAdd)
                 {
-                    const string insertHeaderSql = @"
-INSERT INTO catActPreSl
+                    const string insertSql = @"
+INSERT INTO dbo.catActPreSl
 (
     docuNumb, docuMnth, actvDate, meetDate, actvName,
     caaActTy, caaObjTy, actvCity, district, pinCodeN,
@@ -154,7 +166,7 @@ INSERT INTO catActPreSl
     caaPrjTy, mobileNo, emailAdd, contPers, potnInMT,
     maturtMn, rejcRmrk, statFlag, createId, createDt,
     latitude, longtude, atchNmId,
-    userRole, emplCont, chnlCont, inflCont, totlCont
+    areaCode, userRole, emplCont, chnlCont, inflCont, totlCont
 )
 VALUES
 (
@@ -165,7 +177,7 @@ VALUES
     @caaPrjTy, @mobileNo, @emailAdd, @contPers, @potnInMT,
     @maturtMn, @rejcRmrk, @statFlag, @createId, GETDATE(),
     @latitude, @longtude, @atchNmId,
-    @userRole, @emplCont, @chnlCont, @inflCont, @totlCont
+    @areaCode, @userRole, @emplCont, @chnlCont, @inflCont, @totlCont
 );
 
 SELECT @docuNumb AS docuNumb;";
@@ -179,10 +191,10 @@ SELECT @docuNumb AS docuNumb;";
                         ["@actvName"] = actvName,
                         ["@caaActTy"] = caaActTy,
                         ["@caaObjTy"] = caaObjTy,
-                        ["@actvCity"] = cityName,
+                        ["@actvCity"] = actvCity,
                         ["@district"] = district,
                         ["@pinCodeN"] = pinCodeN,
-                        ["@noOfPart"] = totlCont,
+                        ["@noOfPart"] = noOfPart,
                         ["@noOfEnqu"] = noOfEnqu,
                         ["@noOfVist"] = noOfVist,
                         ["@prodCtLs"] = prodCtLs,
@@ -198,52 +210,48 @@ SELECT @docuNumb AS docuNumb;";
                         ["@rejcRmrk"] = rejcRmrk,
                         ["@statFlag"] = statFlag,
                         ["@createId"] = loginIdn,
-                        ["@latitude"] = latitude,
-                        ["@longtude"] = longtude,
+                        ["@latitude"] = (object?)latitude ?? DBNull.Value,
+                        ["@longtude"] = (object?)longtude ?? DBNull.Value,
                         ["@atchNmId"] = string.IsNullOrEmpty(atchNmId) ? DBNull.Value : atchNmId,
-                        ["@userRole"] = (object?)request.UserRole ?? DBNull.Value,
+                        ["@areaCode"] = areaCode,
+                        ["@userRole"] = (object?)userRole ?? DBNull.Value,
                         ["@emplCont"] = emplCont,
                         ["@chnlCont"] = chnlCont,
                         ["@inflCont"] = inflCont,
                         ["@totlCont"] = totlCont
                     };
 
-                    _db.QaEWebBean(insertHeaderSql, p);
+                    _db.QaEWebBean(insertSql, p);
                 }
                 else
                 {
-                    const string updateHeaderSql = @"
-UPDATE catActPreSl
+                    // UPDATE HEADER
+                    const string updateSql = @"
+UPDATE dbo.catActPreSl
 SET
-    actvDate   = @actvDate,
-    meetDate   = @meetDate,
-    actvName   = @actvName,
-    actvCity   = @actvCity,
-    district   = @district,
-    pinCodeN   = @pinCodeN,
-    noOfPart   = @noOfPart,
-    noOfEnqu   = @noOfEnqu,
-    noOfVist   = @noOfVist,
-    prodCtLs   = @prodCtLs,
-    empPrsLs   = @empPrsLs,
-    actvRmrk   = @actvRmrk,
-    meetVenu   = @meetVenu,
-    mobileNo   = @mobileNo,
-    emailAdd   = @emailAdd,
-    contPers   = @contPers,
-    potnInMT   = @potnInMT,
-    maturtMn   = @maturtMn,
-    rejcRmrk   = @rejcRmrk,
-    latitude   = @latitude,
-    longtude   = @longtude,
-    atchNmId   = @atchNmId,
-    userRole   = @userRole,
-    emplCont   = @emplCont,
-    chnlCont   = @chnlCont,
-    inflCont   = @inflCont,
-    totlCont   = @totlCont,
-    updateId   = @updateId,
-    updateDt   = GETDATE()
+    actvDate = @actvDate,
+    meetDate = @meetDate,
+    actvName = @actvName,
+    actvCity = @actvCity,
+    district = @district,
+    noOfPart = @noOfPart,
+    noOfEnqu = @noOfEnqu,
+    noOfVist = @noOfVist,
+    prodCtLs = @prodCtLs,
+    empPrsLs = @empPrsLs,
+    actvRmrk = @actvRmrk,
+    meetVenu = @meetVenu,
+    latitude = @latitude,
+    longtude = @longtude,
+    atchNmId = @atchNmId,
+    areaCode = @areaCode,
+    userRole = @userRole,
+    emplCont = @emplCont,
+    chnlCont = @chnlCont,
+    inflCont = @inflCont,
+    totlCont = @totlCont,
+    updateId = @updateId,
+    updateDt = GETDATE()
 WHERE docuNumb = @docuNumb;";
 
                     var p = new Dictionary<string, object?>
@@ -252,26 +260,20 @@ WHERE docuNumb = @docuNumb;";
                         ["@actvDate"] = actvDate,
                         ["@meetDate"] = meetDate,
                         ["@actvName"] = actvName,
-                        ["@actvCity"] = cityName,
+                        ["@actvCity"] = actvCity,
                         ["@district"] = district,
-                        ["@pinCodeN"] = pinCodeN,
-                        ["@noOfPart"] = totlCont,
+                        ["@noOfPart"] = noOfPart,
                         ["@noOfEnqu"] = noOfEnqu,
                         ["@noOfVist"] = noOfVist,
                         ["@prodCtLs"] = prodCtLs,
                         ["@empPrsLs"] = empPrsLs,
                         ["@actvRmrk"] = actvRmrk,
                         ["@meetVenu"] = meetVenu,
-                        ["@mobileNo"] = mobileNo,
-                        ["@emailAdd"] = emailAdd,
-                        ["@contPers"] = contPers,
-                        ["@potnInMT"] = potnInMT,
-                        ["@maturtMn"] = maturtMn,
-                        ["@rejcRmrk"] = rejcRmrk,
-                        ["@latitude"] = latitude,
-                        ["@longtude"] = longtude,
+                        ["@latitude"] = (object?)latitude ?? DBNull.Value,
+                        ["@longtude"] = (object?)longtude ?? DBNull.Value,
                         ["@atchNmId"] = string.IsNullOrEmpty(atchNmId) ? DBNull.Value : atchNmId,
-                        ["@userRole"] = (object?)request.UserRole ?? DBNull.Value,
+                        ["@areaCode"] = areaCode,
+                        ["@userRole"] = (object?)userRole ?? DBNull.Value,
                         ["@emplCont"] = emplCont,
                         ["@chnlCont"] = chnlCont,
                         ["@inflCont"] = inflCont,
@@ -279,112 +281,21 @@ WHERE docuNumb = @docuNumb;";
                         ["@updateId"] = loginIdn
                     };
 
-                    _db.QaEWebBean(updateHeaderSql, p);
+                    _db.QaEWebBean(updateSql, p);
 
-                    // Delete old details for this docuNumb
-                    const string deleteDtlSql = @"DELETE FROM catActPreSlDtl WHERE docuNumb = @docuNumb;";
-                    _db.QaEWebBean(deleteDtlSql,
-                        new Dictionary<string, object?> { ["@docuNumb"] = docuNumb });
+                    // Clear old detail rows
+                    const string deleteDtl = @"DELETE FROM dbo.catActPreSlDtl WHERE docuNumb = @docuNumb;";
+                    _db.QaEWebBean(deleteDtl, new Dictionary<string, object?> { ["@docuNumb"] = docuNumb });
                 }
 
-                // ===================================
-                // 3) Insert detail rows (QaEWebBean)
-                // ===================================
-                const string insertDtlSql = @"
-INSERT INTO catActPreSlDtl
-(
-    docuNumb, attnType, attnCode,
-    statFlag, createId, createDt,
-    retlCode, dsrRem06, dsrRem07, dsrRem08, dsrRem09
-)
-VALUES
-(
-    @docuNumb, @attnType, @attnCode,
-    @statFlag, @createId, GETDATE(),
-    @retlCode, @dsrRem06, @dsrRem07, @dsrRem08, @dsrRem09
-);";
-
-                // Employees
-                if (request.Employees != null)
-                {
-                    foreach (var emp in request.Employees)
-                    {
-                        var pEmp = new Dictionary<string, object?>
-                        {
-                            ["@docuNumb"] = docuNumb,
-                            ["@attnType"] = "E", // Employee
-                            ["@attnCode"] = emp.EmployeeCode ?? "",
-                            ["@statFlag"] = "N",
-                            ["@createId"] = loginIdn,
-                            ["@retlCode"] = DBNull.Value,
-                            ["@dsrRem06"] = emp.Name ?? "",
-                            ["@dsrRem07"] = emp.Mobile ?? "",
-                            ["@dsrRem08"] = DBNull.Value,
-                            ["@dsrRem09"] = DBNull.Value
-                        };
-                        _db.QaEWebBean(insertDtlSql, pEmp);
-                    }
-                }
-
-                // Painters / Contractors / Applicators
-                if (request.Painters != null)
-                {
-                    foreach (var p in request.Painters)
-                    {
-                        string attnType = "P"; // Painter default
-                        var t = (p.Type ?? "").Trim().ToUpperInvariant();
-                        if (t.Contains("CONTRACTOR")) attnType = "C";
-                        else if (t.Contains("APPLICATOR")) attnType = "A";
-
-                        var pPain = new Dictionary<string, object?>
-                        {
-                            ["@docuNumb"] = docuNumb,
-                            ["@attnType"] = attnType,
-                            ["@attnCode"] = p.Mobile ?? "",
-                            ["@statFlag"] = "N",
-                            ["@createId"] = loginIdn,
-                            ["@retlCode"] = DBNull.Value,
-                            ["@dsrRem06"] = p.Name ?? "",
-                            ["@dsrRem07"] = p.Type ?? "",
-                            ["@dsrRem08"] = DBNull.Value,
-                            ["@dsrRem09"] = DBNull.Value
-                        };
-                        _db.QaEWebBean(insertDtlSql, pPain);
-                    }
-                }
-
-                // Channel Partners
-                if (request.ChannelPartners != null)
-                {
-                    foreach (var cp in request.ChannelPartners)
-                    {
-                        var pCp = new Dictionary<string, object?>
-                        {
-                            ["@docuNumb"] = docuNumb,
-                            ["@attnType"] = "H", // Code for Channel Partner / Dealer (adjust as per your logic)
-                            ["@attnCode"] = cp.PurchaserCode ?? "",
-                            ["@statFlag"] = "N",
-                            ["@createId"] = loginIdn,
-                            ["@retlCode"] = cp.PurchaserCode ?? "",
-                            ["@dsrRem06"] = cp.Name ?? "",
-                            ["@dsrRem07"] = cp.Mobile ?? "",
-                            ["@dsrRem08"] = cp.Type ?? "",
-                            ["@dsrRem09"] = DBNull.Value
-                        };
-                        _db.QaEWebBean(insertDtlSql, pCp);
-                    }
-                }
+                // -------- INSERT DETAIL ROWS (catActPreSlDtl) --------
+                InsertDetails(docuNumb, loginIdn, request);
 
                 return Ok(new
                 {
                     success = true,
-                    message = isAdd ? "Activity created successfully." : "Activity updated successfully.",
+                    message = isAdd ? "Activity saved successfully." : "Activity updated successfully.",
                     docuNumb,
-                    processType = isAdd ? "Add" : "Update",
-                    totalParticipants = totlCont,
-                    employeesCount = empCount,
-                    paintersCount = painterCount,
-                    channelPartnersCount = chPartnerCount,
                     timestamp = DateTime.Now
                 });
             }
@@ -400,18 +311,157 @@ VALUES
             }
         }
 
-        // ----------------- helpers -----------------
+        // =========================
+        // Detail insert helper
+        // =========================
+        private void InsertDetails(string docuNumb, string loginIdn, ActivityEntryRequest request)
+        {
+            const string insertDtlSql = @"
+INSERT INTO dbo.catActPreSlDtl
+(
+    docuNumb, attnType, attnCode,
+    statFlag, createId, createDt
+)
+VALUES
+(
+    @docuNumb, @attnType, @attnCode,
+    'N', @createId, GETDATE()
+);";
+
+            // Employees -> attnType 'E'
+            if (request.Employees != null)
+            {
+                foreach (var emp in request.Employees)
+                {
+                    var code = string.IsNullOrWhiteSpace(emp.EmployeeCode)
+                        ? Cut(emp.Name, 50)
+                        : Cut(emp.EmployeeCode, 50);
+
+                    if (string.IsNullOrWhiteSpace(code)) continue;
+
+                    var parms = new Dictionary<string, object?>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@attnType"] = "E",
+                        ["@attnCode"] = code,
+                        ["@createId"] = loginIdn
+                    };
+                    _db.QaEWebBean(insertDtlSql, parms);
+                }
+            }
+
+            // Painters / Contractors / Applicators -> attnType 'I'
+            if (request.Painters != null)
+            {
+                foreach (var pnt in request.Painters)
+                {
+                    var code = !string.IsNullOrWhiteSpace(pnt.Mobile)
+                        ? Cut(pnt.Mobile, 50)
+                        : Cut(pnt.Name, 50);
+
+                    if (string.IsNullOrWhiteSpace(code)) continue;
+
+                    var parms = new Dictionary<string, object?>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@attnType"] = "I",
+                        ["@attnCode"] = code,
+                        ["@createId"] = loginIdn
+                    };
+                    _db.QaEWebBean(insertDtlSql, parms);
+                }
+            }
+
+            // Channel Partners -> attnType 'C'
+            if (request.ChannelPartners != null)
+            {
+                foreach (var ch in request.ChannelPartners)
+                {
+                    var code = !string.IsNullOrWhiteSpace(ch.PurchaserCode)
+                        ? Cut(ch.PurchaserCode, 50)
+                        : Cut(ch.Name, 50);
+
+                    if (string.IsNullOrWhiteSpace(code)) continue;
+
+                    var parms = new Dictionary<string, object?>
+                    {
+                        ["@docuNumb"] = docuNumb,
+                        ["@attnType"] = "C",
+                        ["@attnCode"] = code,
+                        ["@createId"] = loginIdn
+                    };
+                    _db.QaEWebBean(insertDtlSql, parms);
+                }
+            }
+        }
+
+        // =========================
+        // Helper functions
+        // =========================
         private static string Cut(string? s, int max)
         {
             if (string.IsNullOrWhiteSpace(s)) return "";
             var t = s.Trim();
-            return t.Length <= max ? t : t[..max];
+            return t.Length <= max ? t : t.Substring(0, max);
+        }
+
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static DateTime? SafeParseDate(string? dateString)
+        {
+            if (string.IsNullOrWhiteSpace(dateString)) return null;
+            var formats = new[]
+            {
+                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
+                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
+            };
+            foreach (var f in formats)
+            {
+                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            if (DateTime.TryParse(dateString, out var any)) return any;
+            return null;
         }
     }
 
-    // =======================
-    //   DTOs (View Models)
-    // =======================
+    // =========================
+    // DTOs (within same file)
+    // =========================
+    public sealed class ActivityEntryRequest
+    {
+        public string? ProcessType { get; set; }      // Add / Update
+        public string? DocuNumb { get; set; }         // For Update
+
+        public string? ActivityName { get; set; }
+        public string? Description { get; set; }
+        public string? ActivityDate { get; set; }
+        public string? MeetingVenue { get; set; }
+        public string? CityName { get; set; }
+        public string? District { get; set; }         // Emirates
+        public string? Product { get; set; }
+
+        public int? NoOfEmployees { get; set; }       // optional (we also compute from list)
+        public int? TotalParticipants { get; set; }
+
+        public string? Latitude { get; set; }
+        public string? Longitude { get; set; }
+
+        public string? LoginIdn { get; set; }
+        public string? UserRole { get; set; }
+
+        public List<ActivityEmployeeDto>? Employees { get; set; }
+        public List<ActivityPainterDto>? Painters { get; set; }
+        public List<ActivityChannelPartnerDto>? ChannelPartners { get; set; }
+
+        public List<string>? ImageIds { get; set; }
+    }
 
     public sealed class ActivityEmployeeDto
     {
@@ -422,54 +472,16 @@ VALUES
 
     public sealed class ActivityPainterDto
     {
-        // "Painter", "Contractor", "Applicator"
-        public string? Type { get; set; }
+        public string? Type { get; set; }     // Painter / Contractor / Applicator
         public string? Name { get; set; }
         public string? Mobile { get; set; }
     }
 
     public sealed class ActivityChannelPartnerDto
     {
-        // e.g. "Authorsied dealer", "Direct Dealer", "Retailer", etc.
-        public string? Type { get; set; }
-        public string? PurchaserCode { get; set; }
+        public string? Type { get; set; }           // Authorised dealer, Retailer, etc.
+        public string? PurchaserCode { get; set; }  // Purchaser Code
         public string? Name { get; set; }
         public string? Mobile { get; set; }
-    }
-
-    public sealed class ActivityEntryRequest
-    {
-        // "Add" / "Update"
-        public string? ProcessType { get; set; }
-
-        // For Update
-        public string? DocuNumb { get; set; }
-
-        // Header fields from Flutter
-        public string? ActivityName { get; set; }        // Painter Meet / Contractor Meet / Applicator Meet
-        public string? Description { get; set; }         // actvRmrk
-        public string? ActivityDate { get; set; }        // yyyy-MM-dd
-        public string? MeetingVenue { get; set; }        // Address
-        public string? CityName { get; set; }
-        public string? District { get; set; }            // Emirates
-        public string? Product { get; set; }             // Wall Care Putty
-
-        public int NoOfEmployees { get; set; }           // optional
-        public int TotalParticipants { get; set; }       // optional, else computed
-
-        public string? Latitude { get; set; }
-        public string? Longitude { get; set; }
-
-        // Audit
-        public string? LoginIdn { get; set; }            // createId/updateId
-        public string? UserRole { get; set; }            // maps to userRole
-
-        // Collections
-        public List<ActivityEmployeeDto> Employees { get; set; } = new();
-        public List<ActivityPainterDto> Painters { get; set; } = new();
-        public List<ActivityChannelPartnerDto> ChannelPartners { get; set; } = new();
-
-        // Optional: Upload IDs / file names for atchNmId
-        public List<string> ImageIds { get; set; } = new();
     }
 }
