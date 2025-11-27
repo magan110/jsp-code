@@ -1,330 +1,1706 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Mvc.ModelBinding;   // for [BindNever]
 using sparshWebService.DataAccess;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;                              // for FirstOrDefault()
-using System.Text.Json.Serialization;
+using System.Linq;
+
+#nullable enable
 
 namespace sparshWebService.Controllers
 {
-    [ApiController]
     [Route("api/[controller]")]
+    [ApiController]
     [Produces("application/json")]
-    public class SamplingExecutionEntryController : ControllerBase
+    public class ContractorController : ControllerBase
     {
         private readonly DatabaseHelper _db;
-        public SamplingExecutionEntryController(DatabaseHelper dbHelper) => _db = dbHelper;
 
-        // ---------------- Envelope ----------------
-        public sealed class ApiResponse<T>
+        public ContractorController(DatabaseHelper dbHelper)
         {
-            [JsonPropertyName("success")] public bool Success { get; set; }
-            [JsonPropertyName("data")] public T Data { get; set; }
-            [JsonPropertyName("error")] public string Error { get; set; }
-            public static ApiResponse<T> Ok(T d) => new() { Success = true, Data = d };
-            public static ApiResponse<T> Fail(string m) => new() { Success = false, Error = m };
+            _db = dbHelper;
         }
 
-        // -------------- DTO (UI fields ONLY) --------------
-        public class SamplingExecDto
+        // ---------------------------------------------------------------------
+        // POST: /api/Contractor/register
+        // ---------------------------------------------------------------------
+        [HttpPost("register")]
+        [Consumes("application/json")]
+        public IActionResult Register([FromBody] ContractorRegistrationRequest? request = null)
         {
-            // Server-generated: do NOT require/bind from client
-            [BindNever]
-            [JsonIgnore]
-            [JsonPropertyName("docuNumb")]
-            public string? DocuNumb { get; set; }
+            try
+            {
+                request ??= new ContractorRegistrationRequest();
 
-            [JsonPropertyName("retailerName")] public string RetailerName { get; set; }
-            [JsonPropertyName("retailerCode")] public string RetailerCode { get; set; }
-            [JsonPropertyName("distributorName")] public string DistributorName { get; set; }
-            [JsonPropertyName("emirates")] public string Emirates { get; set; }
-            [JsonPropertyName("distributionDate")] public DateTime DistributionDate { get; set; }
-            [JsonPropertyName("painterName")] public string PainterName { get; set; }
-            [JsonPropertyName("painterMobile")] public string PainterMobile { get; set; }
-            [JsonPropertyName("qtyDistributedKg")] public double QtyDistributedKg { get; set; }
-            [JsonPropertyName("siteAddress")] public string SiteAddress { get; set; }
-            [JsonPropertyName("sampleDate")] public DateTime? SampleDate { get; set; }
-            [JsonPropertyName("product")] public string Product { get; set; }
-            [JsonPropertyName("photoImage")] public string? PhotoImage { get; set; }
-            [JsonPropertyName("reimbursementMode")] public string ReimbursementMode { get; set; }
-            [JsonPropertyName("reimbursementAmountAED")] public double ReimbursementAmountAED { get; set; }
+                // --- Keys / defaults ---
+                var inflType = (Left(request.ContractorType, 2) ?? "").ToUpperInvariant(); // char(2)
+                var areaCode = (Left(request.Emirates, 3) ?? "").ToUpperInvariant();       // char(3)
 
-            [JsonPropertyName("sampleCancelFlag")]
-            public string SampleCancelFlag { get; set; }
+                // ---- normalize & duplicate-check mobile BEFORE anything else ----
+                var mobile12 = FormatMobile12(request.MobileNumber);
+                if (string.IsNullOrWhiteSpace(mobile12))
+                {
+                    return BadRequest(new
+                    {
+                        success = false,
+                        message = "Mobile number is required.",
+                        field = "mobileNumber",
+                        timestamp = DateTime.Now
+                    });
+                }
+
+                if (IsMobileExists(mobile12))
+                {
+                    return StatusCode(StatusCodes.Status409Conflict, new
+                    {
+                        success = false,
+                        duplicate = true,
+                        message = "Mobile number already registered.",
+                        field = "mobileNumber",
+                        timestamp = DateTime.Now
+                    });
+                }
+                // -----------------------------------------------------------------
+
+                // Generate sequential inflCode (kept 2IKxxxxx logic)
+                string inflCode = GetNextInfluencerCode(inflType);
+
+                // Build names and enforce sizes
+                var fullName = string.Join(" ",
+                    new[] { request.FirstName, request.MiddleName, request.LastName }
+                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
+
+                var inflName256 = Cut(fullName, 256); // inflName nvarchar(256)
+                var contName40 = Cut(fullName, 40);  // contName varchar(40)
+
+                // Address fields (NOT NULL: inflAdd3, district, inflPinC)
+                var inflAdd1_50 = Cut(request.Address, 50);
+                var inflAdd2_100 = "";
+                var inflAdd3_30 = "";
+                var inflCity_255 = "";
+
+                // Bank fields
+                var bankName100 = Cut(request.BankName, 100);
+                var branchName100 = Cut(request.BranchName, 100);
+                var acctHolder40 = Cut(request.AccountHolderName, 40);
+
+                // New 255 columns (contractor block)
+                var contrtyp255 = Cut(request.ContractorType, 255);
+                var frstname255 = Cut(request.FirstName, 255);
+                var middname255 = Cut(request.MiddleName, 255);
+                var lastname255 = Cut(request.LastName, 255);
+                var emirates255 = Cut(request.Emirates, 255);
+
+                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
+                var vatfrmnm255 = Cut(request.FirmName, 255);
+                var vatraddr255 = Cut(request.VatAddress, 255);
+                var vattxreg255 = Cut(request.TaxRegistrationNumber, 255);
+                var vatefdt255 = Cut(request.VatEffectiveDate, 255);
+                var comlcnno255 = Cut(request.LicenseNumber, 255);
+                var comissau255 = Cut(request.IssuingAuthority, 255);
+                var comlctyp255 = Cut(request.LicenseType, 255);
+                var comestdt255 = Cut(request.EstablishmentDate, 255);
+                var comexpdt255 = Cut(request.LicenseExpiryDate, 255);
+                var comtrdnm255 = Cut(request.TradeName, 255);
+                var comrespn255 = Cut(request.ResponsiblePerson, 255);
+                var comraddr255 = Cut(request.LicenseAddress, 255);
+                var comeffdt255 = Cut(request.EffectiveDate, 255);
+
+                // ---- Emirates ID block (SAME columns you used for Painter) ----
+                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
+                var idholder255 = Cut(request.IdName, 255);
+                var nationty255 = Cut(request.Nationality, 255);
+                var employer255 = Cut(request.CompanyDetails, 255);
+                var issudate255 = Cut(request.IssueDate, 255);
+                var expirydt255 = Cut(request.ExpiryDate, 255);
+                var occupatn255 = Cut(request.Occupation, 255);
+                var bankaddr255 = Cut(request.BankAddress, 255);
+
+                // Date of birth (optional)
+                DateTime? birthDat = SafeParseDate(request.DateOfBirth);
+
+                // Build parameter bag: supply EVERYTHING used in INSERT
+                var p = new Dictionary<string, object?>
+                {
+                    ["@inflCode"] = inflCode,
+                    ["@inflType"] = inflType,
+                    ["@inflName"] = inflName256,
+                    ["@contName"] = contName40,
+
+                    ["@inflAdd1"] = inflAdd1_50,
+                    ["@inflAdd2"] = inflAdd2_100,
+                    ["@inflAdd3"] = inflAdd3_30,
+                    ["@inflCity"] = inflCity_255,
+                    ["@district"] = "",
+                    ["@inflPinC"] = "",
+
+                    ["@mobileNo"] = mobile12,          // varchar(12)
+                    ["@emailAdd"] = "",
+                    ["@busSttYr"] = "",
+                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
+                    ["@inflQual"] = "",
+                    ["@expertis"] = "",
+                    ["@wrkrDetl"] = "",
+                    ["@anniDate"] = DBNull.Value,
+                    ["@landLnNo"] = "",
+                    ["@inflLevl"] = "",
+                    ["@isActive"] = "T",
+                    ["@createId"] = "API",
+                    ["@updateId"] = DBNull.Value,
+                    ["@updateDt"] = DBNull.Value,
+                    ["@needMaru"] = "N",
+                    ["@refDocNo"] = DBNull.Value,
+                    ["@areaCode"] = areaCode,
+
+                    ["@itxPanNo"] = "",
+                    ["@locStxNo"] = "",
+
+                    ["@bankAcNo"] = "",
+                    ["@bankBnNm"] = bankName100,
+                    ["@bankBnDs"] = branchName100,
+                    ["@bankBnNo"] = "",
+                    ["@bankIFSC"] = "",
+
+                    ["@kycVerFl"] = "",
+                    ["@kycVerDt"] = DBNull.Value,
+                    ["@idCardTy"] = "",
+                    ["@idCardNo"] = "",
+                    ["@inDocCnt"] = DBNull.Value,
+                    ["@rjcRemrk"] = "",
+                    ["@entrBySg"] = "",
+                    ["@kycVrTyp"] = "",
+                    ["@adhrName"] = "",
+                    ["@panCName"] = "",
+                    ["@sapInsDt"] = DBNull.Value,
+                    ["@sapUpdDt"] = DBNull.Value,
+                    ["@urbRurFl"] = "",
+
+                    ["@bankApNm"] = acctHolder40,
+
+                    ["@infAddP1"] = "",
+                    ["@infAddP2"] = "",
+                    ["@infAddP3"] = "",
+                    ["@infPCity"] = "",
+                    ["@distrctP"] = "",
+                    ["@infPinCP"] = "",
+
+                    ["@adhOtpFl"] = "",
+                    ["@concEmpl"] = "",
+                    ["@bnkKycFl"] = "",
+                    ["@bnkKycDt"] = DBNull.Value,
+                    ["@inflPinL"] = "",
+                    ["@adhCpUId"] = "",
+                    ["@adhCpUDt"] = DBNull.Value,
+                    ["@panCpUId"] = "",
+                    ["@panCpUDt"] = DBNull.Value,
+                    ["@bnkCpUId"] = "",
+                    ["@bnkCpUDt"] = DBNull.Value,
+                    ["@randNmSt"] = "",
+                    ["@kycStats"] = "",
+                    ["@inflTyOl"] = "",
+                    ["@kycAprBy"] = "",
+                    ["@blkStuts"] = "",
+                    ["@blkStDat"] = DBNull.Value,
+                    ["@cntrApFl"] = "",
+                    ["@frstScDt"] = DBNull.Value,
+                    ["@sourceCnt"] = "",
+                    ["@promoteNm"] = "",
+                    ["@pmobilen"] = "",
+                    ["@isTDSEli"] = "",
+                    ["@panAdhLk"] = "",
+                    ["@panVldIn"] = "",
+                    ["@panCatgF"] = "",
+
+                    // contractor “new 255s”
+                    ["@contrtyp"] = contrtyp255,
+                    ["@frstname"] = frstname255,
+                    ["@middname"] = middname255,
+                    ["@lastname"] = lastname255,
+                    ["@emirates"] = emirates255,
+
+                    ["@ibannumb"] = ibannumb255,
+                    ["@vatfrmnm"] = vatfrmnm255,
+                    ["@vatraddr"] = vatraddr255,
+                    ["@vattxreg"] = vattxreg255,
+                    ["@vatefdt"] = vatefdt255,
+                    ["@comlcnno"] = comlcnno255,
+                    ["@comissau"] = comissau255,
+                    ["@comlctyp"] = comlctyp255,
+                    ["@comestdt"] = comestdt255,
+                    ["@comexpdt"] = comexpdt255,
+                    ["@comtrdnm"] = comtrdnm255,
+                    ["@comrespn"] = comrespn255,
+                    ["@comraddr"] = comraddr255,
+                    ["@comeffdt"] = comeffdt255,
+
+                    // Emirates ID block
+                    ["@emiridno"] = emiridno255,
+                    ["@idholder"] = idholder255,
+                    ["@nationty"] = nationty255,
+                    ["@employer"] = employer255,
+                    ["@issudate"] = issudate255,
+                    ["@expirydt"] = expirydt255,
+                    ["@occupatn"] = occupatn255,
+                    ["@bankaddr"] = bankaddr255
+                };
+
+                var sql = @"
+INSERT INTO dbo.ctmInfluncr
+(
+    inflCode, inflType, inflName, contName,
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
+    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
+    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
+    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
+    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
+    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
+    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
+    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
+
+    -- contractor block
+    contrtyp, frstname, middname, lastname, emirates, ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
+
+    -- emirates id block (shared)
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
+)
+VALUES
+(
+    @inflCode, @inflType, @inflName, @contName,
+    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
+    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
+    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
+    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
+    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
+    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
+    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
+    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
+    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
+    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
+
+    @contrtyp, @frstname, @middname, @lastname, @emirates, @ibannumb,
+    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
+    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
+
+    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
+);
+
+SELECT @inflCode AS InflCode;
+";
+
+                var result = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Registration saved",
+                    influencerCode = savedCode,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
         }
 
-        // =================== GET: /top100 ===================
-        [HttpGet("top100")]
-        public ActionResult<ApiResponse<List<SamplingExecDto>>> Top100()
+        // ---------------------------------------------------------------------
+        // GET: /api/Contractor/update?mobileNumber=...
+        // (Fetch existing record by mobile for editing)
+        // ---------------------------------------------------------------------
+        [HttpGet("update")]
+        public IActionResult GetForUpdate([FromQuery] string mobileNumber)
+        {
+            try
+            {
+                var mobile = FormatMobile12(mobileNumber);
+                if (string.IsNullOrWhiteSpace(mobile))
+                    return BadRequest(new { success = false, message = "Valid mobileNumber is required." });
+
+                const string sql = @"
+SELECT TOP 1
+    inflCode, areaCode,
+    -- names / type
+    contrtyp, frstname, middname, lastname,
+    -- contact / address
+    mobileNo, inflAdd1, emirates,
+    -- bank
+    bankApNm, ibannumb, bankBnNm, bankBnDs, bankaddr,
+    -- VAT
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    -- license cluster
+    comlcnno, comissau, comlctyp, comestdt, comexpdt,
+    comtrdnm, comrespn, comraddr, comeffdt,
+    -- emirates id block
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn,
+    -- dob
+    birthDat
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE mobileNo = @mobileNo
+ORDER BY createDt DESC;";
+
+                var rows = _db.QaEWebBean(sql, new Dictionary<string, object?> { ["@mobileNo"] = mobile });
+                var row = rows?.FirstOrDefault();
+                if (row == null)
+                    return NotFound(new { success = false, message = "No contractor found for this mobile number." });
+
+                var resp = new ContractorRegistrationResponse
+                {
+                    InflCode = row["inflCode"]?.ToString(),
+                    AreaCode = row["areaCode"]?.ToString(),
+
+                    ContractorType = row["contrtyp"]?.ToString(),
+                    FirstName = row["frstname"]?.ToString(),
+                    MiddleName = row["middname"]?.ToString(),
+                    LastName = row["lastname"]?.ToString(),
+
+                    MobileNumber = row["mobileNo"]?.ToString(),
+                    Address = row["inflAdd1"]?.ToString(),
+                    Emirates = row["emirates"]?.ToString(),
+                    Area = row["areaCode"]?.ToString(),
+
+                    AccountHolderName = row["bankApNm"]?.ToString(),
+                    IbanNumber = row["ibannumb"]?.ToString(),
+                    BankName = row["bankBnNm"]?.ToString(),
+                    BranchName = row["bankBnDs"]?.ToString(),
+                    BankAddress = row["bankaddr"]?.ToString(),
+
+                    FirmName = row["vatfrmnm"]?.ToString(),
+                    VatAddress = row["vatraddr"]?.ToString(),
+                    TaxRegistrationNumber = row["vattxreg"]?.ToString(),
+                    VatEffectiveDate = row["vatefdt"]?.ToString(),
+
+                    LicenseNumber = row["comlcnno"]?.ToString(),
+                    IssuingAuthority = row["comissau"]?.ToString(),
+                    LicenseType = row["comlctyp"]?.ToString(),
+                    EstablishmentDate = row["comestdt"]?.ToString(),
+                    LicenseExpiryDate = row["comexpdt"]?.ToString(),
+                    TradeName = row["comtrdnm"]?.ToString(),
+                    ResponsiblePerson = row["comrespn"]?.ToString(),
+                    LicenseAddress = row["comraddr"]?.ToString(),
+                    EffectiveDate = row["comeffdt"]?.ToString(),
+
+                    // Emirates ID
+                    EmiratesIdNumber = row["emiridno"]?.ToString(),
+                    IdName = row["idholder"]?.ToString(),
+                    Nationality = row["nationty"]?.ToString(),
+                    CompanyDetails = row["employer"]?.ToString(),
+                    IssueDate = row["issudate"]?.ToString(),
+                    ExpiryDate = row["expirydt"]?.ToString(),
+                    Occupation = row["occupatn"]?.ToString(),
+
+                    // DOB
+                    DateOfBirth = row["birthDat"] is DateTime dt ? dt.ToString("yyyy-MM-dd") : null
+                };
+
+                return Ok(new { success = true, data = resp });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // POST: /api/Contractor/update?mobileNumber=...
+        // (Patch-like: only provided fields overwrite existing)
+        // ---------------------------------------------------------------------
+        [HttpPost("update")]
+        [Consumes("application/json")]
+        public IActionResult PostUpdate([FromQuery] string mobileNumber, [FromBody] ContractorRegistrationRequest body)
+        {
+            try
+            {
+                var mobile = FormatMobile12(mobileNumber);
+                if (string.IsNullOrWhiteSpace(mobile))
+                    return BadRequest(new { success = false, message = "Valid mobileNumber is required." });
+
+                // ensure exists
+                const string checkSql = "SELECT COUNT(*) AS Cnt FROM dbo.ctmInfluncr WHERE mobileNo = @mobileNo;";
+                var exists = Convert.ToInt32(
+                    _db.QaEWebBean(checkSql, new Dictionary<string, object?> { ["@mobileNo"] = mobile })?
+                       .FirstOrDefault()?["Cnt"] ?? 0
+                ) > 0;
+
+                if (!exists)
+                    return NotFound(new { success = false, message = "No contractor found for this mobile number." });
+
+                // normalize incoming (null => keep existing)
+                string? contrtyp = string.IsNullOrWhiteSpace(body.ContractorType) ? null : Cut(body.ContractorType, 255);
+                string? first = string.IsNullOrWhiteSpace(body.FirstName) ? null : Cut(body.FirstName, 255);
+                string? middle = string.IsNullOrWhiteSpace(body.MiddleName) ? null : Cut(body.MiddleName, 255);
+                string? last = string.IsNullOrWhiteSpace(body.LastName) ? null : Cut(body.LastName, 255);
+
+                string? addr = string.IsNullOrWhiteSpace(body.Address) ? null : Cut(body.Address, 50);
+                string? emir = string.IsNullOrWhiteSpace(body.Emirates) ? null : Cut(body.Emirates, 255);
+
+                // bank
+                string? acct = string.IsNullOrWhiteSpace(body.AccountHolderName) ? null : Cut(body.AccountHolderName, 40);
+                string? iban = string.IsNullOrWhiteSpace(body.IbanNumber) ? null : Cut(FormatIban(body.IbanNumber), 255);
+                string? bnk = string.IsNullOrWhiteSpace(body.BankName) ? null : Cut(body.BankName, 100);
+                string? brn = string.IsNullOrWhiteSpace(body.BranchName) ? null : Cut(body.BranchName, 100);
+                string? baddr = string.IsNullOrWhiteSpace(body.BankAddress) ? null : Cut(body.BankAddress, 255);
+
+                // VAT
+                string? firm = string.IsNullOrWhiteSpace(body.FirmName) ? null : Cut(body.FirmName, 255);
+                string? vaddr = string.IsNullOrWhiteSpace(body.VatAddress) ? null : Cut(body.VatAddress, 255);
+                string? vreg = string.IsNullOrWhiteSpace(body.TaxRegistrationNumber) ? null : Cut(body.TaxRegistrationNumber, 255);
+                string? vefdt = string.IsNullOrWhiteSpace(body.VatEffectiveDate) ? null : Cut(body.VatEffectiveDate, 255);
+
+                // license
+                string? licNo = string.IsNullOrWhiteSpace(body.LicenseNumber) ? null : Cut(body.LicenseNumber, 255);
+                string? issAuth = string.IsNullOrWhiteSpace(body.IssuingAuthority) ? null : Cut(body.IssuingAuthority, 255);
+                string? licTyp = string.IsNullOrWhiteSpace(body.LicenseType) ? null : Cut(body.LicenseType, 255);
+                string? estDt = string.IsNullOrWhiteSpace(body.EstablishmentDate) ? null : Cut(body.EstablishmentDate, 255);
+                string? expDt = string.IsNullOrWhiteSpace(body.LicenseExpiryDate) ? null : Cut(body.LicenseExpiryDate, 255);
+                string? trdNm = string.IsNullOrWhiteSpace(body.TradeName) ? null : Cut(body.TradeName, 255);
+                string? respPer = string.IsNullOrWhiteSpace(body.ResponsiblePerson) ? null : Cut(body.ResponsiblePerson, 255);
+                string? licAddr = string.IsNullOrWhiteSpace(body.LicenseAddress) ? null : Cut(body.LicenseAddress, 255);
+                string? effDt = string.IsNullOrWhiteSpace(body.EffectiveDate) ? null : Cut(body.EffectiveDate, 255);
+
+                // emirates id block
+                string? eid = string.IsNullOrWhiteSpace(body.EmiratesIdNumber) ? null : Cut(body.EmiratesIdNumber, 255);
+                string? idnm = string.IsNullOrWhiteSpace(body.IdName) ? null : Cut(body.IdName, 255);
+                string? nat = string.IsNullOrWhiteSpace(body.Nationality) ? null : Cut(body.Nationality, 255);
+                string? comp = string.IsNullOrWhiteSpace(body.CompanyDetails) ? null : Cut(body.CompanyDetails, 255);
+                string? iss = string.IsNullOrWhiteSpace(body.IssueDate) ? null : Cut(body.IssueDate, 255);
+                string? exp = string.IsNullOrWhiteSpace(body.ExpiryDate) ? null : Cut(body.ExpiryDate, 255);
+                string? occ = string.IsNullOrWhiteSpace(body.Occupation) ? null : Cut(body.Occupation, 255);
+
+                // dob
+                DateTime? dob = SafeParseDate(body.DateOfBirth);
+
+                const string upd = @"
+UPDATE dbo.ctmInfluncr
+SET
+    -- names / type
+    contrtyp = COALESCE(@contrtyp, contrtyp),
+    frstname = COALESCE(@frstname, frstname),
+    middname = COALESCE(@middname, middname),
+    lastname = COALESCE(@lastname, lastname),
+
+    -- contact / address
+    inflAdd1 = COALESCE(@inflAdd1, inflAdd1),
+    emirates = COALESCE(@emirates, emirates),
+
+    -- bank
+    bankApNm = COALESCE(@bankApNm, bankApNm),
+    ibannumb = COALESCE(@ibannumb, ibannumb),
+    bankBnNm = COALESCE(@bankBnNm, bankBnNm),
+    bankBnDs = COALESCE(@bankBnDs, bankBnDs),
+    bankaddr = COALESCE(@bankaddr, bankaddr),
+
+    -- VAT
+    vatfrmnm = COALESCE(@vatfrmnm, vatfrmnm),
+    vatraddr = COALESCE(@vatraddr, vatraddr),
+    vattxreg = COALESCE(@vattxreg, vattxreg),
+    vatefdt  = COALESCE(@vatefdt,  vatefdt),
+
+    -- license cluster
+    comlcnno = COALESCE(@comlcnno, comlcnno),
+    comissau = COALESCE(@comissau, comissau),
+    comlctyp = COALESCE(@comlctyp, comlctyp),
+    comestdt = COALESCE(@comestdt, comestdt),
+    comexpdt = COALESCE(@comexpdt, comexpdt),
+    comtrdnm = COALESCE(@comtrdnm, comtrdnm),
+    comrespn = COALESCE(@comrespn, comrespn),
+    comraddr = COALESCE(@comraddr, comraddr),
+    comeffdt = COALESCE(@comeffdt, comeffdt),
+
+    -- emirates id
+    emiridno = COALESCE(@emiridno, emiridno),
+    idholder = COALESCE(@idholder, idholder),
+    nationty = COALESCE(@nationty, nationty),
+    employer = COALESCE(@employer, employer),
+    issudate = COALESCE(@issudate, issudate),
+    expirydt = COALESCE(@expirydt, expirydt),
+    occupatn = COALESCE(@occupatn, occupatn),
+
+    -- dob
+    birthDat = COALESCE(@birthDat, birthDat),
+
+    updateId = 'API',
+    updateDt = GETDATE()
+WHERE mobileNo = @mobileNo;
+
+SELECT TOP 1
+    inflCode, areaCode,
+    contrtyp, frstname, middname, lastname,
+    mobileNo, inflAdd1, emirates,
+    bankApNm, ibannumb, bankBnNm, bankBnDs, bankaddr,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt,
+    comtrdnm, comrespn, comraddr, comeffdt,
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn,
+    birthDat
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE mobileNo = @mobileNo
+ORDER BY updateDt DESC, createDt DESC;";
+
+                var parms = new Dictionary<string, object?>
+                {
+                    ["@mobileNo"] = mobile,
+
+                    ["@contrtyp"] = (object?)contrtyp ?? DBNull.Value,
+                    ["@frstname"] = (object?)first ?? DBNull.Value,
+                    ["@middname"] = (object?)middle ?? DBNull.Value,
+                    ["@lastname"] = (object?)last ?? DBNull.Value,
+
+                    ["@inflAdd1"] = (object?)addr ?? DBNull.Value,
+                    ["@emirates"] = (object?)emir ?? DBNull.Value,
+
+                    ["@bankApNm"] = (object?)acct ?? DBNull.Value,
+                    ["@ibannumb"] = (object?)iban ?? DBNull.Value,
+                    ["@bankBnNm"] = (object?)bnk ?? DBNull.Value,
+                    ["@bankBnDs"] = (object?)brn ?? DBNull.Value,
+                    ["@bankaddr"] = (object?)baddr ?? DBNull.Value,
+
+                    ["@vatfrmnm"] = (object?)firm ?? DBNull.Value,
+                    ["@vatraddr"] = (object?)vaddr ?? DBNull.Value,
+                    ["@vattxreg"] = (object?)vreg ?? DBNull.Value,
+                    ["@vatefdt"] = (object?)vefdt ?? DBNull.Value,
+
+                    ["@comlcnno"] = (object?)licNo ?? DBNull.Value,
+                    ["@comissau"] = (object?)issAuth ?? DBNull.Value,
+                    ["@comlctyp"] = (object?)licTyp ?? DBNull.Value,
+                    ["@comestdt"] = (object?)estDt ?? DBNull.Value,
+                    ["@comexpdt"] = (object?)expDt ?? DBNull.Value,
+                    ["@comtrdnm"] = (object?)trdNm ?? DBNull.Value,
+                    ["@comrespn"] = (object?)respPer ?? DBNull.Value,
+                    ["@comraddr"] = (object?)licAddr ?? DBNull.Value,
+                    ["@comeffdt"] = (object?)effDt ?? DBNull.Value,
+
+                    ["@emiridno"] = (object?)eid ?? DBNull.Value,
+                    ["@idholder"] = (object?)idnm ?? DBNull.Value,
+                    ["@nationty"] = (object?)nat ?? DBNull.Value,
+                    ["@employer"] = (object?)comp ?? DBNull.Value,
+                    ["@issudate"] = (object?)iss ?? DBNull.Value,
+                    ["@expirydt"] = (object?)exp ?? DBNull.Value,
+                    ["@occupatn"] = (object?)occ ?? DBNull.Value,
+
+                    ["@birthDat"] = (object?)dob ?? DBNull.Value
+                };
+
+                var rows = _db.QaEWebBean(upd, parms);
+                var row = rows?.FirstOrDefault();
+
+                var resp = new ContractorRegistrationResponse
+                {
+                    InflCode = row?["inflCode"]?.ToString(),
+                    AreaCode = row?["areaCode"]?.ToString(),
+
+                    ContractorType = row?["contrtyp"]?.ToString(),
+                    FirstName = row?["frstname"]?.ToString(),
+                    MiddleName = row?["middname"]?.ToString(),
+                    LastName = row?["lastname"]?.ToString(),
+
+                    MobileNumber = row?["mobileNo"]?.ToString(),
+                    Address = row?["inflAdd1"]?.ToString(),
+                    Emirates = row?["emirates"]?.ToString(),
+                    Area = row?["areaCode"]?.ToString(),
+
+                    AccountHolderName = row?["bankApNm"]?.ToString(),
+                    IbanNumber = row?["ibannumb"]?.ToString(),
+                    BankName = row?["bankBnNm"]?.ToString(),
+                    BranchName = row?["bankBnDs"]?.ToString(),
+                    BankAddress = row?["bankaddr"]?.ToString(),
+
+                    FirmName = row?["vatfrmnm"]?.ToString(),
+                    VatAddress = row?["vatraddr"]?.ToString(),
+                    TaxRegistrationNumber = row?["vattxreg"]?.ToString(),
+                    VatEffectiveDate = row?["vatefdt"]?.ToString(),
+
+                    LicenseNumber = row?["comlcnno"]?.ToString(),
+                    IssuingAuthority = row?["comissau"]?.ToString(),
+                    LicenseType = row?["comlctyp"]?.ToString(),
+                    EstablishmentDate = row?["comestdt"]?.ToString(),
+                    LicenseExpiryDate = row?["comexpdt"]?.ToString(),
+                    TradeName = row?["comtrdnm"]?.ToString(),
+                    ResponsiblePerson = row?["comrespn"]?.ToString(),
+                    LicenseAddress = row?["comraddr"]?.ToString(),
+                    EffectiveDate = row?["comeffdt"]?.ToString(),
+
+                    EmiratesIdNumber = row?["emiridno"]?.ToString(),
+                    IdName = row?["idholder"]?.ToString(),
+                    Nationality = row?["nationty"]?.ToString(),
+                    CompanyDetails = row?["employer"]?.ToString(),
+                    IssueDate = row?["issudate"]?.ToString(),
+                    ExpiryDate = row?["expirydt"]?.ToString(),
+                    Occupation = row?["occupatn"]?.ToString(),
+
+                    DateOfBirth = row is not null && row["birthDat"] is DateTime dt
+                        ? dt.ToString("yyyy-MM-dd")
+                        : null
+                };
+
+                return Ok(new { success = true, message = "Updated.", data = resp });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // GET: /api/Contractor/check-mobile?mobileNumber=...
+        // ---------------------------------------------------------------------
+        [HttpGet("check-mobile")]
+        public IActionResult CheckDuplicateMobile([FromQuery] string mobileNumber)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(mobileNumber))
+                    return BadRequest(new { success = false, message = "Mobile number is required." });
+
+                var formattedMobile = FormatMobile12(mobileNumber);
+                bool exists = IsMobileExists(formattedMobile);
+
+                return Ok(new
+                {
+                    success = true,
+                    exists,
+                    message = exists ? "Mobile number already registered." : "Mobile number is available.",
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "Error checking mobile number.",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // ================== helpers ==================
+        private string GetNextInfluencerCode(string inflType)
+        {
+            string newCode;
+            int attempts = 0;
+            const int maxAttempts = 100;
+
+            do
+            {
+                int nextNumber = GetNextInfluencerSequence();
+                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK + 5 digits = 8 chars
+                attempts++;
+                if (attempts >= maxAttempts)
+                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
+            }
+            while (IsInfluencerCodeExists(newCode));
+
+            return newCode;
+        }
+
+        private int GetNextInfluencerSequence()
+        {
+            var sql = @"
+                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
+                FROM dbo.ctmInfluncr
+                WHERE inflCode LIKE '2IK%' AND LEN(inflCode) = 8 AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1";
+
+            var result = _db.QaEWebBean(sql, new Dictionary<string, object?>());
+            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
+            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
+        }
+
+        private bool IsInfluencerCodeExists(string influencerCode)
+        {
+            var sql = "SELECT COUNT(*) as Count FROM dbo.ctmInfluncr WHERE inflCode = @inflCode";
+            var parameters = new Dictionary<string, object?> { ["@inflCode"] = influencerCode };
+            var result = _db.QaEWebBean(sql, parameters);
+            var count = result?.FirstOrDefault()?["Count"];
+            return count != null && Convert.ToInt32(count) > 0;
+        }
+
+        // shared duplicate checker
+        private bool IsMobileExists(string mobile12)
+        {
+            const string sql = @"
+                SELECT COUNT(1) AS Cnt
+                FROM dbo.ctmInfluncr WITH (NOLOCK)
+                WHERE mobileNo = @mobileNo;";
+
+            var prms = new Dictionary<string, object?> { ["@mobileNo"] = mobile12 };
+            var res = _db.QaEWebBean(sql, prms);
+            var cnt = res?.FirstOrDefault()?["Cnt"];
+            return cnt != null && Convert.ToInt32(cnt) > 0;
+        }
+
+        private static string? Left(string? s, int n)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // keep last 12 digits if user typed country code
+        private static string FormatMobile12(string? s)
+        {
+            var d = Digits(s);
+            if (d.Length <= 12) return d;
+            return d.Substring(d.Length - 12);
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+
+        private static DateTime? SafeParseDate(string? dateString)
+        {
+            if (string.IsNullOrWhiteSpace(dateString)) return null;
+            var formats = new[] {
+                "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
+                "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
+            };
+            foreach (var f in formats)
+            {
+                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            if (DateTime.TryParse(dateString, out var any)) return any;
+            return null;
+        }
+    }
+
+    // ================== DTOs ==================
+    public sealed class ContractorRegistrationRequest
+    {
+        // Personal
+        public string? ContractorType { get; set; }
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? ProfilePhoto { get; set; }
+
+        // Emirates ID details (added)
+        public string? EmiratesIdNumber { get; set; }
+        public string? IdName { get; set; }           // Name on ID
+        public string? DateOfBirth { get; set; }      // maps to birthDat
+        public string? Nationality { get; set; }
+        public string? CompanyDetails { get; set; }   // Employer
+        public string? IssueDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? Occupation { get; set; }
+
+        // Bank
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+
+        // VAT
+        public string? VatCertificate { get; set; }
+        public string? FirmName { get; set; }
+        public string? VatAddress { get; set; }
+        public string? TaxRegistrationNumber { get; set; }
+        public string? VatEffectiveDate { get; set; }
+
+        // License
+        public string? LicenseDocument { get; set; }
+        public string? LicenseNumber { get; set; }
+        public string? IssuingAuthority { get; set; }
+        public string? LicenseType { get; set; }
+        public string? EstablishmentDate { get; set; }
+        public string? LicenseExpiryDate { get; set; }
+        public string? TradeName { get; set; }
+        public string? ResponsiblePerson { get; set; }
+        public string? LicenseAddress { get; set; }
+        public string? EffectiveDate { get; set; }
+    }
+
+    public sealed class ContractorRegistrationResponse
+    {
+        public string? InflCode { get; set; }
+        public string? ContractorType { get; set; }
+
+        // Personal
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+
+        // Emirates ID details (added)
+        public string? EmiratesIdNumber { get; set; }
+        public string? IdName { get; set; }
+        public string? DateOfBirth { get; set; }
+        public string? Nationality { get; set; }
+        public string? CompanyDetails { get; set; }
+        public string? IssueDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? Occupation { get; set; }
+
+        // Bank
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+
+        // VAT
+        public string? FirmName { get; set; }
+        public string? VatAddress { get; set; }
+        public string? TaxRegistrationNumber { get; set; }
+        public string? VatEffectiveDate { get; set; }
+
+        // License
+        public string? LicenseNumber { get; set; }
+        public string? IssuingAuthority { get; set; }
+        public string? LicenseType { get; set; }
+        public string? EstablishmentDate { get; set; }
+        public string? LicenseExpiryDate { get; set; }
+        public string? TradeName { get; set; }
+        public string? ResponsiblePerson { get; set; }
+        public string? LicenseAddress { get; set; }
+        public string? EffectiveDate { get; set; }
+
+        // Extras
+        public string? AreaCode { get; set; }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Mvc;
+using sparshWebService.DataAccess;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+namespace sparshWebService.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Produces("application/json")]
+    public class PainterController : ControllerBase
+    {
+        private readonly DatabaseHelper _db;
+
+        public PainterController(DatabaseHelper dbHelper)
+        {
+            _db = dbHelper;
+        }
+
+        // =========================
+        // POST: /api/Painter/register
+        // =========================
+        [HttpPost("register")]
+        [Consumes("application/json")]
+        public IActionResult Register([FromBody] PainterRegistrationRequest? request = null)
+        {
+            try
+            {
+                request ??= new PainterRegistrationRequest();
+
+                // ---- Basic validation / defaults ----
+                if (string.IsNullOrWhiteSpace(request.FirstName))
+                    return BadRequest(new { success = false, message = "First name is required." });
+
+                var mobile12 = FormatMobile12(request.MobileNumber);
+                if (string.IsNullOrWhiteSpace(mobile12) || mobile12.Length < 8)
+                    return BadRequest(new { success = false, message = "Valid mobile number is required." });
+
+                // inflType stays PN (painter), but inflCode will be 2IKxxxxx like contractor
+                var inflType = "PN"; // Painter
+                var areaCode = (Left(request.Emirates, 3) ?? "UAE").ToUpperInvariant();
+
+                // === inflCode: SAME LOGIC AS CONTRACTOR (2IK + 5 digits, 8 chars) ===
+                string inflCode = GetNextInfluencerCode();
+
+                // Names
+                var fullName = string.Join(" ",
+                    new[] { request.FirstName, request.MiddleName, request.LastName }
+                    .Where(v => !string.IsNullOrWhiteSpace(v))).Trim();
+
+                var inflName256 = Cut(fullName, 256);  // inflName nvarchar(256)
+                var contName40 = Cut(fullName, 40);   // contName varchar(40)
+
+                // Address cluster (legacy)
+                var inflAdd1_50 = Cut(request.Address, 50);
+                var inflAdd2_100 = "";
+                var inflAdd3_30 = "";                // keep empty (NOT NULL but "" allowed)
+                var inflCity_255 = "";
+
+                // Bank (legacy)
+                var bankName100 = Cut(request.BankName, 100);
+                var branchName100 = Cut(request.BranchName, 100);
+                var acctHolder40 = Cut(request.AccountHolderName, 40);
+
+                // Painter extra (varchar 255 columns we added)
+                var emiridno255 = Cut(request.EmiratesIdNumber, 255);
+                var idholder255 = Cut(request.IdName, 255);
+                var nationty255 = Cut(request.Nationality, 255);
+                var employer255 = Cut(request.CompanyDetails, 255);
+                var issudate255 = Cut(request.IssueDate, 255);
+                var expirydt255 = Cut(request.ExpiryDate, 255);
+                var occupatn255 = Cut(request.Occupation, 255);
+                var bankaddr255 = Cut(request.BankAddress, 255);
+
+                // Existing “new” 255 columns reused when relevant
+                var contrtyp255 = "Painter";                            // painter role label
+                var frstname255 = Cut(request.FirstName, 255);
+                var middname255 = Cut(request.MiddleName, 255);
+                var lastname255 = Cut(request.LastName, 255);
+                var emirates255 = Cut(request.Emirates, 255);
+                var referenc255 = Cut(request.Reference, 255);
+                var ibannumb255 = Cut(FormatIban(request.IbanNumber), 255);
+
+                // DOB -> map to legacy smalldatetime birthDat
+                var birthDat = SafeParseDate(request.DateOfBirth);
+
+                // OPTIONAL: duplicate checks
+                // Mobile
+                {
+                    const string dupMobSql = @"SELECT COUNT(*) AS Cnt FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE mobileNo = @mobileNo";
+                    var dupMob = _db.QaEWebBean(dupMobSql, new Dictionary<string, object?> { ["@mobileNo"] = mobile12 })
+                                    ?.FirstOrDefault()?["Cnt"];
+                    if (Convert.ToInt32(dupMob ?? 0) > 0)
+                        return Conflict(new { success = false, message = "Mobile number already registered." });
+                }
+                // Emirates ID (optional)
+                if (!string.IsNullOrWhiteSpace(emiridno255))
+                {
+                    const string dupIdSql = @"SELECT COUNT(*) AS Cnt FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE emiridno = @emiridno";
+                    var dupId = _db.QaEWebBean(dupIdSql, new Dictionary<string, object?> { ["@emiridno"] = emiridno255 })
+                                   ?.FirstOrDefault()?["Cnt"];
+                    if (Convert.ToInt32(dupId ?? 0) > 0)
+                        return Conflict(new { success = false, message = "Emirates ID already registered." });
+                }
+
+                // Build parameter bag
+                var p = new Dictionary<string, object?>
+                {
+                    // ==== Required legacy (NOT NULL) ====
+                    ["@inflCode"] = inflCode,                // char(8) - 2IK00001...
+                    ["@inflType"] = inflType,                // char(2)
+                    ["@inflName"] = inflName256,             // nvarchar(256)
+                    ["@contName"] = contName40,              // varchar(40)
+
+                    // Address cluster
+                    ["@inflAdd1"] = inflAdd1_50,             // varchar(50)
+                    ["@inflAdd2"] = inflAdd2_100,            // varchar(100)
+                    ["@inflAdd3"] = inflAdd3_30,             // varchar(30) NOT NULL
+                    ["@inflCity"] = inflCity_255,            // varchar(255)
+                    ["@district"] = "",                      // varchar(30)  NOT NULL
+                    ["@inflPinC"] = "",                      // varchar(6)   NOT NULL
+
+                    ["@mobileNo"] = mobile12,                // varchar(12)  NOT NULL
+                    ["@emailAdd"] = "",                      // varchar(40)  NOT NULL
+                    ["@busSttYr"] = "",                      // varchar(4)   NOT NULL
+                    ["@birthDat"] = (object?)birthDat ?? DBNull.Value,
+                    ["@inflQual"] = "",                      // varchar(20)  NOT NULL
+                    ["@expertis"] = "",                      // varchar(100)
+                    ["@wrkrDetl"] = "",                      // varchar(20)  NOT NULL
+                    ["@anniDate"] = DBNull.Value,            // smalldatetime NULL
+                    ["@landLnNo"] = "",                      // varchar(11)  NOT NULL
+                    ["@inflLevl"] = "",                      // char(1)      NOT NULL
+                    ["@isActive"] = "T",                     // char(1)      NOT NULL
+                    ["@createId"] = "API",                   // varchar(10)  NOT NULL
+                    ["@updateId"] = DBNull.Value,
+                    ["@updateDt"] = DBNull.Value,
+                    ["@needMaru"] = "N",                     // varchar(1)   NOT NULL
+                    ["@refDocNo"] = DBNull.Value,            // char(16)     NULL
+                    ["@areaCode"] = areaCode,                // char(3)      NOT NULL
+
+                    // Tax IDs / misc
+                    ["@itxPanNo"] = "",
+                    ["@locStxNo"] = "",
+
+                    // Banking (legacy)
+                    ["@bankAcNo"] = "",
+                    ["@bankBnNm"] = bankName100,
+                    ["@bankBnDs"] = branchName100,
+                    ["@bankBnNo"] = "",
+                    ["@bankIFSC"] = "",
+
+                    // KYC & misc
+                    ["@kycVerFl"] = "",
+                    ["@kycVerDt"] = DBNull.Value,
+                    ["@idCardTy"] = "",
+                    ["@idCardNo"] = "",
+                    ["@inDocCnt"] = DBNull.Value,
+                    ["@rjcRemrk"] = "",
+                    ["@entrBySg"] = "",
+                    ["@kycVrTyp"] = "",
+                    ["@adhrName"] = "",
+                    ["@panCName"] = "",
+                    ["@sapInsDt"] = DBNull.Value,
+                    ["@sapUpdDt"] = DBNull.Value,
+                    ["@urbRurFl"] = "",
+
+                    ["@bankApNm"] = acctHolder40,            // varchar(40)
+
+                    // Permanent/alt address
+                    ["@infAddP1"] = "",
+                    ["@infAddP2"] = "",
+                    ["@infAddP3"] = "",
+                    ["@infPCity"] = "",
+                    ["@distrctP"] = "",
+                    ["@infPinCP"] = "",
+
+                    ["@adhOtpFl"] = "",
+                    ["@concEmpl"] = "",
+                    ["@bnkKycFl"] = "",
+                    ["@bnkKycDt"] = DBNull.Value,
+                    ["@inflPinL"] = "",
+                    ["@adhCpUId"] = "",
+                    ["@adhCpUDt"] = DBNull.Value,
+                    ["@panCpUId"] = "",
+                    ["@panCpUDt"] = DBNull.Value,
+                    ["@bnkCpUId"] = "",
+                    ["@bnkCpUDt"] = DBNull.Value,
+                    ["@randNmSt"] = "",
+                    ["@kycStats"] = "",
+                    ["@inflTyOl"] = "",
+                    ["@kycAprBy"] = "",
+                    ["@blkStuts"] = "",
+                    ["@blkStDat"] = DBNull.Value,
+                    ["@cntrApFl"] = "",
+                    ["@frstScDt"] = DBNull.Value,
+                    ["@sourceCnt"] = "",
+                    ["@promoteNm"] = "",
+                    ["@pmobilen"] = "",
+                    ["@isTDSEli"] = "",
+                    ["@panAdhLk"] = "",
+                    ["@panVldIn"] = "",
+                    ["@panCatgF"] = "",
+
+                    // ==== Existing 255s we reuse ====
+                    ["@contrtyp"] = contrtyp255,
+                    ["@frstname"] = frstname255,
+                    ["@middname"] = middname255,
+                    ["@lastname"] = lastname255,
+                    ["@emirates"] = emirates255,
+                    ["@referenc"] = referenc255,
+                    ["@ibannumb"] = ibannumb255,
+                    ["@vatfrmnm"] = "",
+                    ["@vatraddr"] = "",
+                    ["@vattxreg"] = "",
+                    ["@vatefdt"] = "",
+                    ["@comlcnno"] = "",
+                    ["@comissau"] = "",
+                    ["@comlctyp"] = "",
+                    ["@comestdt"] = "",
+                    ["@comexpdt"] = "",
+                    ["@comtrdnm"] = "",
+                    ["@comrespn"] = "",
+                    ["@comraddr"] = "",
+                    ["@comeffdt"] = "",
+
+                    // ==== Painter-specific 8-char columns (varchar 255) ====
+                    ["@emiridno"] = emiridno255,
+                    ["@idholder"] = idholder255,
+                    ["@nationty"] = nationty255,
+                    ["@employer"] = employer255,
+                    ["@issudate"] = issudate255,
+                    ["@expirydt"] = expirydt255,
+                    ["@occupatn"] = occupatn255,
+                    ["@bankaddr"] = bankaddr255,
+                };
+
+                var sql = @"
+INSERT INTO dbo.ctmInfluncr
+(
+    inflCode, inflType, inflName, contName,
+    inflAdd1, inflAdd2, inflAdd3, inflCity, district, inflPinC,
+    mobileNo, emailAdd, busSttYr, birthDat, inflQual, expertis, wrkrDetl, anniDate, landLnNo,
+    inflLevl, isActive, createId, createDt, updateId, updateDt, needMaru, refDocNo, areaCode,
+    itxPanNo, locStxNo, bankAcNo, bankBnNm, bankBnDs, bankBnNo, bankIFSC,
+    kycVerFl, kycVerDt, idCardTy, idCardNo, inDocCnt, rjcRemrk, entrBySg, kycVrTyp, adhrName,
+    panCName, sapInsDt, sapUpdDt, urbRurFl, bankApNm,
+    infAddP1, infAddP2, infAddP3, infPCity, distrctP, infPinCP,
+    adhOtpFl, concEmpl, bnkKycFl, bnkKycDt, inflPinL,
+    adhCpUId, adhCpUDt, panCpUId, panCpUDt, bnkCpUId, bnkCpUDt,
+    randNmSt, kycStats, inflTyOl, kycAprBy, blkStuts, blkStDat, cntrApFl, frstScDt, sourceCnt,
+    promoteNm, pmobilen, isTDSEli, panAdhLk, panVldIn, panCatgF,
+
+    -- shared 255s
+    contrtyp, frstname, middname, lastname, emirates, referenc, ibannumb,
+    vatfrmnm, vatraddr, vattxreg, vatefdt,
+    comlcnno, comissau, comlctyp, comestdt, comexpdt, comtrdnm, comrespn, comraddr, comeffdt,
+
+    -- painter-specific 8-char name columns (varchar 255)
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn, bankaddr
+)
+VALUES
+(
+    @inflCode, @inflType, @inflName, @contName,
+    @inflAdd1, @inflAdd2, @inflAdd3, @inflCity, @district, @inflPinC,
+    @mobileNo, @emailAdd, @busSttYr, @birthDat, @inflQual, @expertis, @wrkrDetl, @anniDate, @landLnNo,
+    @inflLevl, @isActive, @createId, GETDATE(), @updateId, @updateDt, @needMaru, @refDocNo, @areaCode,
+    @itxPanNo, @locStxNo, @bankAcNo, @bankBnNm, @bankBnDs, @bankBnNo, @bankIFSC,
+    @kycVerFl, @kycVerDt, @idCardTy, @idCardNo, @inDocCnt, @rjcRemrk, @entrBySg, @kycVrTyp, @adhrName,
+    @panCName, @sapInsDt, @sapUpdDt, @urbRurFl, @bankApNm,
+    @infAddP1, @infAddP2, @infAddP3, @infPCity, @distrctP, @infPinCP,
+    @adhOtpFl, @concEmpl, @bnkKycFl, @bnkKycDt, @inflPinL,
+    @adhCpUId, @adhCpUDt, @panCpUId, @panCpUDt, @bnkCpUId, @bnkCpUDt,
+    @randNmSt, @kycStats, @inflTyOl, @kycAprBy, @blkStuts, @blkStDat, @cntrApFl, @frstScDt, @sourceCnt,
+    @promoteNm, @pmobilen, @isTDSEli, @panAdhLk, @panVldIn, @panCatgF,
+
+    @contrtyp, @frstname, @middname, @lastname, @emirates, @referenc, @ibannumb,
+    @vatfrmnm, @vatraddr, @vattxreg, @vatefdt,
+    @comlcnno, @comissau, @comlctyp, @comestdt, @comexpdt, @comtrdnm, @comrespn, @comraddr, @comeffdt,
+
+    @emiridno, @idholder, @nationty, @employer, @issudate, @expirydt, @occupatn, @bankaddr
+);
+
+SELECT @inflCode AS InflCode;";
+
+                var result = _db.QaEWebBean(sql, p) ?? new List<Dictionary<string, object>>();
+                var savedCode = result.FirstOrDefault()?["InflCode"]?.ToString() ?? inflCode;
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Painter registration saved",
+                    influencerCode = savedCode,
+                    timestamp = DateTime.Now
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Registration failed",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
+                });
+            }
+        }
+
+        // =========================
+        // GET: /api/Painter/emirates-list
+        // =========================
+        [HttpGet("emirates-list")]
+        public ActionResult<IEnumerable<PainterAreaItem>> GetEmirates([FromQuery] bool onlyActive = true)
         {
             try
             {
                 const string sql = @"
-SELECT TOP 100
-       a.docuNumb,
-       a.docuDate,
-       a.areaCode,                             -- emirates
-       a.custName,                             -- retailerName
-       ISNULL(d.cusRtlCd,'') AS retailerCode,
-       a.concDist,                             -- distributorName
-       a.sampDate,                             -- distribution/sample date
-       a.contName,                             -- painterName
-       a.mobileNo,                             -- painterMobile
-       ISNULL(d.prodName, a.prodName) AS prodName,
-       d.pouchCnt,                             -- qty distributed
-       ISNULL(d.reimbMod,'') AS reimbMod,
-       ISNULL(d.reimbAmt, 0) AS reimbAmt
-FROM dbo.catsamplead a WITH (NOLOCK)
-LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
-ORDER BY a.docuDate DESC, d.serialNo;";
+SELECT areaCode, areaDesc
+FROM dbo.bkmAreaMast WITH (NOLOCK)
+WHERE (@onlyActive = 0 OR isActive = 'Y')
+ORDER BY areaDesc;";
 
-                var rows = _db.QaEWebBean(sql, new Dictionary<string, object>()) as List<Dictionary<string, object>>;
-                var list = MapRowsToExecDto(rows);
-                return Ok(ApiResponse<List<SamplingExecDto>>.Ok(list));
+                var parameters = new Dictionary<string, object> { { "@onlyActive", onlyActive ? 1 : 0 } };
+                var result = _db.QaEWebBean(sql, parameters);
+
+                var list = new List<PainterAreaItem>();
+                if (result != null)
+                {
+                    foreach (var row in result)
+                    {
+                        list.Add(new PainterAreaItem
+                        {
+                            code = row["areaCode"]?.ToString()?.Trim() ?? "",
+                            desc = row["areaDesc"]?.ToString()?.Trim() ?? ""
+                        });
+                    }
+                }
+
+                return Ok(list);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, ApiResponse<List<SamplingExecDto>>.Fail(ex.Message));
+                return StatusCode(500, new { success = false, message = ex.Message });
             }
         }
 
-        // =================== GET: /search ===================
-        // Query: retailerCode / retailerName / painterNameFilter + optional start/end (yyyy-MM-dd) + top
-        [HttpGet("search")]
-        public ActionResult<ApiResponse<List<SamplingExecDto>>> Search(
-            [FromQuery] string retailerCode = null,
-            [FromQuery] string retailerName = null,
-            [FromQuery] string painterNameFilter = null,
-            [FromQuery] string start = null,
-            [FromQuery] string end = null,
-            [FromQuery] int top = 200)
+        // =========================
+        // GET: /api/Painter/check-mobile?mobileNumber=...
+        // =========================
+        [HttpGet("check-mobile")]
+        public IActionResult CheckDuplicateMobile([FromQuery] string mobileNumber)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(retailerCode) &&
-                    string.IsNullOrWhiteSpace(retailerName) &&
-                    string.IsNullOrWhiteSpace(painterNameFilter) &&
-                    string.IsNullOrWhiteSpace(start) &&
-                    string.IsNullOrWhiteSpace(end))
+                if (string.IsNullOrWhiteSpace(mobileNumber))
+                    return BadRequest(new { success = false, message = "Mobile number is required." });
+
+                var formattedMobile = FormatMobile12(mobileNumber);
+
+                const string sql = @"
+            SELECT COUNT(*) AS Count
+            FROM dbo.ctmInfluncr WITH (NOLOCK)
+            WHERE mobileNo = @mobileNo";
+
+                var parameters = new Dictionary<string, object?>
                 {
-                    return BadRequest(ApiResponse<List<SamplingExecDto>>.Fail(
-                        "Provide at least one filter (retailerCode/retailerName/painterNameFilter/start/end)."));
-                }
-
-                DateTime? startDate = TryParseDate(start);
-                DateTime? endDate = TryParseDate(end);
-
-                var where = new List<string> { "1=1" };
-                var p = new Dictionary<string, object> { ["@top"] = top };
-
-                if (!string.IsNullOrWhiteSpace(retailerCode))
-                {
-                    where.Add("(ISNULL(d.cusRtlCd,'') = @retailerCode OR ISNULL(a.custName,'') LIKE '%' + @retailerCode + '%')");
-                    p["@retailerCode"] = retailerCode.Trim();
-                }
-                if (!string.IsNullOrWhiteSpace(retailerName))
-                {
-                    where.Add("ISNULL(a.custName,'') LIKE '%' + @retailerName + '%'");
-                    p["@retailerName"] = retailerName.Trim();
-                }
-                if (!string.IsNullOrWhiteSpace(painterNameFilter))
-                {
-                    where.Add("ISNULL(a.contName,'') LIKE '%' + @painterName + '%'");
-                    p["@painterName"] = painterNameFilter.Trim();
-                }
-                if (startDate.HasValue) { where.Add("a.sampDate >= @start"); p["@start"] = startDate.Value; }
-                if (endDate.HasValue) { where.Add("a.sampDate < DATEADD(DAY,1,@end)"); p["@end"] = endDate.Value; }
-
-                var sql = $@"
-SELECT TOP (@top)
-       a.docuNumb,
-       a.docuDate,
-       a.areaCode,                             -- emirates
-       a.custName,                             -- retailerName
-       ISNULL(d.cusRtlCd,'') AS retailerCode,
-       a.concDist,                             -- distributorName
-       a.sampDate,                             -- distribution/sample date
-       a.contName,                             -- painterName
-       a.mobileNo,                             -- painterMobile
-       ISNULL(d.prodName, a.prodName) AS prodName,
-       d.pouchCnt,                             -- qty distributed
-       ISNULL(d.reimbMod,'') AS reimbMod,
-       ISNULL(d.reimbAmt, 0) AS reimbAmt
-FROM dbo.catsamplead a WITH (NOLOCK)
-LEFT JOIN dbo.catsampleadDtl d WITH (NOLOCK) ON a.docuNumb = d.docuNumb
-WHERE {string.Join(" AND ", where)}
-ORDER BY a.docuDate DESC, d.serialNo;";
-
-                var rows = _db.QaEWebBean(sql, p) as List<Dictionary<string, object>>;
-                var list = MapRowsToExecDto(rows);
-                return Ok(ApiResponse<List<SamplingExecDto>>.Ok(list));
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, ApiResponse<List<SamplingExecDto>>.Fail(ex.Message));
-            }
-        }
-
-        // =================== POST: /submit ===================
-        // Saves one entry. Header -> catsamplead, Detail -> catsampleadDtl
-        [HttpPost("submit")]
-        public ActionResult<ApiResponse<string>> Create([FromBody] SamplingExecDto dto)
-        {
-            if (dto == null) return BadRequest(ApiResponse<string>.Fail("Request body is missing."));
-            if (string.IsNullOrWhiteSpace(dto.Emirates)) return BadRequest(ApiResponse<string>.Fail("Emirates (areaCode) is required."));
-            if (string.IsNullOrWhiteSpace(dto.RetailerName)) return BadRequest(ApiResponse<string>.Fail("Retailer Name is required."));
-            if (string.IsNullOrWhiteSpace(dto.DistributorName)) return BadRequest(ApiResponse<string>.Fail("Concern Distributor is required."));
-            if (string.IsNullOrWhiteSpace(dto.PainterName)) return BadRequest(ApiResponse<string>.Fail("Painter/Contractor Name is required."));
-            if (dto.DistributionDate == default) return BadRequest(ApiResponse<string>.Fail("Distribution date is required."));
-
-            try
-            {
-                // 1) Get document number from procedure
-                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
-                var genParams = new Dictionary<string, object>
-                {
-                    ["@DocType"] = "SEE",
-                    ["@AreaCode"] = dto.Emirates.Trim()
+                    ["@mobileNo"] = formattedMobile
                 };
 
-                var rows = _db.QaEWebBean(genSql, genParams) as List<Dictionary<string, object>>;
-                if (rows == null || rows.Count == 0)
-                    return StatusCode(500, ApiResponse<string>.Fail("Doc number proc returned no rows."));
+                var result = _db.QaEWebBean(sql, parameters);
+                var count = result?.FirstOrDefault()?["Count"] ?? 0;
+                bool exists = Convert.ToInt32(count) > 0;
 
-                string docuNumb = null;
-                var row = rows[0];
-                // prefer known keys, otherwise first column value
-                if (!row.TryGetValue("docuNumb", out var v) &&
-                    !row.TryGetValue("DocuNumb", out v) &&
-                    !row.TryGetValue("DOCUNUMB", out v) &&
-                    !row.TryGetValue("DocNo", out v) &&
-                    !row.TryGetValue("DocumentNo", out v))
+                return Ok(new
                 {
-                    v = row.Values.FirstOrDefault();
-                }
-                docuNumb = v?.ToString();
-
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                    return StatusCode(500, ApiResponse<string>.Fail("Failed to read document number from proc."));
-
-                // Server owns this field
-                dto.DocuNumb = docuNumb;
-
-                // 2) Insert header
-                const string sqlHeader = @"
-INSERT INTO dbo.catsamplead
-( docuNumb, docuDate, areaCode, custName, contName, mobileNo, concDist, sampDate, prodName )
-VALUES
-( @docuNumb, GETDATE(), @areaCode, @custName, @contName, @mobileNo, @concDist, @sampDate, @prodName );";
-
-                _db.QaEWebBean(sqlHeader, new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = dto.DocuNumb,
-                    ["@areaCode"] = dto.Emirates,
-                    ["@custName"] = (object?)dto.RetailerName ?? DBNull.Value,
-                    ["@contName"] = (object?)dto.PainterName ?? DBNull.Value,
-                    ["@mobileNo"] = (object?)dto.PainterMobile ?? DBNull.Value,
-                    ["@concDist"] = (object?)dto.DistributorName ?? DBNull.Value,
-                    ["@sampDate"] = dto.DistributionDate,
-                    ["@prodName"] = (object?)dto.Product ?? DBNull.Value
+                    success = true,
+                    exists,
+                    message = exists ? "Mobile number already registered." : "Mobile number is available.",
+                    timestamp = DateTime.Now
                 });
-
-                // 3) Insert detail (with new 3 columns)
-                const string sqlDetail = @"
-INSERT INTO dbo.catsampleadDtl
-( docuNumb, sampDate, pouchCnt, sampCnCl, cusRtlCd, prodName, reimbMod, reimbAmt )
-VALUES
-( @docuNumb, @sampDate, @pouchCnt, @sampCnCl, @cusRtlCd, @prodName, @reimbMod, @reimbAmt );";
-
-                _db.QaEWebBean(sqlDetail, new Dictionary<string, object>
-                {
-                    ["@docuNumb"] = dto.DocuNumb,
-                    ["@sampDate"] = dto.DistributionDate,
-                    ["@pouchCnt"] = dto.QtyDistributedKg,
-                    ["@sampCnCl"] = string.IsNullOrEmpty(dto.SampleCancelFlag) ? "S" : dto.SampleCancelFlag,
-                    ["@cusRtlCd"] = (object?)dto.RetailerCode ?? DBNull.Value,
-                    ["@prodName"] = (object?)dto.Product ?? DBNull.Value,
-                    ["@reimbMod"] = (object?)dto.ReimbursementMode ?? DBNull.Value,
-                    ["@reimbAmt"] = dto.ReimbursementAmountAED
-                });
-
-                // 4) Advance the sequence AFTER successful inserts
-                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
-                _db.QaEWebBean(updSql, genParams);
-
-                return Ok(ApiResponse<string>.Ok(dto.DocuNumb));
             }
             catch (Exception ex)
             {
-                return StatusCode(500, ApiResponse<string>.Fail(ex.Message));
-            }
-        }
-
-        // ---------------- Mapping (only UI fields) ----------------
-        private static List<SamplingExecDto> MapRowsToExecDto(List<Dictionary<string, object>> rows)
-        {
-            var list = new List<SamplingExecDto>();
-            if (rows == null) return list;
-
-            foreach (var r in rows)
-            {
-                var sampDate = ToDate(GetObj(r, "sampDate")) ?? DateTime.UtcNow;
-
-                list.Add(new SamplingExecDto
+                return StatusCode(500, new
                 {
-                    // DocuNumb is server-only in API input; safe to expose in GET mapping if needed
-                    DocuNumb = GetStr(r, "docuNumb"),
-                    RetailerName = GetStr(r, "custName"),
-                    RetailerCode = GetStr(r, "retailerCode"),
-                    DistributorName = GetStr(r, "concDist"),
-                    Emirates = GetStr(r, "areaCode"),
-                    DistributionDate = sampDate,
-                    PainterName = GetStr(r, "contName"),
-                    PainterMobile = GetStr(r, "mobileNo"),
-                    QtyDistributedKg = ToDouble(GetObj(r, "pouchCnt")),
-                    SiteAddress = "",                           // placeholder (no column yet)
-                    SampleDate = sampDate,                      // for now
-                    Product = GetStr(r, "prodName"),
-                    PhotoImage = null,                          // placeholder
-                    ReimbursementMode = GetStr(r, "reimbMod"),
-                    ReimbursementAmountAED = ToDouble(GetObj(r, "reimbAmt")),
-                    SampleCancelFlag = ""                       // not retrieved here
+                    success = false,
+                    message = "Error checking mobile number.",
+                    error = ex.Message,
+                    timestamp = DateTime.Now
                 });
             }
-            return list;
         }
 
-        // ---------------- Util helpers ----------------
-        private static object GetObj(Dictionary<string, object> row, string k)
-            => row.TryGetValue(k, out var v) ? v : null;
+        // =========================
+        // GET: /api/Painter/update?mobileNumber=...
+        // (Fetch for edit)
+        // =========================
+        [HttpGet("update")]
+        public IActionResult GetForUpdate([FromQuery] string mobileNumber)
+        {
+            try
+            {
+                var mobile = FormatMobile12(mobileNumber);
+                if (string.IsNullOrWhiteSpace(mobile))
+                    return BadRequest(new { success = false, message = "Valid mobileNumber is required." });
 
-        private static string GetStr(Dictionary<string, object> row, string k)
-            => row.TryGetValue(k, out var v) && v != null && v != DBNull.Value ? v.ToString() : "";
+                const string sql = @"
+SELECT TOP 1
+    inflCode, areaCode,
+    frstname, middname, lastname,
+    mobileNo, inflAdd1,
+    emirates, referenc,
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn,
+    bankApNm, ibannumb, bankBnNm, bankBnDs, bankaddr,
+    birthDat
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE mobileNo = @mobileNo
+ORDER BY createDt DESC;";
 
-        private static DateTime? TryParseDate(string s)
+                var rows = _db.QaEWebBean(sql, new Dictionary<string, object?> { ["@mobileNo"] = mobile });
+                var row = rows?.FirstOrDefault();
+                if (row == null)
+                    return NotFound(new { success = false, message = "No painter found for this mobile number." });
+
+                var resp = new PainterRegistrationResponse
+                {
+                    InflCode = row["inflCode"]?.ToString(),
+                    AreaCode = row["areaCode"]?.ToString(),
+                    FirstName = row["frstname"]?.ToString(),
+                    MiddleName = row["middname"]?.ToString(),
+                    LastName = row["lastname"]?.ToString(),
+                    MobileNumber = row["mobileNo"]?.ToString(),
+                    Address = row["inflAdd1"]?.ToString(),
+                    Emirates = row["emirates"]?.ToString(),
+                    Reference = row["referenc"]?.ToString(),
+                    EmiratesIdNumber = row["emiridno"]?.ToString(),
+                    IdName = row["idholder"]?.ToString(),
+                    Nationality = row["nationty"]?.ToString(),
+                    CompanyDetails = row["employer"]?.ToString(),
+                    IssueDate = row["issudate"]?.ToString(),
+                    ExpiryDate = row["expirydt"]?.ToString(),
+                    Occupation = row["occupatn"]?.ToString(),
+                    AccountHolderName = row["bankApNm"]?.ToString(),
+                    IbanNumber = row["ibannumb"]?.ToString(),
+                    BankName = row["bankBnNm"]?.ToString(),
+                    BranchName = row["bankBnDs"]?.ToString(),
+                    BankAddress = row["bankaddr"]?.ToString(),
+                    DateOfBirth = row["birthDat"] is DateTime dt ? dt.ToString("yyyy-MM-dd") : null,
+                    Area = row["areaCode"]?.ToString()
+                };
+
+                return Ok(new { success = true, data = resp });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // =========================
+        // POST: /api/Painter/update?mobileNumber=...
+        // (Patch-like update: only provided fields overwrite)
+        // =========================
+        [HttpPost("update")]
+        [Consumes("application/json")]
+        public IActionResult PostUpdate([FromQuery] string mobileNumber, [FromBody] PainterRegistrationRequest body)
+        {
+            try
+            {
+                var mobile = FormatMobile12(mobileNumber);
+                if (string.IsNullOrWhiteSpace(mobile))
+                    return BadRequest(new { success = false, message = "Valid mobileNumber is required." });
+
+                // Ensure record exists
+                const string checkSql = "SELECT COUNT(*) AS Cnt FROM dbo.ctmInfluncr WHERE mobileNo = @mobileNo;";
+                var exists = Convert.ToInt32(
+                    _db.QaEWebBean(checkSql, new Dictionary<string, object?> { ["@mobileNo"] = mobile })?
+                        .FirstOrDefault()?["Cnt"] ?? 0
+                ) > 0;
+
+                if (!exists)
+                    return NotFound(new { success = false, message = "No painter found for this mobile number." });
+
+                // Normalize incoming values using helpers
+                string? f = string.IsNullOrWhiteSpace(body.FirstName) ? null : Cut(body.FirstName, 255);
+                string? m = string.IsNullOrWhiteSpace(body.MiddleName) ? null : Cut(body.MiddleName, 255);
+                string? l = string.IsNullOrWhiteSpace(body.LastName) ? null : Cut(body.LastName, 255);
+                string? addr = string.IsNullOrWhiteSpace(body.Address) ? null : Cut(body.Address, 50);
+                string? emir = string.IsNullOrWhiteSpace(body.Emirates) ? null : Cut(body.Emirates, 255);
+                string? refer = string.IsNullOrWhiteSpace(body.Reference) ? null : Cut(body.Reference, 255);
+
+                string? eid = string.IsNullOrWhiteSpace(body.EmiratesIdNumber) ? null : Cut(body.EmiratesIdNumber, 255);
+                string? idnm = string.IsNullOrWhiteSpace(body.IdName) ? null : Cut(body.IdName, 255);
+                string? nat = string.IsNullOrWhiteSpace(body.Nationality) ? null : Cut(body.Nationality, 255);
+                string? comp = string.IsNullOrWhiteSpace(body.CompanyDetails) ? null : Cut(body.CompanyDetails, 255);
+                string? iss = string.IsNullOrWhiteSpace(body.IssueDate) ? null : Cut(body.IssueDate, 255);
+                string? exp = string.IsNullOrWhiteSpace(body.ExpiryDate) ? null : Cut(body.ExpiryDate, 255);
+                string? occ = string.IsNullOrWhiteSpace(body.Occupation) ? null : Cut(body.Occupation, 255);
+
+                string? acct = string.IsNullOrWhiteSpace(body.AccountHolderName) ? null : Cut(body.AccountHolderName, 40);
+                string? iban = string.IsNullOrWhiteSpace(body.IbanNumber) ? null : Cut(FormatIban(body.IbanNumber), 255);
+                string? bnk = string.IsNullOrWhiteSpace(body.BankName) ? null : Cut(body.BankName, 100);
+                string? brn = string.IsNullOrWhiteSpace(body.BranchName) ? null : Cut(body.BranchName, 100);
+                string? baddr = string.IsNullOrWhiteSpace(body.BankAddress) ? null : Cut(body.BankAddress, 255);
+
+                DateTime? dob = SafeParseDate(body.DateOfBirth);
+
+                const string upd = @"
+UPDATE dbo.ctmInfluncr
+SET
+    frstname = COALESCE(@frstname, frstname),
+    middname = COALESCE(@middname, middname),
+    lastname = COALESCE(@lastname, lastname),
+    inflAdd1 = COALESCE(@inflAdd1, inflAdd1),
+    emirates = COALESCE(@emirates, emirates),
+    referenc = COALESCE(@referenc, referenc),
+
+    emiridno = COALESCE(@emiridno, emiridno),
+    idholder = COALESCE(@idholder, idholder),
+    nationty = COALESCE(@nationty, nationty),
+    employer = COALESCE(@employer, employer),
+    issudate = COALESCE(@issudate, issudate),
+    expirydt = COALESCE(@expirydt, expirydt),
+    occupatn = COALESCE(@occupatn, occupatn),
+
+    bankApNm = COALESCE(@bankApNm, bankApNm),
+    ibannumb = COALESCE(@ibannumb, ibannumb),
+    bankBnNm = COALESCE(@bankBnNm, bankBnNm),
+    bankBnDs = COALESCE(@bankBnDs, bankBnDs),
+    bankaddr = COALESCE(@bankaddr, bankaddr),
+
+    birthDat = COALESCE(@birthDat, birthDat),
+    updateId = 'API',
+    updateDt = GETDATE()
+WHERE mobileNo = @mobileNo;
+
+SELECT TOP 1
+    inflCode, areaCode,
+    frstname, middname, lastname, mobileNo, inflAdd1,
+    emirates, referenc,
+    emiridno, idholder, nationty, employer, issudate, expirydt, occupatn,
+    bankApNm, ibannumb, bankBnNm, bankBnDs, bankaddr,
+    birthDat
+FROM dbo.ctmInfluncr WITH (NOLOCK)
+WHERE mobileNo = @mobileNo
+ORDER BY updateDt DESC, createDt DESC;";
+
+                var parms = new Dictionary<string, object?>
+                {
+                    ["@mobileNo"] = mobile,
+
+                    ["@frstname"] = (object?)f ?? DBNull.Value,
+                    ["@middname"] = (object?)m ?? DBNull.Value,
+                    ["@lastname"] = (object?)l ?? DBNull.Value,
+                    ["@inflAdd1"] = (object?)addr ?? DBNull.Value,
+                    ["@emirates"] = (object?)emir ?? DBNull.Value,
+                    ["@referenc"] = (object?)refer ?? DBNull.Value,
+
+                    ["@emiridno"] = (object?)eid ?? DBNull.Value,
+                    ["@idholder"] = (object?)idnm ?? DBNull.Value,
+                    ["@nationty"] = (object?)nat ?? DBNull.Value,
+                    ["@employer"] = (object?)comp ?? DBNull.Value,
+                    ["@issudate"] = (object?)iss ?? DBNull.Value,
+                    ["@expirydt"] = (object?)exp ?? DBNull.Value,
+                    ["@occupatn"] = (object?)occ ?? DBNull.Value,
+
+                    ["@bankApNm"] = (object?)acct ?? DBNull.Value,
+                    ["@ibannumb"] = (object?)iban ?? DBNull.Value,
+                    ["@bankBnNm"] = (object?)bnk ?? DBNull.Value,
+                    ["@bankBnDs"] = (object?)brn ?? DBNull.Value,
+                    ["@bankaddr"] = (object?)baddr ?? DBNull.Value,
+
+                    ["@birthDat"] = (object?)dob ?? DBNull.Value
+                };
+
+                var rows = _db.QaEWebBean(upd, parms);
+                var row = rows?.FirstOrDefault();
+                if (row == null)
+                    return Ok(new { success = true, message = "Updated." });
+
+                var resp = new PainterRegistrationResponse
+                {
+                    InflCode = row["inflCode"]?.ToString(),
+                    AreaCode = row["areaCode"]?.ToString(),
+                    FirstName = row["frstname"]?.ToString(),
+                    MiddleName = row["middname"]?.ToString(),
+                    LastName = row["lastname"]?.ToString(),
+                    MobileNumber = row["mobileNo"]?.ToString(),
+                    Address = row["inflAdd1"]?.ToString(),
+                    Emirates = row["emirates"]?.ToString(),
+                    Reference = row["referenc"]?.ToString(),
+                    EmiratesIdNumber = row["emiridno"]?.ToString(),
+                    IdName = row["idholder"]?.ToString(),
+                    Nationality = row["nationty"]?.ToString(),
+                    CompanyDetails = row["employer"]?.ToString(),
+                    IssueDate = row["issudate"]?.ToString(),
+                    ExpiryDate = row["expirydt"]?.ToString(),
+                    Occupation = row["occupatn"]?.ToString(),
+                    AccountHolderName = row["bankApNm"]?.ToString(),
+                    IbanNumber = row["ibannumb"]?.ToString(),
+                    BankName = row["bankBnNm"]?.ToString(),
+                    BranchName = row["bankBnDs"]?.ToString(),
+                    BankAddress = row["bankaddr"]?.ToString(),
+                    DateOfBirth = row["birthDat"] is DateTime dt ? dt.ToString("yyyy-MM-dd") : null
+                };
+
+                return Ok(new { success = true, message = "Updated.", data = resp });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, message = ex.Message });
+            }
+        }
+
+        // ----------------- inflCode helpers (2IKxxxxx, SAME AS CONTRACTOR) -----------------
+        private string GetNextInfluencerCode()
+        {
+            string newCode;
+            int attempts = 0;
+            const int maxAttempts = 100;
+
+            do
+            {
+                int nextNumber = GetNextInfluencerSequence();
+                newCode = "2IK" + nextNumber.ToString().PadLeft(5, '0'); // 2IK00001, 2IK00002...
+                attempts++;
+                if (attempts >= maxAttempts)
+                    throw new InvalidOperationException("Unable to generate unique influencer code after maximum attempts");
+            }
+            while (IsInfluencerCodeExists(newCode));
+
+            return newCode;
+        }
+
+        private int GetNextInfluencerSequence()
+        {
+            const string sql = @"
+                SELECT ISNULL(MAX(CAST(SUBSTRING(inflCode, 4, 5) AS INT)), 0) + 1 AS NextSequence
+                FROM dbo.ctmInfluncr WITH (NOLOCK)
+                WHERE inflCode LIKE '2IK%'
+                  AND LEN(inflCode) = 8
+                  AND ISNUMERIC(SUBSTRING(inflCode, 4, 5)) = 1;";
+
+            var result = _db.QaEWebBean(sql, new Dictionary<string, object?>());
+            var nextSeq = result?.FirstOrDefault()?["NextSequence"];
+            return nextSeq != null ? Convert.ToInt32(nextSeq) : 1;
+        }
+
+        private bool IsInfluencerCodeExists(string influencerCode)
+        {
+            const string sql = "SELECT COUNT(*) AS Count FROM dbo.ctmInfluncr WITH (NOLOCK) WHERE inflCode = @inflCode";
+            var result = _db.QaEWebBean(sql, new Dictionary<string, object?> { ["@inflCode"] = influencerCode });
+            return Convert.ToInt32(result?.FirstOrDefault()?["Count"] ?? 0) > 0;
+        }
+
+        // ----------------- other helpers -----------------
+        private static string? Left(string? s, int n)
         {
             if (string.IsNullOrWhiteSpace(s)) return null;
-            if (DateTime.TryParseExact(s.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)) return dt;
-            if (DateTime.TryParse(s, out var any)) return any;
+            var t = s.Trim();
+            return t.Length <= n ? t : t.Substring(0, n);
+        }
+
+        private static string Cut(string? s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var t = s.Trim();
+            return t.Length <= max ? t : t[..max];
+        }
+
+        private static string Digits(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return new string(s.Where(char.IsDigit).ToArray());
+        }
+
+        // keep last 12 digits if user typed country code
+        private static string FormatMobile12(string? s)
+        {
+            var d = Digits(s);
+            if (d.Length <= 12) return d;
+            return d.Substring(d.Length - 12);
+        }
+
+        private static string? FormatIban(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return s;
+            return s.Replace(" ", "").ToUpperInvariant();
+        }
+
+        private static DateTime? SafeParseDate(string? dateString)
+        {
+            if (string.IsNullOrWhiteSpace(dateString)) return null;
+            var formats = new[] {
+                    "yyyy-MM-dd","MM/dd/yyyy","dd/MM/yyyy","yyyy/MM/dd",
+                    "MM-dd-yyyy","dd-MM-yyyy","yyyyMMdd","ddMMyyyy"
+                };
+            foreach (var f in formats)
+            {
+                if (DateTime.TryParseExact(dateString, f, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            if (DateTime.TryParse(dateString, out var any)) return any;
             return null;
         }
+    }
 
-        private static DateTime? ToDate(object o)
-        {
-            if (o == null || o == DBNull.Value) return (DateTime?)null;
-            if (o is DateTime dt) return dt;
-            return DateTime.TryParse(o.ToString(), out var d) ? d : (DateTime?)null;
-        }
+    // -------- view models --------
+    public class PainterRegistrationRequest
+    {
+        // Personal
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? Reference { get; set; }
 
-        private static double ToDouble(object o)
-        {
-            if (o == null || o == DBNull.Value) return 0d;
-            if (o is double d) return d;
-            if (o is decimal m) return (double)m;
-            if (o is float f) return f;
-            return double.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var v) ? v : 0d;
-        }
+        // Emirates ID Details
+        public string? EmiratesIdNumber { get; set; }
+        public string? IdName { get; set; }          // Name on ID
+        public string? DateOfBirth { get; set; }     // maps to birthDat
+        public string? Nationality { get; set; }
+        public string? CompanyDetails { get; set; }  // Employer
+        public string? IssueDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? Occupation { get; set; }
+
+        // Bank Details (optional)
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+    }
+
+    public sealed class PainterRegistrationResponse
+    {
+        public string? InflCode { get; set; }
+        public string? FirstName { get; set; }
+        public string? MiddleName { get; set; }
+        public string? LastName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? Address { get; set; }
+        public string? Area { get; set; }
+        public string? Emirates { get; set; }
+        public string? Reference { get; set; }
+
+        public string? EmiratesIdNumber { get; set; }
+        public string? IdName { get; set; }
+        public string? DateOfBirth { get; set; }
+        public string? Nationality { get; set; }
+        public string? CompanyDetails { get; set; }
+        public string? IssueDate { get; set; }
+        public string? ExpiryDate { get; set; }
+        public string? Occupation { get; set; }
+
+        public string? AccountHolderName { get; set; }
+        public string? IbanNumber { get; set; }
+        public string? BankName { get; set; }
+        public string? BranchName { get; set; }
+        public string? BankAddress { get; set; }
+
+        public string? AreaCode { get; set; }
+    }
+
+    public class PainterAreaItem
+    {
+        public string code { get; set; } = "";
+        public string desc { get; set; } = "";
     }
 }
