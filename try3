@@ -1,467 +1,212 @@
-using Microsoft.AspNetCore.Mvc;
-using sparshWebService.DataAccess;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
+# main.py
 
-namespace sparshWebService.Controllers
-{
-    [ApiController]
-    [Route("api/[controller]")]
-    public class ActivityController : ControllerBase
-    {
-        private readonly DatabaseHelper _db;
+"""
+AI CHATBOT + SQL SERVER SCHEMA READER (AUTO-DETECT LOCALDB)
 
-        public ActivityController(DatabaseHelper dbHelper)
-        {
-            _db = dbHelper;
-        }
+Before running:
+    python -m pip install transformers accelerate sentencepiece pyodbc pandas
+"""
 
-        // -----------------------------------------
-        // POST: /api/Activity/submit
-        // -----------------------------------------
-        [HttpPost("submit")]
-        public IActionResult Submit([FromBody] ActivityEntryRequest req)
-        {
-            try
-            {
-                if (req == null)
-                    return BadRequest(new { success = false, message = "Empty request." });
+import subprocess
+import pyodbc
+import pandas as pd
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
-                // ===== Basic validations from Flutter fields =====
-                if (string.IsNullOrWhiteSpace(req.areaCode))
-                    return BadRequest(new { success = false, message = "areaCode (Emirate code) is required." });
 
-                if (string.IsNullOrWhiteSpace(req.activityName))
-                    return BadRequest(new { success = false, message = "Activity is required." });
+# -------------------------------------------------------------------
+# 1. Load AI model
+# -------------------------------------------------------------------
 
-                if (string.IsNullOrWhiteSpace(req.activityDate))
-                    return BadRequest(new { success = false, message = "Activity date is required." });
+print("Loading AI model…")
 
-                if (!TryParseDate(req.activityDate, out var actvDate))
-                    return BadRequest(new { success = false, message = "Invalid activity date." });
-
-                // ===== loginId (createId) from header or body =====
-                var loginId = Request.Headers.ContainsKey("LoginID")
-                    ? (Request.Headers["LoginID"].ToString() ?? "SYSTEM")
-                    : (string.IsNullOrWhiteSpace(req.loginId) ? "SYSTEM" : req.loginId);
-
-                loginId ??= "SYSTEM";
-                loginId = loginId.Trim();
-                if (loginId.Length > 10) loginId = loginId.Substring(0, 10);   // catActPreSl.createId = varchar(10)
-
-                // ===== areaCode (max 3 chars) =====
-                var areaCode = (req.areaCode ?? "").Trim();
-                if (areaCode.Length > 3) areaCode = areaCode.Substring(0, 3);
-
-                // ===================================================
-                // 1) Generate document number using wcpDocNoGen (AEF)
-                // ===================================================
-                const string docType = "AEF";
-                const string genSql = "EXEC dbo.wcpDocNoGen @DocType, @AreaCode";
-
-                var genParams = new Dictionary<string, object>
-                {
-                    ["@DocType"] = docType,
-                    ["@AreaCode"] = areaCode
-                };
-
-                var genRows = _db.QaEWebBean(genSql, genParams) as List<Dictionary<string, object>>;
-                string docuNumb = null;
-
-                if (genRows != null && genRows.Count > 0)
-                {
-                    var row = genRows.First();
-                    var candidates = new[] { "docuNumb", "DocuNumb", "DOCUNUMB", "DocNo", "DocumentNo" };
-                    foreach (var key in candidates)
-                    {
-                        if (row.TryGetValue(key, out var val) && val != null)
-                        {
-                            docuNumb = val.ToString();
-                            break;
-                        }
-                    }
-
-                    // Fallback – first column
-                    if (string.IsNullOrWhiteSpace(docuNumb) && row.Count > 0)
-                        docuNumb = row.First().Value?.ToString();
-                }
-
-                if (string.IsNullOrWhiteSpace(docuNumb))
-                {
-                    return StatusCode(500, new ActivitySubmitResponse
-                    {
-                        success = false,
-                        message = "Could not generate document number.",
-                        docuNumb = null
-                    });
-                }
-
-                docuNumb = docuNumb.Trim();
-                if (docuNumb.Length > 16) docuNumb = docuNumb.Substring(0, 16); // char(16)
-
-                // ===================================================
-                // 2) Immediately advance sequence via wcpDocNoUpd
-                //     (Same as SampleDistributionController)
-                // ===================================================
-                const string updSql = "EXEC dbo.wcpDocNoUpd @DocType, @AreaCode";
-                _db.QaEWebBean(updSql, genParams);
-
-                // ===================================================
-                // 3) Insert HEADER into catActPreSl
-                // ===================================================
-
-                // docuMnth & maturtMn -> yyyymm (char(6))
-                var docuMnth = actvDate.ToString("yyyyMM");
-                var maturtMn = docuMnth;
-
-                // meetDate – we only have Activity Date in Flutter, so use same
-                var meetDate = actvDate;
-
-                // Meeting Venue, City, Description, Product, GPS from Flutter
-                var actvName = Cut(req.activityName, 100);       // varchar(100)
-                var actvRmrk = Cut(req.description, 200);        // varchar(200)
-                var meetVenu = Cut(req.meetingVenue, 50);        // varchar(50)
-                var actvCity = Cut(req.cityName, 40);            // varchar(40)
-                var prodCtLs = Cut(req.product, 50);             // varchar(50)
-
-                // Employees present list -> empPrsLs (employee codes)
-                string empPrsLs = "";
-                if (req.employees != null && req.employees.Count > 0)
-                {
-                    empPrsLs = string.Join(",",
-                        req.employees
-                           .Select(e => (e.employeeCode ?? "").Trim())
-                           .Where(s => !string.IsNullOrWhiteSpace(s)));
-                    empPrsLs = Cut(empPrsLs, 100); // varchar(100)
-                }
-
-                // numbers
-                short noOfPart = SafeToShort(req.totalParticipants);
-                short noOfEnqu = SafeToShort(req.noOfEnquiries);
-                short noOfVist = SafeToShort(req.noOfVisits);
-                short potnInMT = SafeToShort(req.potentialInMT);
-
-                // simple static mappings for codes
-                // caaActTy & caaObjTy & caaPrjTy: 2-char codes
-                string caaActTy = "01";  // default
-                string caaObjTy = "01";  // default
-                string caaPrjTy = "01";  // default
-
-                // Map activityName to caaActTy if you want
-                if (!string.IsNullOrWhiteSpace(req.activityName))
-                {
-                    var a = req.activityName.Trim().ToUpperInvariant();
-                    if (a.Contains("PAINTER")) caaActTy = "PM";
-                    else if (a.Contains("CONTRACTOR")) caaActTy = "CM";
-                    else if (a.Contains("APPLICATOR")) caaActTy = "AM";
-                }
-
-                // district, pincode, etc. – not present in Flutter, so ""
-                var district = Cut(req.district ?? "", 30);      // varchar(30) NOT NULL
-                var pinCodeN = Cut(req.pinCode ?? "", 6);        // varchar(6) NOT NULL
-
-                var rejcRmrk = "";                               // NOT NULL, keep blank
-                var mobileNo = "";                               // NOT NULL
-                var emailAdd = "";                               // NOT NULL
-                var contPers = "";                               // NOT NULL
-
-                // GPS – both old(latitute/lgtitute) and new(latitude/longtude)
-                var lat = Cut(req.latitude ?? "", 50);
-                var lng = Cut(req.longitude ?? "", 50);
-
-                var insertHeaderSql = @"
-INSERT INTO dbo.catActPreSl
-(
-  docuNumb, docuMnth, actvDate, meetDate, actvName, caaActTy, caaObjTy,
-  actvCity, district, pinCodeN, noOfPart, noOfEnqu, noOfVist,
-  prodCtLs, empPrsLs, actvRmrk, meetVenu, caaPrjTy,
-  mobileNo, emailAdd, contPers, potnInMT, maturtMn, rejcRmrk,
-  statFlag, createId, createDt,
-  areaCode, latitude, longtude, latitute, lgtitute
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, dtype=torch.float32
 )
-VALUES
-(
-  @docuNumb, @docuMnth, @actvDate, @meetDate, @actvName, @caaActTy, @caaObjTy,
-  @actvCity, @district, @pinCodeN, @noOfPart, @noOfEnqu, @noOfVist,
-  @prodCtLs, @empPrsLs, @actvRmrk, @meetVenu, @caaPrjTy,
-  @mobileNo, @emailAdd, @contPers, @potnInMT, @maturtMn, @rejcRmrk,
-  'N', @createId, GETDATE(),
-  @areaCode, @latitude, @longtude, @latitute, @lgtitute
-);";
 
-                var headerParams = new Dictionary<string, object?>
-                {
-                    ["@docuNumb"]  = docuNumb,
-                    ["@docuMnth"]  = docuMnth,
-                    ["@actvDate"]  = actvDate,
-                    ["@meetDate"]  = meetDate,
-                    ["@actvName"]  = actvName,
-                    ["@caaActTy"]  = caaActTy,
-                    ["@caaObjTy"]  = caaObjTy,
+conversation_history = []
 
-                    ["@actvCity"]  = actvCity,
-                    ["@district"]  = district,
-                    ["@pinCodeN"]  = pinCodeN,
-                    ["@noOfPart"]  = noOfPart,
-                    ["@noOfEnqu"]  = noOfEnqu,
-                    ["@noOfVist"]  = noOfVist,
 
-                    ["@prodCtLs"]  = prodCtLs,
-                    ["@empPrsLs"]  = empPrsLs,
-                    ["@actvRmrk"]  = actvRmrk,
-                    ["@meetVenu"]  = meetVenu,
-                    ["@caaPrjTy"]  = caaPrjTy,
+# -------------------------------------------------------------------
+# 2. Auto-detect the correct LocalDB instance name
+# -------------------------------------------------------------------
 
-                    ["@mobileNo"]  = mobileNo,
-                    ["@emailAdd"]  = emailAdd,
-                    ["@contPers"]  = contPers,
-                    ["@potnInMT"]  = potnInMT,
-                    ["@maturtMn"]  = maturtMn,
-                    ["@rejcRmrk"]  = rejcRmrk,
+def detect_localdb_instance():
+    try:
+        result = subprocess.check_output(["sqllocaldb", "info"], text=True)
+        instances = [line.strip() for line in result.split("\n") if line.strip()]
+        print("LocalDB instances detected:", instances)
 
-                    ["@createId"]  = loginId,
+        # Prefer MSSQLLocalDB if exists
+        for inst in instances:
+            if inst.upper() == "MSSQLLOCALDB":
+                return "(localdb)\\MSSQLLocalDB"
 
-                    ["@areaCode"]  = areaCode,
-                    ["@latitude"]  = lat,
-                    ["@longtude"]  = lng,
-                    ["@latitute"]  = lat,   // old columns
-                    ["@lgtitute"]  = lng
-                };
+        # Otherwise return the first instance
+        if len(instances) > 0:
+            return f"(localdb)\\{instances[0]}"
 
-                _db.QaEWebBean(insertHeaderSql, headerParams);
+    except:
+        pass
 
-                // ===================================================
-                // 4) Insert DETAIL rows into catActPreSlDtl
-                //     - Painters/Contractors/Applicators
-                //     - Channel Partners
-                // ===================================================
+    # Fallback for full SQL Server installation
+    return "localhost"
 
-                var insertDetailSql = @"
-INSERT INTO dbo.catActPreSlDtl
-(
-  docuNumb, attnType, attnCode,
-  statFlag, createId, createDt,
-  retlCode, tlKitFlg, nwPntFlg,
-  atchNmId, dsrRem09, dsrRem08, dsrRem07,
-  oldKycFl, sampFlag, appDownd, giftType, dsrRem06
-)
-VALUES
-(
-  @docuNumb, @attnType, @attnCode,
-  'N', @createId, GETDATE(),
-  @retlCode, @tlKitFlg, @nwPntFlg,
-  @atchNmId, @dsrRem09, @dsrRem08, @dsrRem07,
-  @oldKycFl, @sampFlag, @appDownd, @giftType, @dsrRem06
-);";
 
-                // ---- Painter / Contractor / Applicator list ----
-                if (req.painters != null)
-                {
-                    foreach (var p in req.painters)
-                    {
-                        var typeText = (p.type ?? "").Trim();
-                        string attnType = "P"; // default Painter
+SERVER_NAME = detect_localdb_instance()
+print("Using SQL Server instance:", SERVER_NAME)
 
-                        if (typeText.ToUpperInvariant().Contains("CONTRACTOR")) attnType = "C";
-                        else if (typeText.ToUpperInvariant().Contains("APPLICATOR")) attnType = "A";
 
-                        var attnCode = Digits(p.mobile).PadLeft(10, '0');
-                        if (attnCode.Length > 10) attnCode = attnCode.Substring(attnCode.Length - 10);
+# -------------------------------------------------------------------
+# 3. Build working connection string
+# -------------------------------------------------------------------
 
-                        var parms = new Dictionary<string, object?>
-                        {
-                            ["@docuNumb"] = docuNumb,
-                            ["@attnType"] = attnType,                          // char(1)
-                            ["@attnCode"] = attnCode,                          // varchar(10)
-                            ["@createId"] = loginId,
+CONNECTION_STRING = fr"""
+Driver={{ODBC Driver 17 for SQL Server}};
+Server={SERVER_NAME};
+Database=customers;
+Trusted_Connection=Yes;
+"""
 
-                            ["@retlCode"] = "",                                // varchar(8)
-                            ["@tlKitFlg"] = "",                                // varchar(1)
-                            ["@nwPntFlg"] = "",                                // varchar(1)
-                            ["@atchNmId"] = (object)DBNull.Value,              // varchar(500)
-                            ["@dsrRem09"] = Cut(p.name, 500),                  // varchar(500)
-                            ["@dsrRem08"] = Cut(typeText, 100),                // varchar(100)
-                            ["@dsrRem07"] = "",                                // varchar(100)
-                            ["@oldKycFl"] = "",                                // char(1)
-                            ["@sampFlag"] = "AEF",                             // varchar(3) – mark as Activity Entry Form
-                            ["@appDownd"] = "",                               // varchar(1)
-                            ["@giftType"] = "",                               // varchar(5)
-                            ["@dsrRem06"] = ""                                // varchar(10)
-                        };
+print("Connection string:", CONNECTION_STRING)
 
-                        _db.QaEWebBean(insertDetailSql, parms);
-                    }
-                }
 
-                // ---- Channel Partner list ----
-                if (req.channelPartners != null)
-                {
-                    foreach (var c in req.channelPartners)
-                    {
-                        var typeText = (c.type ?? "").Trim();
-                        string attnType = "C"; // Channel
+# -------------------------------------------------------------------
+# 4. Read SQL Server Schema
+# -------------------------------------------------------------------
 
-                        var attnCode = Digits(c.mobile).PadLeft(10, '0');
-                        if (attnCode.Length > 10) attnCode = attnCode.Substring(attnCode.Length - 10);
+def load_database_schema():
+    print("Connecting to database and reading schema…")
 
-                        var retlCode = Cut(c.purchaserCode ?? "", 8);
+    try:
+        conn = pyodbc.connect(CONNECTION_STRING)
+    except Exception as e:
+        print("\n❌ CONNECTION FAILED ❌")
+        print("Error:", e)
+        print("\nTry installing the ODBC driver:")
+        print("https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver")
+        exit()
 
-                        var parms = new Dictionary<string, object?>
-                        {
-                            ["@docuNumb"] = docuNumb,
-                            ["@attnType"] = attnType,
-                            ["@attnCode"] = attnCode,
-                            ["@createId"] = loginId,
+    cursor = conn.cursor()
+    schema = {}
 
-                            ["@retlCode"] = retlCode,
-                            ["@tlKitFlg"] = "",
-                            ["@nwPntFlg"] = "",
-                            ["@atchNmId"] = (object)DBNull.Value,
-                            ["@dsrRem09"] = Cut(c.name, 500),
-                            ["@dsrRem08"] = Cut(typeText, 100),
-                            ["@dsrRem07"] = "",
-                            ["@oldKycFl"] = "",
-                            ["@sampFlag"] = "AEF",
-                            ["@appDownd"] = "",
-                            ["@giftType"] = "",
-                            ["@dsrRem06"] = ""
-                        };
+    tables = cursor.tables(tableType="TABLE")
 
-                        _db.QaEWebBean(insertDetailSql, parms);
-                    }
-                }
+    for table in tables:
+        table_name = table.table_name
+        schema[table_name] = {"columns": [], "primary_keys": [], "foreign_keys": []}
 
-                // ===== Done =====
-                return Ok(new ActivitySubmitResponse
-                {
-                    success = true,
-                    message = "Activity saved successfully.",
-                    docuNumb = docuNumb
-                });
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new ActivitySubmitResponse
-                {
-                    success = false,
-                    message = "Error while saving activity.",
-                    error = ex.Message,
-                    docuNumb = null
-                });
-            }
-        }
+        # Columns
+        for col in cursor.columns(table=table_name):
+            schema[table_name]["columns"].append({
+                "name": col.column_name,
+                "type": col.type_name,
+                "size": col.column_size
+            })
 
-        // ================= Helper methods =================
+        # PK
+        for pk in cursor.primaryKeys(table=table_name):
+            schema[table_name]["primary_keys"].append(pk.column_name)
 
-        private static bool TryParseDate(string? s, out DateTime dt)
-        {
-            dt = DateTime.MinValue;
-            if (string.IsNullOrWhiteSpace(s)) return false;
+        # FK
+        for fk in cursor.foreignKeys(table=table_name):
+            schema[table_name]["foreign_keys"].append({
+                "fk_column": fk.fkcolumn_name,
+                "pk_table": fk.pktable_name,
+                "pk_column": fk.pkcolumn_name
+            })
 
-            // Your Flutter date is usually "yyyy-MM-dd"
-            var formats = new[]
-            {
-                "yyyy-MM-dd","dd/MM/yyyy","MM/dd/yyyy",
-                "yyyy/MM/dd","dd-MM-yyyy","MM-dd-yyyy",
-                "yyyyMMdd","ddMMyyyy"
-            };
+    conn.close()
+    print("\n✅ Schema loaded successfully!\n")
+    return schema
 
-            foreach (var f in formats)
-            {
-                if (DateTime.TryParseExact(s, f, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out dt))
-                    return true;
-            }
 
-            return DateTime.TryParse(s, out dt);
-        }
+database_schema = load_database_schema()
 
-        private static string Cut(string? s, int max)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim();
-            return t.Length <= max ? t : t.Substring(0, max);
-        }
 
-        private static short SafeToShort(int? n)
-        {
-            if (n == null) return 0;
-            if (n < short.MinValue) return short.MinValue;
-            if (n > short.MaxValue) return short.MaxValue;
-            return (short)n.Value;
-        }
+# -------------------------------------------------------------------
+# 5. AI Response Generator (with schema included)
+# -------------------------------------------------------------------
 
-        private static string Digits(string? s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            var arr = s.Where(char.IsDigit).ToArray();
-            return new string(arr);
-        }
-    }
+def generate_ai_response(user_input):
+    global conversation_history
 
-    // ================= DTOs inside controller namespace =================
+    # Build schema text block
+    schema_text = "DATABASE SCHEMA:\n"
+    for table, info in database_schema.items():
+        schema_text += f"\nTABLE: {table}\n"
+        schema_text += "  Columns:\n"
+        for col in info["columns"]:
+            schema_text += f"    - {col['name']} ({col['type']})\n"
 
-    public sealed class ActivityEntryRequest
-    {
-        // From Flutter / header
-        public string? loginId { get; set; }          // createId (or from header LoginID)
-        public string areaCode { get; set; }          // Emirate code (e.g. DUB, ABD)
-        public string activityName { get; set; }      // 'Painter Meet' / 'Contractor Meet' / 'Applicator Meet'
-        public string? description { get; set; }      // actvRmrk
-        public string activityDate { get; set; }      // yyyy-MM-dd
-        public string? meetingVenue { get; set; }     // meetVenu
-        public string? cityName { get; set; }         // actvCity
-        public string? district { get; set; }         // district (optional in UI)
-        public string? pinCode { get; set; }          // pinCodeN
-        public string? product { get; set; }          // Product dropdown (e.g. Wall Care Putty)
-        public string? latitude { get; set; }         // GPS
-        public string? longitude { get; set; }        // GPS
+        if info["primary_keys"]:
+            schema_text += f"  Primary Keys: {', '.join(info['primary_keys'])}\n"
 
-        // Counters
-        public int? totalParticipants { get; set; }   // noOfPart
-        public int? noOfEnquiries { get; set; }       // noOfEnqu
-        public int? noOfVisits { get; set; }          // noOfVist
-        public int? potentialInMT { get; set; }       // potnInMT
+        if info["foreign_keys"]:
+            schema_text += f"  Foreign Keys:\n"
+            for fk in info["foreign_keys"]:
+                schema_text += (
+                    f"    - {fk['fk_column']} → {fk['pk_table']}.{fk['pk_column']}\n"
+                )
 
-        // Employees present – list of simple objects
-        public List<ActivityEmployeeDto>? employees { get; set; }
+    # Store user question
+    conversation_history.append({"role": "user", "content": user_input})
 
-        // Painters / Contractors / Applicators
-        public List<ActivityPainterDto>? painters { get; set; }
+    # Construct the Llama prompt
+    prompt = "<|system|>You are a SQL Server expert AI. Use the database schema below to answer questions.\n"
+    prompt += schema_text + "\n"
 
-        // Channel Partners
-        public List<ActivityChannelPartnerDto>? channelPartners { get; set; }
-    }
+    for msg in conversation_history:
+        if msg["role"] == "user":
+            prompt += f"<|user|>{msg['content']}"
+        elif msg["role"] == "assistant":
+            prompt += f"<|assistant|>{msg['content']}"
 
-    public sealed class ActivityEmployeeDto
-    {
-        public string? employeeCode { get; set; }
-        public string? name { get; set; }
-        public string? mobile { get; set; }
-    }
+    prompt += "<|assistant|>"
 
-    public sealed class ActivityPainterDto
-    {
-        public string? type { get; set; }     // Painter / Contractor / Applicator
-        public string? mobile { get; set; }
-        public string? name { get; set; }
-    }
+    inputs = tokenizer(prompt, return_tensors="pt")
 
-    public sealed class ActivityChannelPartnerDto
-    {
-        public string? type { get; set; }          // Authorised Dealer / Retailer etc.
-        public string? purchaserCode { get; set; } // Purchaser Code (retlCode)
-        public string? mobile { get; set; }
-        public string? name { get; set; }
-    }
+    output = model.generate(
+        **inputs,
+        max_new_tokens=300,
+        temperature=0.7,
+        top_p=0.9,
+        do_sample=True,
+    )
 
-    public sealed class ActivitySubmitResponse
-    {
-        public bool success { get; set; }
-        public string message { get; set; }
-        public string? error { get; set; }
-        public string? docuNumb { get; set; }
-    }
-}
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    # Only take final answer
+    if "<|assistant|>" in response:
+        reply = response.split("<|assistant|>")[-1].strip()
+    else:
+        reply = response
+
+    conversation_history.append({"role": "assistant", "content": reply})
+    return reply
+
+
+# -------------------------------------------------------------------
+# 6. Chat Loop
+# -------------------------------------------------------------------
+
+def main():
+    print("\nDatabase-Aware Chatbot Ready!")
+    print("Ask anything about your tables, schema, relationships, or SQL.")
+    print("Type 'bye' to exit.\n")
+
+    while True:
+        user = input("You: ")
+
+        if user.lower() in ["bye", "quit", "exit"]:
+            print("AI: Goodbye!")
+            break
+
+        reply = generate_ai_response(user)
+        print("AI:", reply)
+
+
+if __name__ == "__main__":
+    main()
